@@ -1,0 +1,22 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: archcheck (deterministic-core boundary)
+        run: go run ./tools/archcheck
+      - name: unit tests
+        run: go test ./... -short -race

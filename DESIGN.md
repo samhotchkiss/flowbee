@@ -1766,3 +1766,226 @@ The first time Flowbee points at a repo with humans already working in it, the d
 ```
 
 Three rules make ADOPT safe: **(1) mirrored-but-quiescent is a real state** — adopted jobs are reconciled but **never scheduled**, so no worker ever touches human-owned in-flight work; **(2) project-OUT does not reassert renderings on adopted-quiescent objects** (the explicit §8.2.3 exception: a human's label on a quiescent job is *not* drift); **(3) opt-in is deliberate, by label or watermark** — the operator promotes work into Flowbee's control one decision at a time, and Flowbee **never seizes** work it didn't originate. The watermark (schedule only work created after `T0`) is the clean "start fresh" default; the `flowbee:adopt` label is the "pull this specific item in" escape hatch. ADOPT mode is the precondition for the strangler migration (§13) — it avoids a first-boot stampede over live PRs.
+
+---
+
+## 13. MVP & migration path
+
+What we build first, and what we leave on the floor. The clean-room invariants (§15) force a sharp line between *the slice that kills the original pain* and *the slice that THE ONE DECISION (§14) gates*.
+
+### 13.1 The strangler, not the rewrite
+
+Flowbee replaces a working — if sprawling — pipeline. The migration is a **strangler fig**: Flowbee grows around the existing `samhotchkiss/russ` scripts, takes over one responsibility at a time, and each script is deleted only once its replacement reconciles correctly in production. No flag day.
+
+| `russ` artifact (today) | Concern it owns | Strangled by | Cutover signal |
+|---|---|---|---|
+| `reconcile.go` | batched GraphQL sweep → `state.json` | **reconcile-IN** loop (Domain-B facts → store) | Flowbee mirror matches `state.json` for 48 h |
+| `route_prs.sh` | "what PR needs what next" routing | **scheduler** (job DAG + capability match) | scheduler dispatches a real build/review lease |
+| `review_prs.sh` | invoking the reviewer, gathering verdict | `code_reviewer` role + **reconciled sign-off** (I-9) | first SHA-bound sign-off minted from reconciled state |
+| `codex_watch_needs_codex.sh` | claim-dirs, board-sync, sweep, poison-guardian | **fenced leases** (I-4) + escalation (I-6) + **Rung-3/4 liveness** | first lease survives a heartbeat cycle + a forced revocation |
+| 2× launchd dispatchers + reviewer-watchdog | spawning/restarting agents | **pull-loop workers** dialing out (R2) | two workers (one build, one review) lease concurrently |
+| per-token GitHub hammering | outbound writes on a shared token | **project-OUT** outbox + single installation identity (I-14) | `rateLimit.remaining` floor stops dropping |
+
+The cutover discipline is **read-before-write, mirror-before-schedule**:
+
+```
+ PHASE 0  Flowbee dark-launched: reconcile-IN only. Scripts still own everything.
+          Flowbee's mirror is compared to reconcile.go's state.json. No writes.
+              │  (mirror agreement ≥ 48h)
+              ▼
+ PHASE 1  Flip the SCRIPTS to read Flowbee's mirror instead of polling GitHub.
+          ── this alone kills the rate-limit storm: N redundant statusCheckRollup
+             polls collapse to ONE reconcile-IN sweep. project-OUT owns writes.
+              │  (rateLimit.remaining floor flat for 1 week — §13.4)
+              ▼
+ PHASE 2  Flowbee SCHEDULES: fenced leases, capability match, ADOPT-mode import,
+          one build worker + one review worker, reconciled sign-offs, spec gate.
+          route_prs.sh / review_prs.sh / codex_watch deleted as each lease path proves out.
+              │
+              ▼
+ PHASE 3  Decision-gated (§14): either the human merge gate stays (ship lean),
+          or it comes off (content-integrity + side-effect machinery becomes MVP).
+```
+
+Phase 1 is the single highest-leverage step: it removes the exact failure (≈5 loops + every worker poll on one shared token, 3 redundantly polling `statusCheckRollup`) that motivated the whole project, and requires **none** of the agent-orchestration machinery. If Flowbee shipped *only* Phase 1, it would already have paid for itself.
+
+### 13.2 What ships in v1 vs. deferred to v1.1
+
+The line: **v1 contains exactly the invariants whose absence reintroduces a failure the original pipeline already suffered, plus the minimum to run two workers across the SHA boundary.** The notation `[T1✚]` marks items that **become v1** if §14 removes the human merge gate and **stay deferred** if it stays — the swing set.
+
+| Capability | v1 (MVP) | v1.1 / later | Invariant |
+|---|:---:|:---:|---|
+| reconcile-IN sweep (Domain-B facts) | ✅ | | I-1, I-3 |
+| Webhooks-as-hints + HMAC + dedupe + write-ahead inbox | ✅ | | I-2 |
+| project-OUT outbox (labels/checks/comments/draft↔ready/PR-open/merge-enqueue) | ✅ | | — |
+| **Single GitHub App installation token** (drop multi-PAT pool) | ✅ | | **I-14** |
+| Fenced exactly-once leases (atomic claim + epoch) | ✅ | | I-4 |
+| Capability matching on **attested** tags; derived constraints (arch-lottery fix) | ✅ | | — |
+| `max_attempts`/`max_bounces` → `needs_human`; `no_eligible_worker` alarm | ✅ | | I-6 |
+| **ADOPT mode** (import open issues/PRs as mirrored-but-quiescent) | ✅ | | **I-16** |
+| **Reconciled sign-off** (verdict derived from reconciled state, never `status:succeeded`) | ✅ | | **I-9** |
+| Enforced anti-affinity (identity ✚ model_family ✚ lens, 4 terms) at lease time | ✅ | | I-10 |
+| Spec flow (`spec_author` → `spec_review` GATE) before any SHA | ✅ | | — |
+| Build flow, **batch-size-1** merges via merge queue (through `merger` stage) | ✅ | | I-5 |
+| Branch protection on `main` as server-side backstop | ✅ | | I-8 |
+| Flowbee performs all git writes; ephemeral creds; workers hold no token | ✅ | | I-7 |
+| Per-job / per-flow **cost ceiling** (token/$ meter) | ✅ | | I-15 |
+| Liveness: **Rung-3 + Rung-4 + minimal Rung-2 gate + two fast-paths** | ✅ | | I-13 |
+| **Content-integrity gate** (path denylist + blast-radius + static checks) | `[T1✚]` | ✅ | **I-11** |
+| **Epoch-namespaced side effects** (refs/CI-by-epoch/compensation) | `[T1✚]` | ✅ | **I-12** |
+| **Unattended merge** (`self_merge` arm enabled) | `[T1✚]` | ✅ | I-9+I-11+I-12 |
+| Multi-reviewer fan-out / quorum (`majority`/`any_veto`/`weighted`) | | ✅ | — |
+| Merge-queue batch-size > 1 + `flowbee/review-valid@SHA` re-eval | | ✅ | I-5 (merge-queue fix) |
+| SSE event stream (replace long-poll) | | ✅ | — |
+| Full Rung-0 / Rung-1 liveness + adaptive priors | | ✅ | I-13 |
+| Stacked-PR depth, HA, multi-repo, multi-tenant | | ✅ | — |
+
+Two points the draft's §10 did not make: **the spec flow is v1, not v1.1** (Flowbee's real entry point is a chat that produces a spec, gated *before any SHA exists*; that gate is cheap — pure Flowbee state — and is the first place independence is enforced); and **ADOPT mode is v1, full stop** (without I-16, project-OUT would seize the board on first boot).
+
+### 13.3 The smallest slice that still honors the non-negotiables
+
+The **minimum** Flowbee runnable against live `russ` without violating a single non-negotiable invariant — Branch A, Phase 2, nothing more:
+
+```
+ SMALLEST HONEST FLOWBEE  (Branch A / human gate stays)
+ ─────────────────────────────────────────────────────
+  ✓ reconcile-IN sweep (I-1, I-3)        ✓ webhooks-as-hints, HMAC, inbox (I-2)
+  ✓ project-OUT outbox + ONE installation token (I-14)
+  ✓ ADOPT mode (I-16)                    ✓ fenced exactly-once leases (I-4)
+  ✓ capability match + derived constraints (arch-lottery dead)
+  ✓ spec_review GATE + lens anti-affinity (I-10)
+  ✓ code_review GATE → reconciled sign-off (I-9)
+  ✓ enforced anti-affinity at lease time, 4 terms (I-10)
+  ✓ batch-size-1 merge via merger stage (I-5)   ✓ branch protection backstop (I-8)
+  ✓ Flowbee does all git writes (I-7)    ✓ per-job cost ceiling (I-15)
+  ✓ Rung-3 + Rung-4 + minimal Rung-2 + 2 fast-paths (I-13)
+
+  ✗ handoff → HUMAN merges. self_merge arm DISABLED.   ← the human IS the I-11 gate
+  ✗ NO content-integrity machinery (I-11 deferred)     ← premature while the human gates
+  ✗ NO epoch-namespaced side-effects beyond fencing (I-12 deferred)
+  ✗ NO multi-reviewer fan-out, NO SSE, NO HA, NO multi-repo
+```
+
+The MVP is "lean" by deferring exactly the two invariants (I-11, I-12) the human merge gate makes redundant — **and not one more**. Drop fenced leases, reconciled sign-offs, ADOPT mode, anti-affinity, or the single-identity token and you have not shipped lean; you have shipped the original pipeline's bugs with a new name.
+
+### 13.4 The measurement gate (do this BEFORE choosing a branch)
+
+Both branches share a prerequisite, and it is *not* optional: **land the interim rate-limit patch and measure `rateLimit.remaining` for a week before building anything heavier.** This is the cheapest de-risking and it informs the decision rather than presuming it.
+
+**The interim patch** (deployable against the *current* scripts with zero Flowbee — defined here once; §8.4 cites this): (1) **de-dup the 3 redundant `statusCheckRollup` polls** onto `reconcile.go`'s existing `state.json` (the other loops read the mirror instead of GitHub); (2) **slow the clocks** on the remaining poll loops; (3) **add 403/`Retry-After` backoff** on the shared token. Then instrument and watch for a week:
+
+| Signal measured | What it tells you | How it informs §14 |
+|---|---|---|
+| `rateLimit.remaining` floor (min over the day) | Is the rate-limit storm solved by the patch alone? | Healthy floor with *just* the patch ⇒ Branch A "ship lean" is well-supported. |
+| review throughput vs. human-merge latency | Is the **human** the bottleneck, or verification? | Humans keep up ⇒ Branch A costs little. Human-merge is the jam ⇒ Branch B's value is concrete. |
+| frequency of denylist-relevant diffs (CI config, lockfiles, Dockerfiles) | How often would the content-integrity gate fire? | High ⇒ Branch B's I-11 is load-bearing and worth building; low ⇒ the human gate is rarely exercised on dangerous paths. |
+| build/review cost per job (token/$) | Does the cost ceiling (I-15) bind in practice? | Sizes the blast radius of an unattended (Branch B) runaway before enabling `self_merge`. |
+
+The sequencing rule is blunt: **measure, then ship lean, then — and only with data in hand — decide whether the gate comes off.** Building I-11/I-12's heavy machinery *before* the measurement gate is the exact "move fast" mistake the invariants exist to prevent.
+
+---
+
+## 14. THE ONE DECISION — may the MVP merge without a human in the loop?
+
+This is the one decision the document deliberately does **not** make. It re-sorts the `[T1✚]` rows of §13.2 and therefore determines what "MVP" even means. It is left to Sam.
+
+> **The question:** at the code-review GATE, when `code_reviewer` returns `approved`, may Flowbee take the **`self_merge` arm** (§5.4) and merge to `main` with **no human between the verdict and the merge commit** — or must *every* approved job take the **`handoff`→human** arm?
+
+The two branches are not "more features vs. fewer." They are **two different products with two different MVPs:**
+
+```
+                          ┌──────────────────── THE ONE DECISION ─────────────────────┐
+                          │   May an approved job merge with NO human in the loop?      │
+                          └───────────────┬────────────────────────────┬──────────────┘
+                                          │ GATE STAYS                  │ GATE COMES OFF
+                                          ▼                             ▼
+            ┌─────────────────────────────────────────┐ ┌──────────────────────────────────────────┐
+            │ Product = "a faster, safer human board"  │ │ Product = "agents that merge unattended"  │
+            │ self_merge arm DISABLED in policy.       │ │ self_merge arm is the WHOLE POINT.        │
+            │ Every approved job → handoff → human.    │ │ NOTHING but Flowbee stands between an LLM  │
+            │ Content-integrity (I-11) + epoch-        │ │ verdict and main.                          │
+            │ namespaced side-effects (I-12) are       │ │ ⇒ I-9 reconciled provenance, I-11 content │
+            │ PREMATURE. The human IS the gate.        │ │ integrity, I-12 epoch side-effects ARE    │
+            │ SHIP LEAN (§13.3) + measure first (§13.4)│ │ the MVP — not v1.1 polish.                │
+            └─────────────────────────────────────────┘ └──────────────────────────────────────────┘
+```
+
+**Branch A — the human merge gate STAYS.** If a human reviews and clicks merge, the human *is* the content-integrity gate. An LLM reviewer that waves through a poisoned `.github/workflows` change is caught by the human before `main`. Building I-11's path-denylist + blast-radius + static checks and I-12's epoch-namespaced refs/`(job,epoch)` CI gating/compensation *first* is **premature optimization of a safety boundary you already have**. Ship lean (§13.3), measure first (§13.4). A perfectly respectable place for v1 to live indefinitely.
+
+**Branch B — the gate COMES OFF.** The instant no human stands between an LLM's `approved` and a merge commit, the LLM reviewer's verdict is load-bearing in a way it never was, and a returned diff is *untrusted data* with a direct path to production:
+
+- **I-11 (content-integrity)** is the *only* deterministic, non-LLM thing standing between a prompt-injected `eng_worker` and a malicious CI-config change. The path denylist is the **primary safety boundary**, not defense-in-depth.
+- **I-12 (epoch-namespaced side effects)** stops being hygiene and becomes the thing preventing a revoked zombie from racing a live worker to the merge. Ack≠execution is no longer abstract: a stale epoch that force-pushes a branch now has an unsupervised path to `main`.
+- **I-9 (reconciled-verdict provenance)** is what makes a "sign-off" mean something when no human re-derived it — the verdict *must* be Flowbee's own conclusion from reconciled GitHub state, because there is no human to catch a forged `status:succeeded`.
+- **§9.7's egress gap** moves from "named post-v1 work" to a residual risk the operator must consciously accept.
+
+In Branch B these are **the actual MVP**; Phases 0–2 become table stakes on the way to the real product.
+
+**Why this is held open.** It is a risk-appetite and operational-readiness call, not an engineering one — and the architecture is deliberately constructed so **either branch is reachable without restructuring.** The `self_merge`/`handoff` branch point (§5.4) is a policy toggle, not a wiring change; flipping it disables one arm and promotes three invariants from deferred to MVP. The document's job is to make the cost of each branch legible, then get out of the way.
+
+---
+
+## 15. Correctness invariants (the canonical I-1 … I-16)
+
+The single source of truth for the invariant IDs. They hold even at MVP; their removal reintroduces the exact wedge/double-merge/unreviewed-merge failures Flowbee exists to delete. The first eight carry the draft's §11 forward; the rest are clean-room additions.
+
+**Carried forward (draft §11):**
+
+- **I-1 — reconcile-IN is ground truth for Domain B; webhooks are hints.** No webhook is authority; gaps (delivery high-water-mark) force a sweep. (§3.3, §8.1)
+- **I-2 — HMAC-verify every webhook, dedupe by `X-GitHub-Delivery`, write-ahead inbox** before acting (crash-replay safe; the endpoint is internet-reachable). (§8.1.3)
+- **I-3 — SHA-monotonic gating + terminal-SHA guard.** Ignore any event older than recorded head SHA / `updated_at`; a merged/settled job is never re-dispatched by a late or replayed event. (§8.1.5)
+- **I-4 — fenced, exactly-once leases:** atomic claim (`UPDATE … WHERE state='ready'`) + partial unique index "one active lease per job" + `lease_epoch` rejecting stale mutations. (§6.3)
+- **I-5 — serialized merges; CI-green AND review-valid bound to the exact `(head_sha, base_sha)`.** Any base/head move supersedes the verdict and re-arms review + CI. (§6.2.4, §8.5)
+- **I-6 — `max_attempts` / `max_bounces` → `needs_human`; `no_eligible_worker` alarm.** Bounded retry, no infinite poison loop, no silent starvation. (§6.6, §6.7)
+- **I-7 — Flowbee performs all git writes** with ephemeral, least-privilege creds; workers never hold the installation token; promotion of worker output goes only through epoch-namespaced refs. (§3.5, §9.4)
+- **I-8 — branch protection on `main` as server-side backstop:** no direct/force push, required checks, required review from an identity distinct from the author. (§9.6)
+
+**Clean-room additions:**
+
+- **I-9 — Reconciled-verdict sign-off.** A sign-off (spec-review gate, code-review gate) is a **tamper-evident Flowbee record derived from reconciled GitHub state** (build) or the reviewed spec bytes addressed by `spec_content_hash` (spec), never a worker self-reported `status: succeeded`. (§5.5, §11.5)
+- **I-10 — Independence / anti-affinity is enforced, not advisory.** The canonical four terms — `eng_worker.identity != code_reviewer.identity` ∧ `eng_worker.model_family != code_reviewer.model_family` ∧ `spec_author.lens != spec_reviewer.lens` ∧ `code_reviewer.identity != merger.identity` — enforced at lease time (§6.3.1); reviewer context stripped of untrusted PR/issue prose (judge the diff). (§5.5, §9.3)
+- **I-11 — Content-integrity gate.** A returned diff is **untrusted data.** Before auto-merge it must pass a **path denylist** (CI config, `.github/workflows`, lockfiles + postinstall, Dockerfiles, secrets, Flowbee's own source → forced human gate), a **declared blast-radius** check, and **deterministic non-LLM static checks**. No LLM verdict alone clears this gate. (§9.2)
+- **I-12 — Epoch-namespaced side effects (ack ≠ execution).** Every externally-visible action is idempotent against re-dispatch: epoch-namespaced refs promoted only post-validation, CI gated on `(job, epoch)`, explicit compensation on revocation, no worker-supplied PR number. (§3.5, §6.5)
+- **I-13 — Two-rung kill rule.** A kill (lease revocation for a presumed-stalled agent) requires **two independent liveness rungs agreeing, at least one Rung-2 (external) or Rung-3 (clock)** — never two worker-reported rungs. "Worker partitioned" is distinguished from "agent stalled"; the reconnecting zombie is handled by fencing (I-4). (§10.3)
+- **I-14 — Single-identity ToS constraint.** Outbound GitHub identity resolves toward **one GitHub App installation token** (one larger ToS-clean bucket). The multi-PAT "multiply the buckets" pool is **dropped** — a ToS-suspension vector. Stated as a constraint, not a tuning knob. (§8.3, §9.4)
+- **I-15 — Per-job / per-flow cost ceiling.** Token/$ metering with an enforced ceiling per job and per flow, alongside the GitHub-budget meter. Exceeding the ceiling escalates; it does not silently overspend. (§6.7, §12.6)
+- **I-16 — ADOPT-mode bootstrap.** First run against a live repo imports existing open issues/PRs as mirrored-but-quiescent; only work opted-in via label / watermark is scheduled. Flowbee never seizes human-owned in-flight work, and project-OUT does not reassert renderings on adopted-quiescent objects until opt-in. (§12.7)
+
+> **Held open deliberately (not an invariant — the one live decision, §14):** *may the MVP merge without a human in the loop?* If the gate **stays**, I-11 and the heavy side-effect machinery of I-12 are *premature* — ship lean and first measure `rateLimit.remaining` for a week. If it **comes off**, I-9 + I-11 + I-12 stop being v1.1 polish and become the **actual MVP**.
+
+*(Capability attestation — "probed/attested, not self-declared" — is a hard requirement carried from the original spec §8 and enforced in §7.2/§9.4.1, but is not assigned a numbered invariant; it is a property of the worker protocol's trust boundary.)*
+
+---
+
+## 16. Biggest risks (design around these)
+
+| # | Risk | Why it bites | Mitigation (where) |
+|---|---|---|---|
+| 1 | **Webhooks-as-sole-truth → board drift** (highest in the draft) | webhooks are lossy/replayable/forgeable | reconcile-IN is ground truth; webhooks are hints (I-1, §3.3, §8.1) |
+| 2 | **Forged/replayed events → unreviewed merge** | internet-reachable endpoint | HMAC + dedupe + write-ahead inbox + SHA-monotonic gating (I-2, I-3) |
+| 3 | **Worker compromise** (untrusted agents, broad local privilege, untrusted prose) | prompt injection + permission bypass | credential classes + content-integrity gate + diff-only reviewer context + branch-protection backstop (§9) |
+| 4 | **Stale approval on base/head move** (stacked PRs, merge-queue integrated head) | the queue re-runs CI but not review | verdicts bound to the SHA pair; `superseded` re-arm; `flowbee/review-valid@SHA` re-eval (I-5, §8.5) |
+| 5 | **Ack ≠ execution / zombie workers** | fencing doesn't reach git/CI/GitHub | epoch-namespaced refs + `(job,epoch)` CI + explicit compensation (I-12, §3.5, §6.5) |
+| 6 | **Crash-consistency / SPOF** | single process, v1 | reconstruct-on-boot, idempotent re-checkable external actions, WAL+replication, launchd KeepAlive (§12.4) |
+| 7 | **Liveness false-positives** (kill a healthy 40-min E2E or a long reasoning step) | cheap signals are gameable, un-gameable ones are slow | 5-rung ladder + two-rung kill rule + abstain semantics + CI-tolerance extension (I-13, §10) |
+| 8 | **Verification becomes the bottleneck** | unattended merge outruns trust | cap WIP via the human merge gate (Branch A) OR ship the full content-integrity machinery (Branch B) — §14 decides |
+| 9 | **ToS suspension from multi-PAT buckets** | sock-puppeting rate limits | single installation identity; the pool is dropped (I-14, §8.3) |
+| 10 | **First-boot stampede over live human PRs** | project-OUT seizes the board | ADOPT mode: mirrored-but-quiescent + opt-in (I-16, §12.7) |
+| 11 | **Worker-host data exfiltration** | the host owns its own egress | bounded blast radius (no token, one-epoch write key); egress confinement is the first post-v1 item (§9.7) |
+| 12 | **Cost runaway** (a spinning agent burns tokens) | the draft metered only the GitHub budget | per-job/per-flow token/$ ceiling → escalate (I-15, §12.6) |
+
+---
+
+## Appendix: what it replaces
+
+| `russ` artifact | Flowbee successor |
+|---|---|
+| `scripts/pipeline/reconcile.go` | the **reconcile-IN** sweep (Domain-B ground truth, §8.1) |
+| `route_prs.sh` + `review_prs.sh` | the **scheduler + flow engine** (job DAG, capability match, gated flows, §5–§6) |
+| `codex_watch_needs_codex.sh` (claim-dirs, board-sync, sweep, poison-guardian) | the **worker registry + fenced leases + escalation + liveness ladder** (§6, §7, §10) |
+| the two launchd dispatchers + reviewer-watchdog | **pull-loop workers** dialing out + the single control plane (§4, §7) |
+| per-token GitHub hammering | the **single installation identity + reconcile-first + project-OUT outbox** (§8, I-14) |
+
+What is genuinely *new* (no `russ` antecedent): the **spec-review gate and spec flow** (§11), the **two-domain reconciliation model** (§3), the **content-integrity gate** (§9.2), the **scoped-read provisioning credential class** (§7.4, §9.4), **ADOPT mode** (§12.7), and the **per-job/per-flow cost ceiling** (§12.6).
+
+The original working-name draft ("Foreman") additionally floated a multi-PAT identity pool and a single build→review→merge flow rooted at "build an issue"; both are **superseded** here — the pool by the single installation identity (I-14), and the single flow by the two gated flows joined at the SHA boundary (§5).
