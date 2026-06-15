@@ -5,11 +5,10 @@ import (
 	"fmt"
 
 	"github.com/samhotchkiss/flowbee/internal/config"
-	fbriver "github.com/samhotchkiss/flowbee/internal/river"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
-// runMigrate applies River + Flowbee migrations idempotently. M0 supports `up`.
+// runMigrate applies migrations idempotently. M0 supports `up`.
 func runMigrate(args []string) error {
 	dir := "up"
 	if len(args) > 0 {
@@ -31,10 +30,7 @@ func runMigrate(args []string) error {
 	}
 	defer st.Close()
 
-	if err := fbriver.Migrate(ctx, st.Pool); err != nil {
-		return err
-	}
-	if err := store.MigrateUp(ctx, st.Pool); err != nil {
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
 		return err
 	}
 	fmt.Println("migrations applied")

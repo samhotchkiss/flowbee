@@ -7,19 +7,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/api"
 	"github.com/samhotchkiss/flowbee/internal/config"
-	fbriver "github.com/samhotchkiss/flowbee/internal/river"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
-// runServe boots the control plane: load config -> open store -> migrate
-// (River then Flowbee) -> start River -> open health + private listeners ->
-// block until signal -> graceful shutdown.
+// runServe boots the control plane: load config -> open store -> migrate ->
+// open health + private listeners -> block until signal -> graceful shutdown.
 func runServe(_ []string) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -36,25 +33,12 @@ func runServe(_ []string) error {
 	}
 	defer st.Close()
 
-	if err := fbriver.Migrate(ctx, st.Pool); err != nil {
-		return err
-	}
-	if err := store.MigrateUp(ctx, st.Pool); err != nil {
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
 		return err
 	}
 	logger.Info("migrations applied")
 
-	riverClient, err := fbriver.NewClient(st.Pool, cfg.RiverMaxWorkers)
-	if err != nil {
-		return err
-	}
-	if err := riverClient.Start(ctx); err != nil {
-		return err
-	}
-	var riverStarted atomic.Bool
-	riverStarted.Store(true)
-
-	srv := api.New(st, &riverStarted, version)
+	srv := api.New(st, version)
 	healthSrv := &http.Server{Addr: cfg.HealthAddr, Handler: srv.HealthHandler()}
 	privateSrv := &http.Server{Addr: cfg.PrivateAddr, Handler: srv.PrivateHandler()}
 
@@ -71,9 +55,6 @@ func runServe(_ []string) error {
 	defer cancel()
 	_ = healthSrv.Shutdown(shutdownCtx)
 	_ = privateSrv.Shutdown(shutdownCtx)
-	if err := riverClient.Stop(shutdownCtx); err != nil {
-		logger.Error("river stop", "err", err)
-	}
 	return nil
 }
 

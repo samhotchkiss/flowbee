@@ -6,19 +6,17 @@ package api
 import (
 	"encoding/json"
 	"net/http"
-	"sync/atomic"
 
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
 type Server struct {
-	store        *store.Store
-	riverStarted *atomic.Bool
-	version      string
+	store   *store.Store
+	version string
 }
 
-func New(st *store.Store, riverStarted *atomic.Bool, version string) *Server {
-	return &Server{store: st, riverStarted: riverStarted, version: version}
+func New(st *store.Store, version string) *Server {
+	return &Server{store: st, version: version}
 }
 
 // HealthHandler serves the health listener.
@@ -44,10 +42,9 @@ func (s *Server) PrivateHandler() http.Handler {
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	dbOK := s.store.Ping(r.Context()) == nil
-	riverOK := s.riverStarted.Load()
 
 	status, code := "ok", http.StatusOK
-	if !dbOK || !riverOK {
+	if !dbOK {
 		status, code = "unavailable", http.StatusServiceUnavailable
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -55,7 +52,6 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":  status,
 		"db":      dbOK,
-		"river":   riverOK,
 		"version": s.version,
 	})
 }

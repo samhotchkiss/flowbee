@@ -26,7 +26,7 @@ type Config struct {
 
 func Default() Config {
 	return Config{
-		DatabaseURL:        "postgres://flowbee:flowbee@localhost:5433/flowbee?sslmode=disable",
+		DatabaseURL:        "flowbee.db",
 		PrivateAddr:        ":7070",
 		HealthAddr:         ":7001",
 		WebhookAddr:        ":8443",
