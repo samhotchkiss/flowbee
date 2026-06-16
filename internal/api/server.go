@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/clock"
+	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/lease"
 	"github.com/samhotchkiss/flowbee/internal/scheduler"
@@ -35,6 +36,13 @@ type Server struct {
 	leaseTTL     time.Duration
 	longPollWait time.Duration
 	pollInterval time.Duration
+
+	// mirrorPath is the shared bare-repo mirror path handed to same-box workers
+	// for `worktree` provisioning (§7.4). Empty when no local mirror is configured
+	// (the worker then has no repo to provision and must supply its own).
+	mirrorPath string
+	// staleHB is the roster's stale-heartbeat threshold (§12.6.2).
+	staleHB time.Duration
 }
 
 // Config carries the timing knobs the worker API needs.
@@ -51,6 +59,15 @@ type Config struct {
 	// defaults to the DB-backed source (domain_b_facts), which reconcile-IN writes
 	// (M3 tests seed it directly via store.UpsertDomainBFacts).
 	Facts store.FactSource
+	// MirrorPath is the shared bare-repo mirror handed to same-box `worktree`
+	// workers (§7.4). Empty disables local provisioning hints.
+	MirrorPath string
+	// Allowlist is the enrolled-identity attestation policy (§9.4.1). The zero
+	// value attests no role/family/tool; tests/dev use worker.OpenAllowlist().
+	Allowlist worker.Allowlist
+	// StaleHBThreshold badges a worker stale on the roster after this idle gap
+	// (§12.6.2). Defaults to 3× the heartbeat interval.
+	StaleHBThreshold time.Duration
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -59,11 +76,26 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 	if facts == nil {
 		facts = store.DBFactSource{DB: st.DB}
 	}
+	allow := cfg.Allowlist
+	if !allow.Open && allow.Permit == nil {
+		// unconfigured: default to the permissive dev/test allowlist (every
+		// role/family/tool claim attested; arch/os still gated by the handshake).
+		// Production sets an explicit strict allowlist via Config.Allowlist.
+		allow = worker.OpenAllowlist()
+	}
+	staleHB := cfg.StaleHBThreshold
+	if staleHB == 0 {
+		hb := cfg.HeartbeatInterval
+		if hb == 0 {
+			hb = 30 * time.Second
+		}
+		staleHB = 3 * hb
+	}
 	return &Server{
 		store:        st,
 		clock:        clk,
 		minter:       minter,
-		registry:     worker.NewRegistry(st, cfg.LeaseTTLS, cfg.HeartbeatIntervalS),
+		registry:     worker.NewRegistry(st, cfg.LeaseTTLS, cfg.HeartbeatIntervalS, allow),
 		broker:       NewBroker(),
 		version:      version,
 		facts:        facts,
@@ -71,6 +103,8 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		leaseTTL:     cfg.LeaseTTL,
 		longPollWait: cfg.LongPollWait,
 		pollInterval: poll,
+		mirrorPath:   cfg.MirrorPath,
+		staleHB:      staleHB,
 	}
 }
 
@@ -94,8 +128,30 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{job}/review", s.review)
 	mux.HandleFunc("POST /v1/jobs/{job}/release", s.release)
 	mux.HandleFunc("GET /v1/events", s.eventsHandler)
+	mux.HandleFunc("GET /v1/roster", s.rosterJSON)
+	mux.HandleFunc("GET /roster", s.rosterPage)
 	mux.HandleFunc("GET /", s.board)
 	return mux
+}
+
+// rosterJSON serves the worker roster as JSON (§12.6.2).
+func (s *Server) rosterJSON(w http.ResponseWriter, r *http.Request) {
+	roster, err := s.store.Roster(r.Context(), s.clock.Now(), s.staleHB)
+	if err != nil {
+		http.Error(w, "roster error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, roster)
+}
+
+// rosterPage serves the HTML worker roster with a stale-hb badge (§12.6.2).
+func (s *Server) rosterPage(w http.ResponseWriter, r *http.Request) {
+	roster, err := s.store.Roster(r.Context(), s.clock.Now(), s.staleHB)
+	if err != nil {
+		http.Error(w, "roster error", http.StatusInternalServerError)
+		return
+	}
+	renderRoster(w, roster)
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +190,12 @@ type LeaseGrant struct {
 	LeaseEpoch int    `json:"lease_epoch"`
 	LeaseTTLS  int    `json:"lease_ttl_s"`
 	Deadline   string `json:"lease_deadline"`
+	// Repo provisioning (§7.4). For same-box `worktree`, MirrorPath is the shared
+	// bare mirror the worker adds a per-lease worktree off; PushTarget is the
+	// epoch-namespaced ref the worker pushes its build to (Flowbee promotes it).
+	Provisioning string `json:"provisioning"`
+	MirrorPath   string `json:"mirror_path"`
+	PushTarget   string `json:"push_target"`
 }
 
 // lease long-polls: rank `ready` candidates (scheduler: priority + aging +
@@ -191,11 +253,19 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 			if err == nil {
 				j, _ := s.store.GetJob(r.Context(), cand.JobID)
 				s.broker.Publish(LifeEvent{JobID: cand.JobID, State: string(j.State), Event: "lease_claimed", Epoch: ls.Epoch})
-				writeJSON(w, http.StatusOK, LeaseGrant{
+				grant := LeaseGrant{
 					JobID: cand.JobID, Kind: string(j.Kind), Role: string(j.Role),
 					BaseSHA: j.BaseSHA, LeaseID: ls.LeaseID, LeaseEpoch: ls.Epoch,
 					LeaseTTLS: int(s.leaseTTL / time.Second), Deadline: ls.Deadline.Format(time.RFC3339Nano),
-				})
+				}
+				// same-box `worktree` provisioning hints (§7.4): only for build jobs
+				// that carry a base_sha and only when a local mirror is configured.
+				if s.mirrorPath != "" && j.BaseSHA != "" {
+					grant.Provisioning = "worktree"
+					grant.MirrorPath = s.mirrorPath
+					grant.PushTarget = gitops.EpochRef(cand.JobID, ls.Epoch)
+				}
+				writeJSON(w, http.StatusOK, grant)
 				return
 			}
 			if !errors.Is(err, lease.ErrLostRace) {
@@ -289,8 +359,18 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	idemKey := r.Header.Get("Idempotency-Key")
+	// the eng_worker's work-product (§7.3): a patch bound to base_sha + the epoch
+	// ref it pushed. Untrusted hints; Flowbee records the pushed ref so it can
+	// promote it (the canonical PR-open trigger lands fully in M7). There is NO pr
+	// field — Domain B owns PR existence (§3.4).
+	var body struct {
+		PushedRef string `json:"pushed_ref"`
+		BaseSHA   string `json:"base_sha"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
 	resp, err := s.store.Result(r.Context(), store.ResultParams{
 		JobID: jobID, Epoch: epoch, IdempotencyKey: idemKey, Now: s.clock.Now(),
+		PushedRef: body.PushedRef,
 	})
 	if err != nil {
 		s.writeFenceError(w, err)

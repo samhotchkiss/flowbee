@@ -23,12 +23,16 @@ func New(baseURL string) *Client {
 	return &Client{BaseURL: baseURL, HTTP: http.DefaultClient}
 }
 
-// Registration mirrors the server-side enrollment payload.
+// Registration mirrors the server-side enrollment payload. Arch/OS are the
+// attestation handshake (§7.2): the server attests arch:*/os:* claims against
+// them.
 type Registration struct {
 	WorkerID     string   `json:"worker_id"`
 	Identity     string   `json:"identity"`
 	Host         string   `json:"host"`
 	Capabilities []string `json:"capabilities"`
+	Arch         string   `json:"arch,omitempty"`
+	OS           string   `json:"os,omitempty"`
 }
 
 type RegisterResponse struct {
@@ -49,14 +53,17 @@ func (c *Client) Register(ctx context.Context, reg Registration) (RegisterRespon
 
 // LeaseGrant is the §7.2 lease envelope.
 type LeaseGrant struct {
-	JobID      string `json:"job_id"`
-	Kind       string `json:"kind"`
-	Role       string `json:"role"`
-	BaseSHA    string `json:"base_sha"`
-	LeaseID    string `json:"lease_id"`
-	LeaseEpoch int    `json:"lease_epoch"`
-	LeaseTTLS  int    `json:"lease_ttl_s"`
-	Deadline   string `json:"lease_deadline"`
+	JobID        string `json:"job_id"`
+	Kind         string `json:"kind"`
+	Role         string `json:"role"`
+	BaseSHA      string `json:"base_sha"`
+	LeaseID      string `json:"lease_id"`
+	LeaseEpoch   int    `json:"lease_epoch"`
+	LeaseTTLS    int    `json:"lease_ttl_s"`
+	Deadline     string `json:"lease_deadline"`
+	Provisioning string `json:"provisioning"`
+	MirrorPath   string `json:"mirror_path"`
+	PushTarget   string `json:"push_target"`
 }
 
 // Lease long-polls for a lease. ok=false means a 204 (no work this round).

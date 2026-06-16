@@ -49,6 +49,10 @@ func runServe(_ []string) error {
 		LongPollWait:       cfg.LongPollWait(),
 		LeaseTTLS:          cfg.LeaseTTLS,
 		HeartbeatIntervalS: cfg.HeartbeatIntervalS,
+		// same-box `worktree` provisioning: hand workers the shared bare mirror so
+		// they can add a per-lease worktree at base_sha and push to the epoch ref
+		// (§7.4). Empty disables local provisioning hints.
+		MirrorPath: os.Getenv("FLOWBEE_MIRROR_PATH"),
 	}, version)
 	healthSrv := &http.Server{Addr: cfg.HealthAddr, Handler: srv.HealthHandler()}
 	privateSrv := &http.Server{Addr: cfg.PrivateAddr, Handler: srv.PrivateHandler()}

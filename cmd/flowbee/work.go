@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/samhotchkiss/flowbee/client"
+	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/worker"
 )
 
@@ -18,32 +19,67 @@ func envOr(key, def string) string {
 	return def
 }
 
-// runWork runs the Mode-A harness. In M1, --stub runs the echo stub loop once.
+// runWork runs the Mode-A harness (DESIGN §7.1): the thin pull loop around an
+// agent CLI. --stub runs the built-in echo stub (no worktree). Otherwise it runs
+// the real harness: provision a per-lease worktree at base_sha off the shared
+// mirror, spawn FLOWBEE_AGENT_CMD in it, push to the epoch ref, submit the patch.
+// --once runs a single lease cycle (used by tests); default loops forever.
 func runWork(args []string) error {
 	fs := flag.NewFlagSet("work", flag.ContinueOnError)
-	stub := fs.Bool("stub", false, "run the built-in echo stub worker (M1)")
-	identity := fs.String("identity", envOr("FLOWBEE_IDENTITY", "stub-worker"), "worker identity")
+	stub := fs.Bool("stub", false, "run the built-in echo stub worker (no worktree)")
+	once := fs.Bool("once", false, "run a single lease cycle, then exit")
+	identity := fs.String("identity", envOr("FLOWBEE_IDENTITY", "worker"), "worker identity")
 	family := fs.String("model-family", envOr("FLOWBEE_MODEL_TAG", "stub"), "model family tag")
+	role := fs.String("role", envOr("FLOWBEE_ROLE", ""), "role filter")
+	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", ""), "agent CLI to spawn per lease")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if !*stub {
-		return fmt.Errorf("only --stub is implemented in M1")
-	}
 	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
-	out, err := worker.RunOnce(context.Background(), worker.StubConfig{
-		BaseURL: url, Identity: *identity, ModelFamily: *family,
-	})
-	if err != nil {
-		return err
-	}
-	if !out.Got {
-		fmt.Println("no work available (204)")
+	ctx := context.Background()
+
+	if *stub {
+		out, err := worker.RunOnce(ctx, worker.StubConfig{
+			BaseURL: url, Identity: *identity, ModelFamily: *family,
+		})
+		if err != nil {
+			return err
+		}
+		if !out.Got {
+			fmt.Println("no work available (204)")
+			return nil
+		}
+		fmt.Printf("stub completed job %s -> %s (epoch %d)\n", out.JobID, out.JobState, out.LeaseEpoch)
 		return nil
 	}
-	fmt.Printf("stub completed job %s -> %s (epoch %d)\n", out.JobID, out.JobState, out.LeaseEpoch)
-	return nil
+
+	run := func() error {
+		out, err := worker.RunOnceHarness(ctx, worker.HarnessConfig{
+			BaseURL: url, Identity: *identity, ModelFamily: *family, Role: *role, AgentCmd: *agentCmd,
+		})
+		if err != nil {
+			return err
+		}
+		if !out.Got {
+			fmt.Println("no work available (204)")
+			return nil
+		}
+		fmt.Printf("completed job %s -> %s (epoch %d) pushed %s @ %s\n",
+			out.JobID, out.JobState, out.LeaseEpoch, out.PushedRef, out.PushedSHA)
+		return nil
+	}
+
+	if *once {
+		return run()
+	}
+	for {
+		if err := run(); err != nil {
+			fmt.Fprintf(envErr(), "work cycle: %v\n", err)
+		}
+	}
 }
+
+func envErr() *os.File { return os.Stderr }
 
 // runLease is the Mode-B thin client: one GET /v1/lease, print JSON.
 func runLease(args []string) error {
@@ -69,13 +105,22 @@ func runLease(args []string) error {
 	return nil
 }
 
-// runSubmit is the Mode-B thin client: post a result (or heartbeat/release).
+// runSubmit is the Mode-B thin client (DESIGN §7.1, the MCP-shim surface): post a
+// result / heartbeat / release for a held lease. For a build job it can also
+// PROVISION a worktree off the mirror, spawn an agent CLI, and push to the epoch
+// ref before submitting — the same work the Mode-A harness does, driven from the
+// CLI so Mode B completes the identical build thread.
 func runSubmit(args []string) error {
 	fs := flag.NewFlagSet("submit", flag.ContinueOnError)
 	jobID := fs.String("job", "", "job id")
 	epoch := fs.Int("epoch", 0, "lease epoch (the fence)")
 	action := fs.String("action", "result", "result|heartbeat|release")
 	idem := fs.String("idempotency-key", "", "idempotency key (result only)")
+	// build-result provisioning (Mode-B does the git work itself, no creds):
+	mirror := fs.String("mirror", "", "shared bare mirror path (from the lease envelope)")
+	baseSHA := fs.String("base-sha", "", "base SHA to provision the worktree at")
+	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", ""), "agent CLI to spawn in the worktree")
+	identity := fs.String("identity", envOr("FLOWBEE_IDENTITY", "modeb"), "worker identity (for the commit)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -101,6 +146,34 @@ func runSubmit(args []string) error {
 		fmt.Printf("status=%d\n", st)
 	case "result":
 		body := map[string]any{"kind": "patch", "blast_radius": map[string]any{"scope": "modeb"}}
+		// if a mirror was supplied, provision + push a real patch to the epoch ref.
+		if *mirror != "" {
+			workRoot, err := os.MkdirTemp("", "flowbee-modeb-")
+			if err != nil {
+				return err
+			}
+			defer os.RemoveAll(workRoot)
+			m := gitops.Open(*mirror)
+			ws := gitops.WorktreeBase(workRoot, *jobID, *epoch)
+			wt, err := m.AddWorktree(ws, *baseSHA)
+			if err != nil {
+				return fmt.Errorf("provision worktree: %w", err)
+			}
+			defer wt.Destroy()
+			if *agentCmd != "" {
+				if _, err := wt.Run("sh", "-c", *agentCmd); err != nil {
+					return fmt.Errorf("agent cmd: %w", err)
+				}
+			}
+			sha, ref, err := wt.CommitAndPushEpoch(*jobID, *epoch,
+				fmt.Sprintf("flowbee: %s mode-b build %s@e%d", *identity, *jobID, *epoch))
+			if err != nil {
+				return fmt.Errorf("push epoch ref: %w", err)
+			}
+			body["base_sha"] = *baseSHA
+			body["pushed_ref"] = ref
+			fmt.Printf("pushed %s @ %s\n", ref, sha)
+		}
 		res, st, err := c.Result(ctx, *jobID, *epoch, *idem, body)
 		if err != nil {
 			return err

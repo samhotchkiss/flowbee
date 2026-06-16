@@ -278,6 +278,15 @@ func (s *Store) Heartbeat(ctx context.Context, p HeartbeatParams) (engine.Direct
 			p.Now.Format(rfc3339), p.JobID); err != nil {
 			return fmt.Errorf("extend heartbeat: %w", err)
 		}
+		// bump the bound worker's last_seen so the roster's stale-hb badge clears on
+		// a live heartbeat (§12.6.2). Keyed by the job's bound identity.
+		if j.BoundIdentity != "" {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE workers SET last_seen_at = ? WHERE identity = ?`,
+				p.Now.Format(rfc3339), j.BoundIdentity); err != nil {
+				return fmt.Errorf("touch worker last_seen: %w", err)
+			}
+		}
 		nextSeq := seq + 1
 		ev := ledger.Event{
 			JobID: p.JobID, JobSeq: nextSeq, Kind: ledger.KindHeartbeat,
@@ -301,6 +310,10 @@ type ResultParams struct {
 	Epoch          int
 	IdempotencyKey string
 	Now            time.Time
+	// PushedRef is the epoch-namespaced ref the eng_worker pushed its build to
+	// (§7.3). Flowbee records it on the job so it can validate+promote it (the full
+	// PR-open trigger is M7); an empty value (e.g. a review result) is ignored.
+	PushedRef string
 }
 
 // ResultResponse is the cached/applied response for a result POST.
@@ -371,12 +384,13 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 				       required_capabilities = ?,
 				       builder_identity     = COALESCE(builder_identity, bound_identity),
 				       builder_model_family = COALESCE(builder_model_family, bound_model_family),
+				       head_ref = COALESCE(NULLIF(?, ''), head_ref),
 				       lease_id = NULL, bound_identity = NULL,
 				       bound_model_family = NULL, lease_hb_due = NULL,
 				       eng_worker_job = COALESCE(eng_worker_job, id),
 				       updated_at = datetime('now')
 				 WHERE id = ?`,
-				string(final), marshalStrings([]string{"role:code_reviewer"}), p.JobID); err != nil {
+				string(final), marshalStrings([]string{"role:code_reviewer"}), p.PushedRef, p.JobID); err != nil {
 				return fmt.Errorf("apply result projection: %w", err)
 			}
 			// arm the review-stage no_eligible_worker alarm (I-6): if no compliant,
@@ -647,6 +661,17 @@ func (s *Store) CompleteJob(ctx context.Context, p CompleteParams) ([]string, er
 // GetJob reads the jobs projection for id.
 func (s *Store) GetJob(ctx context.Context, id string) (job.Job, error) {
 	return scanJob(s.DB.QueryRowContext(ctx, jobSelect+` WHERE id = ?`, id))
+}
+
+// JobHeadRef returns the epoch-namespaced ref the eng_worker pushed its build to,
+// recorded on the build result (§7.3). Empty if none recorded yet.
+func (s *Store) JobHeadRef(ctx context.Context, id string) (string, error) {
+	var ref sql.NullString
+	err := s.DB.QueryRowContext(ctx, `SELECT head_ref FROM jobs WHERE id = ?`, id).Scan(&ref)
+	if err != nil {
+		return "", err
+	}
+	return ref.String, nil
 }
 
 // LoadEvents reads the full ordered event stream for a job (for replay tests).
