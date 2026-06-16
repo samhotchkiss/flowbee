@@ -102,7 +102,51 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 	}
 	b.WriteString("\n## How to complete this\n\nMake the change by creating or editing files in THIS working directory. " +
 		"Write the actual files to disk now — do not just describe or print them. Touch only what the task requires.\n")
+	b.WriteString("\nWhen done, write `.flowbee/commit.md` with a clear, DETAILED commit message for your change: " +
+		"a concise one-line summary, a blank line, then a body explaining WHAT you changed and WHY. " +
+		"This becomes the commit on the issue branch, so the history shows how the work was built.\n")
 	return b.String()
+}
+
+// nodeCommitMessage is the commit message a build/resolve node commits with. It
+// prefers the agent's OWN description of its change — the agent writes detailed
+// notes to .flowbee/commit.md (instructed by the brief), so the commit body is the
+// node author's account of WHAT changed and WHY (build-list: "detailed notes in
+// each commit"). When the agent wrote none, it falls back to a rendered default
+// built from the task. Must be called BEFORE the .flowbee scaffolding is stripped.
+func nodeCommitMessage(wsDir, identity, role, jobID string, c *client.LeaseContext) string {
+	if raw, err := os.ReadFile(filepath.Join(wsDir, ".flowbee", "commit.md")); err == nil {
+		if msg := strings.TrimSpace(string(raw)); msg != "" {
+			return msg
+		}
+	}
+	verb := "build"
+	if role == "conflict_resolver" {
+		verb = "resolve"
+	}
+	title := jobID
+	if c != nil {
+		if t := firstLineOf(c.Task); t != "" {
+			title = strings.TrimLeft(t, "# ")
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s(%s): %s\n\n", verb, identity, title)
+	if c != nil && strings.TrimSpace(c.Task) != "" {
+		b.WriteString(strings.TrimSpace(c.Task))
+		b.WriteString("\n\n")
+	}
+	fmt.Fprintf(&b, "Job: %s — committed by the %s node (no .flowbee/commit.md written).", jobID, identity)
+	return b.String()
+}
+
+func firstLineOf(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 // HarnessConfig parameterizes the Mode-A worker harness (DESIGN §7.1): the thin
@@ -245,6 +289,9 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	}
 
 	// The .flowbee/ scaffolding is Flowbee's INPUT to the agent, not the agent's
+	// capture the node's own detailed commit message (the agent's .flowbee/commit.md)
+	// BEFORE the scaffolding is stripped — it becomes the commit on the issue branch.
+	commitMsg := nodeCommitMessage(wsDir, cfg.Identity, grant.Role, grant.JobID, grant.Context)
 	// work-product: strip it before computing the diff so it never enters the
 	// untrusted patch the content-integrity gate judges (§9.2).
 	_ = os.RemoveAll(filepath.Join(wsDir, ".flowbee"))
@@ -266,8 +313,7 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	// asked for self_merge).
 	diff, _ := wt.Diff()
 
-	sha, ref, err := wt.CommitAndPushEpoch(grant.JobID, grant.LeaseEpoch,
-		fmt.Sprintf("flowbee: %s build %s@e%d", cfg.Identity, grant.JobID, grant.LeaseEpoch))
+	sha, ref, err := wt.CommitAndPushEpoch(grant.JobID, grant.LeaseEpoch, commitMsg)
 	if err != nil {
 		return out, fmt.Errorf("push epoch ref: %w", err)
 	}
@@ -392,6 +438,9 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		return out, err
 	}
 
+	// capture the node's own detailed commit message before stripping the scaffolding;
+	// the control plane commits the patch WITH it (the worker is credential-less).
+	commitMsg := nodeCommitMessage(wsDir, cfg.Identity, grant.Role, grant.JobID, grant.Context)
 	// strip the Flowbee scaffolding before computing the untrusted diff (§9.2).
 	_ = os.RemoveAll(filepath.Join(wsDir, ".flowbee"))
 
@@ -415,7 +464,8 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		"kind":     "patch",
 		"base_sha": grant.BaseSHA,
 		// NO pushed_ref: the worker is credential-less and pushed nothing.
-		"diff": diff,
+		"diff":           diff,
+		"commit_message": commitMsg,
 		"blast_radius": map[string]any{
 			"scope": "bundle",
 			"paths": content.TouchedPaths(diff),
@@ -528,6 +578,7 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 			return out, fmt.Errorf("agent cmd: %v: %s", err, strings.TrimSpace(errb.String()))
 		}
 	}
+	commitMsg := nodeCommitMessage(wsDir, cfg.Identity, grant.Role, grant.JobID, grant.Context)
 	_ = os.RemoveAll(filepath.Join(wsDir, ".flowbee"))
 	changed, err := wt.HasChanges()
 	if err != nil {
@@ -547,8 +598,9 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	idem := fmt.Sprintf("%s-e%d", grant.JobID, grant.LeaseEpoch)
 	body := map[string]any{
 		"kind": "patch", "base_sha": grant.BaseSHA, "diff": diff,
-		"blast_radius": map[string]any{"scope": "worktree", "paths": content.TouchedPaths(diff)},
-		"status":       "succeeded",
+		"commit_message": commitMsg,
+		"blast_radius":   map[string]any{"scope": "worktree", "paths": content.TouchedPaths(diff)},
+		"status":         "succeeded",
 	}
 	res, st, err := c.Result(ctx, grant.JobID, grant.LeaseEpoch, idem, body)
 	if err != nil {

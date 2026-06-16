@@ -996,6 +996,11 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 		// BlastRadius is the worker's DECLARED scope (paths + scope), a commitment
 		// Flowbee verifies against the actual diff (§9.2b).
 		BlastRadius json.RawMessage `json:"blast_radius"`
+		// CommitMessage is the node's OWN detailed commit message (the agent's
+		// .flowbee/commit.md). When the control plane commits the patch on the worker's
+		// behalf (credential-less bundle path), it commits WITH this message so the
+		// issue-branch history carries the node author's account of the change.
+		CommitMessage string `json:"commit_message"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
@@ -1011,9 +1016,12 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 	// the disposable worktree and the result is declined (it cannot corrupt the mirror).
 	pushedRef := body.PushedRef
 	if s.bundleProvisioning && pushedRef == "" && body.Diff != "" && s.mirrorPath != "" && body.BaseSHA != "" {
+		applyMsg := body.CommitMessage
+		if strings.TrimSpace(applyMsg) == "" {
+			applyMsg = "flowbee: applied bundle-worker patch " + jobID
+		}
 		_, ref, aerr := gitops.Open(s.mirrorPath).ApplyPatchAndPushEpoch(
-			jobID, epoch, body.BaseSHA, body.Diff,
-			"flowbee: applied bundle-worker patch "+jobID)
+			jobID, epoch, body.BaseSHA, body.Diff, applyMsg)
 		if aerr != nil {
 			// the returned patch did not apply cleanly: decline the result. The worker
 			// re-leases (its lease is still live until it releases) or the job re-arms.
