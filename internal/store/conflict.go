@@ -324,16 +324,20 @@ func (s *Store) RebaseOnto(ctx context.Context, mirror *gitops.Mirror, p RebaseO
 // plane replays each onto mainTip via RebaseOnto — a clean rebase re-arms review +
 // CI at the integrated head; a real conflict diverts to a conflict_resolver BEFORE
 // any review effort is spent. A job already on mainTip is skipped (no-op).
-func (s *Store) StaleReviewBuilds(ctx context.Context, mainTip string) ([]string, error) {
+func (s *Store) StaleReviewBuilds(ctx context.Context, repoID, mainTip string) ([]string, error) {
 	if strings.TrimSpace(mainTip) == "" {
 		return nil, nil
 	}
+	// F9: scope to ONE repo so a job is only ever compared to (and rebased onto) its
+	// OWN repo's integration tip — never another repo's. repoID "" matches all (the
+	// legacy single-repo path).
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT id FROM jobs
 		 WHERE state = 'review_pending' AND kind = 'build'
+		   AND (? = '' OR repo = ?)
 		   AND base_sha != '' AND base_sha != ?
 		   AND patch_diff IS NOT NULL AND patch_diff != ''
-		 ORDER BY updated_at ASC`, mainTip)
+		 ORDER BY updated_at ASC`, repoID, repoID, mainTip)
 	if err != nil {
 		return nil, err
 	}

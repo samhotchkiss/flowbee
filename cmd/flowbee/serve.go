@@ -133,16 +133,13 @@ func runServe(_ []string) error {
 		WithLiveness(livenessCfg, store.DBFactSource{DB: st.DB}, srv.Broker())
 	go poller.Run(ctx)
 
-	// base_sha refresh (build-list): keep the local mirror's integration branch
-	// tracking GitHub, so a build seeded after a merge is cut from the CURRENT tip
-	// (not a stale base). Cheap public fetch every 45s; the next build then resolves
-	// base_sha = the fresh main. Only when a local mirror is configured.
-	if mp := os.Getenv("FLOWBEE_MIRROR_PATH"); mp != "" {
-		branch := os.Getenv("FLOWBEE_GITHUB_DEFAULT_BRANCH")
-		if branch == "" {
-			branch = "main"
-		}
-		pushURL := githubPushURL()
+	// base_sha refresh + rebase-before-review, PER REPO (F9): each managed repo's bare
+	// mirror tracks its OWN integration branch, so a build is cut from / rebased onto
+	// the correct repo's tip — never another repo's tree. Queries the registry at tick
+	// time (repos are registered at startup by wireMultiRepo). Single-repo "default"
+	// keeps using FLOWBEE_MIRROR_PATH directly (controlMirrorFor), so this is backward
+	// compatible. Cheap public fetch + a rebase pass every 45s.
+	if os.Getenv("FLOWBEE_MIRROR_PATH") != "" {
 		go func() {
 			t := time.NewTicker(45 * time.Second)
 			defer t.Stop()
@@ -151,18 +148,27 @@ func runServe(_ []string) error {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					if err := gitops.Open(mp).FetchBranch(branch); err != nil {
-						logger.Warn("mirror refresh", "branch", branch, "err", err)
+					repos, err := st.ListRepos(ctx, true)
+					if err != nil {
 						continue
 					}
-					// rebase-before-review (build-list): now that the mirror's integration
-					// branch tracks GitHub, replay any review_pending build that is behind the
-					// tip onto it BEFORE a reviewer leases it — so the reviewer judges what will
-					// actually merge, and a real conflict is diverted to a conflict_resolver
-					// instead of wasting a full review. A clean rebase re-arms review + CI at
-					// the integrated head; the rebased commit is force-pushed to the issue
-					// branch so the PR + CI track it.
-					rebaseStaleReviews(ctx, logger, st, mp, pushURL, branch)
+					for _, r := range repos {
+						mp := controlMirrorFor(r)
+						if mp == "" {
+							continue
+						}
+						url := repoTokenURL(r)
+						ensureRepoMirror(logger, mp, url)
+						branch := r.DefaultBranch
+						if branch == "" {
+							branch = "main"
+						}
+						if err := gitops.Open(mp).FetchBranch(branch); err != nil {
+							logger.Warn("mirror refresh", "repo", r.ID, "branch", branch, "err", err)
+							continue
+						}
+						rebaseStaleReviews(ctx, logger, st, r.ID, mp, url, branch)
+					}
 				}
 			}
 		}()
@@ -322,12 +328,12 @@ func githubPushURL() string {
 // review + CI at the integrated head and the rebased commit is force-pushed to the
 // issue branch so the PR + CI track it; a real conflict diverts the job to a
 // conflict_resolver. Best-effort: a single job's failure never blocks the others.
-func rebaseStaleReviews(ctx context.Context, logger *slog.Logger, st *store.Store, mirrorPath, pushURL, branch string) {
+func rebaseStaleReviews(ctx context.Context, logger *slog.Logger, st *store.Store, repoID, mirrorPath, pushURL, branch string) {
 	mainTip, err := gitops.Open(mirrorPath).HeadSHA("refs/heads/" + branch)
 	if err != nil {
 		return
 	}
-	stale, err := st.StaleReviewBuilds(ctx, mainTip)
+	stale, err := st.StaleReviewBuilds(ctx, repoID, mainTip)
 	if err != nil || len(stale) == 0 {
 		return
 	}
@@ -353,6 +359,51 @@ func rebaseStaleReviews(ctx context.Context, logger *slog.Logger, st *store.Stor
 			logger.Info("review diverted to conflict_resolver before review", "job", jobID)
 		}
 	}
+}
+
+// controlMirrorFor resolves the control-plane bare mirror for a repo (F9 per-repo
+// mirror). Backward-compatible: the legacy single-repo "default" keeps using
+// FLOWBEE_MIRROR_PATH directly; additional repos get sibling mirrors <dir>/<id>.git,
+// so a non-default repo's build NEVER resolves base_sha from another repo's tree.
+// Empty when no mirror is configured.
+func controlMirrorFor(r store.Repo) string {
+	base := os.Getenv("FLOWBEE_MIRROR_PATH")
+	if base == "" {
+		return ""
+	}
+	if r.ID == "" || r.ID == "default" {
+		return base
+	}
+	return filepath.Join(filepath.Dir(base), r.ID+".git")
+}
+
+// repoTokenURL builds the credential-bearing clone/push URL for a repo from the
+// shared FLOWBEE_GITHUB_TOKEN (the local mirror sweep's auth; per-repo token_env is
+// honored for the GitHub-API writer in wireMultiRepo). Empty if coords/token missing.
+func repoTokenURL(r store.Repo) string {
+	tok := os.Getenv("FLOWBEE_GITHUB_TOKEN")
+	if r.Owner == "" || r.Repo == "" || tok == "" {
+		return ""
+	}
+	return "https://x-access-token:" + tok + "@github.com/" + r.Owner + "/" + r.Repo + ".git"
+}
+
+// ensureRepoMirror clones a repo's bare mirror if absent (F9 per-repo provisioning),
+// locking it down so the baked-in token isn't world/group-readable. A no-op when the
+// mirror is already present or coords are missing.
+func ensureRepoMirror(logger *slog.Logger, mp, url string) {
+	if mp == "" || url == "" {
+		return
+	}
+	if _, err := os.Stat(mp); err == nil {
+		return // already provisioned
+	}
+	if out, err := exec.Command("git", "clone", "--bare", "--quiet", url, mp).CombinedOutput(); err != nil {
+		logger.Error("clone repo mirror", "path", mp, "err", err, "out", strings.TrimSpace(string(out)))
+		return
+	}
+	_ = os.Chmod(mp, 0o700)
+	_ = os.Chmod(filepath.Join(mp, "config"), 0o600)
 }
 
 func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, st *store.Store, srv *api.Server) *multirepo.Manager {
@@ -413,8 +464,16 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 	// mirror is the same one workers' worktrees/bundles come off; an unset mirror
 	// path leaves history.write rows as audited no-ops (the ledger stays canonical).
 	var historyOpt []multirepo.Option
-	if mp := os.Getenv("FLOWBEE_MIRROR_PATH"); mp != "" {
-		historyOpt = append(historyOpt, multirepo.WithHistory(func(store.Repo) project.HistoryWriter {
+	if os.Getenv("FLOWBEE_MIRROR_PATH") != "" {
+		// F9: each repo's history archive + base_sha resolution come off ITS OWN bare
+		// mirror (provisioned lazily), not one shared mirror — so a non-default repo
+		// never reads another repo's tree.
+		historyOpt = append(historyOpt, multirepo.WithHistory(func(r store.Repo) project.HistoryWriter {
+			mp := controlMirrorFor(r)
+			if mp == "" {
+				return nil
+			}
+			ensureRepoMirror(logger, mp, repoTokenURL(r))
 			return gitops.Open(mp)
 		}))
 	}

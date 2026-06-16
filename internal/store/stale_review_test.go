@@ -37,7 +37,7 @@ func TestStaleReviewBuilds(t *testing.T) {
 	seed("nopatch", "old111", "", "review_pending")                     // behind but no patch -> skip
 	seed("building", "old111", "diff --git a/f b/f\n+z", "building")     // not review_pending -> skip
 
-	ids, err := st.StaleReviewBuilds(ctx, mainTip)
+	ids, err := st.StaleReviewBuilds(ctx, "", mainTip)
 	if err != nil {
 		t.Fatalf("StaleReviewBuilds: %v", err)
 	}
@@ -46,7 +46,20 @@ func TestStaleReviewBuilds(t *testing.T) {
 	}
 
 	// an empty tip (no integration ref yet) reports nothing — never rebase blind.
-	if ids, err := st.StaleReviewBuilds(ctx, ""); err != nil || len(ids) != 0 {
+	if ids, err := st.StaleReviewBuilds(ctx, "", ""); err != nil || len(ids) != 0 {
 		t.Fatalf("empty tip = %v,%v want none", ids, err)
+	}
+
+	// F9 repo scoping: a stale job in repo "other" is NOT returned when scoping to a
+	// different repo (never compare/rebase across repos).
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET repo='other' WHERE id='stale'`); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := st.StaleReviewBuilds(ctx, "myrepo", mainTip); len(ids) != 0 {
+		t.Fatalf("scoping to myrepo must exclude repo 'other': %v", ids)
+	}
+	if ids, _ := st.StaleReviewBuilds(ctx, "other", mainTip); len(ids) != 1 || ids[0] != "stale" {
+		t.Fatalf("scoping to 'other' must include it: %v", ids)
 	}
 }
