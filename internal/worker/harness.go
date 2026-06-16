@@ -99,6 +99,8 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 			b.WriteString("\n```\n")
 		}
 	}
+	b.WriteString("\n## How to complete this\n\nMake the change by creating or editing files in THIS working directory. " +
+		"Write the actual files to disk now — do not just describe or print them. Touch only what the task requires.\n")
 	return b.String()
 }
 

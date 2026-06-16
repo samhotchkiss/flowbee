@@ -27,6 +27,8 @@ func main() {
 		err = runDoctor(args)
 	case "serve":
 		err = runServe(args)
+	case "up":
+		err = runUp(args)
 	case "migrate":
 		err = runMigrate(args)
 	case "seed":
@@ -51,5 +53,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|serve|migrate|work|lease|submit|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|up|serve|migrate|work|lease|submit|seed|version>")
 }
