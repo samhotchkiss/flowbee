@@ -9,6 +9,36 @@
 > Where `DESIGN.md` left a fork, this plan **picks one and flags it** (see §7). The design doc may carry
 > minor residual inconsistencies from assembly; the established design facts in the task brief are
 > authoritative over the doc where they conflict (notably: the event-sourced ledger as the spine).
+>
+> ---
+>
+> ## ⚑ Reconciliation banner (built reality, 2026-06-16) — read before the historical plan below
+>
+> The engine (M0–M12) is **built, committed, and green**. This plan was written *before* the build and names
+> a few substrates that were **changed during construction**. The corrections, authoritative everywhere below:
+>
+> 1. **Store = embedded SQLite, NOT Postgres/River.** `modernc.org/sqlite` (pure-Go, `CGO_ENABLED=0`) via
+>    stdlib `database/sql` with `SetMaxOpenConns(1)` is the **single store of record**. **There is no
+>    Postgres, no River, no pgx, no testcontainers, no docker-compose.** River's cadence/timer/retry/dedup
+>    role is served by a **hand-rolled `timers` table + one in-process polling goroutine** (epoch-guarded).
+>    SQLite dialect: `?` placeholders; no `TIMESTAMPTZ` (TEXT/RFC3339 + `datetime('now')`); `INTEGER PRIMARY
+>    KEY AUTOINCREMENT`; partial unique indexes + `UPDATE … RETURNING` (the atomic claim). Where the plan
+>    below says "Postgres", "River", "pgx", "pgxpool", "TIMESTAMPTZ", "testcontainers", or "docker-compose"
+>    as the substrate, **read SQLite + the in-process timer loop**; the semantics are preserved, only the
+>    dependency changed. §3.2 is the corrected, canonical library table.
+> 2. **Determinism is an explicit invariant (I-0).** `internal/{engine,job,ledger,lease,scheduler,flow}` is a
+>    deterministic, replayable function of persisted facts — no clock/`math.rand`/`crypto.rand`/ULID/GitHub/LLM
+>    imports (the `crypto/sha256` deterministic-hash exception aside); `tools/archcheck` enforces it and stays
+>    green. (§1.2, DESIGN §3.6 I-0.)
+> 3. **THE ONE DECISION (§14) is RESOLVED: Branch B — autonomous merge, no human gate.** `Policy.AllowSelfMerge`
+>    (`config.AllowSelfMerge`, env `FLOWBEE_ALLOW_SELF_MERGE`, `flowbee.yaml: allow_self_merge`) is the
+>    **configurable** toggle; production posture `true`. It defaults `false` in code as a fail-safe. The safety
+>    net is deterministic — content-integrity gate (I-11) + epoch side-effects (I-12) + reconciled SHA-bound
+>    verdict (I-9) + CI-green-at-head (I-5) — not a human.
+> 4. **GitHub auth: a fine-grained repo-scoped PAT for the single-operator default**; a GitHub App only at
+>    org/multi-repo scale (DESIGN §8.3). **Mode A (`claude -p` / `codex exec`, subscription-covered, harness-
+>    driven) is the default** worker mode; Mode B is optional. **Workers hold NO GitHub creds** — Flowbee does
+>    all git writes (F3).
 
 ---
 
@@ -53,7 +83,8 @@ persisted facts ──fold──▶ EngineState ──engine.Decide()──▶ D
 
 The single most important test in the codebase is the **concurrent-claim race test** (M1): N goroutines
 race for one `ready` job; **exactly one** wins; the partial unique index is the structural backstop. It is
-written under `-race -count=50` against **real Postgres** (mocks prove nothing about MVCC). Every milestone
+written under `-race -count=50` against a **real temp-file SQLite DB** (mocks prove nothing; the
+single-connection serialization + partial unique index are what the test exercises). Every milestone
 ships with a `DONE WHEN` acceptance test that is an observable behavior, runnable in CI. The replay test
 (fold == projection) and the stale-epoch fencing test (`409`) are written in M1 alongside it.
 
@@ -61,23 +92,24 @@ ships with a `DONE WHEN` acceptance test that is an observable behavior, runnabl
 
 ## 2. Milestone roadmap
 
-Each milestone is independently shippable. `DONE WHEN` is the acceptance gate. Branch decision (§14 of
-the design — *may the MVP merge without a human?*) is held open throughout: every milestone keeps the
-`self_merge`/`handoff` toggle a **policy flip** (`Policy.AllowSelfMerge`, default `false` = Branch A), never
-a rewire. I-11 (content-integrity, M9) and I-12 (epoch-namespaced side-effects, M11) are the milestones that
-*flip Branch B on* once enabled.
+Each milestone is independently shippable. `DONE WHEN` is the acceptance gate. The §14 decision is now
+**RESOLVED — Branch B (autonomous merge, no human gate)**; during the build it was kept a **policy flip**
+(`Policy.AllowSelfMerge` — `config.AllowSelfMerge`, env `FLOWBEE_ALLOW_SELF_MERGE`), never a rewire, so the
+resolution is a config setting (production `true`; code default `false` as a fail-safe). I-11 (content-
+integrity, M9) and I-12 (epoch-namespaced side-effects, M11) are the milestones that make Branch B safe; both
+are built, so the toggle is real.
 
 | M | Goal | Scope (in) | DONE WHEN | DESIGN refs | Deps |
 |---|---|---|---|---|---|
-| **M0** | **Scaffold.** Buildable single binary, store + River wired, migrations run on boot, health green. | cobra-free stdlib CLI dispatch (`serve`/`migrate`/`work`/`lease`/`submit`/`seed`); pgxpool; embedded-SQL migration runner + River migrator; in-process River client (no workers); config; `docker-compose.yml` PG; CI (build, vet, lint, smoke). | `flowbee serve` boots against empty PG, runs all migrations idempotently (re-run is a no-op), starts River, opens health (`/healthz` 200) + private listeners; `make test` green in CI. | §4, §12.1, §12.3, §12.4 | — |
+| **M0** | **Scaffold.** Buildable single binary, store + timer loop wired, migrations run on boot, health green. | cobra-free stdlib CLI dispatch (`serve`/`migrate`/`work`/`lease`/`submit`/`seed`); SQLite (`database/sql`, 1 conn); embedded-SQL migration runner; in-process timer/dispatch loop (no workers); config; CI (build, vet, lint, smoke). *(as-built: SQLite, not Postgres/River)* | `flowbee serve` boots against an empty SQLite file, runs all migrations idempotently (re-run is a no-op), starts the timer loop, opens health (`/healthz` 200) + private listeners; tests green in CI. | §4, §12.1, §12.3, §12.4 | — |
 | **M1** | **Deterministic control-plane core — THE lease thread.** Prove core + fenced exactly-once lease + stub worker + live view against a manually-seeded job. Zero GitHub, zero flow. | `job_events` ledger + `jobs` projection (in-tx fold); §6.3.1 atomic claim + partial unique index + `lease_epoch`; private worker API (register/lease long-poll/heartbeat/result/release), fenced → 409; trivial state machine `ready→leased→building→review_pending`; stub worker; `seed-job`; SSE `/v1/events` + minimal HTML board; replay test. | (1) two stub workers race one seeded job → **exactly one** wins, loser gets 204; (2) stale-`lease_epoch` heartbeat → 409, current → continue; (3) result → `review_pending`, duplicate idempotency-key → identical response, no re-apply; (4) `Fold(events)` == `jobs` projection; (5) lifecycle visible live via SSE. | §6.3 (I-4), §7.1–7.2, §3.5/§6.4, DETERMINISM, §12.1 | M0 |
-| **M2** | **Event-sourced ledger as spine + real job model + scheduler core (DAG/priority/aging).** | full §6.1.1 record; topo walk over `blocked_by`; priority + aging; capability match on **claimed-as-attested** (real attest = M5); `no_eligible_worker` River alarm; `attempts`/`max_attempts` → `needs_human` (partial). | hand-seeded `A→B→C` DAG: `B` blocked until `A` done; aged low-prio offered before high-prio newcomer; worker lacking a required cap never wins, `no_eligible_worker` fires after timeout; run reconstructable by replaying `job_events`. | §6.1, §6.6 (I-6), §5.6 (partial), EVENT-SOURCED | M1 |
+| **M2** | **Event-sourced ledger as spine + real job model + scheduler core (DAG/priority/aging).** | full §6.1.1 record; topo walk over `blocked_by`; priority + aging; capability match on **claimed-as-attested** (real attest = M5); `no_eligible_worker` timer alarm; `attempts`/`max_attempts` → `needs_human` (partial). | hand-seeded `A→B→C` DAG: `B` blocked until `A` done; aged low-prio offered before high-prio newcomer; worker lacking a required cap never wins, `no_eligible_worker` fires after timeout; run reconstructable by replaying `job_events`. | §6.1, §6.6 (I-6), §5.6 (partial), EVENT-SOURCED | M1 |
 | **M3** | **Flow engine + build flow + code_review GATE (deterministic gates, GitHub stubbed).** | flow/role YAML loader + §5.6 neutrality lint; full §6.2 build-flow state machine (pure fn); gate **mints** verdict from a stubbed `FactSource` (I-9 shape); code-review bounce loop (`bounces`/`max_bounces`); `self_merge`/`handoff` toggle (default handoff). | seeded build job drives `building→review_pending→code_review` across distinct builder+reviewer stubs; `changes_requested` bounces + increments `bounces`; `max_bounces`→`needs_human`; `approved` + green stub FactSource mints a SHA-bound tamper-evident verdict (never from worker `status`) → `mergeable`→`merge_handoff`; the §5.6 lint **fails the build** on a planted provider literal. | §5.1–5.4, §5.6, §6.2, §6.2.3 (I-6), §5.5 (partial, I-9) | M2 |
 | **M4** | **Enforced anti-affinity at lease time (I-10).** | full §6.3.1 `NOT EXISTS` clauses wired to real sibling lineage; sibling-job edges populated; single-provider-fleet alarm. | a worker that built `J` never wins `J`'s `code_review` lease (0 rows); same-`model_family` worker excluded; with only `model:codex` workers, review stage raises `no_eligible_worker`; exclusion holds under race. | §5.5 (I-10), §6.3.1, §9.3 | M3 |
 | **M5** | **Real worker harness + attestation + repo provisioning + BOTH worker modes.** | Mode A `flowbee work` (spawns `FLOWBEE_AGENT_CMD`, one-shot worktree per lease, `collect_work_product`); Mode B `flowbee lease`/`submit` (thin client / MCP shim); attestation (handshake arch/os + enrolled-identity allowlist for `role`/`model_family`/`tool`); same-box `git worktree` off bare mirror, push to epoch ref, no creds; roster UI. | `flowbee work` with a fake agent leases a build job, provisions a worktree at `base_sha`, pushes `refs/flowbee/<job>/epoch-<n>`, submits a real patch; a Mode-B session completes the same kind via `lease`/`submit`; unattested cap never matched; roster shows both workers + stale-hb badge. | §7.1–7.6, §9.4.1, §12.6.2 | M3, M4 |
-| **M6** | **GitHub reconcile-IN + inbox + App identity (the IN half, read-only).** | single installation token (`ghinstallation`); batched `BoardSweep` GraphQL on River timer + boot + gap; webhook listener (HMAC, `X-GitHub-Delivery` dedupe, write-ahead inbox, targeted refetch); SHA-monotonic + terminal-SHA guards (I-3); `superseded` (I-5); real `FactSource` for M3's gate; identity-budget gauge. | sweep populates Domain-B columns to match a test repo; forged/replayed webhook rejected/deduped, at worst triggers a refetch of real state (cannot fast-track); new commit to an open PR → job `superseded` + re-armed; budget gauge live; a test asserts reconcile-IN never writes a Domain-A field. | §3.3, §8.1 (I-1/I-2/I-3), §8.3 (I-14), §6.2.4 (I-5), §12.6.3 | M3, M5 |
+| **M6** | **GitHub reconcile-IN + inbox + App identity (the IN half, read-only).** | single outbound GitHub identity (PAT for single-operator; App at org-scale); batched `BoardSweep` GraphQL on a timer + boot + gap; webhook listener (HMAC, `X-GitHub-Delivery` dedupe, write-ahead inbox, targeted refetch); SHA-monotonic + terminal-SHA guards (I-3); `superseded` (I-5); real `FactSource` for M3's gate; identity-budget gauge. | sweep populates Domain-B columns to match a test repo; forged/replayed webhook rejected/deduped, at worst triggers a refetch of real state (cannot fast-track); new commit to an open PR → job `superseded` + re-armed; budget gauge live; a test asserts reconcile-IN never writes a Domain-A field. | §3.3, §8.1 (I-1/I-2/I-3), §8.3 (I-14), §6.2.4 (I-5), §12.6.3 | M3, M5 |
 | **M7** | **project-OUT outbox + spec flow + ADOPT mode (the OUT half; first full chat→merge thread).** | transactional outbox keyed `(job_id, action, head_sha)`, single serialized sender, ≤1 in-flight, `Retry-After`; canonical PR-open trigger (§7.3); spec flow (`spec_author`→`spec_review` GATE→`materialize_issues`, BLAKE3 `spec_content_hash`, content-hash supersession, lens anti-affinity, chat as lineage root); batch-size-1 merge via merge queue; ADOPT mode (I-16); branch-protection assertion (I-8). | against a test repo: spec doc → spec job, commits `spec.md`, hashes, gates on distinct-lens reviewer; edit supersedes prior sign-off; sign-off **materializes a real issue**; builder patch → **Flowbee opens the PR and stamps #**; reviewer approves → `handoff`/`needs_human`; human merges → reconcile-IN flips to `done`; pre-existing PRs imported **quiescent, untouched**; every GitHub action appears once in the audit log keyed `(job_id, action, head_sha)`. | §8.2 (I-7), §8.5.2 (I-5), §11 (I-9/I-10), §12.7 (I-16), §9.6 (I-8) | M6, M5, M3/M4 |
-| **M8** | **Liveness MVP (Rung-3 + Rung-4 + minimal Rung-2 + two fast-paths + two-rung kill, I-13).** | per-phase soft deadline + absolute lease cap (River timers, Flowbee sole clock); Rung-4 governor (`stall_revocations` → `needs_human`, fleet rate-limit); minimal Rung-2 (net-diff-convergence-or-abstain on the sweep + CI-tolerance + circuit breaker; spec-flow forces abstain); two-rung kill (I-13); two free fast-paths; partition≠stall; WARN→CANCEL→REVOKE ladder. | a forever-heartbeating no-net-diff worker killed **only** when Rung-2 + Rung-3 agree, **not** when Rung-2 abstains; past absolute cap → unilateral revoke; partitioned worker's healed-link result 409'd; exited agent fast-pathed to `failed`; killed-and-resumed past governor ceiling sticks in `needs_human`; a healthy 40-min E2E with a CI `running` transition is **not** killed. | §10 (MVP cut), I-13, §6.8, §6.7 (partial) | M5, M6 |
+| **M8** | **Liveness MVP (Rung-3 + Rung-4 + minimal Rung-2 + two fast-paths + two-rung kill, I-13).** | per-phase soft deadline + absolute lease cap (the in-process timer loop, Flowbee sole clock); Rung-4 governor (`stall_revocations` → `needs_human`, fleet rate-limit); minimal Rung-2 (net-diff-convergence-or-abstain on the sweep + CI-tolerance + circuit breaker; spec-flow forces abstain); two-rung kill (I-13); two free fast-paths; partition≠stall; WARN→CANCEL→REVOKE ladder. | a forever-heartbeating no-net-diff worker killed **only** when Rung-2 + Rung-3 agree, **not** when Rung-2 abstains; past absolute cap → unilateral revoke; partitioned worker's healed-link result 409'd; exited agent fast-pathed to `failed`; killed-and-resumed past governor ceiling sticks in `needs_human`; a healthy 40-min E2E with a CI `running` transition is **not** killed. | §10 (MVP cut), I-13, §6.8, §6.7 (partial) | M5, M6 |
 | **M9** | **Content-integrity gate (I-11) — the Branch-B safety boundary.** | path denylist (`.github/workflows/**`, lockfiles+lifecycle, Dockerfiles, secrets, Flowbee's own source + the denylist itself); declared-vs-actual blast-radius; deterministic static checks (applies-clean@base, parse/compile, secret-scan, binary allowlist, size bounds); wired as §5.4 predicate conditions 2–4. | a `.github/workflows/ci.yml` patch forced to `handoff` regardless of `self_merge` request; blast-radius-exceeding patch flagged as tamper → `handoff`; non-applying / secret-tripping patch fails static checks, never self-merge-eligible; with §14 toggle off, clean diffs unchanged (human still merges) — proving the gate is a pure policy-promotion. | §9.2 (I-11), §5.4 (cond. 2–4) | M7, M8 |
 | **M10** | **Cost metering + ceilings (I-15) + full escalation chokepoint.** | `{tokens_in, tokens_out, $}` on heartbeat/result, per-job + per-flow rollup; enforced ceilings → `needs_human` + mid-flight `cancel` directive + `flowbee:over-budget`; unified `needs_human` chokepoint surfaced in UI. | a job crossing its ceiling is escalated (live `cancel` + `over-budget` label); per-flow rollup answers "what did this feature cost across spec+build+review"; UI `needs_human` lane shows jobs from all four triggers (attempts, bounces, cost, stall). | §6.7 (I-6+I-15), §12.6.5, I-15 | M5, M8 |
 | **M11** | **Epoch-namespaced side-effects + compensation (I-12) — enables unattended merge.** | epoch-namespaced refs end-to-end (promote only post-validation; stale ref orphaned); `(job,epoch)`-scoped CI gating; `compensate()` (drop dead ref, cancel CI, draft-back PR, bump epoch); per-job scoped write credential class; wire the §14 toggle (I-9+I-11+I-12 present → `self_merge` becomes config-enabled). | a worker revoked mid-build then reconnects and pushes to its stale epoch ref → ref never fast-forwarded, its CI can't satisfy the live gate, compensation dropped it + bumped epoch (409'd); live re-dispatch completes; with toggle ON on a clean/denylist-clear/in-budget/unmoved-SHA diff, Flowbee **merges unattended** via the queue with reconciled provenance — denylist/SHA-moved diff still falls to `handoff`; toggle off restores Branch A. | §3.5/§6.5 (I-12), §9.4, §5.4 cond. 6, §14 | M9, M8, M7 |
@@ -90,7 +122,7 @@ The two-domain reconciliation (the design's spine) is proven by **M6+M7**. The t
 
 **Deferred to v1.1+ (explicit non-goals):** HA/leader-election, multi-repo, multi-tenant, merge-queue
 batch-size>1 + `flowbee/review-valid@SHA` re-eval, multi-reviewer fan-out/quorum, full Rung-0/Rung-1 +
-adaptive priors, egress confinement (§9.7), stacked-PR depth, SQLite store, River→Temporal swap.
+adaptive priors, egress confinement (§9.7), stacked-PR depth, a future durable-workflow-engine swap behind the clean interface (§12.5). *(Note: SQLite is the shipped store of record, not a deferred item — the pre-build "SQLite store" deferral is obsolete.)*
 
 ---
 
@@ -99,7 +131,7 @@ adaptive priors, egress confinement (§9.7), stacked-PR depth, SQLite store, Riv
 ### 3.1 Toolchain & module
 
 - **Module:** `github.com/swh/flowbee` (single Go module).
-- **Go 1.25** (installed: `go1.25.6`). Single static binary, `CGO_ENABLED=0`. One Postgres.
+- **Go 1.25** (installed: `go1.25.6`). Single static binary, `CGO_ENABLED=0`. One embedded SQLite file (`modernc.org/sqlite`, pure-Go) — **no external database server**.
 - **One `main` (`cmd/flowbee`), two roles.** "Two binaries / one artifact" = the same binary as control
   plane (`flowbee serve`) vs. worker (`flowbee work` / `lease` / `submit`). An **architecture test**
   (`go list -deps`) asserts the worker subcommand packages never transitively import
@@ -108,11 +140,13 @@ adaptive priors, egress confinement (§9.7), stacked-PR depth, SQLite store, Riv
 
 ### 3.2 Library choices (locked, with justification)
 
+> **Reconciled to the built engine (2026-06-16).** The pre-build plan named **Postgres + River + pgx**. The shipped engine uses **embedded SQLite (`modernc.org/sqlite`, pure-Go) as the single store of record** via stdlib `database/sql` with `SetMaxOpenConns(1)`, and a **hand-rolled `timers` table + one polling goroutine** in place of River. There is **no Postgres, no River, no pgx** dependency. The table below is corrected; the rows that named the dropped deps are struck and replaced.
+
 | Concern | Choice | Why this one |
 |---|---|---|
-| DB driver/pool | `github.com/jackc/pgx/v5` (+ `pgxpool`) — native, **not** `database/sql` | River requires pgx/v5; we need `LISTEN/NOTIFY` (long-poll wakeups), typed `RETURNING *` scans for the atomic claim. `database/sql` would force a second pool. |
-| Job queue / timers | `github.com/riverqueue/river` + `riverpgxv5` driver, in-process | §12.3 names it. Buys transactional enqueue, retries/backoff, timers (reconcile cadence, soft deadlines, alarms), unique-job dedup, rescuer. **Agent leases are custom on top — never River-worked rows.** |
-| Migrations | embedded `//go:embed migrations/*.sql` + a tiny in-process runner (`schema_migrations` table) for Flowbee tables; `river/rivermigrate` for River's own tables, run **first** | One binary owns schema. No goose/atlas/golang-migrate CLI dependency; raw SQL keeps the §6.3.1 partial index legible. Idempotent re-run. |
+| Store / DB driver | `modernc.org/sqlite` (pure-Go SQLite) via stdlib `database/sql`, **single connection** (`SetMaxOpenConns(1)`) | The system is single-operator, single-repo, single-writer. Pure-Go keeps `CGO_ENABLED=0` and a single static binary; one connection serializes writes so the §6.3.1 partial unique index holds without MVCC. SQLite dialect: `?` placeholders, no `TIMESTAMPTZ` (TEXT/RFC3339 + `datetime('now')`), `INTEGER PRIMARY KEY AUTOINCREMENT`, partial unique indexes + `UPDATE … RETURNING` for the atomic claim. **(Replaces the planned pgx/v5 + Postgres — dropped.)** |
+| Job queue / timers | **hand-rolled `timers` table** (`due_at`, `expected_epoch`, `fired`) + **one in-process polling goroutine** | Buys what §12.3 needs — transactional enqueue coupled to the state change, retries/backoff, timers (reconcile cadence, soft deadlines, alarms), dedup, sweeper — without an external server. Epoch-guarded deadline checks are idempotent (stale epoch → no-op). **Agent leases are custom on top — never plain queued rows. (Replaces the planned riverqueue/river + riverpgxv5 — dropped.)** |
+| Migrations | embedded `//go:embed migrations/*.sql` + a tiny in-process runner (`schema_migrations` table), raw SQLite SQL | One binary owns schema. No goose/atlas/golang-migrate CLI dependency, no River migrator; raw SQL keeps the §6.3.1 partial index legible. Idempotent re-run. |
 | HTTP router | stdlib `net/http` 1.22 `ServeMux` (method+path patterns: `POST /v1/jobs/{job}/heartbeat`) | Covers the whole §7.2 surface + webhooks in ~6 routes. Two separate `*http.Server`s (public webhook, private worker API). No chi/framework tax. |
 | CLI | stdlib `flag` + a small dispatch in `main.go` (no cobra) | The subcommand set is small and fixed; cobra is dead weight for the skeleton. (If the tree grows past M5, revisit cobra — contained to `cmd/`.) |
 | Config | env + a single `flowbee.yaml` parsed with `gopkg.in/yaml.v3` (flows/roles/lenses are YAML from M3) | One YAML parser for config and flows; no viper/koanf global-state. Env overrides via `FLOWBEE_*`. |
@@ -123,7 +157,7 @@ adaptive priors, egress confinement (§9.7), stacked-PR depth, SQLite store, Riv
 | Web UI | Go `html/template` + `//go:embed` + htmx (no SPA build step) | §12.6 is board/roster/feed/cost read straight off SQL. htmx polling (then SSE) beats a JS toolchain inside a single-binary ethos. |
 | Auth | v1: signed per-worker bearer tokens (HMAC, enrolled-identity allowlist); mTLS in M12 | §7.6 allows either. Tokens are curl-debuggable over Tailscale and simple to enroll; one `auth.Authenticator` interface contains the swap. |
 | Logging | stdlib `log/slog` (JSON handler) | No telemetry pipeline in v1; the auditable log is a DB table, not logs. |
-| Testing | stdlib `testing` + `github.com/stretchr/testify/require` + `github.com/testcontainers/testcontainers-go/modules/postgres` + `go.uber.org/goleak` | Replay/race tests need real Postgres for the partial unique index + MVCC; testcontainers is the hermetic CI path, docker-compose the fast local loop. |
+| Testing | stdlib `testing` + `github.com/stretchr/testify/require` + `go.uber.org/goleak` | Replay/race/acceptance tests run against a **real temp-file SQLite DB** (no testcontainers, no Postgres, no docker). The partial unique index + single-connection serialization give the exactly-once-lease guarantee under `-race`; hermetic and fast with zero external services. **(Replaces the planned testcontainers-go/postgres — dropped.)** |
 
 ### 3.3 Repo layout
 
@@ -131,7 +165,7 @@ adaptive priors, egress confinement (§9.7), stacked-PR depth, SQLite store, Riv
 flowbee/
 ├── go.mod  go.sum
 ├── Makefile
-├── docker-compose.yml                  # local Postgres for dev + tests
+│                                       # (no docker-compose — the store is an embedded SQLite file)
 ├── .golangci.yml
 ├── flowbee.yaml                        # sample config
 ├── DESIGN.md  BUILD.md
@@ -147,7 +181,7 @@ flowbee/
 │   ├── config/                         # typed config; env + flowbee.yaml; flows/roles loader (M3)
 │   ├── clock/                          # Clock interface (Flowbee is the SOLE clock, §6.3.3) — injectable
 │   ├── ulid/                           # ULID minting wrapper (monotonic, testable)
-│   ├── store/                          # pgxpool, Store/Queries interfaces, hand-written SQL, migration runner
+│   ├── store/                          # SQLite (database/sql, 1 conn), Store/Queries, hand-written SQL, migration runner, timers
 │   │   └── migrations/*.sql            # embedded
 │   ├── ledger/                         # EVENT-SOURCED spine: job_events append + Fold → jobs projection
 │   ├── job/                            # job domain types, State/Kind/Role/Stage enums, pure Transition()
@@ -164,7 +198,7 @@ flowbee/
 │   ├── webhook/                        # HMAC verify, X-GitHub-Delivery dedupe, write-ahead inbox
 │   ├── content/                        # content-integrity gate: denylist + blast-radius + static (I-11)
 │   ├── gitops/                         # mirror, worktrees, epoch-ref promotion, spec commits, bundles
-│   ├── liveness/                       # rung ladder, two-rung kill, governor — River-timer driven
+│   ├── liveness/                       # rung ladder, two-rung kill, governor — driven by the in-process timer loop
 │   ├── cost/                           # per-job/per-flow token-$ meter + ceiling (I-15)
 │   ├── projector/                      # docs/history/<id>.md + TOC (post-merge read-model)
 │   └── web/                            # embedded dashboard (templates + htmx + SSE)
@@ -175,7 +209,7 @@ flowbee/
 │   └── providerlint/                   # §5.6: no provider literal outside model_family:* / lens.prompt_ref
 └── test/
     ├── replay/                         # determinism: golden event logs → folded state
-    └── acceptance/                     # walking-skeleton + flow integration tests (testcontainers PG)
+    └── acceptance/                     # walking-skeleton + flow integration tests (real temp-file SQLite)
 ```
 
 ### 3.4 Key package interfaces
@@ -210,7 +244,7 @@ type Decision struct {
     Verdicts    []job.VerdictMint   // tamper-evident sign-offs to mint (post-reconcile, I-9)
     SideEffects []SideEffect         // project-OUT outbox rows: open PR, label, check, comment, enqueue-merge
     GitOps      []GitOp              // promote epoch ref, commit spec, drop ref, compensation
-    Timers      []TimerRequest       // River timers to (re)arm: phase deadline, absolute cap, alarm
+    Timers      []TimerRequest       // timers to (re)arm (the `timers` table): phase deadline, absolute cap, alarm
     LeaseOps    []LeaseOp            // epoch bump, revoke, grant — DESCRIBED here, executed by runtime
     Directive   *worker.Directive    // continue|cancel reply for a heartbeat
     Reject      *RejectReason        // e.g. stale-epoch → 409
@@ -244,7 +278,7 @@ type EventKind string  // job_created, lease_claimed, worker_started, heartbeat,
 
 // Append writes one event WITHIN the caller's tx, deriving job_seq = prev+1. MUST share the tx that
 // mutates the jobs projection — append + fold are atomic.
-func Append(ctx context.Context, tx pgx.Tx, e Event) (int64, error)
+func Append(ctx context.Context, tx *sql.Tx, e Event) (int64, error)  // stdlib database/sql, SQLite
 
 // Fold replays events into a projection. PURE: no clock, no RNG, no I/O. Fold(events) == jobs row.
 func Fold(events []Event) (job.Job, error)
@@ -254,7 +288,7 @@ func Fold(events []Event) (job.Job, error)
 
 ```go
 type Store interface {
-    Tx(ctx context.Context, fn func(q Queries) error) error  // River enqueue inside fn shares this tx
+    Tx(ctx context.Context, fn func(q Queries) error) error  // one SQLite tx; outbox/timer enqueue inside fn shares it
     Queries
 }
 type Queries interface {
@@ -269,7 +303,7 @@ type Queries interface {
 }
 ```
 
-**The custom fenced lease** (`internal/lease`) — *not* a River job:
+**The custom fenced lease** (`internal/lease`) — *not* a timer/queue-worked row:
 
 ```go
 type Lease struct {
@@ -316,64 +350,74 @@ type WorkProduct struct {
 `Heartbeat`/`Result`/`Release` delegate the *decision* to `engine.Decide` and apply the returned `Decision`
 transactionally — the handler never makes a state decision itself.
 
-### 3.5 The River/lease boundary (the highest-conceptual-risk rule — state it once)
+### 3.5 The timer/lease boundary (the highest-conceptual-risk rule — state it once)
 
-**An agent lease is NEVER a River-worked row.** River workers run *internal, trusted, bounded* units of
-Flowbee's own work. The agent lease is an *external, untrusted, renewable, network-held* claim whose liveness
-is Flowbee's clock and whose death triggers compensation, not a River retry. `GET /v1/lease` runs the custom
-atomic claim against `jobs`; it does **not** dequeue a River job.
+> **Reconciled:** there is **no River**. "River jobs" below are **timer-driven internal jobs** fired by the
+> `timers` table + polling goroutine (§12.3). The boundary rule is unchanged in substance.
 
-River jobs in Flowbee are **only**: `reconcile_sweep`, `targeted_refetch`, `project_out_drain`,
-`lease_deadline_check{job_id, expected_epoch}`, `phase_deadline_check`, `partition_grace_check`,
-`escalation_check`, `rung2_sweep`. A `lease_deadline_check` is **idempotent and epoch-guarded**: it carries
-`expected_epoch`; on run it re-reads the job; if `lease_epoch != expected_epoch` it **no-ops** (returns
-success — do not let River retry it). If still held and past deadline, it runs the revocation transaction
-(epoch++, compensation enqueue, state transition) in one pgx tx. This is the only place River and the lease
-meet, and it meets correctly because the epoch guard makes a stale timer a no-op. An architecture test
-asserts no registered River worker kind represents the agent's work.
+**An agent lease is NEVER a plain timer-worked/queued row.** The internal timer loop runs *internal,
+trusted, bounded* units of Flowbee's own work. The agent lease is an *external, untrusted, renewable,
+network-held* claim whose liveness is Flowbee's clock and whose death triggers compensation, not a silent
+retry. `GET /v1/lease` runs the custom atomic claim against `jobs` (`UPDATE … WHERE state='ready' …
+RETURNING`); it does **not** dequeue a timer/queue job.
+
+The internal timer-driven jobs in Flowbee are **only**: `reconcile_sweep`, `targeted_refetch`,
+`project_out_drain`, `lease_deadline_check{job_id, expected_epoch}`, `phase_deadline_check`,
+`partition_grace_check`, `escalation_check`, `rung2_sweep`. A `lease_deadline_check` is **idempotent and
+epoch-guarded**: it carries `expected_epoch`; on run it re-reads the job; if `lease_epoch != expected_epoch`
+it **no-ops**. If still held and past deadline, it runs the revocation transaction (epoch++, compensation
+enqueue, state transition) in one SQLite tx. This is the only place the timer loop and the lease meet, and it
+meets correctly because the epoch guard makes a stale timer a no-op. An architecture test asserts no
+registered internal job kind represents the agent's work.
 
 ---
 
 ## 4. Milestone 0 — scaffold (ordered task checklist, ready to execute)
 
+> **As-built reconciliation:** M0 shipped on **SQLite**, not Postgres/River. Read the checklist below with
+> these substitutions (per the top banner): deps = `modernc.org/sqlite` (+ stdlib `database/sql`), **not**
+> pgx/river/testcontainers; no `docker-compose.yml`; `internal/store` opens a SQLite DB with
+> `SetMaxOpenConns(1)` (no pgxpool, no `*river.Client`); migrations run the embedded `*.sql` only (no
+> rivermigrate), `schema_migrations(version text pk, applied_at text)`; the timer loop replaces the River
+> client; `/healthz` reports `{status, db, version}`. The checklist text is preserved as the original plan.
+
 ```
 [ ] 0.1  go mod init github.com/swh/flowbee  (go 1.25); add deps:
-         pgx/v5, riverqueue/river + riverpgxv5 + rivermigrate, oklog/ulid/v2,
-         zeebo/blake3, stretchr/testify, testcontainers-go/modules/postgres, go.uber.org/goleak,
-         gopkg.in/yaml.v3
-[ ] 0.2  docker-compose.yml: postgres:16, user/pw/db=flowbee, port 5432, healthcheck pg_isready,
-         dev-only flags (fsync=off, synchronous_commit=off) for fast local loop.
-[ ] 0.3  Makefile targets: dev (compose up --wait), down, build (CGO_ENABLED=0), migrate, serve,
-         seed, lint, test, accept, fmt. DB_URL exported as FLOWBEE_DATABASE_URL.
-[ ] 0.4  internal/config: Config{DatabaseURL, PrivateAddr=:7000, HealthAddr=:7001, WebhookAddr (unused M0),
-         LeaseTTL=300s, HeartbeatInterval=30s, LongPollWait=30s, RiverMaxWorkers=10, LogLevel}.
+         modernc.org/sqlite (pure-Go, via stdlib database/sql), oklog/ulid/v2,
+         zeebo/blake3, stretchr/testify, go.uber.org/goleak, gopkg.in/yaml.v3
+         (NOT: pgx/river/testcontainers — dropped; SQLite is the store)
+[ ] 0.2  (no docker-compose — the store is a single embedded SQLite file; nothing to stand up)
+[ ] 0.3  Makefile targets: build (CGO_ENABLED=0), migrate, serve,
+         seed, lint, test, accept, fmt. DB path via FLOWBEE_DATABASE_URL (a SQLite file path).
+[ ] 0.4  internal/config: Config{DatabaseURL (SQLite file), PrivateAddr=:7000, HealthAddr=:7001, WebhookAddr (unused M0),
+         LeaseTTL=300s, HeartbeatInterval=30s, LongPollWait=30s, LogLevel}.
          Load() reads env, applies defaults, VALIDATES LeaseTTL >= 3*HeartbeatInterval (§6.3.3).
 [ ] 0.5  internal/clock: Clock interface { Now() time.Time; NewTimer(d) Timer }; realClock + fakeClock.
 [ ] 0.6  internal/ulid: monotonic minter with an injectable entropy source (testable).
-[ ] 0.7  internal/store: pgxpool Open() (MaxConns~20, MinConns 2); Store wrapping pool + *river.Client;
-         Ping() for /healthz; Close().
-[ ] 0.8  internal/store/migrate.go: //go:embed migrations/*.sql; MigrateUp() runs (1) rivermigrate,
-         then (2) embedded *.sql in lexical order, each in its own tx, recorded in
-         schema_migrations(version text pk, applied_at timestamptz). Idempotent.
-[ ] 0.9  internal/river: NewClient(pool, cfg) — embedded River client, Workers empty in M0,
-         Queues{default:{MaxWorkers:cfg.RiverMaxWorkers}}. Started/stopped by serve.
-[ ] 0.10 internal/api/server.go (health half): GET /healthz → 200 {status,db,river,version} / 503 on
-         Ping fail or River not started. Health listener on HealthAddr; worker-API listener on
+[ ] 0.7  internal/store: Open() a SQLite DB (database/sql, modernc.org/sqlite, SetMaxOpenConns(1));
+         Store wrapping *sql.DB + the in-process timer loop; Ping() for /healthz; Close().
+[ ] 0.8  internal/store/migrate.go: //go:embed migrations/*.sql; MigrateUp() runs the embedded *.sql in
+         lexical order, each in its own tx, recorded in
+         schema_migrations(version text pk, applied_at text /* RFC3339 */). Idempotent.
+[ ] 0.9  internal/store timers: a `timers` table (due_at, expected_epoch, fired) + ONE polling
+         goroutine, started/stopped by serve (replaces the planned in-process River client).
+[ ] 0.10 internal/api/server.go (health half): GET /healthz → 200 {status,db,version} / 503 on
+         Ping fail. Health listener on HealthAddr; worker-API listener on
          PrivateAddr (404 stubs in M0). Two distinct *http.Server (§12.1).
 [ ] 0.11 cmd/flowbee/main.go: flag dispatch on os.Args[1]:
-           serve   → Load → Open → MigrateUp → start River → start health+private servers → block on
+           serve   → Load → Open → MigrateUp → start the timer loop → start health+private servers → block on
                      signal → graceful shutdown.
-           migrate → Load → Open pool → MigrateUp → exit 0.
+           migrate → Load → Open SQLite → MigrateUp → exit 0.
            work|lease|submit|seed → print usage stub (filled M1+).
            version → print build SHA.
 [ ] 0.12 CI (.github/workflows or equivalent): go build, go vet, golangci-lint run,
-         smoke test that boots `serve` against testcontainers PG and hits /healthz, then exits.
+         smoke test that boots `serve` against a temp-file SQLite DB and hits /healthz, then exits.
 [ ] 0.13 tools/archcheck skeleton: walk `go list -deps` for internal/engine, internal/job, internal/ledger,
          internal/lease; fail if any depends on time(beyond type)/math/rand/crypto/rand/ULID/clock/
          github/LLM. (No core packages exist yet — wire the tool so it's green and enforced from M1.)
 
-DONE WHEN: `flowbee serve` boots against empty PG, runs all migrations idempotently (re-run = no-op),
-starts River, opens both listeners (/healthz returns 200), and `make test` is green in CI.
+DONE WHEN: `flowbee serve` boots against an empty SQLite file, runs all migrations idempotently
+(re-run = no-op), starts the timer loop, opens both listeners (/healthz returns 200), and tests are green in CI.
 ```
 
 ---
@@ -386,6 +430,13 @@ review_pending` → a second concurrent worker gets **204**; any stale-epoch cal
 no LLM, no PR — the result transition stops at `review_pending` (PR-open is M7).
 
 ### 5.1 SQL schema (embedded migrations)
+
+> **As-built dialect note.** The DDL below is written in the planned Postgres dialect. The shipped
+> migrations are **SQLite** (`modernc.org/sqlite`). Translate as you read: `BIGINT GENERATED ALWAYS AS
+> IDENTITY` / `SERIAL` → `INTEGER PRIMARY KEY AUTOINCREMENT`; `TIMESTAMPTZ … DEFAULT now()` → `TEXT` holding
+> RFC3339, default `datetime('now')`; `JSONB` → `TEXT` (JSON string); `$1,$2` placeholders → `?`; the
+> partial unique index and `UPDATE … RETURNING` carry over unchanged (SQLite supports both). The semantics
+> — append-only ledger, per-job ordinal, the "one active lease per job" partial unique index — are identical.
 
 **`0002_job_events.sql` — the append-only ledger (the spine):**
 
@@ -590,7 +641,8 @@ epoch)` is the current live lease in an active state; 0 rows → `ErrStaleEpoch`
 | `GET /` | board | embedded HTML listing jobs + states. |
 
 Long-poll loop: `engine.Claim` every ~1s up to `LongPollWait`; `ErrLostRace`/`ErrNoEligibleJob` → keep
-looping until deadline, then **204**. (M2 upgrades the poll to `LISTEN/NOTIFY` wakeups — flag 5.)
+looping until deadline, then **204**. (The planned Postgres `LISTEN/NOTIFY` wake-up optimization does not
+apply on SQLite; the ~1s poll-loop is the shipped mechanism — correctness identical, see flag 5.)
 
 ### 5.5 Stub worker
 
@@ -603,7 +655,7 @@ is wired from day one.
 
 ### 5.6 The acceptance test (`test/acceptance/lease_once_test.go`)
 
-Real Postgres (testcontainers), in-process HTTP server, two concurrent stub workers:
+Real temp-file SQLite, in-process HTTP server, two concurrent stub workers:
 
 1. seed a `ready` build job (+ `job_created` event, one tx);
 2. two workers register with distinct identities + model families, long-poll the **same** job concurrently;
@@ -634,7 +686,7 @@ via SSE.
 |---|---|---|---|
 | **unit** | `Fold` purity, state-machine transitions, `engine.Decide`, `liveness.EvaluateKill` truth table, content checks, HMAC verify | ms, no DB | `go test ./... -short -race` |
 | **replay** | golden event streams → projection; **live == replay** | ms (events are fixtures) | part of unit lane |
-| **integration** | atomic claim, fencing, idempotency, reconcile/project vs `fakeGitHub`, ADOPT | seconds, testcontainers PG | `go test ./... -race` (tag `integration`) |
+| **integration** | atomic claim, fencing, idempotency, reconcile/project vs `fakeGitHub`, ADOPT | seconds, real temp-file SQLite | `go test ./... -race` |
 | **race** | the M1 concurrent-claim race, the no-double-lease model test, goleak | seconds, hammered | `go test ./internal/lease -race -count=50` |
 | **e2e (in-proc)** | httptest server + in-process stub worker + `fakeGitHub`, full happy/sad flows | seconds | tag `e2e` |
 | **e2e_github** | real sandbox repo + App creds; one smoke PR + merge | minutes, manual/nightly | tag `e2e_github`, off by default |
@@ -653,7 +705,7 @@ via SSE.
 
 `internal/clock.Clock` is injected everywhere; **never** call `time.Now()` in core. Liveness/lease-cap
 tests use a fake clock with manual `Advance(d)`. For liveness, unit-test the pure decision functions
-(`EvaluateKill`, the §10.3 truth table) with the fake clock; keep River-real-timer tests few and slow.
+(`EvaluateKill`, the §10.3 truth table) with the fake clock; keep real-timer-loop tests few and slow.
 
 ### 6.4 Stubs
 
@@ -664,21 +716,25 @@ tests use a fake clock with manual `Advance(d)`. For liveness, unit-test the pur
 - **git fixture**: a bare repo in a temp dir per test for epoch-ref promotion, worktree, bundle (local git
   ops, no network).
 
-### 6.5 Postgres for tests
+### 6.5 SQLite for tests (no Postgres, no containers)
 
-Default **testcontainers-go** (`postgres` module), fresh **database per test** on a shared container
-(cheaper than per-test containers, parallelizes cleanly — prefer this over truncation, which is a footgun
-with River's tables + the partial index). Fast local loop: long-lived docker-compose PG via
-`FLOWBEE_TEST_DATABASE_URL`; `newTestDB(t)` detects the env var, creates a uniquely-named DB, migrates,
-registers `t.Cleanup` to drop.
+> **As-built:** the planned testcontainers-Postgres path was **dropped**. Tests run against a **real
+> temp-file SQLite DB** — hermetic, zero external services, fast.
 
-### 6.6 docker-compose + Makefile
+`newTestDB(t)` creates a fresh temp-file SQLite DB (`t.TempDir()`), opens it with `SetMaxOpenConns(1)`,
+runs the embedded migrations, and registers `t.Cleanup` to close it. No shared container, no truncation
+footgun: each test gets its own file. The single-connection store serializes writes so the partial unique
+index and the atomic claim are exercised exactly as in production. The race lane (`-race -count=50`) drives
+the concurrent claim through this real store.
 
-`docker-compose.yml`: `postgres:16`, `fsync=off`/`synchronous_commit=off` (dev-only), healthcheck.
-Makefile: `dev down build migrate serve seed lint test accept fmt`. `lint` runs `golangci-lint` **plus**
+### 6.6 Makefile
+
+There is **no `docker-compose.yml`** — the store is a single embedded SQLite file. Makefile:
+`build migrate serve seed lint test accept fmt`. `lint` runs `golangci-lint` **plus**
 `tools/archcheck` (no clock/rand/LLM/GitHub in core) **plus** `tools/providerlint` (§5.6: no provider
-literal outside `model_family:*` / `lens.prompt_ref`). CI gates merges on `lint` + `test` + `integration`;
-`e2e_github` nightly. A migration round-trip test asserts `up; down; up` is clean.
+literal outside `model_family:*` / `lens.prompt_ref`). The green bar is
+`go build ./... && go vet ./... && go test ./... -race && go run ./tools/archcheck`. A migration round-trip
+test asserts re-running migrations is idempotent.
 
 ---
 
@@ -716,10 +772,10 @@ must be settled before writing the M1 migrations; **4–8** before the milestone
    lease-delivery path (still long-poll), honoring §12.2's "never the lease path" rule. *Flagged: contradicts
    the literal "post-MVP" label.*
 
-5. **Long-poll wakeup mechanism (not specified).** §7.2 says `GET /v1/lease` blocks ~30s. **Resolution:**
-   M1 uses a ~1s sleep-poll loop; M2 upgrades to Postgres `LISTEN/NOTIFY` on a `job_ready` channel to wake
-   blocked long-polls immediately (pgx-native), falling back to the 30s timeout. Correctness identical;
-   latency/efficiency only.
+5. **Long-poll wakeup mechanism (not specified).** §7.2 says `GET /v1/lease` blocks ~30s. **Resolution
+   (as-built):** the shipped store is SQLite, which has no `LISTEN/NOTIFY`; the lease long-poll uses a
+   **~1s sleep-poll loop** up to `LongPollWait`, then `204`. (The pre-build plan's "M2 upgrades to Postgres
+   `LISTEN/NOTIFY`" is moot — no Postgres.) Correctness identical; latency/efficiency only.
 
 6. **`reconciling_verdict` appears in a §7.3 API response but not in the §6.2.1 state catalogue.** The
    `code_reviewer` result returns `job_state:"reconciling_verdict"`. **Resolution:** treat it as an
@@ -751,9 +807,10 @@ must be settled before writing the M1 migrations; **4–8** before the milestone
 
 1. **Async projection breaks the atomic claim** → keep the fold synchronous (flag 1). Retired by the race
    test + live==replay.
-2. **Modeling the agent lease as a River-worked row** → River's rescuer double-dispatches with no fence
-   bump (the T2 zombie race, *caused by the queue*). Retired by §3.5's rule + the "no River kind is the
-   agent's work" structural test + the stale-deadline-check no-op test.
+2. **Modeling the agent lease as a plain queue/timer-worked row** → a generic queue's rescuer would
+   double-dispatch with no fence bump (the T2 zombie race, *caused by the queue*). Retired by §3.5's rule +
+   the "no internal job kind is the agent's work" structural test + the stale-deadline-check no-op test.
+   (This is also *why* the lease is a custom primitive on SQLite, not delegated to any job-queue library.)
 3. **Claim predicate wrong / not checking `rowsAffected`** → double-lease. Retired by the 64-goroutine race
    test under `-race -count=50` + the unique-index population assertion.
 4. **Nondeterminism leaks into the fold** → replay diverges, audit lies. Retired by `tools/archcheck` +
@@ -770,17 +827,19 @@ must be settled before writing the M1 migrations; **4–8** before the milestone
 
 ### 7.3 What Sam must provide (prerequisites & decisions)
 
-**Available now (verified):** Go 1.25.6, Docker, git, the repo at `/Users/sam/dev/flowbee`. M0–M5 need
-**nothing further** — they run entirely against local Postgres (docker-compose) with stub workers and a fake
-agent CLI. Build can start immediately.
+**Available now (verified):** Go 1.25.6, git, the repo at `/Users/sam/dev/flowbee`. M0–M5 need
+**nothing further** — they run entirely against an embedded SQLite file (no Docker, no Postgres) with stub
+workers and a fake agent CLI. Build can start immediately.
 
 **Needed before M6 (GitHub reconcile-IN) — the first external dependency:**
 
-- [ ] **A GitHub App** (not a PAT). Create it and provide: App ID, a generated **private key** (`.pem`),
-      the **installation ID** on the target repo, and the **webhook secret** (HMAC). Least-privilege
-      permissions: `contents` (read/write), `pull_requests` (read/write), `issues` (read/write),
-      `checks` (write), `statuses` (write). This is the **single installation identity** (I-14) — confirm
-      the multi-PAT pool is dropped (it is, per the design).
+- [ ] **One outbound GitHub identity.** For the **single-operator default**, a **fine-grained, repo-scoped
+      PAT** (or a `gh` token) is sufficient and recommended — reconcile-first makes the 5k/hr budget a
+      non-issue (DESIGN §8.3, I-14). At **org/multi-repo scale**, use a **GitHub App** instead and provide:
+      App ID, a generated private key (`.pem`), the installation ID, and the webhook secret (HMAC).
+      Least-privilege permissions either way: `contents`, `pull_requests`, `issues` (read/write),
+      `checks`, `statuses` (write), + the webhook HMAC secret. This is the **single outbound identity**
+      (I-14) — the multi-PAT/multi-account *pool* is dropped (a single PAT is not a pool).
 - [ ] **A dedicated test/sandbox repo** (throwaway, with branch protection configurable) for M6/M7 e2e —
       separate from any live repo, so the first reconcile/project-OUT runs cannot disturb real work.
 - [ ] **A webhook ingress path** to the public listener (`:8443`) for the test repo — a Tailscale Funnel,
@@ -789,11 +848,12 @@ agent CLI. Build can start immediately.
 
 **Needed before M7 (project-OUT writes to a live repo) — a decision:**
 
-- [ ] **THE ONE DECISION (§14), at least provisionally.** Default is **Branch A** (`Policy.AllowSelfMerge=
-      false`, human merge gate stays) and the whole build proceeds on that default. Sam does not need to
-      decide to *start*, but should run the **§13.4 measurement gate** (instrument the current `russ` scripts
-      and watch `rateLimit.remaining` + human-merge latency + denylist-diff frequency for a week) in parallel
-      from day one — it gates whether/when to flip Branch B (M9/M11), not any milestone's completion.
+- [ ] **THE ONE DECISION (§14) — RESOLVED: Branch B.** The decision is made: **autonomous merge, no human
+      gate**, configurable via `Policy.AllowSelfMerge` (`config.AllowSelfMerge`, env
+      `FLOWBEE_ALLOW_SELF_MERGE`, `flowbee.yaml: allow_self_merge`). The code default is `false` (a fail-safe
+      Branch A), but the **production posture is `true`**. The safety net is deterministic — content-integrity
+      gate (I-11) + epoch side-effects (I-12) + reconciled SHA-bound verdict (I-9) + CI-green-at-head (I-5),
+      all built (M9/M11). Optional: run the §13.4 measurement gate to *confirm* the posture, not to decide it.
 - [ ] **Branch protection on the test repo's `main`** (required review from a distinct identity, no
       force-push) so the M7 startup assertion (I-8) and the human-merge step have something to check against.
 
@@ -801,8 +861,8 @@ agent CLI. Build can start immediately.
 
 - [ ] **Tailscale (or WireGuard) tailnet** spanning Flowbee's host and any worker boxes, plus the
       enrolled-identity scheme (which boxes may attest which roles).
-- [ ] **Postgres WAL replication target** (standby or WAL archive) and a documented RPO; **launchd**
-      `KeepAlive` on the macOS host.
+- [ ] **SQLite WAL-mode + litestream-style continuous replication** of the DB file and a documented RPO;
+      **launchd** `KeepAlive` on the macOS host. (No Postgres standby — the store is SQLite.)
 - [ ] **Confirm cross-box worker hosts are trusted with the repo source** — §9.7's egress gap is *not*
       closed in v1; running an untrusted host means accepting it can leak (not escalate) repo bytes. Under
       Branch B this becomes a residual risk Sam must consciously accept.
@@ -810,5 +870,6 @@ agent CLI. Build can start immediately.
 **Open setup decisions (defaults chosen; override if desired):**
 
 - Module path `github.com/swh/flowbee` (matches `s@swh.me`); listener ports `7000` private / `7001` health /
-  `8443` webhook; lease TTL 300s / heartbeat 30s (k=10, satisfies k≥3); Postgres-only store (SQLite caveat
-  declined for v1 — see deferred list). Say the word to change any of these before M0.
+  `8443` webhook; lease TTL 300s / heartbeat 30s (k=10, satisfies k≥3); **embedded-SQLite store**
+  (`modernc.org/sqlite`, single connection — the shipped decision; Postgres declined for the single-operator
+  scale). Say the word to change any of these before M0.

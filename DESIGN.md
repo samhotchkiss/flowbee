@@ -1,7 +1,9 @@
 # Flowbee — design (ground-up)
 
-> **Status:** authoritative ground-up design · supersedes the "Foreman" draft (`/Users/sam/Desktop/foreman-spec.md`) · incorporates an adversarial review and several design sessions · 2026-06-15.
-> One open decision remains and is foregrounded throughout as **THE ONE DECISION** (§14): *may the MVP merge without a human in the loop?* The architecture is built so either answer is a policy flip, not a redesign.
+> **Status:** authoritative ground-up design · supersedes the "Foreman" draft (`/Users/sam/Desktop/foreman-spec.md`) · incorporates an adversarial review and several design sessions · reconciled to the built engine (M0–M12) 2026-06-16.
+> **THE ONE DECISION (§14) is RESOLVED: Branch B — autonomous merge, no human gate.** `Policy.AllowSelfMerge` is the configurable toggle (`config.AllowSelfMerge`, env `FLOWBEE_ALLOW_SELF_MERGE`); the production posture is `true`. The architecture made either answer a policy flip, not a redesign — and the flip is taken. The safety net is deterministic, not a human: the content-integrity gate (I-11), CI-green-at-the-integrated-head (I-5), and the reconciled, SHA-bound verdict (I-9), with auto-revert as later hardening.
+>
+> **Reconciliation note (built reality vs. the draft below).** This document was drafted before the engine was built and named **River/Postgres** as the store and job-queue substrate. The shipped engine does **not** use them. The store of record is **embedded SQLite** (`modernc.org/sqlite`, pure-Go, `CGO_ENABLED=0`, one connection — `SetMaxOpenConns(1)`); River's cadence/timer/retry role is served by a **hand-rolled `timers` table + one polling goroutine**, epoch-guarded. Where the prose below still says "River" or "Postgres" as the substrate, read **"SQLite + the in-process timer/dispatch loop"**; the *semantics* the draft attributed to River (transactional enqueue coupled to the state change, idempotent epoch-guarded deadline checks, dedup, sweeper) are all preserved — only the dependency changed. §12.3 is the canonical, reconciled statement of the store.
 
 ---
 
@@ -19,6 +21,8 @@ This is the authoritative spec, not a survey. Read §3 (two domains & invariants
 | Build state | `building` | flow stage-id `build` |
 | Outbound GitHub identity | **the single installation identity** (one GitHub App installation token) | never "pool"; §9.4, I-14 |
 | Content hash (pre-SHA) | **BLAKE3** `spec_content_hash` | §11.5 |
+| Store of record | **embedded SQLite** (`modernc.org/sqlite`, single conn) | §12.3; never Postgres/River |
+| Determinism invariant | **flowbee-core is a deterministic, replayable function of persisted facts** | §3.6 (I-0); all intelligence is a job |
 | Orchestrator | **Flowbee** | never "Foreman" |
 
 ---
@@ -81,7 +85,7 @@ Every later decision is downstream of these.
 
 ### 2.4 Non-goals (v1)
 
-Not a CI system (gates *on* CI, never runs it). Not an inference provider/model host (BYO, R6). Not a general workflow engine (River is the substrate behind a clean interface; not a Temporal competitor). Not a chat UI/IDE (ingests the spec + issues a chat produced). Not multi-tenant SaaS (single operator, single repo to start). Not a replacement for GitHub branch protection (complements it, never assumes it away). **Workers are not trusted** — Flowbee's job is to *contain* a worker, not to believe it.
+Not a CI system (gates *on* CI, never runs it). Not an inference provider/model host (BYO, R6). Not a general workflow engine (the SQLite store + in-process dispatch loop sit behind a clean interface; not a Temporal competitor). Not a chat UI/IDE (ingests the spec + issues a chat produced). Not multi-tenant SaaS (single operator, single repo to start). Not a replacement for GitHub branch protection (complements it, never assumes it away). **Workers are not trusted** — Flowbee's job is to *contain* a worker, not to believe it.
 
 ### 2.5 Standing design tensions (kept foregrounded)
 
@@ -200,7 +204,9 @@ Anti-affinity is part of the same correctness story: a reviewer judging its own 
 
 ### 3.6 The invariants (summary)
 
-The full canonical statement of invariants **I-1 … I-16** lives in §15. They hold even at MVP; their removal reintroduces the exact wedge/double-merge/unreviewed-merge failures Flowbee exists to delete. THE ONE DECISION (§14) determines which of I-9/I-11/I-12 are load-bearing on day one — it does not weaken any invariant.
+**I-0 — Determinism (the load-bearing architectural commitment).** *flowbee-core (the control plane's decision logic AND the worker harness) is a deterministic, replayable function of persisted facts; all intelligence is a job.* The core (`internal/{engine,job,ledger,lease,scheduler,flow}`) takes an immutable folded `EngineState` plus one triggering `Event` and returns a `Decision` — a *description* of transitions, side-effects, and timers — with zero I/O, no clock read, no ID minting, no randomness, and no LLM/GitHub access; time and IDs are injected as values. The same event log replays to the same `Decision` stream, byte-for-byte. This is enforced **mechanically** by `tools/archcheck`, which forbids the core packages from importing `time` (beyond the type), `math/rand`, `crypto/rand`, any ULID minter, any clock, or any LLM/agent/GitHub package (the deterministic-hash exception for `crypto/sha256`/BLAKE3 aside). An LLM's `status: succeeded` enters the core only as a persisted *claim* event; the gate derives the real verdict from reconciled facts (I-9). I-0 is the invariant that makes replay, audit, and the two-domain reconciliation tractable; its removal turns the orchestrator into an unauditable, unreplayable black box.
+
+The full canonical statement of invariants **I-1 … I-16** lives in §15 (with **I-0** added there as the determinism invariant). They hold even at MVP; their removal reintroduces the exact wedge/double-merge/unreviewed-merge failures Flowbee exists to delete. THE ONE DECISION (§14) **is resolved — Branch B, autonomous merge** — so I-9/I-11/I-12 are load-bearing on day one (the configurable `Policy.AllowSelfMerge` defaults `false` in code for safety but is set `true` in the production posture); resolving it never weakened any invariant.
 
 ---
 
@@ -213,7 +219,7 @@ Flowbee is one long-lived Go process: the brain and the only GitHub caller. Work
    GitHub ──reconcile-IN sweep (every 2–5 min)───────▶ ┌──────────────────────────────────────┐
         (Domain-B facts: PR/SHA/CI/merged/budget)      │              FLOWBEE                   │
                                                         │  board mirror ◀ reconcile-IN + hints  │
-   GitHub ◀──project-OUT (outbox, single installation  │  (River/Postgres store, Domain A SoR) │
+   GitHub ◀──project-OUT (outbox, single installation  │  (SQLite store, Domain A SoR)          │
         identity, (job,action,head_sha) dedupe,        │  scheduler (job DAG + capability +    │
         Retry-After backoff)──────────────────────────▶│   anti-affinity + aging)              │
                                                         │  custom fenced-lease primitive        │
@@ -235,7 +241,7 @@ Three structural facts to read off the diagram:
 
 1. **One GitHub caller.** All inbound facts arrive through reconcile-IN (with webhooks as hints); all outbound writes leave through project-OUT under the single installation identity. There is no second GitHub actor, which is why the §3.4 dedupe key and the §8.4 outbound concurrency cap are trivially enforceable and the rate-limit storm cannot recur.
 2. **Workers are outbound-only.** Flowbee holds no address for any worker — only a credential allowlist and a lease table. Same-box (loopback) and cross-box (LAN/Tailscale) differ only in *repo provisioning* and *network substrate*, never in the wire protocol.
-3. **River underneath, the custom lease on top.** River/Postgres supplies transactional enqueue, retries, timers, and a sweeper; the renewable-TTL + heartbeat + fencing **agent lease is a custom primitive on top** — agent leases are *not* plain River-worked rows (§12.3).
+3. **SQLite underneath, the custom lease on top.** The embedded **SQLite** store (`modernc.org/sqlite`, single connection) plus an in-process timer/dispatch loop supplies transactional enqueue, retries, timers, and a sweeper; the renewable-TTL + heartbeat + fencing **agent lease is a custom primitive on top** — agent leases are *not* plain queued rows (§12.3). *(The pre-build draft named River/Postgres here; the shipped engine uses SQLite + a hand-rolled `timers` table. See §12.3.)*
 
 ---
 
@@ -625,7 +631,7 @@ A bounce (verdict-driven) is distinct from a lease failure (attempt-driven). The
 
 ### 6.3 Exactly-once fenced leasing (the custom primitive)
 
-River supplies transactional enqueue, retries, timers, and a sweeper — but River-worked rows are *not* the agent lease. The renewable-TTL + heartbeat + fencing agent lease is a **custom primitive on top of River** (§12.3). A long-poll `GET /v1/lease` does not "dequeue a River job"; it competes for a `ready` job row and, on win, mints a `Lease` with an epoch.
+The SQLite store + in-process timer loop supply transactional enqueue, retries, timers, and a sweeper — but a queued/timer row is *not* the agent lease. The renewable-TTL + heartbeat + fencing agent lease is a **custom primitive on top of the store** (§12.3). A long-poll `GET /v1/lease` does not dequeue a generic job row; it competes for a `ready` job row (`UPDATE … WHERE state='ready' … RETURNING`) and, on win, mints a `Lease` with an epoch.
 
 #### 6.3.1 Atomic claim (with full anti-affinity)
 
@@ -809,6 +815,8 @@ def main():
 ```
 
 Read off this loop: the agent CLI is a black box (`collect_work_product` extracts a *diff against a base SHA* or a *prose verdict*, never a parsed transcript); the loop never branches on model (`MODEL_TAG` is used only by the scheduler's match predicate; the §5.6 CI lint enforces no provider literal in any control position); isolation is per-lease (§7.5).
+
+> **Mode A is the default.** This harness-driven loop (`flowbee work` spawning `FLOWBEE_AGENT_CMD` — e.g. `claude -p`, which is **subscription-covered** under an Anthropic plan, or `codex exec` — fresh-context + one-shot-per-lease) is the **recommended default** worker mode, and docs/config lead with it. The agent runs *under* Flowbee's supervision (Rung-0/§10), gets a fresh context per job (the anti-affinity substrate, §5.5), and holds **no GitHub credentials** (R4). **Mode B** (the thin `flowbee lease`/`submit` client, an operator wires their own agent loop) remains supported but is the advanced/optional path.
 
 ### 7.2 The five calls
 
@@ -1143,7 +1151,7 @@ Two enforced rules: **Flowbee opens the PR and stamps the number** (the worker n
 
 #### 8.2.2 Outbox semantics: `(job_id, action, head_sha)` dedupe
 
-The idempotency backbone and the structural answer to "ack ≠ execution" on the GitHub side. **Transactional enqueue:** the outbox row is written in the *same* DB transaction as the Domain-A state change (River-backed, §12.3); there is no window where Flowbee believes it labeled a PR it never did. **At-least-once send, exactly-once *effect*:** the sender may retry freely; combined with the key and observed GitHub state from the last reconcile, a re-sent `labels.set@SHA` or a duplicated `mergeQueue.enqueue` for the same `(job, head_sha)` collapses to one. **SHA in the key is load-bearing:** when the SHA moves (supersession), stale outbox rows are abandoned and fresh ones enqueued for the new SHA — the same mechanism that voids the sign-off voids its pending renderings.
+The idempotency backbone and the structural answer to "ack ≠ execution" on the GitHub side. **Transactional enqueue:** the outbox row is written in the *same* SQLite transaction as the Domain-A state change (§12.3); there is no window where Flowbee believes it labeled a PR it never did. **At-least-once send, exactly-once *effect*:** the sender may retry freely; combined with the key and observed GitHub state from the last reconcile, a re-sent `labels.set@SHA` or a duplicated `mergeQueue.enqueue` for the same `(job, head_sha)` collapses to one. **SHA in the key is load-bearing:** when the SHA moves (supersession), stale outbox rows are abandoned and fresh ones enqueued for the new SHA — the same mechanism that voids the sign-off voids its pending renderings.
 
 #### 8.2.3 Reasserting drifted renderings
 
@@ -1153,17 +1161,19 @@ When reconcile-IN observes a Flowbee-owned rendering drifted, it enqueues a proj
 
 The sender honors GitHub's flow control as a first-class input. **Primary rate limit:** drains adaptively against `rateLimit.remaining`/`resetAt`; as the budget tails off it widens spacing and prioritizes correctness-critical actions (merge, status check) over cosmetic ones (labels). **`Retry-After` (secondary/abuse limit):** triggered by bursty concurrent writes independent of the hourly budget; the sender treats it as authoritative and parks the *whole* outbox for the stated duration. **Outbound concurrency cap:** the most effective abuse-limit defense is **serializing outbound writes** — one in-flight GitHub mutation at a time (small bounded read pool), jittered. Because there is exactly *one* sender owning *one* identity (§9.4), this is trivial to enforce with no second writer to race it.
 
-### 8.3 Identity: one GitHub App installation token (I-14)
+### 8.3 Identity: one outbound GitHub identity — PAT for a single operator, App for multi-repo (I-14)
 
-Outbound identity resolves toward **a single GitHub App installation token** — one larger, ToS-clean bucket. The draft's multi-PAT "multiply the buckets" pool is **dropped**.
+> **Reconciled.** The pre-build draft mandated a GitHub App installation token as *the* identity. The built reality and the resolved posture: **Flowbee owns actor identity, and the credential is sized to the deployment.** For the **single-operator, single-repo** case (the v1 default), a **fine-grained, repo-scoped Personal Access Token (PAT)** — or a `gh` token — is **sufficient and is the recommended default**: because Flowbee is reconcile-first (one batched sweep every 2–5 min, workers make *zero* GitHub calls), the 5k-requests/hr PAT budget is **never the bottleneck**, so the App's larger bucket buys nothing at this scale. A **GitHub App** is the right identity only at **org-scale / multi-repo / OSS-distribution**, where per-repo installation and a larger bucket matter. The invariant (I-14) is unchanged in substance — **one outbound identity, no multi-account pool** — only the credential *form* is now deployment-sized.
+
+Outbound identity resolves to **a single GitHub identity** — one ToS-clean bucket. The draft's multi-PAT "multiply the buckets" *pool* (rotating several accounts to multiply the budget) is **dropped**; a *single* fine-grained repo-scoped PAT is not a pool and is the single-operator default.
 
 #### 8.3.1 Why the multi-PAT pool is dropped — the ToS constraint
 
 Rotating multiple PATs/bot accounts to *multiply* the budget is, in substance, evading GitHub's rate limits by sock-puppeting accounts. **GitHub's Terms of Service prohibit using multiple accounts to circumvent platform restrictions, including rate limits.** The failure mode is not "slightly against the rules" — it is account/installation suspension, which takes the *whole* control plane offline. A rate-limit *outage* wedges Flowbee until the window resets and is self-healing; a ToS *suspension* wedges it indefinitely and is not. **The ToS constraint is a first-class design input, not a tuning knob** (I-14): the budget is whatever one installation legitimately provides, and the architecture is sized to live within it.
 
-#### 8.3.2 What the App gives, structurally
+#### 8.3.2 What the single identity gives, structurally (PAT or App)
 
-**One legitimate, larger bucket** scoped to the installation, sized by repo/installation rather than the per-user PAT ceiling — no sock-puppets. **Least privilege** — the App requests only contents, pull requests, issues, checks, statuses; workers never receive it (R4, I-7); git writes Flowbee performs use ephemeral per-job scoped credentials minted from the App (§9.4), never the long-lived installation token handed outward. **It IS the single caller** — "one identity" and "one caller" are the same fact, which is why the outbound concurrency cap (§8.2.4) and the dedupe key (§8.2.2) are enforceable.
+**One legitimate bucket** — for a single operator, a fine-grained repo-scoped **PAT** (the recommended default); at org-scale, a GitHub **App** installation token sized by repo/installation. Either way: **no sock-puppets, one caller.** **Least privilege** — the credential is scoped to only contents, pull requests, issues, checks, statuses; workers never receive it (R4, I-7); git writes Flowbee performs use ephemeral per-job scoped credentials (a short-lived deploy key, §9.4), never the long-lived token handed outward. **It IS the single caller** — "one identity" and "one caller" are the same fact, which is why the outbound concurrency cap (§8.2.4) and the dedupe key (§8.2.2) are enforceable. **Flowbee owns actor identity:** every outbound GitHub action is attributed to this one Flowbee identity, which is *distinct* from any human author — the property branch protection's "review from an identity distinct from the author" leans on (§9.6).
 
 #### 8.3.3 The rate-limit math (why one bucket is enough)
 
@@ -1295,14 +1305,16 @@ Because workers dial out, the *protocol* is identical same-box or cross-box — 
 
 | Posture | Isolation | Notes |
 |---|---|---|
-| **Same-box co-location** | **Weaker.** The worker (and its bypass-mode agent) shares a kernel, filesystem, and loopback with Flowbee and Postgres. A compromised agent that escapes its cwd is *adjacent to the installation token's process* and the system of record. | Cheapest, lowest latency; fine for a trusted single-operator dev box. Provision via `git worktree`; run the worker under a separate OS user with filesystem confinement at minimum. |
+| **Same-box co-location** | **Weaker.** The worker (and its bypass-mode agent) shares a kernel, filesystem, and loopback with Flowbee and its SQLite store. A compromised agent that escapes its cwd is *adjacent to the installation token's process* and the system of record. | Cheapest, lowest latency; fine for a trusted single-operator dev box. Provision via `git worktree`; run the worker under a separate OS user with filesystem confinement at minimum. |
 | **Cross-box over Tailscale/WireGuard** | **Stronger, and reusable as the auth substrate.** WireGuard gives transport encryption + cryptographic **node identity**; Tailscale **ACLs** restrict which nodes may reach Flowbee's port. A compromised host is across a network boundary from the token and the store. | The node identity folds into §9.4.1 mutual auth — the Tailscale node key becomes part of "this is an enrolled worker." Preferred for any worker you would not run as yourself. |
 
 The non-obvious point: **moving a worker further away makes it safer.** Co-location optimizes latency at the cost of blast radius; the Tailscale path converts "shares a kernel with my secrets" into "an ACL'd, cryptographically-named node across a WireGuard boundary."
 
-### 9.6 Branch protection: an orchestrator-independent backstop (I-8)
+### 9.6 Branch protection: a *structural* gate, not the reviewer≠author arbiter (I-8)
 
-Everything above is Flowbee logic, and Flowbee can have bugs. **Server-side branch protection on `main` is the backstop that does not depend on Flowbee being correct:** no direct/force push; required status checks (including `flowbee/review-valid@SHA` when batch-size>1, §8.5); **required review from an identity distinct from the author**, enforced by GitHub. This is defense in depth with a deliberately *different trust root*: a rogue worker, a forged lease, **or a Flowbee bug** still cannot corrupt `main`. Flowbee complements branch protection; it never assumes it away.
+> **Reframed (reconciled).** Branch protection is a **structural** server-side gate — *"nothing reaches `main` except via Flowbee's check; no force-push, no direct push."* It is **not** the thing that decides reviewer-≠-author independence. **Flowbee owns actor identity and enforces anti-affinity** (I-10, §5.5, §9.3) at lease time: `eng_worker.identity != code_reviewer.identity` etc. is a Flowbee scheduler constraint, derived from Flowbee-owned process state, not something GitHub's "require review from someone other than the author" can express — because every Flowbee-driven commit and review is attributed to the *single* Flowbee identity (§8.3), so to GitHub author and reviewer look like the same actor. GitHub's branch protection therefore cannot be the arbiter of review independence; **Flowbee is.** Branch protection's job is the *structural* one only.
+
+Everything above is Flowbee logic, and Flowbee can have bugs. **Server-side branch protection on `main` is the structural backstop that does not depend on Flowbee being correct:** no direct/force push; required status checks (including `flowbee/review-valid@SHA` when batch-size>1, §8.5); merges only through the protected path Flowbee drives. This is defense in depth with a deliberately *different trust root*: a rogue worker, a forged lease, **or a Flowbee bug** still cannot force-push or directly push to `main`. The **reviewer-≠-author** guarantee is supplied by **Flowbee's lease-time anti-affinity (I-10)**, not by GitHub — because Flowbee owns actor identity, GitHub's author/reviewer distinction degenerates to one identity. Flowbee complements branch protection; it never assumes it away, and it never delegates *independence* to it.
 
 ### 9.7 The worker host as a hostile execution environment
 
@@ -1398,7 +1410,7 @@ Two transitions are unambiguous enough to bypass the ladder — "free" because t
 
 ### 10.7 State-machine deltas
 
-Liveness threads into the §6 state machine as **sub-state on the lease** plus a governor counter, driven by **River timers** — not a new top-level state.
+Liveness threads into the §6 state machine as **sub-state on the lease** plus a governor counter, driven by **the in-process timer loop** (the `timers` table + polling goroutine, §12.3) — not a new top-level state.
 
 | Field | On | Meaning |
 |---|---|---|
@@ -1427,7 +1439,7 @@ Liveness threads into the §6 state machine as **sub-state on the lease** plus a
 | **BOUNCE** | re-dispatch on revoke | re-lease to a *different* eligible worker (anti-affinity still holds) | `ready → leased` (new epoch) |
 | **needs_human** | `stall_revocations` ceiling (Rung 4), **or** `max_attempts`/`max_bounces` exhausted (I-6) | stop re-dispatching; escalate | active → **`needs_human`** (non-terminal) |
 
-**River timers** drive every wait without a polling loop (`phase_deadline_at`, `lease_deadline`, the WARN→CANCEL grace, the partition-grace are all River timers; the reconcile sweep producing `rung2_last_verdict` is a periodic River job). The lease primitive remains **custom on top of River** (§12.3); liveness adds *timers and counters around* it. Every revocation is transactional with the epoch bump and compensation enqueue, so a crash mid-revoke replays cleanly.
+**The `timers` table + one polling goroutine** drive every wait (`phase_deadline_at`, `lease_deadline`, the WARN→CANCEL grace, the partition-grace are all rows in the `timers` table; the reconcile sweep producing `rung2_last_verdict` is a periodic timer-driven job). The lease primitive remains **custom on top of the SQLite store** (§12.3); liveness adds *timers and counters around* it. Each timer carries `expected_epoch` and no-ops if the epoch moved, so a stale deadline check is idempotent. Every revocation is transactional with the epoch bump and compensation enqueue, so a crash mid-revoke replays cleanly.
 
 ### 10.8 MVP cut
 
@@ -1613,7 +1625,7 @@ The spec gate is **upstream of the human-merge question** and largely orthogonal
 
 ## 12. Deployment topology, storage & operations
 
-Where Flowbee runs, what it persists, how it survives a crash, and how an operator sees inside it. Downstream of two non-negotiables: workers **dial out** (R2), so Flowbee needs zero inbound knowledge of where they are; and Flowbee is the **process system-of-record** (R3), so a boot reconstructs from `Flowbee-Postgres + the reconciled GitHub-owned facts` and nothing else.
+Where Flowbee runs, what it persists, how it survives a crash, and how an operator sees inside it. Downstream of two non-negotiables: workers **dial out** (R2), so Flowbee needs zero inbound knowledge of where they are; and Flowbee is the **process system-of-record** (R3), so a boot reconstructs from `the Flowbee SQLite store + the reconciled GitHub-owned facts` and nothing else.
 
 ### 12.1 Topology is set by one fact: workers dial OUT
 
@@ -1622,7 +1634,7 @@ Because every worker is an outbound long-poll client, Flowbee never holds an add
 ```
    ┌────────────────── ONE Flowbee process (single Go binary) ──────────────────┐
    │  PUBLIC :8443  webhook endpoint (HMAC-only, I-2)   ── internet-facing       │
-   │  PRIVATE :7000 worker API (mutual-auth)  reconcile/project loops  River+PG  │
+   │  PRIVATE :7000 worker API (mutual-auth)  reconcile/project loops  SQLite     │
    └───────▲──────────────────────────────────────────────────────▲────────────┘
            │ long-poll GET /v1/lease (dial OUT, PRIVATE listener)  │
    ┌───────┴────────┐                   ┌───────┴────────┐  ┌───────┴─────────┐
@@ -1653,54 +1665,64 @@ The requirements do not justify the operational tax of gRPC streams or a message
 | Candidate | Why it is *not* needed | What it would cost |
 |---|---|---|
 | **gRPC / bidi streaming** | the only server→worker signal is `directive: continue\|cancel` returned on the worker's *own* heartbeat; no server-initiated push is required | proto toolchain, HTTP/2 keepalive tuning, harder curl-debuggability across Tailscale |
-| **Message bus (NATS/Redis Streams)** | the job *state engine* is River/Postgres (§12.3); a bus is a stream, not a job-state engine; leases need a fenced, transactional atomic claim a bus can't give | a new server type to run/HA, a second source of truth, no transactional coupling to the DAG |
+| **Message bus (NATS/Redis Streams)** | the job *state engine* is the SQLite store + in-process dispatch loop (§12.3); a bus is a stream, not a job-state engine; leases need a fenced, transactional atomic claim a bus can't give | a new server type to run/HA, a second source of truth, no transactional coupling to the DAG |
 | **WebSocket** | same as gRPC — no server-initiated push to justify a persistent socket | connection-state bookkeeping for a non-need |
 
 `GET /v1/lease` long-polls ~30 s and returns `204` if nothing is eligible (a held request *is* the "push"); `POST …/heartbeat` carries `lease_epoch` and returns `{continue|cancel}` (the cancel directive signals supersession/revocation **without any inbound channel to the worker**). **SSE later:** a read-only `/v1/events` stream is a *post-MVP* affordance for the dashboard and lower-latency `cancel`, layered on without disturbing the long-poll core — never the lease-delivery path. A *partitioned* worker simply cannot reach `/heartbeat`; Flowbee's clock expires the lease and fencing (I-4) rejects the reconnecting zombie — the transport choice makes a partition *look like* a partition (clean lease expiry) rather than a stall.
 
-### 12.3 Store: River/Postgres underneath, the custom agent-lease primitive ON TOP
+### 12.3 Store: embedded SQLite underneath, the custom agent-lease primitive ON TOP
 
-Flowbee runs **River (a Postgres-backed Go job queue), in-process**, as the durable substrate, and layers a **custom agent-lease primitive** on top. Two distinct layers; conflating them is a modeling error — **agent leases are NOT plain River-worked rows.**
+> **Reconciled to the built engine.** The pre-build draft named **River/Postgres** here. The shipped engine uses **embedded SQLite as the single store of record** and a **hand-rolled in-process timer/dispatch loop** in place of River. This section is the canonical statement; the substrate is SQLite, not Postgres, and there is **no River dependency**.
+
+Flowbee runs **embedded SQLite** (`modernc.org/sqlite` — a pure-Go SQLite, no cgo, so the binary stays `CGO_ENABLED=0` and statically linked), in-process, as the durable store of record, and layers a **custom agent-lease primitive** on top. Two distinct layers; conflating them is a modeling error — **agent leases are NOT plain queued rows.**
 
 ```
    ┌─────────────────────────────────────────────────────────────────────────┐
-   │  FLOWBEE FLOW ENGINE  (behind a clean interface — River↔Temporal swap)    │
+   │  FLOWBEE FLOW ENGINE  (deterministic core, I-0 — pure Decide())           │
    ├─────────────────────────────────────────────────────────────────────────┤
    │  CUSTOM AGENT-LEASE PRIMITIVE  (renewable TTL + heartbeat + fencing)       │
    │    • atomic claim (§6.3.1) + partial unique index "one active lease/job"   │
    │    • lease_epoch fence: stale-epoch mutations → 409   (I-4)                │
    │    • Flowbee-clock TTL + lease_deadline cap (Rung-3 floor, I-13)           │
    ├─────────────────────────────────────────────────────────────────────────┤
-   │  RIVER / POSTGRES  (transactional enqueue, retries/backoff, timers,        │
-   │                     unique-job dedup, rescuer/sweeper)                      │
+   │  EMBEDDED SQLite  +  in-process timer/dispatch loop                        │
+   │    • single connection (SetMaxOpenConns(1)) — serialized writes, no MVCC   │
+   │    • '?' placeholders, TEXT/RFC3339 + datetime('now') (no TIMESTAMPTZ)     │
+   │    • INTEGER PRIMARY KEY AUTOINCREMENT; partial unique indexes;            │
+   │      UPDATE … RETURNING for the atomic claim                               │
+   │    • `timers` table (due_at, expected_epoch, fired) + ONE polling          │
+   │      goroutine = cadence/deadlines/alarms; transactional enqueue,          │
+   │      epoch-guarded idempotent deadline checks, dedup, sweeper              │
    └─────────────────────────────────────────────────────────────────────────┘
-                         all in one process, one Postgres
+                         all in one process, one SQLite file
 ```
 
-**River buys** (the boring-but-bug-prone substrate we refuse to hand-roll): transactional **enqueue** coupled to the same Postgres transaction that mutates job state; **retries with backoff** for *internal* Flowbee work (a project-OUT push that 403s, a sweep that times out); **timers/scheduled jobs** (the reconcile cadence, the `no_eligible_worker` alarm, per-phase soft deadlines, `max_bounces` escalation); **unique-job dedup** (a replayed webhook doesn't fan out duplicate reconcile work); a **rescuer/sweeper** for River jobs orphaned by a crash.
+**The SQLite store + timer loop buys** (the boring-but-bug-prone substrate we refuse to hand-roll into the lease): transactional **enqueue** coupled to the same SQLite transaction that mutates job state (the outbox row and the Domain-A state change commit together); **retries with backoff** for *internal* Flowbee work (a project-OUT push that 403s parks on `Retry-After`; a sweep that times out re-arms); **timers/scheduled jobs** (the reconcile cadence, the `no_eligible_worker` alarm, per-phase soft deadlines, `max_bounces` escalation) via the `timers` table and the single polling goroutine; **dedup** (a replayed webhook doesn't fan out duplicate reconcile work — the `(job, action, head_sha)` outbox key and inbox `X-GitHub-Delivery` dedupe); a **sweeper** for timers orphaned by a crash (reconstruct-on-boot re-arms from the table). **Why SQLite, not Postgres:** the system is single-operator, single-repo, single-writer; `SetMaxOpenConns(1)` makes writes serialized (no MVCC needed for the partial unique index to hold), and the single-file store keeps the "single static binary, zero external services" property the deployment model (§12.1) is built on. Postgres/River would add an external server to run and an HA story Flowbee does not need at this scale.
 
-**River explicitly does NOT buy, and why the lease is custom:** River gives *a worker grabs a row, works it, acks it* — at-least-once execution of an **internal** unit of work. An **agent lease is a different object**: a *renewable, heart-beated, time-boxed, fenced claim held by an untrusted external process across the network*, whose liveness is judged by **Flowbee's clock**, and whose revocation must drive **explicit compensation** (close the zombie draft PR, drop the epoch ref — §6.5) rather than a silent River retry. River has no concept of `lease_epoch` fencing, no `directive: cancel` mid-flight, no `k·heartbeat` TTL renewal, no two-rung kill rule (I-13). Therefore the agent-facing lease lives in **Flowbee-owned tables** with the §6.3.1 atomic-claim and the partial unique index. River timers *fire the deadline checks*; River does not *own the lease*. The flow engine sits **behind a clean interface** so a future **River→Temporal** swap is contained (§12.5) — but the lease primitive is *deliberately not* delegated to either, because no off-the-shelf queue encodes the fencing + clock-authority + compensation semantics T2 and I-13 demand. One Postgres, one Go process, single static binary; the `jobs`, `leases`, and `lineage` tables stay directly SQL-queryable (which makes §12.6's dashboard and single auditable log cheap).
+**What the lease must NOT delegate, and why it is custom:** a generic queue gives *a worker grabs a row, works it, acks it* — at-least-once execution of an **internal** unit of work. An **agent lease is a different object**: a *renewable, heart-beated, time-boxed, fenced claim held by an untrusted external process across the network*, whose liveness is judged by **Flowbee's clock**, and whose revocation must drive **explicit compensation** (close the zombie draft PR, drop the epoch ref — §6.5) rather than a silent retry. The store has no native concept of `lease_epoch` fencing, no `directive: cancel` mid-flight, no `k·heartbeat` TTL renewal, no two-rung kill rule (I-13). Therefore the agent-facing lease lives in **Flowbee-owned tables** with the §6.3.1 atomic-claim (`UPDATE … WHERE state='ready' … RETURNING`) and the partial unique index. The timer loop *fires the deadline checks* (each carries `expected_epoch`; on run it re-reads the job and **no-ops** if the epoch moved — a stale timer is idempotent); it does not *own the lease*. One SQLite file, one Go process, single static binary; the `jobs`, `leases`, and `lineage` tables stay directly SQL-queryable (which makes §12.6's dashboard and single auditable log cheap).
 
 ### 12.4 SPOF / HA: one binary, reconstruct-on-boot, documented RPO
 
 Flowbee is a **single Go binary** and, in v1, a **single process** — an honest SPOF. We make the failure *recoverable* and *bounded*, the correct v1 posture for a single-operator, single-repo system.
 
-**Boot = reconstruct from two sources, in order:** (1) **Flowbee-Postgres** is authoritative for **Domain A** (the entire process state-of-record — the source GitHub *cannot* reconstruct); (2) **reconcile-IN** re-pulls the **Domain-B facts** and corrects drift accumulated while down (missed webhooks caught by the delivery high-water-mark forcing a full sweep, I-1). The §3 asymmetry makes the boot safe: **you cannot lose the job DAG and rebuild it from GitHub**, so Postgres durability is protected hardest:
+**Boot = reconstruct from two sources, in order:** (1) the **Flowbee SQLite store** is authoritative for **Domain A** (the entire process state-of-record — the source GitHub *cannot* reconstruct); (2) **reconcile-IN** re-pulls the **Domain-B facts** and corrects drift accumulated while down (missed webhooks caught by the delivery high-water-mark forcing a full sweep, I-1). The §3 asymmetry makes the boot safe: **you cannot lose the job DAG and rebuild it from GitHub**, so store durability is protected hardest:
 
 | Mechanism | Purpose | RPO |
 |---|---|---|
-| **Postgres WAL + streaming replication** to a standby (or WAL archiving) | survive disk/box loss of the primary | bounded by replication lag — **document it** (target: seconds) |
+| **SQLite WAL mode + litestream-style continuous replication** (or periodic `.backup`) of the single DB file | survive disk/box loss of the primary | bounded by replication lag — **document it** (target: seconds) |
 | **Idempotent, re-checkable external actions** | a crash mid-merge is safe: on boot, reconcile-IN asks GitHub "is PR #N already merged?" before any re-dispatch (I-3 terminal-SHA guard) | a settled merge is *never* re-driven |
 | **Epoch-namespaced side effects** (§3.5, I-12) | a crash that orphaned a worker's push leaves a `refs/flowbee/<job>/epoch-<n>` ref never fast-forwarded without epoch validation | no torn promotion |
 | **launchd `KeepAlive`** (macOS host) | restart the binary on crash/exit; with reconstruct-on-boot, an unattended crash self-heals | recovery-time, not data-loss |
 
-> **SQLite caveat:** acceptable *only* for an absolute-minimum single-box install, and then *only* with WAL + litestream-style replication and a **documented RPO** — because losing the job graph to disk loss is unrecoverable (Domain A is not in GitHub). For anything beyond the smallest install, Postgres + WAL replication is the floor.
+> **SQLite is the store of record (not a caveat — the decision).** The shipped engine stores Domain A in a single embedded-SQLite file. Because losing the job graph to disk loss is unrecoverable (Domain A is not in GitHub), durability rests on **WAL mode + litestream-style continuous replication + a documented RPO**. This is the right floor for a single-operator, single-repo, single-writer system; Postgres is **not** required and is **not** used. (The pre-build draft inverted this — naming Postgres the floor and SQLite the caveat — before the single-writer scale was settled. Reconciled: SQLite is the store of record.)
 
-**HA is explicitly v1.1+.** A true active/standby Flowbee (leader election, single-writer to the lease table) is deferred. The v1 bet: *reconstruct-on-boot + WAL replication + launchd KeepAlive + idempotent external actions* makes the SPOF a **bounded-downtime, zero-corruption** event rather than data-loss.
+**HA is explicitly v1.1+.** A true active/standby Flowbee (leader election, single-writer to the lease table) is deferred. The v1 bet: *reconstruct-on-boot + SQLite WAL replication + launchd KeepAlive + idempotent external actions* makes the SPOF a **bounded-downtime, zero-corruption** event rather than data-loss.
 
-### 12.5 River → Temporal is a contained later swap (not a v1 question)
+### 12.5 The flow engine is behind a clean interface (a contained later swap)
 
-The flow engine sits behind a clean interface; River is the v1 implementation, not a permanent commitment. The swap to **Temporal** is justified *only if* flows grow into long, branchy, multi-day, human-in-the-loop pipelines or the operator needs real HA — and even then it is contained to the flow-engine implementation, because the **lease primitive** and the **two-domain reconciliation** live *above* the flow engine and are engine-agnostic, the **work-product channel, epoch-namespaced refs, and sign-off rule** are protocol-level, and Domain-A persistence is in Flowbee-owned tables a Temporal swap would not relocate. We **reject Temporal for v1**: its clustered server, determinism tax, and replay model kill the single-static-binary property, and its wins are *flow-engine* wins, not *dispatch* wins.
+> **Reconciled:** the pre-build draft framed this as a "River → Temporal" swap. There is **no River**; the v1 substrate is SQLite + the in-process timer loop. The durable point stands: the flow engine sits **behind a clean interface**, so the store/dispatch substrate is a contained later swap.
+
+The flow engine sits behind a clean interface; **SQLite + the in-process timer/dispatch loop** is the v1 implementation, not a permanent commitment. Moving to a heavier durable-workflow substrate (e.g. Temporal) is justified *only if* flows grow into long, branchy, multi-day, human-in-the-loop pipelines or the operator needs real HA — and even then it is contained to the flow-engine implementation, because the **lease primitive** and the **two-domain reconciliation** live *above* the flow engine and are engine-agnostic, the **work-product channel, epoch-namespaced refs, and sign-off rule** are protocol-level, and Domain-A persistence is in Flowbee-owned tables a substrate swap would not relocate. We **reject Temporal (and any clustered server) for v1**: its clustered server, determinism tax, and replay model kill the single-static-binary property, and its wins are *flow-engine* wins, not *dispatch* wins. The deterministic core (I-0) already gives us the replay property a workflow engine would sell us — without the dependency.
 
 ### 12.6 Observability: one board, one roster, gauges, one auditable log, cost meters
 
@@ -1885,9 +1907,11 @@ The sequencing rule is blunt: **measure, then ship lean, then — and only with 
 
 ---
 
-## 14. THE ONE DECISION — may the MVP merge without a human in the loop?
+## 14. THE ONE DECISION — RESOLVED: Branch B (autonomous merge, no human gate)
 
-This is the one decision the document deliberately does **not** make. It re-sorts the `[T1✚]` rows of §13.2 and therefore determines what "MVP" even means. It is left to Sam.
+> **RESOLVED — Branch B.** The MVP **may** merge without a human in the loop. The `self_merge` arm (§5.4) is the production posture; an approved + denylist-clear + blast-radius-consistent + CI-green-at-head job is merged by Flowbee with **no human between the verdict and the merge commit**. The toggle is **configurable** — `Policy.AllowSelfMerge` (`config.AllowSelfMerge`, env `FLOWBEE_ALLOW_SELF_MERGE`, `flowbee.yaml: allow_self_merge`) — and defaults to `false` in code as a conservative fail-safe, but the **production setting is `true`**. The architecture made this a policy flip, not a redesign (§14 "Why this is held open"); the flip is taken. The safety net is **deterministic, not a human**: the content-integrity gate (I-11), epoch-namespaced side effects (I-12), the reconciled SHA-bound verdict (I-9), and CI-green-at-the-integrated-head (I-5) — with auto-revert as named later hardening. Consequently **I-9, I-11, and I-12 are load-bearing on day one**, and §9.7's egress gap is a residual risk the operator consciously accepts (mitigated by running cross-box workers only on trusted hardware). The sections below record *why* the decision went this way; they are retained as the rationale, not as an open question.
+
+This was the one decision the document deliberately deferred. It re-sorts the `[T1✚]` rows of §13.2 and determined what "MVP" means. **It has now been made by Sam: Branch B.**
 
 > **The question:** at the code-review GATE, when `code_reviewer` returns `approved`, may Flowbee take the **`self_merge` arm** (§5.4) and merge to `main` with **no human between the verdict and the merge commit** — or must *every* approved job take the **`handoff`→human** arm?
 
@@ -1929,6 +1953,10 @@ In Branch B these are **the actual MVP**; Phases 0–2 become table stakes on th
 
 The single source of truth for the invariant IDs. They hold even at MVP; their removal reintroduces the exact wedge/double-merge/unreviewed-merge failures Flowbee exists to delete. The first eight carry the draft's §11 forward; the rest are clean-room additions.
 
+**The determinism invariant (the load-bearing architectural commitment):**
+
+- **I-0 — Determinism / replayability.** *flowbee-core is a deterministic, replayable function of persisted facts; all intelligence is a job.* The core packages (`internal/{engine,job,ledger,lease,scheduler,flow}`) read no clock, mint no IDs, draw no randomness, and import no LLM/GitHub package — time and IDs are injected as values; the same event log replays to the same `Decision` stream. Enforced mechanically by `tools/archcheck` (the deterministic-hash exception for `crypto/sha256`/BLAKE3 aside). Its removal makes the orchestrator unauditable and unreplayable. (§1.2-build, §3.6)
+
 **Carried forward (draft §11):**
 
 - **I-1 — reconcile-IN is ground truth for Domain B; webhooks are hints.** No webhook is authority; gaps (delivery high-water-mark) force a sweep. (§3.3, §8.1)
@@ -1938,7 +1966,7 @@ The single source of truth for the invariant IDs. They hold even at MVP; their r
 - **I-5 — serialized merges; CI-green AND review-valid bound to the exact `(head_sha, base_sha)`.** Any base/head move supersedes the verdict and re-arms review + CI. (§6.2.4, §8.5)
 - **I-6 — `max_attempts` / `max_bounces` → `needs_human`; `no_eligible_worker` alarm.** Bounded retry, no infinite poison loop, no silent starvation. (§6.6, §6.7)
 - **I-7 — Flowbee performs all git writes** with ephemeral, least-privilege creds; workers never hold the installation token; promotion of worker output goes only through epoch-namespaced refs. (§3.5, §9.4)
-- **I-8 — branch protection on `main` as server-side backstop:** no direct/force push, required checks, required review from an identity distinct from the author. (§9.6)
+- **I-8 — branch protection on `main` as a *structural* server-side backstop:** no direct/force push, required checks, merges only via Flowbee's protected path. It is a **structural** gate ("nothing reaches `main` except via Flowbee's check"), **not** the reviewer-≠-author arbiter — Flowbee owns actor identity and enforces review independence at lease time (I-10), since to GitHub every Flowbee action shares one identity. (§9.6, §8.3)
 
 **Clean-room additions:**
 
@@ -1947,11 +1975,11 @@ The single source of truth for the invariant IDs. They hold even at MVP; their r
 - **I-11 — Content-integrity gate.** A returned diff is **untrusted data.** Before auto-merge it must pass a **path denylist** (CI config, `.github/workflows`, lockfiles + postinstall, Dockerfiles, secrets, Flowbee's own source → forced human gate), a **declared blast-radius** check, and **deterministic non-LLM static checks**. No LLM verdict alone clears this gate. (§9.2)
 - **I-12 — Epoch-namespaced side effects (ack ≠ execution).** Every externally-visible action is idempotent against re-dispatch: epoch-namespaced refs promoted only post-validation, CI gated on `(job, epoch)`, explicit compensation on revocation, no worker-supplied PR number. (§3.5, §6.5)
 - **I-13 — Two-rung kill rule.** A kill (lease revocation for a presumed-stalled agent) requires **two independent liveness rungs agreeing, at least one Rung-2 (external) or Rung-3 (clock)** — never two worker-reported rungs. "Worker partitioned" is distinguished from "agent stalled"; the reconnecting zombie is handled by fencing (I-4). (§10.3)
-- **I-14 — Single-identity ToS constraint.** Outbound GitHub identity resolves toward **one GitHub App installation token** (one larger ToS-clean bucket). The multi-PAT "multiply the buckets" pool is **dropped** — a ToS-suspension vector. Stated as a constraint, not a tuning knob. (§8.3, §9.4)
+- **I-14 — Single-identity ToS constraint.** Outbound GitHub identity resolves to **one** ToS-clean identity — a **fine-grained, repo-scoped PAT for the single-operator default** (reconcile-first makes the 5k/hr budget a non-issue), or **a GitHub App installation token at org/multi-repo scale**. The multi-PAT/multi-account "multiply the buckets" *pool* is **dropped** — a ToS-suspension vector. Stated as a constraint, not a tuning knob. (§8.3, §9.4)
 - **I-15 — Per-job / per-flow cost ceiling.** Token/$ metering with an enforced ceiling per job and per flow, alongside the GitHub-budget meter. Exceeding the ceiling escalates; it does not silently overspend. (§6.7, §12.6)
 - **I-16 — ADOPT-mode bootstrap.** First run against a live repo imports existing open issues/PRs as mirrored-but-quiescent; only work opted-in via label / watermark is scheduled. Flowbee never seizes human-owned in-flight work, and project-OUT does not reassert renderings on adopted-quiescent objects until opt-in. (§12.7)
 
-> **Held open deliberately (not an invariant — the one live decision, §14):** *may the MVP merge without a human in the loop?* If the gate **stays**, I-11 and the heavy side-effect machinery of I-12 are *premature* — ship lean and first measure `rateLimit.remaining` for a week. If it **comes off**, I-9 + I-11 + I-12 stop being v1.1 polish and become the **actual MVP**.
+> **RESOLVED (§14): Branch B — the gate comes off.** May the MVP merge without a human in the loop? **Yes**, configurable via `Policy.AllowSelfMerge` (production `true`). Therefore **I-9 + I-11 + I-12 are the actual MVP**, not v1.1 polish — the deterministic content-integrity / epoch-side-effect / reconciled-provenance machinery is what stands between an LLM verdict and `main`.
 
 *(Capability attestation — "probed/attested, not self-declared" — is a hard requirement carried from the original spec §8 and enforced in §7.2/§9.4.1, but is not assigned a numbered invariant; it is a property of the worker protocol's trust boundary.)*
 
