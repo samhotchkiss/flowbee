@@ -275,14 +275,22 @@ func checkGitHub(ctx context.Context, opts DoctorOptions, cfg config.Config, rep
 	} else {
 		rep.add("github write access", StatusFail, "token lacks WRITE — use a fine-grained PAT with Contents + Pull requests + Issues = write (read-only can't push or merge)")
 	}
-	if pre.HasCI {
-		rep.add("ci configured", StatusPass, "repo has GitHub Actions workflows (the merge gate can go green)")
-	} else {
-		rep.add("ci configured", StatusWarn, "no GitHub Actions workflow found — Flowbee merges ONLY on green CI, so nothing will merge until the repo reports a CI status check")
+	switch {
+	case pre.CITriggersOnPR:
+		rep.add("ci configured", StatusPass, "a workflow triggers on pull_request (Flowbee's merge gate can go green)")
+	case pre.HasCI:
+		rep.add("ci configured", StatusWarn, "workflows exist but NONE trigger on pull_request — Flowbee gates the merge on green PR CI, so PRs will sit forever; add `on: pull_request` to a workflow")
+	default:
+		rep.add("ci configured", StatusWarn, "no GitHub Actions workflow found — Flowbee merges ONLY on green CI, so nothing will merge until the repo reports a CI status check on PRs")
 	}
 	if pre.BranchProtected {
 		rep.add("branch protection", StatusWarn, "integration branch is protected — autonomous merge needs the token to satisfy the required checks, or turn protection off")
 	} else {
 		rep.add("branch protection", StatusPass, "integration branch unprotected — autonomous merge OK")
+	}
+	if pre.TokenScopes != "" {
+		rep.add("token scope", StatusWarn, "broadly-scoped CLASSIC PAT (scopes: "+pre.TokenScopes+") — prefer a fine-grained PAT limited to Contents + Pull requests + Issues (least privilege)")
+	} else {
+		rep.add("token scope", StatusPass, "fine-grained / least-privilege token")
 	}
 }

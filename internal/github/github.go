@@ -19,10 +19,12 @@ package github
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -512,7 +514,9 @@ func (c *RealClient) CreateCheck(ctx context.Context, sha, name, conclusion stri
 type Preflight struct {
 	CanWrite        bool
 	HasCI           bool
+	CITriggersOnPR  bool   // an active workflow triggers on pull_request (Flowbee gates on PR CI)
 	BranchProtected bool
+	TokenScopes     string // X-OAuth-Scopes: non-empty = a broadly-scoped CLASSIC PAT; empty = fine-grained / least-privilege
 }
 
 func (c *RealClient) Preflight(ctx context.Context, branch string) (Preflight, error) {
@@ -528,14 +532,45 @@ func (c *RealClient) Preflight(ctx context.Context, branch string) (Preflight, e
 		return pf, err // can't even read the repo — token/owner/repo wrong
 	}
 	pf.CanWrite = repo.Permissions.Push || repo.Permissions.Maintain || repo.Permissions.Admin
-	var wf struct {
-		TotalCount int `json:"total_count"`
-	}
-	if err := c.rest(ctx, http.MethodGet, "/actions/workflows", nil, &wf); err == nil {
-		pf.HasCI = wf.TotalCount > 0
+	// token scopes: a classic PAT reports its scopes in X-OAuth-Scopes (often far
+	// broader than needed — repo, admin:org, delete_repo); a fine-grained PAT reports
+	// none. Read the header off a raw repo GET.
+	if req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, c.restURL(""), nil); rerr == nil {
+		if tok, terr := c.Token(ctx); terr == nil {
+			req.Header.Set("Authorization", "Bearer "+tok)
+			if resp, derr := c.HTTP.Do(req); derr == nil {
+				pf.TokenScopes = strings.TrimSpace(resp.Header.Get("X-OAuth-Scopes"))
+				_ = resp.Body.Close()
+			}
+		}
 	}
 	if branch == "" {
 		branch = "main"
+	}
+	// CI: list workflows, and check at least one ACTIVE workflow triggers on
+	// pull_request — a workflow that only runs on push leaves every PR without a
+	// status check, so Flowbee (which gates the merge on green PR CI) never merges.
+	var wf struct {
+		Workflows []struct {
+			Path  string `json:"path"`
+			State string `json:"state"`
+		} `json:"workflows"`
+	}
+	if err := c.rest(ctx, http.MethodGet, "/actions/workflows", nil, &wf); err == nil {
+		for _, w := range wf.Workflows {
+			if w.State != "active" {
+				continue
+			}
+			pf.HasCI = true
+			var content struct {
+				Content string `json:"content"`
+			}
+			if err := c.rest(ctx, http.MethodGet, "/contents/"+w.Path+"?ref="+branch, nil, &content); err == nil {
+				if raw, derr := base64.StdEncoding.DecodeString(strings.ReplaceAll(content.Content, "\n", "")); derr == nil && strings.Contains(string(raw), "pull_request") {
+					pf.CITriggersOnPR = true
+				}
+			}
+		}
 	}
 	// 404 on protection => not protected (the autonomous-merge-friendly default).
 	if err := c.rest(ctx, http.MethodGet, "/branches/"+branch+"/protection", nil, nil); err == nil {

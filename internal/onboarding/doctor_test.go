@@ -65,7 +65,7 @@ func TestDoctorPreflight(t *testing.T) {
 		return rep
 	}
 
-	rep := run(gh.Preflight{CanWrite: true, HasCI: true, BranchProtected: false})
+	rep := run(gh.Preflight{CanWrite: true, HasCI: true, CITriggersOnPR: true, BranchProtected: false})
 	if !rep.Green() {
 		t.Fatalf("expected green:\n%s", dump(rep))
 	}
@@ -73,6 +73,15 @@ func TestDoctorPreflight(t *testing.T) {
 		if c := findCheck(rep, n); c.Status != StatusPass {
 			t.Fatalf("%q should pass, got %+v", n, c)
 		}
+	}
+
+	// CI workflows exist but none trigger on pull_request -> WARN (PRs would stall).
+	rep = run(gh.Preflight{CanWrite: true, HasCI: true, CITriggersOnPR: false})
+	if !rep.Green() {
+		t.Fatalf("a CI warning must not break green:\n%s", dump(rep))
+	}
+	if c := findCheck(rep, "ci configured"); c.Status != StatusWarn {
+		t.Fatalf("workflows-without-PR-trigger should warn, got %+v", c)
 	}
 
 	rep = run(gh.Preflight{CanWrite: false, HasCI: true})
