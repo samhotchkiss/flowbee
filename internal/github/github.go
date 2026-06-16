@@ -210,7 +210,7 @@ query BoardSweep($owner:String!, $repo:String!, $prCursor:String, $issueCursor:S
     }
     issues(first:50, after:$issueCursor, states:[OPEN], orderBy:{field:UPDATED_AT, direction:DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number updatedAt labels(first:20){ nodes{ name } } }
+      nodes { number updatedAt title body labels(first:20){ nodes{ name } } }
     }
   }
   rateLimit { limit cost remaining resetAt }
@@ -288,6 +288,8 @@ type sweepData struct {
 			Nodes []struct {
 				Number    int       `json:"number"`
 				UpdatedAt time.Time `json:"updatedAt"`
+				Title     string    `json:"title"`
+				Body      string    `json:"body"`
 				Labels    struct {
 					Nodes []struct {
 						Name string `json:"name"`
@@ -323,7 +325,7 @@ func (d sweepData) toSnapshot() BoardSnapshot {
 		snap.PullRequests = append(snap.PullRequests, pr)
 	}
 	for _, n := range d.Repository.Issues.Nodes {
-		iss := Issue{Number: n.Number, UpdatedAt: n.UpdatedAt}
+		iss := Issue{Number: n.Number, UpdatedAt: n.UpdatedAt, Title: n.Title, Body: n.Body}
 		for _, l := range n.Labels.Nodes {
 			iss.Labels = append(iss.Labels, l.Name)
 		}
