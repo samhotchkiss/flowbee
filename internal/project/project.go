@@ -72,6 +72,9 @@ type Sender struct {
 // neither hard-depends on gitops nor reaches GitHub for an archive write.
 type HistoryWriter interface {
 	CommitHistory(branch, message string, files []gitops.HistoryFile) (sha string, ok bool, err error)
+	// HeadSHA resolves a ref (e.g. refs/heads/main) to its commit SHA, so the
+	// signed_off_issue -> build seeding can bind the build to the current main tip.
+	HeadSHA(ref string) (string, error)
 }
 
 // WithHistory wires the local-git history writer + the branch its dedicated
@@ -204,7 +207,17 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		if err := s.store.StampIssueNumber(ctx, row.JobID, number, now); err != nil {
 			return "", fmt.Errorf("stamp issue: %w", err)
 		}
-		return fmt.Sprintf("issue=%d", number), nil
+		// signed_off_issue -> build (build-list flows.yaml entry): the materialized
+		// issue becomes a build job carrying the spec, so an eng_worker implements
+		// it. Best-effort + idempotent (fixed id) so a re-drain never dupes and a
+		// seed failure does NOT unwind the already-created issue.
+		detail := fmt.Sprintf("issue=%d", number)
+		if bid, berr := s.seedBuildFromSpec(ctx, j, now); berr != nil {
+			detail += " build_seed_err=" + berr.Error()
+		} else {
+			detail += " build=" + bid
+		}
+		return detail, nil
 
 	case store.ActionSetLabels:
 		// Prefer the job's stamped PR number; fall back to the payload `number` (an
@@ -315,6 +328,41 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// seedBuildFromSpec turns a just-materialized signed-off spec into a ready build
+// job (the signed_off_issue -> build link). The build carries the spec prose as
+// its task and binds to the current main tip as base_sha. Idempotent: a build
+// with the derived id already present is a no-op, so a re-drain never dupes.
+func (s *Sender) seedBuildFromSpec(ctx context.Context, spec job.Job, now time.Time) (string, error) {
+	buildID := spec.ID + "-build"
+	if _, err := s.store.GetJob(ctx, buildID); err == nil {
+		return buildID, nil // already seeded
+	}
+	if s.history == nil {
+		return "", errors.New("no mirror configured to resolve base_sha")
+	}
+	base, err := s.history.HeadSHA("refs/heads/" + orDefault(s.baseBranch, "main"))
+	if err != nil {
+		return "", fmt.Errorf("resolve base_sha: %w", err)
+	}
+	if _, err := s.store.SeedJob(ctx, store.SeedParams{
+		ID:                 buildID,
+		Kind:               job.KindBuild,
+		Flow:               "build",
+		Stage:              "build",
+		Role:               job.RoleEngWorker,
+		BaseSHA:            base,
+		TaskText:           orDefault(spec.SpecText, spec.TaskText),
+		SpecText:           spec.SpecText,
+		AcceptanceCriteria: spec.AcceptanceCriteria,
+		FlowID:             spec.ID,
+		Repo:               spec.Repo,
+		Now:                now,
+	}); err != nil {
+		return "", err
+	}
+	return buildID, nil
 }
 
 // issueTitle derives a human GitHub issue title from a signed-off spec job: the
