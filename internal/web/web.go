@@ -119,7 +119,19 @@ func (u *UI) funcs() template.FuncMap {
 		"barClass":   barClass,
 		"timeline":   func(c history.Card) []history.TimelineEntry { return c.Timeline },
 		"pips":       pips,
+		"ratio":      ratioPct,
+		"sub":        func(a, b int) int { return a - b },
 	}
+}
+
+// ratioPct renders part/whole as a clamped [0,100] integer percent for a gauge
+// fill width (the dashboard's GitHub-budget meter). A non-positive whole yields 0
+// so a missing budget reads as an empty gauge rather than dividing by zero.
+func ratioPct(part, whole int) int {
+	if whole <= 0 {
+		return 0
+	}
+	return clampPct(part * 100 / whole)
 }
 
 // pips returns one bool per slot: true=busy, false=free, for the fleet slot-pip
