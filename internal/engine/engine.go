@@ -106,6 +106,16 @@ type ReviewClaim struct {
 // the runtime fires it after the gate mints an approval.
 type MergeDispatch struct{}
 
+// CostMeter is a fenced cost report (§6.7, I-15). The runtime has ALREADY folded
+// the worker-reported {tokens_in, tokens_out, $} delta into the job's meter and
+// passes the NEW accumulated micro-USD total in s.Job.CostMicroUSD; the engine
+// runs the PURE ceiling predicate (job.CostExceeded) and either escalates the job
+// to needs_human (revoke + `cancel` directive + the over-budget label rendering,
+// I-15) or returns continue. The dollar arithmetic is exact integer micro-USD —
+// never a float ceiling comparison. Like every other fenced event a stale epoch
+// short-circuits to a 409 reject.
+type CostMeter struct{ Epoch int }
+
 // SpecReviewClaim is a fenced spec-review work-product CLAIM (§11, I-9). The
 // reviewer's decision + the two sub-checks are a CLAIM only — never authoritative.
 // The engine runs the pure spec gate (over the CURRENT content hash, the bytes are
@@ -127,6 +137,7 @@ func (Release) isEngineEvent()         {}
 func (ReviewClaim) isEngineEvent()     {}
 func (MergeDispatch) isEngineEvent()   {}
 func (SpecReviewClaim) isEngineEvent() {}
+func (CostMeter) isEngineEvent()       {}
 
 // Directive is the continue|cancel reply to a heartbeat.
 type Directive string
@@ -235,8 +246,45 @@ func Decide(s EngineState, e Event) Decision {
 				}},
 			}
 		}
+		// §6.7 / I-15: a job already over its $ ceiling (escalated, or mid-escalation)
+		// must be told to STOP — a `cancel` directive on the next heartbeat is how the
+		// live worker learns its lease was pulled for cost. The CostMeter event does the
+		// actual escalation transition; this is the standing directive for an over-budget
+		// job that is still mechanically in an active state.
+		if s.Job.OverBudget || job.CostExceeded(s.Job.CostMicroUSD, s.Job.CostCeilingMicroUSD) {
+			d := DirectiveCancel
+			return Decision{Directive: &d}
+		}
 		d := DirectiveContinue
 		return Decision{Directive: &d}
+
+	case CostMeter:
+		if r := staleEpoch(ev.Epoch, s.Epoch); r != nil {
+			return Decision{Reject: r}
+		}
+		// Only an active-lease job accrues cost against a live lease. A report on a
+		// non-active job is a protocol error (nothing to escalate / cancel).
+		if !job.HasActiveLease(s.Job.State) {
+			return Decision{Reject: &RejectReason{Reason: "job not in an active lease state"}}
+		}
+		// I-15: run the PURE ceiling predicate over the NEW accumulated meter (the
+		// runtime already folded the delta in). Under the ceiling -> continue (the
+		// meter still rolled up for the per-flow report). At/over the ceiling ->
+		// escalate to needs_human + a `cancel` directive + mark over_budget so
+		// project-OUT stamps flowbee:over-budget. The escalation is itself a lease
+		// revocation: bump the epoch (fence the worker) and record the cost reason.
+		if !job.CostExceeded(s.Job.CostMicroUSD, s.Job.CostCeilingMicroUSD) {
+			d := DirectiveContinue
+			return Decision{Directive: &d}
+		}
+		d := DirectiveCancel
+		return Decision{
+			Directive: &d,
+			Transitions: []Transition{{
+				From: s.Job.State, To: job.StateNeedsHuman, Kind: ledger.KindCostEscalated,
+				BumpEpoch: true, RevokeReason: string(job.EscalationCost),
+			}},
+		}
 
 	case LivenessVerdict:
 		// only an active-lease job is subject to the ladder. A non-active job has

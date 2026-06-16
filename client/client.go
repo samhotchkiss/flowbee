@@ -120,6 +120,13 @@ type HeartbeatObs struct {
 	Rung1Class    string `json:"rung1_class,omitempty"`
 	AwaitingInput bool   `json:"awaiting_input,omitempty"`
 	AgentExited   bool   `json:"agent_exited,omitempty"`
+	// M10 cost report (§6.7, I-15): the {tokens_in, tokens_out, $} DELTA since the
+	// last heartbeat. $ is MICRO-USD ($1.00 = 1_000_000) so the meter is exact. A
+	// delta crossing the per-job ceiling escalates the job to needs_human and the
+	// directive comes back `cancel`.
+	TokensInDelta  int64 `json:"tokens_in_delta,omitempty"`
+	TokensOutDelta int64 `json:"tokens_out_delta,omitempty"`
+	MicroUSDDelta  int64 `json:"micro_usd_delta,omitempty"`
 }
 
 // HeartbeatWith sends a fenced heartbeat carrying liveness observations. A `cancel`

@@ -72,6 +72,25 @@ var ActiveLeaseStates = map[State]bool{
 // HasActiveLease reports whether s is a state that holds an active lease.
 func HasActiveLease(s State) bool { return ActiveLeaseStates[s] }
 
+// CostExceeded is the pure §6.7 / I-15 ceiling predicate: a job is over budget
+// iff it has a $ ceiling and its accumulated micro-USD meter reached it. With no
+// ceiling (nil) the meter only accumulates (for the rollup) and never escalates.
+// Pure: it reads only the passed-in resolved values, no clock, no I/O.
+func CostExceeded(costMicroUSD int64, ceiling *int64) bool {
+	return ceiling != nil && costMicroUSD >= *ceiling
+}
+
+// EscalationReason is the canonical reason a job sits in needs_human (§12.6.1):
+// the four independent triggers that all deposit into the one chokepoint.
+type EscalationReason string
+
+const (
+	EscalationAttempts EscalationReason = "attempts"
+	EscalationBounces  EscalationReason = "bounces"
+	EscalationCost     EscalationReason = "cost"
+	EscalationStall    EscalationReason = "stall"
+)
+
 // CapabilitiesSatisfy reports whether the attested capability set satisfies every
 // required capability tag. This is the pure §6.6 capability match (matching is on
 // the attested set; the loop wires it into the atomic claim). Required tags are
@@ -156,6 +175,23 @@ type Job struct {
 	Bounces          int
 	MaxBounces       int
 	StallRevocations int
+
+	// cost meter (§6.7, I-15). The dollar meter is exact integer MICRO-USD
+	// ($1.00 = 1_000_000) so the ceiling comparison is never a float. A nil
+	// CostCeilingMicroUSD means "no $ ceiling" (still metered for the rollup).
+	CostTokensIn        int64
+	CostTokensOut       int64
+	CostMicroUSD        int64
+	CostCeilingMicroUSD *int64
+	OverBudget          bool
+
+	// FlowID groups the spec+build+review jobs of one feature for the per-flow
+	// cost rollup (§12.6.5). Empty falls back to the job's own id.
+	FlowID string
+
+	// EscalationReason records WHY the job is in needs_human (the §12.6.1
+	// chokepoint surfaces all four triggers: attempts | bounces | cost | stall).
+	EscalationReason string
 
 	// verdict (gate stages only; written ONLY by gate logic, never a worker, I-9)
 	Verdict *Verdict

@@ -36,6 +36,12 @@ type SeedParams struct {
 	BlockedBy            []string
 	RequiredCapabilities []string
 	Now                  time.Time
+	// M10 cost metering (§6.7, I-15). CostCeilingMicroUSD is the enforced per-job $
+	// ceiling in micro-USD ($1.00 = 1_000_000); nil/0 = no ceiling. FlowID groups
+	// the spec+build+review jobs of one feature for the per-flow rollup (§12.6.5);
+	// empty falls back to the job's own id.
+	CostCeilingMicroUSD *int64
+	FlowID              string
 }
 
 // SeedJob inserts a job and its job_created event in one transaction (append +
@@ -54,13 +60,22 @@ func (s *Store) SeedJob(ctx context.Context, p SeedParams) (job.Job, error) {
 		}
 		blockedJSON := marshalStrings(p.BlockedBy)
 		reqJSON := marshalStrings(p.RequiredCapabilities)
+		flowID := p.FlowID
+		if flowID == "" {
+			flowID = p.ID // a standalone job is a flow of one (§12.6.5)
+		}
+		var ceiling any
+		if p.CostCeilingMicroUSD != nil {
+			ceiling = *p.CostCeilingMicroUSD
+		}
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO jobs (id, kind, flow, stage, state, role, base_sha, priority,
 			                  blocked_by, required_capabilities, enqueued_at,
-			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 3, 0)`,
+			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
+			                  cost_ceiling_micro_usd, flow_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 3, 0, ?, ?)`,
 			p.ID, string(p.Kind), p.Flow, p.Stage, string(state), string(p.Role), p.BaseSHA, p.Priority,
-			blockedJSON, reqJSON, p.Now.Format(rfc3339))
+			blockedJSON, reqJSON, p.Now.Format(rfc3339), ceiling, flowID)
 		if err != nil {
 			return fmt.Errorf("insert job: %w", err)
 		}
@@ -806,7 +821,9 @@ const jobSelect = `
 	       attempts, max_attempts, bounces, max_bounces, stall_revocations,
 	       COALESCE(verdict,''), job_seq,
 	       COALESCE(spec_content_hash,''), COALESCE(spec_version,0), COALESCE(spec_signoff,''),
-	       COALESCE(issue_number,0), COALESCE(pr_number,0)
+	       COALESCE(issue_number,0), COALESCE(pr_number,0),
+	       cost_tokens_in, cost_tokens_out, cost_micro_usd, cost_ceiling_micro_usd,
+	       over_budget, COALESCE(flow_id,''), COALESCE(escalation_reason,'')
 	  FROM jobs`
 
 type rowScanner interface {
@@ -816,6 +833,8 @@ type rowScanner interface {
 func scanJob(row rowScanner) (job.Job, error) {
 	var j job.Job
 	var kind, role, blockedJSON, reqJSON, enqueued, verdictJSON, specSignoffJSON string
+	var overBudget int
+	var ceiling sql.NullInt64
 	err := row.Scan(&j.ID, &kind, &j.Flow, &j.Stage, (*string)(&j.State), &role,
 		&j.BaseSHA, &j.HeadSHA, &j.Priority, &blockedJSON, &reqJSON, &enqueued,
 		&j.LeaseID, &j.LeaseEpoch,
@@ -823,10 +842,17 @@ func scanJob(row rowScanner) (job.Job, error) {
 		&j.Attempts, &j.MaxAttempts, &j.Bounces, &j.MaxBounces, &j.StallRevocations,
 		&verdictJSON, &j.JobSeq,
 		&j.SpecContentHash, &j.SpecVersion, &specSignoffJSON,
-		&j.IssueNum, &j.PRNumber)
+		&j.IssueNum, &j.PRNumber,
+		&j.CostTokensIn, &j.CostTokensOut, &j.CostMicroUSD, &ceiling,
+		&overBudget, &j.FlowID, &j.EscalationReason)
 	if err != nil {
 		return j, err
 	}
+	if ceiling.Valid {
+		c := ceiling.Int64
+		j.CostCeilingMicroUSD = &c
+	}
+	j.OverBudget = overBudget != 0
 	j.Kind = job.Kind(kind)
 	j.Role = job.Role(role)
 	j.BlockedBy = unmarshalStrings(blockedJSON)

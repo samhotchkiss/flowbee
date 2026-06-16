@@ -470,6 +470,11 @@ type heartbeatRequest struct {
 	Rung1Class    string `json:"rung1_class"`    // Rung-1 (working|frozen|spinning)
 	AwaitingInput bool   `json:"awaiting_input"` // §10.6 fast-path -> cancel
 	AgentExited   bool   `json:"agent_exited"`   // §10.6 fast-path -> failed
+	// M10 cost report (§6.7, I-15): the {tokens_in, tokens_out, $} DELTA. $ is
+	// MICRO-USD. A delta crossing the ceiling escalates -> needs_human + cancel.
+	TokensInDelta  int64 `json:"tokens_in_delta"`
+	TokensOutDelta int64 `json:"tokens_out_delta"`
+	MicroUSDDelta  int64 `json:"micro_usd_delta"`
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
@@ -481,6 +486,27 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	var req heartbeatRequest
 	_ = json.NewDecoder(r.Body).Decode(&req) // optional body
+	// M10 (§6.7, I-15): fold any reported cost delta FIRST. If it crosses the ceiling
+	// the lease is revoked to needs_human in this call and the worker is told to
+	// `cancel` — there is nothing further to heartbeat (the next heartbeat would 409).
+	if req.TokensInDelta != 0 || req.TokensOutDelta != 0 || req.MicroUSDDelta != 0 {
+		cr, err := s.store.RecordCost(r.Context(), store.CostParams{
+			JobID: jobID, Epoch: epoch, Now: s.clock.Now(),
+			TokensInDelta:  req.TokensInDelta,
+			TokensOutDelta: req.TokensOutDelta,
+			MicroUSDDelta:  req.MicroUSDDelta,
+		})
+		if err != nil {
+			s.writeFenceError(w, err)
+			return
+		}
+		if cr.Escalated {
+			j, _ := s.store.GetJob(r.Context(), jobID)
+			s.broker.Publish(LifeEvent{JobID: jobID, State: string(j.State), Event: "cost_escalated", Epoch: epoch})
+			writeJSON(w, http.StatusOK, map[string]string{"directive": string(cr.Directive)})
+			return
+		}
+	}
 	dir, err := s.store.Heartbeat(r.Context(), store.HeartbeatParams{
 		JobID: jobID, Epoch: epoch, Now: s.clock.Now(),
 		Health:        liveness.AgentHealth(req.AgentHealth),

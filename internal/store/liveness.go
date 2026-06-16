@@ -185,6 +185,21 @@ func (s *Store) EvaluateLiveness(ctx context.Context, jobID string, now time.Tim
 		if err := applyRevokeTx(ctx, tx, &j, seq, t, newEpoch, now); err != nil {
 			return err
 		}
+		// M10 (§12.6.1): on an escalation to needs_human, stamp the canonical trigger
+		// so the unified chokepoint view distinguishes the §6.7 conditions. The
+		// absolute cap escalates for one of two reasons — max_attempts exhausted (the
+		// attempts ceiling) or the Rung-4 governor (a genuine stall) — disambiguated
+		// by the booleans the engine consumed. A two-rung stall kill is always stall.
+		if t.To == job.StateNeedsHuman {
+			reason := job.EscalationStall
+			if attemptsExhausted && !governorReached {
+				reason = job.EscalationAttempts
+			}
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE jobs SET escalation_reason = ? WHERE id = ?`, string(reason), j.ID); err != nil {
+				return fmt.Errorf("stamp escalation reason: %w", err)
+			}
+		}
 		res.Killed = true
 		res.ToState = t.To
 		res.Reason = t.RevokeReason

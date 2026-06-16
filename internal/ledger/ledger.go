@@ -55,6 +55,11 @@ const (
 	KindStallEscalated EventKind = "stall_escalated" // Rung-4 governor ceiling: active -> needs_human
 	KindAgentExited    EventKind = "agent_exited"    // agent_exited_zombie fast-path -> failed (§10.6)
 	KindFastCancelled  EventKind = "fast_cancelled"  // awaiting_input fast-path -> ready (§10.6)
+	// M10 cost metering + ceiling event kinds (§6.7, I-15). A metered cost report is
+	// recorded for audit + the per-flow rollup; an escalation revokes the lease
+	// (epoch++, the worker's fence) and routes the job to needs_human + over-budget.
+	KindCostMetered   EventKind = "cost_metered"   // a {tokens_in,tokens_out,$} report folded into the meter
+	KindCostEscalated EventKind = "cost_escalated" // cost ceiling crossed: active -> needs_human (I-15)
 )
 
 // Event is one appended ledger row. Payload holds kind-specific RESOLVED facts as
@@ -112,6 +117,15 @@ type Payload struct {
 	SpecSignoff     *job.SpecSignoff `json:",omitempty"`
 	IssueNumber     int              `json:",omitempty"`
 	PRNumber        int              `json:",omitempty"`
+
+	// cost meter (M10, §6.7, I-15). The DELTA reported on a metered event (folded
+	// into the running meter at fold time) + the resulting accumulated totals.
+	CostTokensInDelta  int64 `json:",omitempty"`
+	CostTokensOutDelta int64 `json:",omitempty"`
+	CostMicroUSDDelta  int64 `json:",omitempty"`
+	// EscalationReason records WHY a cost_escalated event routed to needs_human
+	// (always "cost" for I-15); recorded for the §12.6.1 chokepoint replay.
+	EscalationReason string `json:",omitempty"`
 }
 
 // Fold replays events into the jobs projection. PURE: no clock, no RNG, no I/O.
@@ -329,6 +343,29 @@ func Fold(events []Event) (job.Job, error) {
 			j.State = e.ToState
 			j.LeaseEpoch = e.LeaseEpoch
 			j.Attempts += e.Payload.AttemptsDelta
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindCostMetered:
+			// M10 (§6.7, I-15): a {tokens_in, tokens_out, $} report folded into the
+			// meter. Pure accumulation — no state change, no clock. The per-flow rollup
+			// reads these totals; the ceiling predicate compares CostMicroUSD.
+			j.CostTokensIn += e.Payload.CostTokensInDelta
+			j.CostTokensOut += e.Payload.CostTokensOutDelta
+			j.CostMicroUSD += e.Payload.CostMicroUSDDelta
+		case KindCostEscalated:
+			// M10 (§6.7, I-15): the $ ceiling was crossed. The lease is revoked (epoch
+			// bumped, the worker's fence rides the event), the job routed to needs_human,
+			// over_budget marked, and the escalation reason recorded so the §12.6.1
+			// chokepoint shows the cost trigger. The final metered delta (if any) is
+			// folded too so the meter reflects the report that tripped the ceiling.
+			j.CostTokensIn += e.Payload.CostTokensInDelta
+			j.CostTokensOut += e.Payload.CostTokensOutDelta
+			j.CostMicroUSD += e.Payload.CostMicroUSDDelta
+			j.State = e.ToState
+			j.LeaseEpoch = e.LeaseEpoch
+			j.OverBudget = true
+			j.EscalationReason = e.Payload.EscalationReason
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""
