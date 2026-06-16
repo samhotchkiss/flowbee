@@ -138,6 +138,10 @@ type LeaseContext struct {
 	Spec               string         `json:"spec,omitempty"`
 	AcceptanceCriteria string         `json:"acceptance_criteria,omitempty"`
 	PriorVerdict       map[string]any `json:"prior_verdict,omitempty"`
+	// Diff is the eng_worker's build patch, shipped to a code_reviewer so its agent
+	// can judge the actual change (the review harness writes it to .flowbee/diff.patch
+	// + $FLOWBEE_DIFF). Empty for non-review roles.
+	Diff string `json:"diff,omitempty"`
 }
 
 // Lease long-polls for a lease. ok=false means a 204 (no work this round).

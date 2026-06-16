@@ -497,6 +497,9 @@ type LeaseContext struct {
 	// PriorVerdict is the last minted gate verdict on this job, if any (e.g. a
 	// build re-armed after a bounce sees the reviewer's prior changes-requested).
 	PriorVerdict *job.Verdict `json:"prior_verdict,omitempty"`
+	// Diff is the eng_worker's build patch, shipped to a code_reviewer so its agent
+	// judges the actual change (the review harness writes .flowbee/diff.patch).
+	Diff string `json:"diff,omitempty"`
 }
 
 // lease long-polls: rank `ready` candidates (scheduler: priority + aging +
@@ -611,6 +614,13 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 					Spec:               j.SpecText,
 					AcceptanceCriteria: j.AcceptanceCriteria,
 					PriorVerdict:       j.Verdict,
+				}
+				// a code_reviewer judges the actual change: ship the build patch so its
+				// agent reads the diff (the review harness writes .flowbee/diff.patch).
+				if reviewing {
+					if d, derr := s.store.JobPatchDiff(r.Context(), cand.JobID); derr == nil {
+						grant.Context.Diff = d
+					}
 				}
 				// Repo provisioning hints (§7.4): only for build jobs that carry a
 				// base_sha and only when a local mirror is configured.

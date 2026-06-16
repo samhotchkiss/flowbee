@@ -74,12 +74,22 @@ func runWork(args []string) error {
 	}
 
 	token := os.Getenv("FLOWBEE_WORKER_TOKEN")
+	cfg := worker.HarnessConfig{
+		BaseURL: url, Identity: *identity, ModelFamily: *family, Role: *role,
+		AgentCmd: *agentCmd, BearerToken: token,
+		ModelSlots: slots, Weight: *weight, Accounts: accts,
+	}
 	run := func() error {
-		out, err := worker.RunOnceHarness(ctx, worker.HarnessConfig{
-			BaseURL: url, Identity: *identity, ModelFamily: *family, Role: *role,
-			AgentCmd: *agentCmd, BearerToken: token,
-			ModelSlots: slots, Weight: *weight, Accounts: accts,
-		})
+		// review/author roles emit a DECISION (verdict file) — not a patch — so they
+		// run the verdict-file harness, which posts /spec, /spec-review, or /review.
+		// eng_worker (and conflict_resolver) run the worktree build harness.
+		var out worker.HarnessOutcome
+		var err error
+		if worker.IsReviewRole(*role) {
+			out, err = worker.RunOnceReviewHarness(ctx, cfg)
+		} else {
+			out, err = worker.RunOnceHarness(ctx, cfg)
+		}
 		if err != nil {
 			return err
 		}

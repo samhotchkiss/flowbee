@@ -27,6 +27,12 @@ func (s *Store) jobPatchDiff(ctx context.Context, jobID string) (string, error) 
 	return diff, nil
 }
 
+// JobPatchDiff is the exported reader for a job's stored build patch, so the lease
+// path can ship it to a code_reviewer's agent (it judges the actual change).
+func (s *Store) JobPatchDiff(ctx context.Context, jobID string) (string, error) {
+	return s.jobPatchDiff(ctx, jobID)
+}
+
 // F8 — merge conflicts: blast-radius reservations, the resolve_conflict job, and
 // integrated-head re-review (DESIGN §E). The store is the runtime side of three pure
 // concerns: (1) fold the in-flight builds' declared write-sets into the scheduler's
