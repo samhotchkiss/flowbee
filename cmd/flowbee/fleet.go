@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/auth"
 )
@@ -33,6 +37,7 @@ func runFleet(args []string) error {
 Create the file(s) on disk now. Make only the change described." --dangerously-skip-permissions`
 	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", defaultAgent), "agent CLI for review/author roles")
 	buildCmd := fs.String("build-agent-cmd", envOr("FLOWBEE_BUILD_AGENT_CMD", buildAgent), "agent CLI for the build role (writes files)")
+	noSmoke := fs.Bool("no-smoke", false, "skip the agent smoke test at startup")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -57,6 +62,17 @@ Create the file(s) on disk now. Make only the change described." --dangerously-s
 	if host == "" {
 		host = "worker"
 	}
+	// verify the agent actually works BEFORE starting workers — a not-authed /
+	// rate-limited / mis-configured agent otherwise stalls every job as the vague
+	// "agent produced no changes". Fail loudly here instead.
+	if !*noSmoke {
+		fmt.Printf("smoke-testing the build agent on %s ...\n", host)
+		if err := smokeAgent(*buildCmd); err != nil {
+			return fmt.Errorf("agent smoke test FAILED on %s: %w\n   fix the agent (e.g. `claude --version` / re-auth) then retry, or --no-smoke to skip", host, err)
+		}
+		fmt.Println("✓ agent works")
+	}
+
 	env := append(os.Environ(), "FLOWBEE_URL="+*url)
 	// If the control plane requires auth, mint a per-worker token from the secret (a
 	// trusted box mints its own identities' tokens). Without a secret the box runs
@@ -107,4 +123,44 @@ Create the file(s) on disk now. Make only the change described." --dangerously-s
 	fmt.Println("\nflowbee fleet: shutting down workers...")
 	killAll(kids)
 	return nil
+}
+
+// smokeAgent runs the build agent on a trivial "write ok.txt" task in a temp dir and
+// confirms it produced the file — proving the agent CLI is installed, authed, and
+// responsive. A failure here is the single most common silent stall (an un-authed or
+// rate-limited agent that exits cleanly having written nothing).
+func smokeAgent(buildCmd string) error {
+	dir, err := os.MkdirTemp("", "flowbee-smoke-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	taskFile := filepath.Join(dir, "task.md")
+	if err := os.WriteFile(taskFile, []byte("# Smoke test\n\nCreate a file named `ok.txt` containing the word ok. Make no other changes."), 0o644); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", buildCmd)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"FLOWBEE_TASK_FILE="+taskFile,
+		"FLOWBEE_TASK=Create a file named ok.txt containing ok.",
+	)
+	out, runErr := cmd.CombinedOutput()
+	if _, statErr := os.Stat(filepath.Join(dir, "ok.txt")); statErr == nil {
+		return nil // the agent wrote the file — it works
+	}
+	if runErr != nil {
+		return fmt.Errorf("agent exited with error (is it installed + authed?): %v: %s", runErr, trunc(string(out), 300))
+	}
+	return fmt.Errorf("agent ran but wrote no file — likely not authed, rate-limited, or wrong --build-agent-cmd: %s", trunc(string(out), 300))
+}
+
+func trunc(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
