@@ -288,6 +288,143 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	return out, nil
 }
 
+// RunOnceHarnessBundle performs ONE full CREDENTIAL-LESS Mode-A cycle (F3, §7.4
+// mode (a)): register+attest, long-poll-lease, fetch a read-only git BUNDLE of
+// base_sha from the control plane (NO GitHub credential, no local mirror, no push
+// path), clone a working tree from it, spawn the agent CLI, collect ONLY the diff,
+// and submit it. The control plane applies the patch + pushes the epoch ref + opens
+// the PR — Flowbee does ALL git writes (R4/§8). The worker holds no creds and never
+// touches git history or GitHub. Got=false on a 204.
+//
+// This is the cross-box topology: the worker needs no inbound repo access and no
+// outbound GitHub access — only the authenticated worker channel to Flowbee.
+func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, error) {
+	arch, osName := cfg.Arch, cfg.OS
+	if arch == "" {
+		arch = runtime.GOARCH
+	}
+	if osName == "" {
+		osName = runtime.GOOS
+	}
+	caps := cfg.Capabilities
+	if len(caps) == 0 {
+		caps = []string{"role:eng_worker", "model_family:" + cfg.ModelFamily, "arch:" + arch, "os:" + osName}
+	}
+
+	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
+	if _, err := c.Register(ctx, client.Registration{
+		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
+	}); err != nil {
+		return HarnessOutcome{}, fmt.Errorf("register: %w", err)
+	}
+
+	grant, ok, err := c.Lease(ctx, cfg.Identity, cfg.ModelFamily, cfg.Role)
+	if err != nil {
+		return HarnessOutcome{}, fmt.Errorf("lease: %w", err)
+	}
+	if !ok {
+		return HarnessOutcome{Got: false}, nil
+	}
+	out := HarnessOutcome{Got: true, JobID: grant.JobID, LeaseEpoch: grant.LeaseEpoch}
+
+	if _, st, err := c.Heartbeat(ctx, grant.JobID, grant.LeaseEpoch); err != nil {
+		return out, fmt.Errorf("heartbeat: %w", err)
+	} else if st != 200 {
+		return out, fmt.Errorf("heartbeat status %d", st)
+	}
+
+	// ── credential-less provisioning: fetch + clone a read-only bundle (§7.4 (a)) ──
+	if grant.Provisioning != "bundle" {
+		return out, fmt.Errorf("bundle harness requires bundle provisioning; got %q", grant.Provisioning)
+	}
+	// The worker holds NO GitHub credential and NO mirror path: it cannot push and
+	// cannot reach GitHub. It pulls repo bytes over the authenticated worker channel.
+	bundle, err := c.Bundle(ctx, grant.JobID)
+	if err != nil {
+		return out, fmt.Errorf("fetch bundle: %w", err)
+	}
+	workRoot := cfg.WorkRoot
+	if workRoot == "" {
+		workRoot, err = os.MkdirTemp("", "flowbee-bw-")
+		if err != nil {
+			return out, fmt.Errorf("mkdir workroot: %w", err)
+		}
+		defer os.RemoveAll(workRoot)
+	}
+	wsDir := filepath.Join(workRoot, "ws-"+grant.JobID)
+	ws, err := gitops.CloneFromBundle(wsDir, bundle, grant.BaseSHA)
+	if err != nil {
+		return out, fmt.Errorf("clone from bundle: %w", err)
+	}
+	defer ws.Destroy()
+
+	// materialize the F1 task context into the workspace (same as the worktree path).
+	taskEnv, err := writeTaskContext(wsDir, grant)
+	if err != nil {
+		return out, fmt.Errorf("write task context: %w", err)
+	}
+
+	if cfg.AgentCmd != "" {
+		cmd := exec.CommandContext(ctx, "sh", "-c", cfg.AgentCmd)
+		cmd.Dir = wsDir
+		cmd.Env = append(os.Environ(),
+			"FLOWBEE_JOB_ID="+grant.JobID,
+			"FLOWBEE_BASE_SHA="+grant.BaseSHA,
+			"FLOWBEE_ROLE="+grant.Role,
+		)
+		cmd.Env = append(cmd.Env, taskEnv...)
+		var errb strings.Builder
+		cmd.Stderr = &errb
+		if err := cmd.Run(); err != nil {
+			return out, fmt.Errorf("agent cmd: %v: %s", err, strings.TrimSpace(errb.String()))
+		}
+	}
+
+	// strip the Flowbee scaffolding before computing the untrusted diff (§9.2).
+	_ = os.RemoveAll(filepath.Join(wsDir, ".flowbee"))
+
+	changed, err := ws.HasChanges()
+	if err != nil {
+		return out, fmt.Errorf("inspect workspace: %w", err)
+	}
+	if !changed {
+		_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
+		return out, fmt.Errorf("agent produced no changes")
+	}
+	diff, err := ws.Diff()
+	if err != nil {
+		return out, fmt.Errorf("diff: %w", err)
+	}
+
+	// ── submit ONLY the patch: NO pushed_ref (the worker pushed nothing). The control
+	// plane applies the patch + pushes the epoch ref + opens the PR (F3/R4/§8). ──
+	idem := fmt.Sprintf("%s-e%d", grant.JobID, grant.LeaseEpoch)
+	body := map[string]any{
+		"kind":     "patch",
+		"base_sha": grant.BaseSHA,
+		// NO pushed_ref: the worker is credential-less and pushed nothing.
+		"diff": diff,
+		"blast_radius": map[string]any{
+			"scope": "bundle",
+			"paths": content.TouchedPaths(diff),
+		},
+		"status": "succeeded", // a HINT only — never the verdict (I-9)
+	}
+	res, st, err := c.Result(ctx, grant.JobID, grant.LeaseEpoch, idem, body)
+	if err != nil {
+		return out, fmt.Errorf("result: %w", err)
+	}
+	if st != 200 {
+		return out, fmt.Errorf("result status %d", st)
+	}
+	out.JobState = res.JobState
+
+	if _, err := c.Release(ctx, grant.JobID, grant.LeaseEpoch); err != nil {
+		_ = err
+	}
+	return out, nil
+}
+
 func hostname() string {
 	if h, err := os.Hostname(); err == nil {
 		return h

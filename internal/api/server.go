@@ -46,6 +46,12 @@ type Server struct {
 	// for `worktree` provisioning (§7.4). Empty when no local mirror is configured
 	// (the worker then has no repo to provision and must supply its own).
 	mirrorPath string
+	// bundleProvisioning selects the CROSS-BOX, credential-less `bundle` mode (F3,
+	// §7.4 mode (a)): the lease advertises `bundle`, the worker fetches a git bundle
+	// of base_sha from GET /v1/bundle (read-only data, NO creds), returns only a
+	// diff, and the CONTROL PLANE applies the patch + pushes the epoch ref + opens
+	// the PR. When false, build leases default to same-box `worktree`.
+	bundleProvisioning bool
 	// staleHB is the roster's stale-heartbeat threshold (§12.6.2).
 	staleHB time.Duration
 	// authn is the worker-transport authenticator (§7.6). Nil = loopback-only dev
@@ -68,8 +74,15 @@ type Config struct {
 	// (M3 tests seed it directly via store.UpsertDomainBFacts).
 	Facts store.FactSource
 	// MirrorPath is the shared bare-repo mirror handed to same-box `worktree`
-	// workers (§7.4). Empty disables local provisioning hints.
+	// workers (§7.4). Empty disables local provisioning hints. It is ALSO the source
+	// the server bundles from for cross-box `bundle` provisioning (F3).
 	MirrorPath string
+	// BundleProvisioning selects the cross-box, credential-less `bundle` mode (F3,
+	// §7.4 mode (a)) for build leases instead of same-box `worktree`. The worker
+	// receives no GitHub credential and no local mirror path: it fetches a read-only
+	// git bundle, returns a diff, and Flowbee does ALL git writes (apply + push +
+	// PR-open). Requires MirrorPath (the bundle source). Default false (worktree).
+	BundleProvisioning bool
 	// Allowlist is the enrolled-identity attestation policy (§9.4.1). The zero
 	// value attests no role/family/tool; tests/dev use worker.OpenAllowlist().
 	Allowlist worker.Allowlist
@@ -125,9 +138,10 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		leaseTTL:     cfg.LeaseTTL,
 		longPollWait: cfg.LongPollWait,
 		pollInterval: poll,
-		mirrorPath:   cfg.MirrorPath,
-		staleHB:      staleHB,
-		authn:        cfg.Authenticator,
+		mirrorPath:         cfg.MirrorPath,
+		bundleProvisioning: cfg.BundleProvisioning,
+		staleHB:            staleHB,
+		authn:              cfg.Authenticator,
 	}
 }
 
@@ -158,6 +172,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	worker.HandleFunc("POST /v1/jobs/{job}/spec", s.specSubmit)
 	worker.HandleFunc("POST /v1/jobs/{job}/spec-review", s.specReview)
 	worker.HandleFunc("POST /v1/jobs/{job}/release", s.release)
+	worker.HandleFunc("GET /v1/jobs/{job}/bundle", s.bundle)
 	authed := auth.Middleware(s.authn, worker)
 
 	mux := http.NewServeMux()
@@ -167,6 +182,7 @@ func (s *Server) PrivateHandler() http.Handler {
 		"POST /v1/jobs/{job}/heartbeat", "POST /v1/jobs/{job}/result",
 		"POST /v1/jobs/{job}/review", "POST /v1/jobs/{job}/spec",
 		"POST /v1/jobs/{job}/spec-review", "POST /v1/jobs/{job}/release",
+		"GET /v1/jobs/{job}/bundle",
 	} {
 		mux.Handle(p, authed)
 	}
@@ -467,12 +483,22 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 					AcceptanceCriteria: j.AcceptanceCriteria,
 					PriorVerdict:       j.Verdict,
 				}
-				// same-box `worktree` provisioning hints (§7.4): only for build jobs
-				// that carry a base_sha and only when a local mirror is configured.
+				// Repo provisioning hints (§7.4): only for build jobs that carry a
+				// base_sha and only when a local mirror is configured.
 				if s.mirrorPath != "" && j.BaseSHA != "" {
-					grant.Provisioning = "worktree"
-					grant.MirrorPath = s.mirrorPath
-					grant.PushTarget = gitops.EpochRef(cand.JobID, ls.Epoch)
+					if s.bundleProvisioning {
+						// F3 cross-box `bundle`: the worker gets NO mirror path and NO push
+						// target — it fetches a read-only bundle from /v1/bundle, returns a
+						// diff, and Flowbee applies the patch + pushes the epoch ref itself.
+						// The worker holds no GitHub credential and never touches git writes.
+						grant.Provisioning = "bundle"
+					} else {
+						// same-box `worktree`: the worker adds a per-lease worktree off the
+						// shared mirror and pushes the epoch ref locally (no creds either).
+						grant.Provisioning = "worktree"
+						grant.MirrorPath = s.mirrorPath
+						grant.PushTarget = gitops.EpochRef(cand.JobID, ls.Epoch)
+					}
 				}
 				writeJSON(w, http.StatusOK, grant)
 				return
@@ -714,9 +740,34 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 		BlastRadius json.RawMessage `json:"blast_radius"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	// F3 — credential-less cross-box write path (§7.4 bundle/scoped-read, R4/§8).
+	// A worker that was provisioned read-only (a bundle) holds NO git write path and
+	// NO GitHub credential: it returns ONLY a diff and pushes nothing. When the
+	// result carries a diff but no epoch ref, THE CONTROL PLANE applies the untrusted
+	// patch onto base_sha in a throwaway worktree, commits under the Flowbee identity,
+	// and pushes the epoch-namespaced ref ITSELF — producing exactly the ref a
+	// same-box worker would have pushed, so the downstream promote/PR-open path is
+	// identical. Flowbee does ALL git writes; the worker touched neither git nor
+	// GitHub. The patch is untrusted data: a malformed/hostile diff fails to apply in
+	// the disposable worktree and the result is declined (it cannot corrupt the mirror).
+	pushedRef := body.PushedRef
+	if s.bundleProvisioning && pushedRef == "" && body.Diff != "" && s.mirrorPath != "" && body.BaseSHA != "" {
+		_, ref, aerr := gitops.Open(s.mirrorPath).ApplyPatchAndPushEpoch(
+			jobID, epoch, body.BaseSHA, body.Diff,
+			"flowbee: applied bundle-worker patch "+jobID)
+		if aerr != nil {
+			// the returned patch did not apply cleanly: decline the result. The worker
+			// re-leases (its lease is still live until it releases) or the job re-arms.
+			http.Error(w, "patch did not apply: "+aerr.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		pushedRef = ref
+	}
+
 	resp, err := s.store.Result(r.Context(), store.ResultParams{
 		JobID: jobID, Epoch: epoch, IdempotencyKey: idemKey, Now: s.clock.Now(),
-		PushedRef:           body.PushedRef,
+		PushedRef:           pushedRef,
 		PatchDiff:           body.Diff,
 		DeclaredBlastRadius: string(body.BlastRadius),
 	})
@@ -726,6 +777,35 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 	}
 	s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "result_accepted", Epoch: epoch})
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// bundle serves a read-only `git bundle` of a job's base SHA (F3, §7.4 mode (a)):
+// the credential-less, cross-box provisioning channel. A `bundle`-provisioned
+// worker GETs this over the authenticated worker transport, clones a working tree
+// from the returned bytes (no network to GitHub, NO credential), runs its agent,
+// and returns ONLY a diff. The bytes are pure read-only data: the worst a hostile
+// worker can do is read code it was already going to build (R4, I-14). It never
+// receives a write path or a token — Flowbee performs every git write (§8).
+func (s *Server) bundle(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job")
+	if s.mirrorPath == "" {
+		http.Error(w, "no mirror configured", http.StatusNotFound)
+		return
+	}
+	j, err := s.store.GetJob(r.Context(), jobID)
+	if err != nil || j.BaseSHA == "" {
+		http.Error(w, "job has no base sha", http.StatusNotFound)
+		return
+	}
+	b, err := gitops.Open(s.mirrorPath).Bundle(j.BaseSHA)
+	if err != nil {
+		http.Error(w, "bundle error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-git-bundle")
+	w.Header().Set("X-Flowbee-Base-SHA", j.BaseSHA)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
 }
 
 func (s *Server) release(w http.ResponseWriter, r *http.Request) {

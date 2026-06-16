@@ -147,6 +147,27 @@ func (c *Client) LeaseWithLens(ctx context.Context, identity, family, role, lens
 	return g, true, nil
 }
 
+// Bundle fetches the read-only git bundle of a job's base SHA (F3, §7.4 mode (a)):
+// the credential-less cross-box provisioning channel. The worker clones a working
+// tree from the returned bytes WITHOUT any GitHub credential and returns only a
+// diff; Flowbee performs every git write. Returns the raw bundle bytes.
+func (c *Client) Bundle(ctx context.Context, jobID string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/v1/jobs/"+jobID+"/bundle", nil)
+	if err != nil {
+		return nil, err
+	}
+	c.authHeader(req)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr(resp)
+	}
+	return io.ReadAll(resp.Body)
+}
+
 // Heartbeat sends a bare fenced heartbeat. status is the HTTP status (409 = stale).
 func (c *Client) Heartbeat(ctx context.Context, jobID string, epoch int) (directive string, status int, err error) {
 	return c.HeartbeatWith(ctx, jobID, epoch, HeartbeatObs{})

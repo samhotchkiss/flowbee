@@ -128,6 +128,88 @@ func TestDropRefOrphansEpochRef(t *testing.T) {
 	}
 }
 
+// TestBundleCloneApplyPushEpoch proves the F3 credential-less round-trip at the
+// gitops layer: the control plane bundles base_sha; a worker clones a working tree
+// from the bundle bytes alone (no mirror, no creds), edits it, and returns a diff;
+// the control plane applies that diff onto base and pushes the epoch ref ITSELF;
+// the pushed ref carries exactly the worker's change and promotes onto a branch.
+func TestBundleCloneApplyPushEpoch(t *testing.T) {
+	m, base := newFixture(t)
+
+	// (1) control plane serves a read-only bundle of base_sha.
+	bundle, err := m.Bundle(base)
+	if err != nil {
+		t.Fatalf("bundle: %v", err)
+	}
+	if len(bundle) == 0 {
+		t.Fatalf("bundle must be non-empty")
+	}
+
+	// (2) the CREDENTIAL-LESS worker clones a working tree from the bundle bytes —
+	// no mirror, no network, no token — edits it, and computes a diff against base.
+	wsDir := filepath.Join(t.TempDir(), "ws")
+	ws, err := CloneFromBundle(wsDir, bundle, base)
+	if err != nil {
+		t.Fatalf("clone from bundle: %v", err)
+	}
+	defer ws.Destroy()
+	mustWrite(t, filepath.Join(wsDir, "feature.go"), "package x // by bundle worker\n")
+	changed, err := ws.HasChanges()
+	if err != nil || !changed {
+		t.Fatalf("HasChanges=%v err=%v want true", changed, err)
+	}
+	diff, err := ws.Diff()
+	if err != nil {
+		t.Fatalf("ws diff: %v", err)
+	}
+	if !strings.Contains(diff, "feature.go") || !strings.Contains(diff, "by bundle worker") {
+		t.Fatalf("worker diff missing change:\n%s", diff)
+	}
+
+	// the worker has NO push path on its workspace: BundleWorkspace exposes no
+	// CommitAndPushEpoch — it can only return the diff (compile-time guarantee).
+
+	// (3) the CONTROL PLANE applies the untrusted patch onto base and pushes the
+	// epoch ref itself (Flowbee does the git write — R4/§8).
+	sha, ref, err := m.ApplyPatchAndPushEpoch("job-bundle", 1, base, diff, "flowbee applies bundle patch")
+	if err != nil {
+		t.Fatalf("apply+push: %v", err)
+	}
+	if ref != EpochRef("job-bundle", 1) {
+		t.Fatalf("ref=%s want %s", ref, EpochRef("job-bundle", 1))
+	}
+	got, ok := m.RefSHA(ref)
+	if !ok || got != sha {
+		t.Fatalf("epoch ref sha=%q ok=%v want %s", got, ok, sha)
+	}
+
+	// (4) the pushed epoch ref carries the worker's change and promotes onto a branch.
+	if err := m.PromoteEpochRef(ref, "refs/heads/job-bundle-branch"); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	tree, err := run("", "git", "--git-dir", m.Path, "show", "refs/heads/job-bundle-branch:feature.go")
+	if err != nil {
+		t.Fatalf("show promoted file: %v", err)
+	}
+	if !strings.Contains(tree, "by bundle worker") {
+		t.Fatalf("promoted branch missing worker change:\n%s", tree)
+	}
+}
+
+// TestApplyPatchRejectsMalformedDiff proves a hostile/malformed patch cannot
+// corrupt the mirror: it fails to apply in the disposable worktree and the epoch
+// ref is never created.
+func TestApplyPatchRejectsMalformedDiff(t *testing.T) {
+	m, base := newFixture(t)
+	_, _, err := m.ApplyPatchAndPushEpoch("job-bad", 1, base, "this is not a valid diff\n", "msg")
+	if err == nil {
+		t.Fatalf("a malformed diff must fail to apply")
+	}
+	if _, ok := m.RefSHA(EpochRef("job-bad", 1)); ok {
+		t.Fatalf("a failed apply must NOT create the epoch ref")
+	}
+}
+
 func mustGit(t *testing.T, dir string, name string, args ...string) {
 	t.Helper()
 	cmd := exec.Command(name, args...)
