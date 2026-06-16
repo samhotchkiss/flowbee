@@ -146,6 +146,11 @@ type LeaseContext struct {
 	// code_reviewer should only judge once CI is green, else its approval can't mint
 	// and it bounces — so the harness skips+releases until this is true.
 	CIReady bool `json:"ci_ready,omitempty"`
+	// IssueBranch is the per-issue branch every node commits to (flowbee/issue-N).
+	// The worker-push harness fetches it, commits its work (a builder's change, a
+	// reviewer's empty findings-commit) on top, and pushes it back — so the branch
+	// history is the node-by-node story. Empty when the job has no bound issue yet.
+	IssueBranch string `json:"issue_branch,omitempty"`
 }
 
 // Lease long-polls for a lease. ok=false means a 204 (no work this round).

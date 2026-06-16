@@ -505,6 +505,9 @@ type LeaseContext struct {
 	// CIReady is true when reconciled facts are green; a code_reviewer harness skips
 	// (releases) until then, so it never approves a not-green PR and thrashes.
 	CIReady bool `json:"ci_ready,omitempty"`
+	// IssueBranch is the per-issue branch the node commits to (flowbee/issue-N): the
+	// worker-push harness fetches it, commits its work on top, and pushes it back.
+	IssueBranch string `json:"issue_branch,omitempty"`
 }
 
 // lease long-polls: rank `ready` candidates (scheduler: priority + aging +
@@ -619,6 +622,12 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 					Spec:               j.SpecText,
 					AcceptanceCriteria: j.AcceptanceCriteria,
 					PriorVerdict:       j.Verdict,
+				}
+				// the per-issue branch the node commits to (worker-push): builds + reviews
+				// both target it. Resolved from the job's bound issue (adopted) or its spec
+				// ancestor's materialized issue. Empty until an issue is bound.
+				if reviewing || role == job.RoleEngWorker || resolvingConflict {
+					grant.Context.IssueBranch = store.IssueBranch(s.store.ResolveIssueNum(r.Context(), cand.JobID), cand.JobID)
 				}
 				// a code_reviewer judges the actual change: ship the build patch so its
 				// agent reads the diff (the review harness writes .flowbee/diff.patch),

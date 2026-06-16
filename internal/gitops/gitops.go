@@ -124,6 +124,40 @@ func (m *Mirror) PushCommit(remoteURL, sha, branch string) error {
 	return nil
 }
 
+// RemoteBranchTip returns the tip SHA of a branch on a remote WITHOUT fetching it
+// (a cheap `git ls-remote`), so the worker-push harness can decide its start point:
+// when the issue branch already exists (a revise / a review after a build), the next
+// node starts from its tip so its commit STACKS on the prior nodes' commits; when it
+// does not exist yet (the first build), the node starts from base. exists=false means
+// the branch is absent on the remote (a brand-new issue branch).
+func (m *Mirror) RemoteBranchTip(remoteURL, branch string) (sha string, exists bool, err error) {
+	out, lerr := run("", "git", "--git-dir", m.Path, "ls-remote", remoteURL, "refs/heads/"+branch)
+	if lerr != nil {
+		return "", false, fmt.Errorf("ls-remote %s: %w", branch, lerr)
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", false, nil
+	}
+	// "<sha>\trefs/heads/<branch>" — take the first field of the first line.
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return "", false, nil
+	}
+	return fields[0], true, nil
+}
+
+// FetchRef fetches a single ref from a remote into the mirror under a local name, so
+// a worktree can be cut from a branch the mirror did not yet have (the issue branch
+// tip the worker-push harness stacks on). Idempotent; force-updates the local ref.
+func (m *Mirror) FetchRef(remoteURL, remoteRef, localRef string) error {
+	spec := "+" + remoteRef + ":" + localRef
+	if _, err := run("", "git", "--git-dir", m.Path, "fetch", "--quiet", remoteURL, spec); err != nil {
+		return fmt.Errorf("fetch %s: %w", remoteRef, err)
+	}
+	return nil
+}
+
 // RefSHA resolves any ref in the mirror to its commit SHA, or "" if absent.
 func (m *Mirror) RefSHA(ref string) (string, bool) {
 	out, err := run("", "git", "--git-dir", m.Path, "rev-parse", "--verify", "--quiet", ref)
@@ -440,6 +474,55 @@ func (w *Worktree) CommitAndPushEpoch(jobID string, epoch int, message string) (
 		return "", "", fmt.Errorf("push epoch ref %s: %w", ref, err)
 	}
 	return strings.TrimSpace(head), ref, nil
+}
+
+// CommitAuthored commits the worktree's changes AUTHORED AS the node (author =
+// identity), with the node's detailed message — the worker-push model where each
+// node is its own committer (build-list: "each node commits"). allowEmpty=true makes
+// the empty findings-commit a reviewer lands (no file changes, the verdict in the
+// message). Returns the new commit SHA. Author and committer are both the node, so
+// `git log` attributes the work to the agent that did it.
+func (w *Worktree) CommitAuthored(identity, message string, allowEmpty bool) (sha string, err error) {
+	if !allowEmpty {
+		if _, err := run(w.Dir, "git", "add", "-A"); err != nil {
+			return "", fmt.Errorf("stage: %w", err)
+		}
+	}
+	email := identity + "@flowbee.local"
+	env := []string{
+		"GIT_AUTHOR_NAME=" + identity, "GIT_AUTHOR_EMAIL=" + email,
+		"GIT_COMMITTER_NAME=" + identity, "GIT_COMMITTER_EMAIL=" + email,
+	}
+	args := []string{"commit", "-m", message}
+	if allowEmpty {
+		args = []string{"commit", "--allow-empty", "-m", message}
+	}
+	if _, err := runEnv(w.Dir, env, "git", args...); err != nil {
+		return "", fmt.Errorf("commit: %w", err)
+	}
+	head, err := run(w.Dir, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("rev-parse HEAD: %w", err)
+	}
+	return strings.TrimSpace(head), nil
+}
+
+// PushTo publishes the worktree's HEAD to refs/heads/<branch> on a remote — the
+// worker-push write (build-list): the node holds a key and pushes its own commit to
+// the issue branch on GitHub. force=false is a fast-forward push (the node started
+// from the branch tip, so its commit stacks cleanly); force=true republishes a
+// rebased/re-armed head. remoteURL bears the node's credential (only the control
+// plane caller ever uses the GitHub API — a push is plain git, not the API).
+func (w *Worktree) PushTo(remoteURL, branch string, force bool) error {
+	args := []string{"push"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, remoteURL, "HEAD:refs/heads/"+branch)
+	if _, err := run(w.Dir, "git", args...); err != nil {
+		return fmt.Errorf("push to %s: %w", branch, err)
+	}
+	return nil
 }
 
 // Destroy removes the per-lease worktree (§7.5: nothing survives the lease).
