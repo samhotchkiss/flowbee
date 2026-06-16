@@ -1,7 +1,17 @@
 {{define "dashboard.html"}}
 <h1><span class="logo">🐝</span>Dashboard</h1>
-<p class="muted">GitHub budget: <b>{{.Budget.Remaining}}</b> / {{.Budget.Limit}} remaining
-{{if not .Budget.LastSweep.IsZero}}· last sweep {{abs .Budget.LastSweep}}{{end}}</p>
+<div class="budget" data-budget>
+  <div class="stats">
+    <div class="pill bee"><div class="n">{{.Budget.Remaining}}</div><div class="l">Remaining</div></div>
+    <div class="pill"><div class="n">{{.Budget.Limit}}</div><div class="l">Limit</div></div>
+    {{if not .Budget.ResetAt.IsZero}}<div class="pill"><div class="n reset">{{abs .Budget.ResetAt}}</div><div class="l">Resets</div></div>{{end}}
+  </div>
+  <div class="gauge" title="GitHub identity-budget used">
+    <div class="acct"><span class="name">▸ GitHub API budget</span><span>{{ratio .Budget.Remaining .Budget.Limit}}% remaining</span></div>
+    <div class="bar"><span class="fill {{barClass (ratio (sub .Budget.Limit .Budget.Remaining) .Budget.Limit) 80}}" style="width:{{ratio (sub .Budget.Limit .Budget.Remaining) .Budget.Limit}}%"></span></div>
+    <div class="roll">{{if not .Budget.LastSweep.IsZero}}last sweep {{abs .Budget.LastSweep}}{{else}}awaiting first sweep{{end}}</div>
+  </div>
+</div>
 
 <div class="panes">
   <div>
