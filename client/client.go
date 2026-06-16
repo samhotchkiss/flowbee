@@ -371,6 +371,13 @@ func (c *Client) Release(ctx context.Context, jobID string, epoch int) (status i
 	return c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/release", epochHeader(epoch), nil, &out)
 }
 
+// Requeue re-arms a stranded job (escalated to needs_human from a now-fixed
+// transient failure) for a fresh attempt: reset attempts/bounces, back to ready.
+func (c *Client) Requeue(ctx context.Context, jobID string) (status int, err error) {
+	var out map[string]string
+	return c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/requeue", nil, nil, &out)
+}
+
 // ReleaseNoPenalty re-arms WITHOUT burning an attempt — for a non-failure abandon
 // (the worker built fine but lost a fast-forward race to a branch move). Keeps the
 // attempt budget for genuine build failures so re-validation churn can't escalate a

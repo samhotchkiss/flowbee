@@ -200,6 +200,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	worker.HandleFunc("POST /v1/jobs/{job}/spec", s.specSubmit)
 	worker.HandleFunc("POST /v1/jobs/{job}/spec-review", s.specReview)
 	worker.HandleFunc("POST /v1/jobs/{job}/release", s.release)
+	worker.HandleFunc("POST /v1/jobs/{job}/requeue", s.requeue)
 	worker.HandleFunc("GET /v1/jobs/{job}/bundle", s.bundle)
 	authed := auth.Middleware(s.authn, worker)
 
@@ -1128,6 +1129,22 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 	}
 	s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "result_accepted", Epoch: epoch})
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// requeue re-arms a stranded job (escalated to needs_human from a now-fixed
+// transient failure) for a fresh attempt: reset attempts/bounces, clear the lease +
+// verdict, bump the epoch, route back to ready. The operator's "retry" — no jobs-table
+// surgery. (An ADMIN action; on a secured listener it needs a token, or run it from
+// the control-plane box where the loopback bypass applies.)
+func (s *Server) requeue(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job")
+	final, err := s.store.RequeueJob(r.Context(), jobID, s.clock.Now())
+	if err != nil {
+		http.Error(w, "requeue: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.broker.Publish(LifeEvent{JobID: jobID, State: string(final), Event: "requeued"})
+	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID, "state": string(final)})
 }
 
 // bundle serves a read-only `git bundle` of a job's base SHA (F3, §7.4 mode (a)):

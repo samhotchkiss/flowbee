@@ -256,6 +256,31 @@ func runLease(args []string) error {
 	return nil
 }
 
+// runRequeue re-arms a stranded job (one that escalated to needs_human from a
+// now-fixed transient failure) for a fresh attempt: `flowbee requeue <job-id>`. Run
+// it on the control-plane box (loopback) or with FLOWBEE_WORKER_TOKEN set.
+func runRequeue(args []string) error {
+	fs := flag.NewFlagSet("requeue", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: flowbee requeue <job-id>")
+	}
+	jobID := fs.Arg(0)
+	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
+	c := client.NewWithToken(url, os.Getenv("FLOWBEE_WORKER_TOKEN"))
+	st, err := c.Requeue(context.Background(), jobID)
+	if err != nil {
+		return err
+	}
+	if st != 200 {
+		return fmt.Errorf("requeue status %d", st)
+	}
+	fmt.Printf("requeued %s -> ready (fresh attempt budget)\n", jobID)
+	return nil
+}
+
 // runSubmit is the Mode-B thin client (DESIGN §7.1, the MCP-shim surface): post a
 // result / heartbeat / release for a held lease. For a build job it can also
 // PROVISION a worktree off the mirror, spawn an agent CLI, and push to the epoch

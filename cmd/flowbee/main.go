@@ -43,6 +43,8 @@ func main() {
 		err = runLease(args)
 	case "submit":
 		err = runSubmit(args)
+	case "requeue":
+		err = runRequeue(args)
 	case "version", "-v", "--version":
 		fmt.Printf("flowbee %s\n", version)
 	default:
@@ -57,5 +59,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|up|fleet|serve|token|migrate|work|lease|submit|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|up|fleet|serve|token|migrate|work|lease|submit|requeue|seed|version>")
 }
