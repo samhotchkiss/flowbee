@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/samhotchkiss/flowbee/client"
+	"github.com/samhotchkiss/flowbee/internal/gitops"
 )
 
 // reviewVerdict is the structured decision a review/author agent writes to
@@ -214,6 +215,12 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		if disp == "" {
 			disp = "self_merge"
 		}
+		// the reviewer lands an EMPTY findings-commit on the issue branch (build-list:
+		// "reviewers perform an empty commit with their findings + verdict"), authored as
+		// the reviewer, so the branch history records the review the same way the issue
+		// comment does. Best-effort: the verdict is canonical in Flowbee's ledger; a push
+		// failure (e.g. the branch moved) is logged, never voids a valid review.
+		reviewerEmptyCommit(cfg, grant, verdict, v.Notes)
 		resp, st, err := c.Review(ctx, grant.JobID, grant.LeaseEpoch, idem, verdict, disp, v.Notes)
 		if err != nil {
 			return out, fmt.Errorf("review: %w", err)
@@ -229,6 +236,70 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	// just-advanced job (spec_review -> ready). A failed POST leaves the lease to
 	// expire on TTL and re-arm for a clean retry.
 	return out, nil
+}
+
+// reviewerEmptyCommit lands the reviewer's verdict as an EMPTY commit on the issue
+// branch (build-list: "reviewers perform an empty commit with their findings and
+// declaration of approved or rejected"), authored AS the reviewer so `git log`
+// attributes the verdict. It fetches the branch tip into the reviewer's own mirror,
+// stacks an --allow-empty commit on it, and pushes with the reviewer's key. Entirely
+// best-effort: the verdict is canonical in Flowbee's ledger, so any git failure here
+// is swallowed (the issue comment + the ledger still record the review). A no-op when
+// the reviewer has no branch/remote configured (same-box / bundle deployments).
+func reviewerEmptyCommit(cfg HarnessConfig, grant client.LeaseGrant, verdict, notes string) {
+	issueBranch := ""
+	if grant.Context != nil {
+		issueBranch = grant.Context.IssueBranch
+	}
+	if issueBranch == "" || cfg.RepoURL == "" {
+		return
+	}
+	mirrorPath := cfg.MirrorPath
+	if mirrorPath == "" {
+		mirrorPath = filepath.Join(os.TempDir(), "flowbee-worker-mirror.git")
+	}
+	branch := cfg.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	if err := ensureMirror(context.Background(), mirrorPath, cfg.RepoURL, branch); err != nil {
+		return
+	}
+	mirror := gitops.Open(mirrorPath)
+	tip, exists, err := mirror.RemoteBranchTip(cfg.RepoURL, issueBranch)
+	if err != nil || !exists || tip == "" {
+		return // nothing to stack the verdict on (no build commit yet)
+	}
+	if err := mirror.FetchRef(cfg.RepoURL, "refs/heads/"+issueBranch, "refs/flowbee/review-tip/"+grant.JobID); err != nil {
+		return
+	}
+	wsRoot, err := os.MkdirTemp("", "flowbee-rvc-")
+	if err != nil {
+		return
+	}
+	defer os.RemoveAll(wsRoot)
+	wsDir := filepath.Join(wsRoot, "ws")
+	wt, err := mirror.AddWorktree(wsDir, tip)
+	if err != nil {
+		return
+	}
+	defer wt.Destroy()
+
+	label := "CHANGES REQUESTED"
+	if verdict == "approved" {
+		label = "APPROVED"
+	}
+	msg := fmt.Sprintf("review(%s): %s\n\n", cfg.Identity, label)
+	if n := strings.TrimSpace(notes); n != "" {
+		msg += n + "\n"
+	} else {
+		msg += "(no findings recorded)\n"
+	}
+	sha, err := wt.CommitAuthored(cfg.Identity, msg, true)
+	if err != nil || sha == "" {
+		return
+	}
+	_ = wt.PushTo(cfg.RepoURL, issueBranch, false)
 }
 
 func readVerdict(path string) (reviewVerdict, error) {
