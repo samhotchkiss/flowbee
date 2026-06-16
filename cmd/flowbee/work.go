@@ -136,9 +136,12 @@ func runWork(args []string) error {
 			return nil
 		}
 		if out.Skipped {
-			// a code_review job whose CI isn't green yet: backed off, will retry.
+			// a code_review job whose CI isn't green yet. CI runs for MINUTES, so a tight
+			// re-poll just churns the lease epoch (each claim bumps it) + bloats the
+			// ledger for no benefit — back off generously. Tunable via
+			// FLOWBEE_CI_WAIT_BACKOFF_S (default 30s).
 			fmt.Printf("skipped job %s (waiting for CI) — backing off\n", out.JobID)
-			time.Sleep(8 * time.Second)
+			time.Sleep(ciWaitBackoff())
 			return nil
 		}
 		fmt.Printf("completed job %s -> %s (epoch %d) pushed %s @ %s\n",
@@ -157,6 +160,18 @@ func runWork(args []string) error {
 }
 
 func envErr() *os.File { return os.Stderr }
+
+// ciWaitBackoff is how long a reviewer waits before re-polling a job whose CI is
+// still running (default 30s). CI takes minutes, so a short interval only churns the
+// lease epoch; 30s keeps reaction prompt without hammering. Tunable for tests/tuning.
+func ciWaitBackoff() time.Duration {
+	if v := os.Getenv("FLOWBEE_CI_WAIT_BACKOFF_S"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 30 * time.Second
+}
 
 // parseModelSlots parses the F6 per-model concurrency advertisement
 // "claude:3,codex:3" into a map. Malformed entries are skipped.
