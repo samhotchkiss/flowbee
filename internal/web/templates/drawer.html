@@ -1,0 +1,39 @@
+{{define "drawer.html"}}
+{{$d := .Detail}}{{$c := $d.Card}}{{$h := $d.History}}
+<h2>{{$c.Title}}</h2>
+<div class="kv">
+  <span class="k">job</span><span class="ident">{{$c.JobID}}</span>
+  <span class="k">state</span><span>{{$c.State}} <span class="muted">({{$c.Stage}})</span></span>
+  <span class="k">role</span><span>{{$c.Role}}</span>
+  {{if $c.Identity}}<span class="k">identity</span><span class="ident">{{$c.Identity}}</span>{{end}}
+  {{if $c.IssueNumber}}<span class="k">issue</span><span>#{{$c.IssueNumber}}</span>{{end}}
+  {{if $c.EpicID}}<span class="k">epic</span><span><a href="#" data-job-link="{{$c.EpicID}}">{{$c.EpicID}}</a></span>{{end}}
+  {{if $h.PRNumber}}<span class="k">PR</span><span>#{{$h.PRNumber}}</span>{{end}}
+  <span class="k">attempts</span><span>{{$h.Attempts}} · bounces {{$h.Bounces}}</span>
+</div>
+
+<h2>Stages</h2>
+<ul class="stage-tl">
+  {{range $d.Timings}}
+  <li>
+    <span class="st">{{.Stage}}{{if .Open}} <span class="open">●</span>{{end}}</span>
+    <span class="times">
+      ENTERED {{abs .Entered}}<br>
+      LEFT {{abs .Left}} · {{hms .DurationS}}
+    </span>
+  </li>
+  {{else}}<li class="muted">no stage transitions yet</li>{{end}}
+</ul>
+
+<h2>Build history</h2>
+<ul class="build-tl">
+  {{range timeline $h}}
+  <li>{{.Note}}<br><span class="at">{{abs .At}}</span></li>
+  {{else}}<li class="muted">no events recorded</li>{{end}}
+</ul>
+
+{{if $h.Lessons}}
+<h2>Lessons</h2>
+<ul class="build-tl">{{range $h.Lessons}}<li>{{.}}</li>{{end}}</ul>
+{{end}}
+{{end}}

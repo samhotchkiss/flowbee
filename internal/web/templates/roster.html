@@ -1,0 +1,12 @@
+{{define "roster.html"}}
+<h1>Worker roster</h1>
+<table>
+  <tr><th>worker</th><th>identity</th><th>host</th><th>arch/os</th><th>attested caps</th><th>lease</th><th>last hb</th></tr>
+  {{range .}}<tr>
+    <td>{{.WorkerID}}</td><td>{{.Identity}}</td><td>{{.Host}}</td><td>{{.Arch}}/{{.OS}}</td>
+    <td>{{range .Attested}}<span class="chip">{{.}}</span> {{end}}</td>
+    <td>{{if .ActiveJob}}{{.ActiveJob}}/e{{.ActiveEpoch}}{{else}}—{{end}}</td>
+    <td>{{.LastSeenAgo}}s{{if .StaleHB}} <span class="stale">⚠ stale-hb</span>{{end}}</td>
+  </tr>{{else}}<tr><td colspan="7" class="muted">— no workers —</td></tr>{{end}}
+</table>
+{{end}}

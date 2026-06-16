@@ -25,6 +25,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/spec"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/ulid"
+	"github.com/samhotchkiss/flowbee/internal/web"
 	"github.com/samhotchkiss/flowbee/internal/worker"
 )
 
@@ -58,6 +59,9 @@ type Server struct {
 	// authn is the worker-transport authenticator (§7.6). Nil = loopback-only dev
 	// (no mutual auth); set for a non-loopback listener (bearer token / mTLS).
 	authn auth.Authenticator
+	// ui is the F12 web UI (internal/web): the productionized Fleet/Board/Dashboard
+	// panes served off the same live store read-models, embedded via go:embed.
+	ui *web.UI
 }
 
 // Config carries the timing knobs the worker API needs.
@@ -127,6 +131,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 	// F2: install the operator content-integrity Policy on the store so the gate
 	// (ReviewResult / DispatchMerge) runs the configured ceilings + extra denylist.
 	st.ContentPolicy = cfg.ContentPolicy
+	ui := web.New(st, clk, web.Config{StaleHB: staleHB})
 	return &Server{
 		store:        st,
 		clock:        clk,
@@ -143,6 +148,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		bundleProvisioning: cfg.BundleProvisioning,
 		staleHB:            staleHB,
 		authn:              cfg.Authenticator,
+		ui:                 ui,
 	}
 }
 
@@ -204,10 +210,26 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{job}/design", s.resolveDesign)
 	mux.HandleFunc("POST /v1/jobs/{job}/promote", s.promoteBacklog)
 	mux.HandleFunc("POST /v1/jobs/{job}/adopt", s.adoptOptIn)
-	mux.HandleFunc("GET /roster", s.rosterPage)
-	mux.HandleFunc("GET /dashboard", s.dashboard)
-	mux.HandleFunc("GET /", s.board)
+	// the board's machine-readable snapshot (HTML clients hit the web UI's "/"; a
+	// JSON client uses this stable endpoint instead of content-negotiating "/").
+	mux.HandleFunc("GET /v1/board", s.boardJSON)
+	// F12 web UI (internal/web): the rich Fleet + Board + Dashboard + Roster panes,
+	// wired to the same live read-models the SSE feed refreshes. Embedded via
+	// go:embed. It owns "/", "/board", "/board/detail", "/fleet", "/dashboard",
+	// "/roster", and "/assets/". The read-only views bind to loopback/Tailscale.
+	s.ui.Mount(mux)
 	return mux
+}
+
+// boardJSON serves the live board snapshot as JSON (the machine-readable board the
+// user-agent loop and any non-browser client consume; the HTML board is the web UI).
+func (s *Server) boardJSON(w http.ResponseWriter, r *http.Request) {
+	jobs, err := s.store.BoardSnapshot(r.Context())
+	if err != nil {
+		http.Error(w, "board error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, jobs)
 }
 
 // budgetJSON serves the single installation token's rate-limit gauge (I-14,
@@ -341,46 +363,6 @@ func (s *Server) adoptOptIn(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"opted_in": true})
 }
 
-// dashboard renders the finished operator UI (§12.6): board + roster + budget +
-// audit + cost in one live page, refreshed off the SSE feed.
-func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	board, err := s.store.BoardSnapshot(ctx)
-	if err != nil {
-		http.Error(w, "dashboard error", http.StatusInternalServerError)
-		return
-	}
-	roster, err := s.store.Roster(ctx, s.clock.Now(), s.staleHB)
-	if err != nil {
-		http.Error(w, "dashboard error", http.StatusInternalServerError)
-		return
-	}
-	budget, err := s.store.RateLimit(ctx)
-	if err != nil {
-		http.Error(w, "dashboard error", http.StatusInternalServerError)
-		return
-	}
-	cost, err := s.store.AllJobCost(ctx)
-	if err != nil {
-		http.Error(w, "dashboard error", http.StatusInternalServerError)
-		return
-	}
-	audit, err := s.store.AllAudit(ctx)
-	if err != nil {
-		http.Error(w, "dashboard error", http.StatusInternalServerError)
-		return
-	}
-	needsHuman, err := s.store.NeedsHumanView(ctx)
-	if err != nil {
-		http.Error(w, "dashboard error", http.StatusInternalServerError)
-		return
-	}
-	renderDashboard(w, dashboardData{
-		Board: board, Roster: roster, Budget: budget,
-		Cost: cost, Audit: audit, NeedsHuman: needsHuman,
-	})
-}
-
 // rosterJSON serves the worker roster as JSON (§12.6.2).
 func (s *Server) rosterJSON(w http.ResponseWriter, r *http.Request) {
 	roster, err := s.store.Roster(r.Context(), s.clock.Now(), s.staleHB)
@@ -389,16 +371,6 @@ func (s *Server) rosterJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, roster)
-}
-
-// rosterPage serves the HTML worker roster with a stale-hb badge (§12.6.2).
-func (s *Server) rosterPage(w http.ResponseWriter, r *http.Request) {
-	roster, err := s.store.Roster(r.Context(), s.clock.Now(), s.staleHB)
-	if err != nil {
-		http.Error(w, "roster error", http.StatusInternalServerError)
-		return
-	}
-	renderRoster(w, roster)
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
@@ -984,19 +956,6 @@ func (s *Server) release(w http.ResponseWriter, r *http.Request) {
 	}
 	s.broker.Publish(LifeEvent{JobID: jobID, State: string(job.StateReady), Event: "lease_released", Epoch: epoch})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func (s *Server) board(w http.ResponseWriter, r *http.Request) {
-	jobs, err := s.store.BoardSnapshot(r.Context())
-	if err != nil {
-		http.Error(w, "board error", http.StatusInternalServerError)
-		return
-	}
-	if r.Header.Get("Accept") == "application/json" {
-		writeJSON(w, http.StatusOK, jobs)
-		return
-	}
-	renderBoard(w, jobs)
 }
 
 // writeFenceError maps the lease sentinel errors to HTTP status codes.

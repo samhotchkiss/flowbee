@@ -343,19 +343,27 @@ func TestM12_DashboardRendersLive(t *testing.T) {
 	assertJSONContains(t, ts, "/v1/cost", "4500")
 	assertJSONContains(t, ts, "/v1/audit", "pulls.create")
 
-	// the unified dashboard page renders every pane.
+	// the F12 productionized dashboard pane renders the operator panes live off the
+	// real store (the board is now its own rich pane at /board; the dashboard carries
+	// budget/roster/cost/audit/needs-human).
 	html := httpGetBody(t, ts, "/dashboard")
 	for _, want := range []string{
-		"Flowbee dashboard", // header
-		jobID,               // board pane
-		"dash.codex",        // roster pane
-		"4321",              // budget gauge
-		"4500",              // cost pane (micro-USD)
-		"pulls.create",      // audit pane
-		"/v1/events",        // SSE live-refresh wiring
+		"Dashboard",          // header
+		"dash.codex",         // roster pane
+		"4321",               // budget gauge
+		"4500",               // cost pane (micro-USD)
+		"pulls.create",       // audit pane
+		"/assets/board.js",   // SSE live-refresh hook (EventSource lives in the asset)
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("dashboard missing %q:\n%s", want, html)
+		}
+	}
+	// the F12 board pane renders the live job card off the same store.
+	board := httpGetBody(t, ts, "/board")
+	for _, want := range []string{"Board", jobID, "fb-drawer", "/assets/board.js"} {
+		if !strings.Contains(board, want) {
+			t.Fatalf("board missing %q:\n%s", want, board)
 		}
 	}
 }

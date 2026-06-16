@@ -1,0 +1,45 @@
+{{define "dashboard.html"}}
+<h1>Dashboard</h1>
+<p class="muted">GitHub budget: <b>{{.Budget.Remaining}}</b> / {{.Budget.Limit}} remaining
+{{if not .Budget.LastSweep.IsZero}}· last sweep {{abs .Budget.LastSweep}}{{end}}</p>
+
+<div class="panes">
+  <div>
+    <h2>⚠ Needs human</h2>
+    <table>
+      <tr><th>job</th><th>flow</th><th>role</th><th>reason</th></tr>
+      {{range .NeedsHuman}}<tr><td>{{.JobID}}</td><td>{{.Flow}}</td><td>{{.Role}}</td><td>{{.Reason}}</td></tr>
+      {{else}}<tr><td colspan="4" class="muted">— none —</td></tr>{{end}}
+    </table>
+  </div>
+  <div>
+    <h2>Roster</h2>
+    <table>
+      <tr><th>identity</th><th>host</th><th>lease</th><th>last hb</th></tr>
+      {{range .Roster}}<tr>
+        <td>{{.Identity}}</td><td>{{.Host}}</td>
+        <td>{{if .ActiveJob}}{{.ActiveJob}}/e{{.ActiveEpoch}}{{else}}—{{end}}</td>
+        <td>{{.LastSeenAgo}}s{{if .StaleHB}} <span class="stale">⚠</span>{{end}}</td>
+      </tr>{{else}}<tr><td colspan="4" class="muted">— none —</td></tr>{{end}}
+    </table>
+  </div>
+</div>
+
+<h2>Cost</h2>
+<table>
+  <tr><th>job</th><th>role</th><th>state</th><th>tokens in/out</th><th>μUSD</th><th>budget</th></tr>
+  {{range .Cost}}<tr>
+    <td>{{.JobID}}</td><td>{{.Role}}</td><td>{{.State}}</td>
+    <td>{{.TokensIn}} / {{.TokensOut}}</td><td>{{.MicroUSD}}</td>
+    <td>{{if .OverBudget}}<span class="over">over</span>{{else}}ok{{end}}</td>
+  </tr>{{else}}<tr><td colspan="6" class="muted">— none —</td></tr>{{end}}
+</table>
+
+<h2>Audit (project-OUT)</h2>
+<table>
+  <tr><th>job</th><th>action</th><th>head_sha</th><th>detail</th><th>at</th></tr>
+  {{range .Audit}}<tr>
+    <td>{{.JobID}}</td><td>{{.Action}}</td><td>{{.HeadSHA}}</td><td>{{.Detail}}</td><td>{{abs .ActedAt}}</td>
+  </tr>{{else}}<tr><td colspan="5" class="muted">— none —</td></tr>{{end}}
+</table>
+{{end}}

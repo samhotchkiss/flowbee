@@ -1,0 +1,43 @@
+{{define "page.html"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flowbee · {{.Title}}</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+{{template "nav.html" .}}
+<main>
+<div id="fb-live">
+{{template "body.html" .}}
+</div>
+</main>
+{{if .Board}}{{template "drawershell.html" .}}{{end}}
+<script src="/assets/board.js"></script>
+</body>
+</html>{{end}}
+
+{{define "nav.html"}}
+<nav class="fb-nav">
+  <span class="brand">🐝 Flowbee</span>
+  <a href="/board" {{if eq .Active "board"}}class="active"{{end}}>Board</a>
+  <a href="/fleet" {{if eq .Active "fleet"}}class="active"{{end}}>Fleet</a>
+  <a href="/dashboard" {{if eq .Active "dashboard"}}class="active"{{end}}>Dashboard</a>
+  <a href="/roster" {{if eq .Active "roster"}}class="active"{{end}}>Roster</a>
+  <span class="spacer"></span>
+  <span class="live"><span class="dot"></span>live</span>
+</nav>{{end}}
+
+{{define "body.html"}}
+{{if .Board}}{{template "board.html" .Board}}{{end}}
+{{if .Fleet}}{{template "fleet.html" .Fleet}}{{end}}
+{{if .Dash}}{{template "dashboard.html" .Dash}}{{end}}
+{{if eq .Active "roster"}}{{template "roster.html" .Roster}}{{end}}
+{{end}}
+
+{{define "drawershell.html"}}
+<aside id="fb-drawer" class="drawer" aria-label="job detail">
+  <button id="fb-drawer-close" class="close" aria-label="close">×</button>
+  <div class="drawer-body"><p class="muted">Click a card to inspect it.</p></div>
+</aside>{{end}}

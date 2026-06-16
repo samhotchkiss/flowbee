@@ -1,0 +1,45 @@
+{{define "fleet.html"}}
+<h1>Fleet</h1>
+{{if not .Boxes}}<p class="muted">No workers registered.</p>{{end}}
+<div class="fleet-grid">
+{{range .Boxes}}
+  <section class="box-card" data-box="{{.WorkerID}}">
+    <div class="box-head">
+      <span class="host">{{if .Host}}{{.Host}}{{else}}{{.Identity}}{{end}}</span>
+      <span class="muted" style="font-size:.78rem">{{.Identity}} · {{.Arch}}/{{.OS}}{{if .StaleHB}} <span class="stale">⚠ stale-hb</span>{{end}}</span>
+    </div>
+    {{range .Models}}
+    <div class="model-block" data-model="{{.Family}}">
+      <div class="slot-row">
+        <span class="model">{{.Family}}</span>
+        <span class="pips">
+          {{range pips .Busy .Total}}<span class="pip {{if .}}busy{{end}}"></span>{{end}}
+        </span>
+      </div>
+      {{range .Accounts}}
+      <div class="gauge" data-account="{{.AccountID}}">
+        <div class="acct"><span class="name">{{.AccountID}}</span><span>{{pct .UsagePct}}% / {{.CeilingPct}}%</span></div>
+        <div class="bar">
+          <span class="fill {{barClass .UsagePct .CeilingPct}}" style="width:{{pct .UsagePct}}%"></span>
+          <span class="ceiling" style="left:{{pct .CeilingPct}}%"></span>
+        </div>
+        <div class="roll">
+          rank {{.PreferenceRank}}
+          {{if .AtCeiling}}<span class="badge">at ceiling → rollover</span>{{end}}
+          {{if .RateLimited}}<span class="badge">429 cool-down</span>{{end}}
+        </div>
+      </div>
+      {{else}}
+      <div class="gauge muted" style="font-size:.78rem">no account enrolled for {{.Family}}</div>
+      {{end}}
+    </div>
+    {{end}}
+    {{if .LiveJobs}}
+    <div class="jobs-live">live: {{range .LiveJobs}}<span class="j">{{.}}</span>{{end}}</div>
+    {{else}}
+    <div class="jobs-live muted">idle</div>
+    {{end}}
+  </section>
+{{end}}
+</div>
+{{end}}
