@@ -2,9 +2,11 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -12,6 +14,93 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/content"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 )
+
+// TaskFileRel is the worktree-relative path the harness writes the resolved task
+// into (§B). The default agent-cmd convention is: the agent reads $FLOWBEE_TASK_FILE
+// (an absolute path to this file) — or, equivalently, .flowbee/task.md at the repo
+// root — and acts on it. $FLOWBEE_SPEC / $FLOWBEE_ACCEPTANCE carry the spec and
+// acceptance criteria inline for agents that prefer env over a file.
+const TaskFileRel = ".flowbee/task.md"
+
+// writeTaskContext materializes the F1 lease context block (grant.Context) into
+// the worktree and returns the env vars an agent CLI reads. It writes
+// .flowbee/task.md (a human/agent-readable task brief) plus .flowbee/context.json
+// (the raw resolved context, for tool-driven agents), and returns
+// FLOWBEE_TASK_FILE / FLOWBEE_SPEC / FLOWBEE_ACCEPTANCE / FLOWBEE_IDENTITY /
+// FLOWBEE_LENS so any agent reads the task without knowing Flowbee. A nil context
+// (old server) is tolerated: the file/env still describe the bare job.
+func writeTaskContext(wsDir string, grant client.LeaseGrant) ([]string, error) {
+	dir := filepath.Join(wsDir, ".flowbee")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	c := grant.Context
+	if c == nil {
+		c = &client.LeaseContext{Role: grant.Role, BaseSHA: grant.BaseSHA}
+	}
+
+	md := renderTaskMarkdown(grant.JobID, c)
+	taskFile := filepath.Join(dir, "task.md")
+	if err := os.WriteFile(taskFile, []byte(md), 0o644); err != nil {
+		return nil, err
+	}
+	if raw, err := json.MarshalIndent(c, "", "  "); err == nil {
+		_ = os.WriteFile(filepath.Join(dir, "context.json"), raw, 0o644)
+	}
+
+	return []string{
+		"FLOWBEE_TASK_FILE=" + taskFile,
+		"FLOWBEE_TASK=" + c.Task,
+		"FLOWBEE_SPEC=" + c.Spec,
+		"FLOWBEE_ACCEPTANCE=" + c.AcceptanceCriteria,
+		"FLOWBEE_IDENTITY=" + c.Identity,
+		"FLOWBEE_LENS=" + c.Lens,
+	}, nil
+}
+
+// renderTaskMarkdown renders the resolved context block as the .flowbee/task.md
+// brief the agent reads. Deterministic given the inputs (no clock).
+func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Flowbee task: %s\n\n", jobID)
+	if c.Identity != "" {
+		fmt.Fprintf(&b, "- **Act as:** %s\n", c.Identity)
+	}
+	if c.Lens != "" {
+		fmt.Fprintf(&b, "- **Lens:** %s\n", c.Lens)
+	}
+	if c.Role != "" {
+		fmt.Fprintf(&b, "- **Role:** %s\n", c.Role)
+	}
+	if c.BaseSHA != "" {
+		fmt.Fprintf(&b, "- **Base SHA:** %s\n", c.BaseSHA)
+	}
+	b.WriteString("\n## Task\n\n")
+	if c.Task != "" {
+		b.WriteString(c.Task)
+	} else {
+		b.WriteString("(no task text provided)")
+	}
+	b.WriteString("\n")
+	if c.Spec != "" {
+		b.WriteString("\n## Spec / context\n\n")
+		b.WriteString(c.Spec)
+		b.WriteString("\n")
+	}
+	if c.AcceptanceCriteria != "" {
+		b.WriteString("\n## Acceptance criteria\n\n")
+		b.WriteString(c.AcceptanceCriteria)
+		b.WriteString("\n")
+	}
+	if c.PriorVerdict != nil {
+		if raw, err := json.Marshal(c.PriorVerdict); err == nil {
+			b.WriteString("\n## Prior verdict\n\n```json\n")
+			b.Write(raw)
+			b.WriteString("\n```\n")
+		}
+	}
+	return b.String()
+}
 
 // HarnessConfig parameterizes the Mode-A worker harness (DESIGN §7.1): the thin
 // pull loop around an agent CLI it knows nothing about. The provider appears in
@@ -110,6 +199,17 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	}
 	defer wt.Destroy()
 
+	// ── F1: materialize the resolved task/context into the worktree (§B) ──
+	// The lease grant ships a self-contained context block. We write it to
+	// .flowbee/task.md inside the worktree AND export FLOWBEE_TASK_FILE/FLOWBEE_SPEC
+	// (+ the resolved identity/lens/role) so ANY agent CLI reads the task without
+	// knowing Flowbee. The worker is UNTRUSTED: it acts AS grant.Context.Identity
+	// (fenced by the server) and never chooses its own identity or task.
+	taskEnv, err := writeTaskContext(wsDir, grant)
+	if err != nil {
+		return out, fmt.Errorf("write task context: %w", err)
+	}
+
 	// ── spawn the agent CLI in the worktree (a black box, §7.1) ──
 	if cfg.AgentCmd != "" {
 		cmd := exec.CommandContext(ctx, "sh", "-c", cfg.AgentCmd)
@@ -119,12 +219,18 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 			"FLOWBEE_BASE_SHA="+grant.BaseSHA,
 			"FLOWBEE_ROLE="+grant.Role,
 		)
+		cmd.Env = append(cmd.Env, taskEnv...)
 		var errb strings.Builder
 		cmd.Stderr = &errb
 		if err := cmd.Run(); err != nil {
 			return out, fmt.Errorf("agent cmd: %v: %s", err, strings.TrimSpace(errb.String()))
 		}
 	}
+
+	// The .flowbee/ scaffolding is Flowbee's INPUT to the agent, not the agent's
+	// work-product: strip it before computing the diff so it never enters the
+	// untrusted patch the content-integrity gate judges (§9.2).
+	_ = os.RemoveAll(filepath.Join(wsDir, ".flowbee"))
 
 	// ── collect the work-product: commit + push to the epoch ref (§7.3) ──
 	changed, err := wt.HasChanges()

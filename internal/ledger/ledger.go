@@ -92,6 +92,10 @@ type Payload struct {
 	Priority             int
 	BlockedBy            []string `json:",omitempty"`
 	RequiredCapabilities []string `json:",omitempty"`
+	// F1 task/context (set on job_created): the human intent folded onto the job.
+	TaskText           string `json:",omitempty"`
+	SpecText           string `json:",omitempty"`
+	AcceptanceCriteria string `json:",omitempty"`
 	// CreatedReady records whether the job entered the ledger already `ready`
 	// (no unmet deps) vs `blocked`. Set on job_created; the fold reads ToState.
 
@@ -156,6 +160,9 @@ func Fold(events []Event) (job.Job, error) {
 			j.Priority = e.Payload.Priority
 			j.BlockedBy = e.Payload.BlockedBy
 			j.RequiredCapabilities = e.Payload.RequiredCapabilities
+			j.TaskText = e.Payload.TaskText
+			j.SpecText = e.Payload.SpecText
+			j.AcceptanceCriteria = e.Payload.AcceptanceCriteria
 			j.State = e.ToState
 			// EnqueuedAt: a job created already-`ready` is enqueued now (aging
 			// clock starts here); a `blocked` job starts aging when deps clear.

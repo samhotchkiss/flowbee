@@ -145,6 +145,16 @@ type Job struct {
 	BaseSHA string
 	HeadSHA string
 
+	// task/context (F1). The human intent folded onto the job and shipped, fully
+	// resolved, in the lease grant's context block (§B self-contained lease JSON).
+	// TaskText is the imperative the agent must satisfy; SpecText the longer
+	// spec/design context; AcceptanceCriteria the DONE-WHEN (newline-delimited).
+	// All are RESOLVED facts (settable via `flowbee seed` or a GitHub issue body),
+	// never read from a clock.
+	TaskText           string
+	SpecText           string
+	AcceptanceCriteria string
+
 	// spec binding (spec flow, §11)
 	SpecContentHash string
 	SpecVersion     int

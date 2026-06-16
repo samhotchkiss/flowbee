@@ -42,6 +42,12 @@ type SeedParams struct {
 	// empty falls back to the job's own id.
 	CostCeilingMicroUSD *int64
 	FlowID              string
+	// F1 task/context: the human intent folded onto the job, shipped (resolved) in
+	// the lease grant's context block. Settable via `flowbee seed` or a GitHub
+	// issue body. Empty is fine (a bare M1 seed carries no task).
+	TaskText           string
+	SpecText           string
+	AcceptanceCriteria string
 }
 
 // SeedJob inserts a job and its job_created event in one transaction (append +
@@ -72,10 +78,12 @@ func (s *Store) SeedJob(ctx context.Context, p SeedParams) (job.Job, error) {
 			INSERT INTO jobs (id, kind, flow, stage, state, role, base_sha, priority,
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
-			                  cost_ceiling_micro_usd, flow_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 3, 0, ?, ?)`,
+			                  cost_ceiling_micro_usd, flow_id,
+			                  task_text, spec_text, acceptance_criteria)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 3, 0, ?, ?, ?, ?, ?)`,
 			p.ID, string(p.Kind), p.Flow, p.Stage, string(state), string(p.Role), p.BaseSHA, p.Priority,
-			blockedJSON, reqJSON, p.Now.Format(rfc3339), ceiling, flowID)
+			blockedJSON, reqJSON, p.Now.Format(rfc3339), ceiling, flowID,
+			p.TaskText, p.SpecText, p.AcceptanceCriteria)
 		if err != nil {
 			return fmt.Errorf("insert job: %w", err)
 		}
@@ -90,6 +98,7 @@ func (s *Store) SeedJob(ctx context.Context, p SeedParams) (job.Job, error) {
 				Kind: p.Kind, Flow: p.Flow, Stage: p.Stage, Role: p.Role,
 				BaseSHA: p.BaseSHA, Priority: p.Priority,
 				BlockedBy: p.BlockedBy, RequiredCapabilities: p.RequiredCapabilities,
+				TaskText: p.TaskText, SpecText: p.SpecText, AcceptanceCriteria: p.AcceptanceCriteria,
 			},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
@@ -824,7 +833,8 @@ const jobSelect = `
 	       COALESCE(issue_number,0), COALESCE(pr_number,0),
 	       cost_tokens_in, cost_tokens_out, cost_micro_usd, cost_ceiling_micro_usd,
 	       over_budget, COALESCE(flow_id,''), COALESCE(escalation_reason,''),
-	       build_epoch, COALESCE(merge_provenance,'')
+	       build_epoch, COALESCE(merge_provenance,''),
+	       COALESCE(task_text,''), COALESCE(spec_text,''), COALESCE(acceptance_criteria,'')
 	  FROM jobs`
 
 type rowScanner interface {
@@ -846,7 +856,8 @@ func scanJob(row rowScanner) (job.Job, error) {
 		&j.IssueNum, &j.PRNumber,
 		&j.CostTokensIn, &j.CostTokensOut, &j.CostMicroUSD, &ceiling,
 		&overBudget, &j.FlowID, &j.EscalationReason,
-		&j.BuildEpoch, &j.MergeProvenance)
+		&j.BuildEpoch, &j.MergeProvenance,
+		&j.TaskText, &j.SpecText, &j.AcceptanceCriteria)
 	if err != nil {
 		return j, err
 	}

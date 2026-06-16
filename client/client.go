@@ -84,6 +84,27 @@ type LeaseGrant struct {
 
 	SpecContentHash string `json:"spec_content_hash"`
 	SpecVersion     int    `json:"spec_version"`
+
+	// Context is the F1 self-contained context block (§B): resolved identity +
+	// task/spec/acceptance/base_sha/prior_verdict. The harness writes Task/Spec/
+	// Acceptance into the worktree and exports them as env so any agent CLI reads
+	// the task without knowing Flowbee. Nil for an old server (back-compat).
+	Context *LeaseContext `json:"context,omitempty"`
+}
+
+// LeaseContext mirrors the server's F1 context block (kept self-contained so the
+// worker client imports no internal package). Every field is a RESOLVED fact: the
+// worker acts AS Identity and cannot choose its own (fenced by the server).
+type LeaseContext struct {
+	Identity           string         `json:"identity"`
+	ModelFamily        string         `json:"model_family,omitempty"`
+	Lens               string         `json:"lens,omitempty"`
+	Role               string         `json:"role"`
+	BaseSHA            string         `json:"base_sha,omitempty"`
+	Task               string         `json:"task,omitempty"`
+	Spec               string         `json:"spec,omitempty"`
+	AcceptanceCriteria string         `json:"acceptance_criteria,omitempty"`
+	PriorVerdict       map[string]any `json:"prior_verdict,omitempty"`
 }
 
 // Lease long-polls for a lease. ok=false means a 204 (no work this round).

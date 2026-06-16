@@ -325,6 +325,34 @@ type LeaseGrant struct {
 	// (a stale binding is rejected as superseded, §11.5).
 	SpecContentHash string `json:"spec_content_hash,omitempty"`
 	SpecVersion     int    `json:"spec_version,omitempty"`
+	// Context is the F1 self-contained context block (§B): the resolved identity
+	// (who-to-be) + task/spec/acceptance + base_sha + prior verdicts that make the
+	// lease JSON self-contained. An untrusted worker reads it; it can never choose
+	// its own identity or task (both are resolved by Flowbee and fenced here).
+	Context *LeaseContext `json:"context,omitempty"`
+}
+
+// LeaseContext is the F1 resolved context block carried in a LeaseGrant (§B
+// "self-contained lease JSON" = resolved identity + context). Every field is a
+// RESOLVED fact: the worker does not negotiate any of it. The Mode-A harness
+// writes Task/Spec/Acceptance into the worktree (.flowbee/task.md) and exports
+// them as env so any agent CLI reads the task without knowing Flowbee.
+type LeaseContext struct {
+	// Identity is who-to-be: the resolved actor the worker acts AS (fenced; the
+	// worker cannot pick its own, §B). Lens is the resolved persona/lens file.
+	Identity    string `json:"identity"`
+	ModelFamily string `json:"model_family,omitempty"`
+	Lens        string `json:"lens,omitempty"`
+	Role        string `json:"role"`
+	// BaseSHA is the SHA the task applies to (echoed for the worktree checkout).
+	BaseSHA string `json:"base_sha,omitempty"`
+	// Task / Spec / Acceptance are the human intent the agent must satisfy.
+	Task               string `json:"task,omitempty"`
+	Spec               string `json:"spec,omitempty"`
+	AcceptanceCriteria string `json:"acceptance_criteria,omitempty"`
+	// PriorVerdict is the last minted gate verdict on this job, if any (e.g. a
+	// build re-armed after a bounce sees the reviewer's prior changes-requested).
+	PriorVerdict *job.Verdict `json:"prior_verdict,omitempty"`
 }
 
 // lease long-polls: rank `ready` candidates (scheduler: priority + aging +
@@ -413,6 +441,22 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 					BaseSHA: j.BaseSHA, LeaseID: ls.LeaseID, LeaseEpoch: ls.Epoch,
 					LeaseTTLS: int(s.leaseTTL / time.Second), Deadline: ls.Deadline.Format(time.RFC3339Nano),
 					SpecContentHash: j.SpecContentHash, SpecVersion: j.SpecVersion,
+				}
+				// F1: ship the self-contained context block (§B). Identity/lens are the
+				// CREDENTIAL-BOUND resolved values (the fence): the worker acts AS this
+				// identity and cannot choose another. The bound_lens persisted at claim
+				// time wins over the self-asserted query param when present.
+				ctxLens := lens
+				if j.BoundLens != "" {
+					ctxLens = j.BoundLens
+				}
+				grant.Context = &LeaseContext{
+					Identity: identity, ModelFamily: family, Lens: ctxLens, Role: string(j.Role),
+					BaseSHA:            j.BaseSHA,
+					Task:               j.TaskText,
+					Spec:               j.SpecText,
+					AcceptanceCriteria: j.AcceptanceCriteria,
+					PriorVerdict:       j.Verdict,
 				}
 				// same-box `worktree` provisioning hints (§7.4): only for build jobs
 				// that carry a base_sha and only when a local mirror is configured.

@@ -24,6 +24,15 @@ func envOr(key, def string) string {
 // the real harness: provision a per-lease worktree at base_sha off the shared
 // mirror, spawn FLOWBEE_AGENT_CMD in it, push to the epoch ref, submit the patch.
 // --once runs a single lease cycle (used by tests); default loops forever.
+//
+// F1 default agent-cmd convention: before spawning, the harness writes the lease's
+// resolved task into .flowbee/task.md at the worktree root and exports the env
+// FLOWBEE_TASK_FILE (absolute path to it), FLOWBEE_TASK, FLOWBEE_SPEC,
+// FLOWBEE_ACCEPTANCE, FLOWBEE_IDENTITY, FLOWBEE_LENS (plus FLOWBEE_JOB_ID/
+// FLOWBEE_BASE_SHA/FLOWBEE_ROLE). The agent-cmd should read $FLOWBEE_TASK_FILE
+// (or .flowbee/task.md) and act on it — e.g. `claude -p "$(cat $FLOWBEE_TASK_FILE)"`
+// or `codex exec "$FLOWBEE_TASK"`. The .flowbee/ scaffolding is stripped before the
+// work-product diff is collected, so it never enters the untrusted patch.
 func runWork(args []string) error {
 	fs := flag.NewFlagSet("work", flag.ContinueOnError)
 	stub := fs.Bool("stub", false, "run the built-in echo stub worker (no worktree)")
@@ -31,7 +40,7 @@ func runWork(args []string) error {
 	identity := fs.String("identity", envOr("FLOWBEE_IDENTITY", "worker"), "worker identity")
 	family := fs.String("model-family", envOr("FLOWBEE_MODEL_TAG", "stub"), "model family tag")
 	role := fs.String("role", envOr("FLOWBEE_ROLE", ""), "role filter")
-	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", ""), "agent CLI to spawn per lease")
+	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", ""), "agent CLI to spawn per lease (reads $FLOWBEE_TASK_FILE / .flowbee/task.md)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
