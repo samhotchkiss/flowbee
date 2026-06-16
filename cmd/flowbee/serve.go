@@ -14,8 +14,11 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/api"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/config"
+	"github.com/samhotchkiss/flowbee/internal/github"
+	"github.com/samhotchkiss/flowbee/internal/reconcile"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/ulid"
+	"github.com/samhotchkiss/flowbee/internal/webhook"
 )
 
 // runServe boots the control plane: load config -> open store -> migrate ->
@@ -64,6 +67,49 @@ func runServe(_ []string) error {
 	// no_eligible_worker alarm, epoch-guarded.
 	poller := alarm.New(st, clock.Real{}, time.Second, srv.Broker())
 	go poller.Run(ctx)
+
+	// reconcile-IN (M6, §8.1): Flowbee is the SINGLE GitHub caller (R4). Wired only
+	// when GitHub App config is present (FLOWBEE_GITHUB_OWNER/REPO/TOKEN); there are
+	// no creds in dev/CI, so this stays dormant by default (e2e_github off). When
+	// configured: a boot sweep, then a low-frequency periodic sweep (the floor),
+	// and a PUBLIC webhook listener (HMAC, deduped, write-ahead -> targeted refetch).
+	if owner, repo := os.Getenv("FLOWBEE_GITHUB_OWNER"), os.Getenv("FLOWBEE_GITHUB_REPO"); owner != "" && repo != "" {
+		tok := os.Getenv("FLOWBEE_GITHUB_TOKEN")
+		ghClient := github.NewRealClient(owner, repo, func(context.Context) (string, error) { return tok, nil })
+		rec := reconcile.New(st, ghClient, clock.Real{}, srv.Broker())
+		// boot sweep + periodic floor sweep (every 2-5 min; default 3 min).
+		go func() {
+			if _, err := rec.Sweep(ctx); err != nil {
+				logger.Error("boot reconcile sweep", "err", err)
+			}
+			t := time.NewTicker(3 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if _, err := rec.Sweep(ctx); err != nil {
+						logger.Error("reconcile sweep", "err", err)
+					}
+				}
+			}
+		}()
+		// the PUBLIC webhook listener (I-2): only started when a secret is set.
+		if secret := os.Getenv("FLOWBEE_WEBHOOK_SECRET"); secret != "" {
+			wh := webhook.New(secret, st, rec)
+			webhookMux := http.NewServeMux()
+			webhookMux.Handle("POST /webhooks", wh)
+			webhookSrv := &http.Server{Addr: cfg.WebhookAddr, Handler: webhookMux}
+			go serveHTTP(logger, "webhook", webhookSrv)
+			defer func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = webhookSrv.Shutdown(shutdownCtx)
+			}()
+		}
+		logger.Info("reconcile-IN wired", "owner", owner, "repo", repo)
+	}
 
 	logger.Info("flowbee serve started",
 		"version", version, "health", cfg.HealthAddr, "private", cfg.PrivateAddr)

@@ -36,6 +36,9 @@ const (
 	KindBounceExhausted EventKind = "bounce_exhausted" // code_review -> needs_human (max_bounces)
 	KindMergeHandoff    EventKind = "merge_handoff"    // mergeable -> merge_handoff
 	KindMergeStarted    EventKind = "merge_started"    // mergeable -> merging (self_merge)
+	// M6 reconcile-IN event kinds (Domain-B-driven transitions; actor='reconcile').
+	KindFactsReconciled EventKind = "facts_reconciled" // a sweep/refetch wrote Domain-B facts (audit)
+	KindSuperseded      EventKind = "superseded"       // SHA move re-armed the job to ready (I-5, §6.2.4)
 )
 
 // Event is one appended ledger row. Payload holds kind-specific RESOLVED facts as
@@ -187,6 +190,28 @@ func Fold(events []Event) (job.Job, error) {
 			j.State = e.ToState
 		case KindMergeStarted:
 			j.State = e.ToState
+		case KindFactsReconciled:
+			// reconcile-IN wrote Domain-B facts; no Domain-A projection field changes
+			// here (the facts live in domain_b_facts, not the jobs row). Recorded for
+			// replay/audit completeness; a merged->done or supersede emits its own event.
+		case KindSuperseded:
+			// I-5 / §6.2.4: a head/base SHA move re-armed the job. The verdict is
+			// invalidated, the lease revoked (epoch bumped on the event), the job
+			// routed back to ready as an eng_worker against the new base.
+			j.State = e.ToState
+			j.Role = job.RoleEngWorker
+			j.Stage = "build"
+			j.RequiredCapabilities = []string{"role:eng_worker"}
+			j.LeaseEpoch = e.LeaseEpoch
+			j.Verdict = nil
+			j.HeadSHA = ""
+			if e.Payload.BaseSHA != "" {
+				j.BaseSHA = e.Payload.BaseSHA
+			}
+			j.EnqueuedAt = e.CreatedAt
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
 		}
 		j.JobSeq = e.JobSeq
 	}

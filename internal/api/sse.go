@@ -53,6 +53,13 @@ func (b *Broker) PublishAlarm(jobID, kind string) {
 	b.Publish(LifeEvent{JobID: jobID, State: "ready", Event: kind})
 }
 
+// PublishReconcile surfaces a reconcile-IN outcome (facts_reconciled / superseded
+// / reconciled_done / terminal_frozen) live on the SSE feed. Satisfies
+// reconcile.Publisher so the sweep/refetch can surface Domain-B drift corrections.
+func (b *Broker) PublishReconcile(jobID, event string) {
+	b.Publish(LifeEvent{JobID: jobID, Event: event})
+}
+
 // Publish broadcasts a lifecycle event to all subscribers (non-blocking).
 func (b *Broker) Publish(e LifeEvent) {
 	blob, err := json.Marshal(e)

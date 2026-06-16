@@ -128,10 +128,22 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{job}/review", s.review)
 	mux.HandleFunc("POST /v1/jobs/{job}/release", s.release)
 	mux.HandleFunc("GET /v1/events", s.eventsHandler)
+	mux.HandleFunc("GET /v1/budget", s.budgetJSON)
 	mux.HandleFunc("GET /v1/roster", s.rosterJSON)
 	mux.HandleFunc("GET /roster", s.rosterPage)
 	mux.HandleFunc("GET /", s.board)
 	return mux
+}
+
+// budgetJSON serves the single installation token's rate-limit gauge (I-14,
+// §12.6) — one bucket to watch. Driven by every reconcile sweep.
+func (s *Server) budgetJSON(w http.ResponseWriter, r *http.Request) {
+	g, err := s.store.RateLimit(r.Context())
+	if err != nil {
+		http.Error(w, "budget error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, g)
 }
 
 // rosterJSON serves the worker roster as JSON (§12.6.2).
