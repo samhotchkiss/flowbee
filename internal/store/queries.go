@@ -360,10 +360,17 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 		// what makes the gate leasable by a code_reviewer and NOT by an eng_worker,
 		// and lets M4's anti-affinity exclusion bite on a distinct reviewer.
 		if final == job.StateReviewPending {
+			// I-10 anti-affinity input: persist the BUILDER's identity + model_family
+			// DURABLY before clearing the live bound_* columns. The review claim
+			// (§6.3.1) reads these from the sibling (eng_worker_job = this job) to
+			// exclude the builder's identity AND model_family from the code_reviewer
+			// lease — a reviewer may never judge its own (or a same-model) build.
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE jobs
 				   SET state = ?, role = 'eng_worker',
 				       required_capabilities = ?,
+				       builder_identity     = COALESCE(builder_identity, bound_identity),
+				       builder_model_family = COALESCE(builder_model_family, bound_model_family),
 				       lease_id = NULL, bound_identity = NULL,
 				       bound_model_family = NULL, lease_hb_due = NULL,
 				       eng_worker_job = COALESCE(eng_worker_job, id),
@@ -371,6 +378,16 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 				 WHERE id = ?`,
 				string(final), marshalStrings([]string{"role:code_reviewer"}), p.JobID); err != nil {
 				return fmt.Errorf("apply result projection: %w", err)
+			}
+			// arm the review-stage no_eligible_worker alarm (I-6): if no compliant,
+			// independent code_reviewer claims this review_pending job before the
+			// window, the alarm fires. This is the surface where a single-provider
+			// fleet reveals itself — the model_family anti-affinity term is
+			// unsatisfiable, so the review stage alarms (§6.6, §5.6). The guard epoch
+			// is the job's current (post-build) lease_epoch; a later review claim
+			// bumps it, making the timer a no-op.
+			if err := s.armNoEligibleTimerTx(ctx, tx, p.JobID, j.LeaseEpoch, p.Now); err != nil {
+				return fmt.Errorf("arm review alarm: %w", err)
 			}
 		} else if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs

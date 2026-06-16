@@ -84,10 +84,15 @@ func markTimerFired(ctx context.Context, tx *sql.Tx, id string) error {
 
 // FireNoEligibleWorker evaluates one due no_eligible_worker timer. It is a no-op
 // (returns fired=false) when the timer is stale (lease_epoch advanced => the job
-// was leased/changed since arming) or the job is no longer `ready`. Otherwise it
-// records the alarm (job_alarms row + a no_eligible_worker ledger event) and
-// marks the timer fired, all in one serialized transaction. The epoch guard is
-// what makes a stale timer harmless (project override #2).
+// was leased/changed since arming) or the job has left the un-leased waiting
+// state it was armed in. The alarm covers BOTH waiting states (I-6): a `ready`
+// job no compliant eng_worker leased, AND a `review_pending` job no compliant,
+// INDEPENDENT code_reviewer could claim — the surface where a single-provider
+// fleet reveals itself (the model_family anti-affinity term is unsatisfiable, so
+// the review stage alarms rather than collapsing review independence, §5.6).
+// Otherwise it records the alarm (job_alarms row + a no_eligible_worker ledger
+// event) and marks the timer fired, all in one serialized transaction. The epoch
+// guard is what makes a stale timer harmless (project override #2).
 func (s *Store) FireNoEligibleWorker(ctx context.Context, t DueTimer, now time.Time) (bool, error) {
 	fired := false
 	err := s.tx(ctx, func(tx *sql.Tx) error {
@@ -101,23 +106,26 @@ func (s *Store) FireNoEligibleWorker(ctx context.Context, t DueTimer, now time.T
 		if err != nil {
 			return fmt.Errorf("load job for alarm: %w", err)
 		}
-		// epoch guard: if the epoch moved, the job was claimed (or otherwise
-		// progressed) since the timer was armed — the timer is stale, no-op.
-		if epoch != t.ExpectedEpoch || job.State(state) != job.StateReady {
+		// epoch guard + waiting-state guard: if the epoch moved, the job was claimed
+		// (or otherwise progressed) since the timer was armed — stale, no-op. The
+		// alarm only fires while the job is still in the un-leased waiting state it
+		// was armed in (`ready` or `review_pending`).
+		waiting := job.State(state) == job.StateReady || job.State(state) == job.StateReviewPending
+		if epoch != t.ExpectedEpoch || !waiting {
 			return markTimerFired(ctx, tx, t.ID)
 		}
-		// still ready under the same epoch: the alarm fires (I-6).
+		// still waiting under the same epoch: the alarm fires (I-6).
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO job_alarms (job_id, kind, fired_at, detail)
 			VALUES (?, ?, ?, ?)
 			ON CONFLICT (job_id, kind) DO UPDATE SET fired_at = excluded.fired_at`,
-			t.JobID, t.Kind, now.Format(rfc3339), "no compliant worker leased the job before the alarm window"); err != nil {
+			t.JobID, t.Kind, now.Format(rfc3339), "no compliant, independent worker claimed the job before the alarm window"); err != nil {
 			return fmt.Errorf("record alarm: %w", err)
 		}
 		nextSeq := seq + 1
 		ev := ledger.Event{
 			JobID: t.JobID, JobSeq: nextSeq, Kind: ledger.KindNoEligibleWorker,
-			FromState: job.StateReady, ToState: job.StateReady, LeaseEpoch: epoch,
+			FromState: job.State(state), ToState: job.State(state), LeaseEpoch: epoch,
 			Actor: "system", CreatedAt: now,
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {

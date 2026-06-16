@@ -108,9 +108,16 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 		}
 
 		// §6.3.1 atomic claim of the gate stage. The anti-affinity NOT EXISTS clause
-		// excludes the bound eng_worker's identity AND model_family (I-10): a
-		// reviewer may never judge its own (or same-model) build. M3 wires it; M4's
-		// acceptance test proves it bites on real sibling lineage.
+		// excludes the eng_worker's identity AND model_family (I-10): a reviewer may
+		// never judge its own build, nor may a same-model_family worker (uncorrelated
+		// failure modes, §5.5). It reads the sibling's DURABLE builder_identity /
+		// builder_model_family — the live bound_* columns were cleared when the build
+		// result landed, so the builder identity is preserved in those columns (set
+		// once at review_pending). The sibling pointer eng_worker_job points at this
+		// same job (self-review case); the predicate generalizes to a distinct
+		// build-job sibling once review is a separate job row. A claim that would
+		// violate the term returns 0 rows (ErrLostRace) and the job stays
+		// review_pending so its no_eligible_worker alarm can fire.
 		row := tx.QueryRowContext(ctx, `
 			UPDATE jobs
 			   SET state              = 'code_review',
@@ -127,8 +134,9 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 			   AND state = 'review_pending'
 			   AND NOT EXISTS (
 			        SELECT 1 FROM jobs sib
-			         WHERE sib.id = jobs.eng_worker_job
-			           AND ( sib.bound_identity = ? OR sib.bound_model_family = ? ) )
+			         WHERE sib.id = COALESCE(jobs.eng_worker_job, jobs.id)
+			           AND ( sib.builder_identity     = ?
+			              OR sib.builder_model_family = ? ) )
 			RETURNING lease_epoch, job_seq`,
 			p.Identity, p.ModelFamily, p.LeaseID,
 			deadline.Format(rfc3339), deadline.Format(rfc3339),
