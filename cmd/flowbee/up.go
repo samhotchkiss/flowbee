@@ -63,6 +63,9 @@ func runUp(args []string) error {
 		"FLOWBEE_MIRROR_PATH="+*mirror,
 		"FLOWBEE_GITHUB_OWNER="+owner,
 		"FLOWBEE_GITHUB_REPO="+repo,
+		// `up` is the single-box local convenience: its workers dial loopback, so
+		// accept the open (no-auth) API rather than refusing to start.
+		"FLOWBEE_INSECURE=1",
 	)
 	if *selfMerge {
 		env = append(env, "FLOWBEE_ALLOW_SELF_MERGE=1")

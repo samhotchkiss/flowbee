@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -48,6 +51,11 @@ func runServe(_ []string) error {
 	}
 	logger.Info("migrations applied")
 
+	// self-provision the control-plane mirror from the GitHub token if it's
+	// configured but absent — so the operator need not pre-clone it, and a PRIVATE
+	// repo works (a plain `git clone` would fail for lack of credentials).
+	ensureControlMirror(logger)
+
 	st.NoEligibleWorkerDelay = cfg.NoEligibleWorker()
 
 	// worker-transport mutual auth (§7.6): when a signing secret is configured the
@@ -60,6 +68,19 @@ func runServe(_ []string) error {
 	if cfg.WorkerAuthSecret != "" {
 		authn = auth.NewBearer([]byte(cfg.WorkerAuthSecret), cfg.EnrolledIdentities, cfg.AuthLoopbackBypass)
 		logger.Info("worker mutual-auth enabled", "enrolled", len(cfg.EnrolledIdentities), "loopback_bypass", cfg.AuthLoopbackBypass)
+	} else if !isLoopbackAddr(cfg.PrivateAddr) {
+		// no auth + a non-loopback bind = the worker API is reachable by any host on
+		// the network with NO token. With autonomous merge on, that means a peer could
+		// register a worker, claim a lease, and push a diff that auto-merges to main.
+		// Refuse to start unless the operator explicitly accepts that (a trusted
+		// tailnet), so "open" is always a conscious choice, never a silent default.
+		if os.Getenv("FLOWBEE_INSECURE") == "" {
+			return fmt.Errorf("REFUSING TO START: worker API binds %s (non-loopback) with NO auth — any host that can reach it could inject code"+
+				"%s set FLOWBEE_WORKER_AUTH_SECRET + FLOWBEE_ENROLLED_IDENTITIES (run `flowbee token --identity X` per worker),"+
+				"%s or, on a trusted private tailnet, set FLOWBEE_INSECURE=1 to accept an open API", cfg.PrivateAddr, "\n   ", "\n   ")
+		}
+		logger.Warn("⚠️  worker API is OPEN (no auth) on a non-loopback bind — relying on the network (e.g. Tailscale) as the only trust boundary",
+			"addr", cfg.PrivateAddr, "self_merge", cfg.AllowSelfMerge)
 	}
 
 	srv := api.New(st, clock.Real{}, ulid.NewMinter(nil), api.Config{
@@ -215,6 +236,45 @@ func runServe(_ []string) error {
 // wireMultiRepo seeds the F9 repos registry from config (or the legacy single-repo
 // env) and builds the per-repo reconcile/project Manager. Returns nil when no repo
 // is configured (dev/CI with no creds), so the control plane runs without GitHub.
+// isLoopbackAddr reports whether a listen address is loopback-only (so an open,
+// no-auth worker API is not exposed to the network). The default ":7070" binds ALL
+// interfaces and is therefore NOT loopback-only.
+func isLoopbackAddr(addr string) bool {
+	host := addr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		host = addr[:i]
+	}
+	switch host {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	default:
+		return false
+	}
+}
+
+// ensureControlMirror clones the control-plane bare mirror from the GitHub token
+// when FLOWBEE_MIRROR_PATH is set but the directory is absent. The token is baked
+// into the mirror's origin so the periodic fetch and branch pushes work against a
+// private repo; the mirror lives on the control plane, which holds the token anyway.
+func ensureControlMirror(logger *slog.Logger) {
+	mp := os.Getenv("FLOWBEE_MIRROR_PATH")
+	if mp == "" {
+		return
+	}
+	if _, err := os.Stat(mp); err == nil {
+		return // already provisioned
+	}
+	url := githubPushURL()
+	if url == "" {
+		logger.Warn("FLOWBEE_MIRROR_PATH set but absent and no FLOWBEE_GITHUB_OWNER/REPO/TOKEN to clone it", "path", mp)
+		return
+	}
+	logger.Info("provisioning control-plane mirror from GitHub", "path", mp)
+	if out, err := exec.Command("git", "clone", "--bare", "--quiet", url, mp).CombinedOutput(); err != nil {
+		logger.Error("clone control-plane mirror", "err", err, "out", strings.TrimSpace(string(out)))
+	}
+}
+
 // githubPushURL builds the credential-bearing https remote the control plane
 // pushes build branches to (so a PR can open), from the single-repo GitHub env.
 // Empty when any of owner/repo/token is unset — auto PR-open is then disabled.
