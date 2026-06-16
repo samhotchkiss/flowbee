@@ -22,6 +22,18 @@ type EngineState struct {
 	Epoch  int              // the live lease epoch of the job (the fence in force)
 	GitHub job.DomainBFacts // reconciled-IN facts (M3: from a stubbed FactSource)
 	Policy job.Policy       // THE ONE DECISION (§14): AllowSelfMerge
+	Spec   SpecState        // spec-flow inputs (M7): the CURRENT content hash + lenses
+}
+
+// SpecState carries the spec-flow ground truth the gate reasons over (§11.5):
+// the spec branch's CURRENT content hash (the authority), its version, and the
+// author/reviewer lenses (the §5.5 distinct-lens term). Resolved by the runtime
+// from the persisted spec job and passed IN — the engine never reads the bytes.
+type SpecState struct {
+	CurrentHash  string
+	Version      int
+	AuthorLens   string
+	ReviewerLens string
 }
 
 // Event is the closed set of triggers the core understands (M1 subset).
@@ -54,11 +66,26 @@ type ReviewClaim struct {
 // the runtime fires it after the gate mints an approval.
 type MergeDispatch struct{}
 
-func (Heartbeat) isEngineEvent()     {}
-func (WorkResult) isEngineEvent()    {}
-func (Release) isEngineEvent()       {}
-func (ReviewClaim) isEngineEvent()   {}
-func (MergeDispatch) isEngineEvent() {}
+// SpecReviewClaim is a fenced spec-review work-product CLAIM (§11, I-9). The
+// reviewer's decision + the two sub-checks are a CLAIM only — never authoritative.
+// The engine runs the pure spec gate (over the CURRENT content hash, the bytes are
+// the ground truth, not a GitHub fact) and either mints a content-hash-bound
+// sign-off or bounces/supersedes. The runtime resolves CurrentSpecHash + lenses
+// from the persisted spec job and passes them in EngineState.Spec.
+type SpecReviewClaim struct {
+	Epoch             int
+	Claim             job.VerdictValue
+	ClaimBindsTo      string // the spec_content_hash the worker judged
+	MeetsStyle        bool
+	MeetsRequirements bool
+}
+
+func (Heartbeat) isEngineEvent()       {}
+func (WorkResult) isEngineEvent()      {}
+func (Release) isEngineEvent()         {}
+func (ReviewClaim) isEngineEvent()     {}
+func (MergeDispatch) isEngineEvent()   {}
+func (SpecReviewClaim) isEngineEvent() {}
 
 // Directive is the continue|cancel reply to a heartbeat.
 type Directive string
@@ -78,9 +105,10 @@ type Transition struct {
 	From          job.State
 	To            job.State
 	Kind          ledger.EventKind
-	BouncesDelta  int          // increment applied to the bounces counter
-	AttemptsDelta int          // increment applied to the attempts counter
-	Verdict       *job.Verdict // the minted, tamper-evident sign-off (I-9); nil if none
+	BouncesDelta  int              // increment applied to the bounces counter
+	AttemptsDelta int              // increment applied to the attempts counter
+	Verdict       *job.Verdict     // the minted, tamper-evident sign-off (I-9); nil if none
+	SpecSignoff   *job.SpecSignoff // the minted, content-hash-bound spec sign-off (§11.5); nil if none
 }
 
 // Decision is DATA describing intent. The runtime applies it; the core never acts.
@@ -90,8 +118,12 @@ type Decision struct {
 	// facts (I-9), if any. The runtime persists it into jobs.verdict. It is also
 	// carried on the minting transition so a single apply covers both.
 	VerdictMint *job.Verdict
-	Directive   *Directive
-	Reject      *RejectReason
+	// SpecMint is the content-hash-bound spec sign-off the spec gate minted (§11.5),
+	// if any. The runtime persists it into jobs.spec_signoff and triggers
+	// materialize_issues (project-OUT renders the GitHub issue).
+	SpecMint  *job.SpecSignoff
+	Directive *Directive
+	Reject    *RejectReason
 }
 
 // fenced checks the caller's epoch against the live fence. It returns a non-nil
@@ -197,6 +229,58 @@ func Decide(s EngineState, e Event) Decision {
 			}}}
 		default:
 			return Decision{Reject: &RejectReason{Reason: "gate produced no transition"}}
+		}
+
+	case SpecReviewClaim:
+		if r := staleEpoch(ev.Epoch, s.Epoch); r != nil {
+			return Decision{Reject: r}
+		}
+		if s.Job.State != job.StateSpecReview {
+			return Decision{Reject: &RejectReason{Reason: "job not in spec_review"}}
+		}
+		// I-9 / §11.5: run the PURE spec gate over the CURRENT content hash (the
+		// bytes, the only ground truth pre-SHA) — NOT the claim. A hostile
+		// `signed_off` over a stale binding or a failed conjunction never mints.
+		out := job.EvaluateSpecGate(job.SpecGateInputs{
+			Claim:             ev.Claim,
+			ClaimBindsTo:      ev.ClaimBindsTo,
+			MeetsStyle:        ev.MeetsStyle,
+			MeetsRequirements: ev.MeetsRequirements,
+			CurrentSpecHash:   s.Spec.CurrentHash,
+			SpecVersion:       s.Spec.Version,
+			ReviewerLens:      s.Spec.ReviewerLens,
+			AuthorLens:        s.Spec.AuthorLens,
+			Bounces:           s.Job.Bounces,
+			MaxBounce:         s.Job.MaxBounces,
+		})
+		switch out.Trigger {
+		case job.TriggerSpecSignedOff:
+			return Decision{
+				SpecMint: out.Signoff,
+				Transitions: []Transition{{
+					From: job.StateSpecReview, To: job.StateDone,
+					Kind: ledger.KindSpecSignoffMinted, SpecSignoff: out.Signoff,
+				}},
+			}
+		case job.TriggerSpecSuperseded:
+			// the spec advanced mid-review: reject as superseded, re-arm the gate
+			// (back to spec_authoring to re-review the new bytes).
+			return Decision{Transitions: []Transition{{
+				From: job.StateSpecReview, To: job.StateSpecAuthoring,
+				Kind: ledger.KindSpecSuperseded,
+			}}}
+		case job.TriggerBounce:
+			return Decision{Transitions: []Transition{{
+				From: job.StateSpecReview, To: job.StateSpecAuthoring,
+				Kind: ledger.KindSpecBounced, BouncesDelta: 1,
+			}}}
+		case job.TriggerBounceExhausted:
+			return Decision{Transitions: []Transition{{
+				From: job.StateSpecReview, To: job.StateNeedsHuman,
+				Kind: ledger.KindBounceExhausted, BouncesDelta: 1,
+			}}}
+		default:
+			return Decision{Reject: &RejectReason{Reason: "spec gate produced no transition"}}
 		}
 
 	case MergeDispatch:

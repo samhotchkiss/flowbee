@@ -766,7 +766,9 @@ const jobSelect = `
 	       COALESCE(lease_id,''), lease_epoch,
 	       COALESCE(bound_identity,''), COALESCE(bound_model_family,''), COALESCE(bound_lens,''),
 	       attempts, max_attempts, bounces, max_bounces, stall_revocations,
-	       COALESCE(verdict,''), job_seq
+	       COALESCE(verdict,''), job_seq,
+	       COALESCE(spec_content_hash,''), COALESCE(spec_version,0), COALESCE(spec_signoff,''),
+	       COALESCE(issue_number,0), COALESCE(pr_number,0)
 	  FROM jobs`
 
 type rowScanner interface {
@@ -775,13 +777,15 @@ type rowScanner interface {
 
 func scanJob(row rowScanner) (job.Job, error) {
 	var j job.Job
-	var kind, role, blockedJSON, reqJSON, enqueued, verdictJSON string
+	var kind, role, blockedJSON, reqJSON, enqueued, verdictJSON, specSignoffJSON string
 	err := row.Scan(&j.ID, &kind, &j.Flow, &j.Stage, (*string)(&j.State), &role,
 		&j.BaseSHA, &j.HeadSHA, &j.Priority, &blockedJSON, &reqJSON, &enqueued,
 		&j.LeaseID, &j.LeaseEpoch,
 		&j.BoundIdentity, &j.BoundModelFamily, &j.BoundLens,
 		&j.Attempts, &j.MaxAttempts, &j.Bounces, &j.MaxBounces, &j.StallRevocations,
-		&verdictJSON, &j.JobSeq)
+		&verdictJSON, &j.JobSeq,
+		&j.SpecContentHash, &j.SpecVersion, &specSignoffJSON,
+		&j.IssueNum, &j.PRNumber)
 	if err != nil {
 		return j, err
 	}
@@ -796,6 +800,12 @@ func scanJob(row rowScanner) (job.Job, error) {
 		var v job.Verdict
 		if json.Unmarshal([]byte(verdictJSON), &v) == nil && v.Value != "" {
 			j.Verdict = &v
+		}
+	}
+	if specSignoffJSON != "" && specSignoffJSON != "null" {
+		var s job.SpecSignoff
+		if json.Unmarshal([]byte(specSignoffJSON), &s) == nil && s.Value != "" {
+			j.SpecSignoff = &s
 		}
 	}
 	return j, nil

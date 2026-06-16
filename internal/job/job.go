@@ -25,6 +25,12 @@ const (
 	StateNeedsHuman    State = "needs_human"
 	StateSuperseded    State = "superseded"
 	StateCancelled     State = "cancelled"
+	// StateQuiescent is the ADOPT-mode mirrored-but-quiescent state (§12.7, I-16):
+	// a job imported from a pre-existing GitHub issue/PR on first boot. It is
+	// reconciled (full Domain-B facts) but NEVER scheduled (no lease) and NEVER
+	// rendered OUT (project-OUT suppressed) until deliberate opt-in. It holds no
+	// active lease, so it is absent from the one_active_lease_per_job index.
+	StateQuiescent State = "quiescent"
 )
 
 // Role is the slot a worker is bound to for a stage (DESIGN §5.2).
@@ -114,6 +120,11 @@ type Job struct {
 	// SHA binding (build)
 	BaseSHA string
 	HeadSHA string
+
+	// spec binding (spec flow, §11)
+	SpecContentHash string
+	SpecVersion     int
+	SpecSignoff     *SpecSignoff
 
 	// scheduling
 	BlockedBy []string // DAG predecessors; job is `ready` only when all are `done`

@@ -2,7 +2,9 @@ package github
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"time"
 )
 
 // Fake is an in-memory, scriptable Client (BUILD.md §6.4). It records every call
@@ -16,14 +18,32 @@ type Fake struct {
 	mu    sync.Mutex
 	prs   map[int]PullRequest
 	rate  RateLimit
-	calls []string // "BoardSweep" / "PullRequest(N)" in order, for assertions
+	calls []string // "BoardSweep" / "PullRequest(N)" / "OpenPR" / ... in order, for assertions
+
+	// project-OUT write state (§8.2).
+	nextPR     int
+	nextIssue  int
+	issues     map[int]CreateIssueInput
+	labels     map[int][]string
+	checks     []string // "name@sha=conclusion"
+	enqueued   []int    // PR numbers enqueued to the merge queue
+	protection map[string]Protection
+
+	// retryAfter, when >0, makes the NEXT write return *ErrRetryAfter (§8.2.4),
+	// then resets — so a test can prove the sender parks the outbox and retries.
+	retryAfter time.Duration
 }
 
 // NewFake builds an empty Fake with a healthy starting rate-limit budget.
 func NewFake() *Fake {
 	return &Fake{
-		prs:  map[int]PullRequest{},
-		rate: RateLimit{Limit: 5000, Remaining: 5000},
+		prs:        map[int]PullRequest{},
+		rate:       RateLimit{Limit: 5000, Remaining: 5000},
+		nextPR:     1000,
+		nextIssue:  2000,
+		issues:     map[int]CreateIssueInput{},
+		labels:     map[int][]string{},
+		protection: map[string]Protection{},
 	}
 }
 
@@ -73,6 +93,142 @@ func (f *Fake) PullRequest(ctx context.Context, number int) (PullRequest, bool, 
 	f.calls = append(f.calls, sprintfPR(number))
 	pr, ok := f.prs[number]
 	return pr, ok, nil
+}
+
+// ── project-OUT scripting helpers ──
+
+// SetBranchProtection scripts the server-side protection on a branch (I-8, §9.6).
+func (f *Fake) SetBranchProtection(branch string, p Protection) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.protection[branch] = p
+}
+
+// FailNextWriteWithRetryAfter makes the next write return *ErrRetryAfter (§8.2.4).
+func (f *Fake) FailNextWriteWithRetryAfter(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.retryAfter = d
+}
+
+// PRState returns a scripted PR (for assertions about an opened/labeled PR).
+func (f *Fake) PRState(number int) (PullRequest, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pr, ok := f.prs[number]
+	return pr, ok
+}
+
+// Labels returns the labels SET on a PR/issue (a copy).
+func (f *Fake) Labels(number int) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.labels[number]...)
+}
+
+// Enqueued returns the PR numbers enqueued to the merge queue (a copy).
+func (f *Fake) Enqueued() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.enqueued...)
+}
+
+// Issues returns the materialized issues (a copy).
+func (f *Fake) Issues() map[int]CreateIssueInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[int]CreateIssueInput, len(f.issues))
+	for k, v := range f.issues {
+		out[k] = v
+	}
+	return out
+}
+
+// retryGate returns *ErrRetryAfter once, if armed. Caller holds f.mu.
+func (f *Fake) retryGate() error {
+	if f.retryAfter > 0 {
+		d := f.retryAfter
+		f.retryAfter = 0
+		return &ErrRetryAfter{RetryAfter: d}
+	}
+	return nil
+}
+
+// ── Writer implementation ──
+
+func (f *Fake) OpenPR(ctx context.Context, in OpenPRInput) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "OpenPR")
+	if err := f.retryGate(); err != nil {
+		return 0, err
+	}
+	f.nextPR++
+	n := f.nextPR
+	f.prs[n] = PullRequest{
+		Number: n, IsDraft: in.Draft, HeadRefOid: in.HeadRef, BaseRefOid: in.BaseRef,
+		CIRollup: CIPending, UpdatedAt: time.Unix(0, 0),
+	}
+	return n, nil
+}
+
+func (f *Fake) CreateIssue(ctx context.Context, in CreateIssueInput) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "CreateIssue")
+	if err := f.retryGate(); err != nil {
+		return 0, err
+	}
+	f.nextIssue++
+	n := f.nextIssue
+	f.issues[n] = in
+	f.labels[n] = append([]string(nil), in.Labels...)
+	return n, nil
+}
+
+func (f *Fake) SetLabels(ctx context.Context, number int, labels []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("SetLabels(%d)", number))
+	if err := f.retryGate(); err != nil {
+		return err
+	}
+	f.labels[number] = append([]string(nil), labels...)
+	if pr, ok := f.prs[number]; ok {
+		pr.Labels = append([]string(nil), labels...)
+		f.prs[number] = pr
+	}
+	return nil
+}
+
+func (f *Fake) CreateCheck(ctx context.Context, sha, name, conclusion string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("CreateCheck(%s)", name))
+	if err := f.retryGate(); err != nil {
+		return err
+	}
+	f.checks = append(f.checks, fmt.Sprintf("%s@%s=%s", name, sha, conclusion))
+	return nil
+}
+
+func (f *Fake) EnqueueMergeQueue(ctx context.Context, number int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("EnqueueMergeQueue(%d)", number))
+	if err := f.retryGate(); err != nil {
+		return err
+	}
+	f.enqueued = append(f.enqueued, number)
+	return nil
+}
+
+func (f *Fake) BranchProtection(ctx context.Context, branch string) (Protection, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("BranchProtection(%s)", branch))
+	p, ok := f.protection[branch]
+	return p, ok, nil
 }
 
 func sprintfPR(n int) string {

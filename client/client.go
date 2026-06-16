@@ -64,15 +64,27 @@ type LeaseGrant struct {
 	Provisioning string `json:"provisioning"`
 	MirrorPath   string `json:"mirror_path"`
 	PushTarget   string `json:"push_target"`
+
+	SpecContentHash string `json:"spec_content_hash"`
+	SpecVersion     int    `json:"spec_version"`
 }
 
 // Lease long-polls for a lease. ok=false means a 204 (no work this round).
 func (c *Client) Lease(ctx context.Context, identity, family, role string) (LeaseGrant, bool, error) {
+	return c.LeaseWithLens(ctx, identity, family, role, "")
+}
+
+// LeaseWithLens long-polls carrying the worker's lens (the §5.5 distinct-lens
+// anti-affinity input for spec_review). ok=false means a 204.
+func (c *Client) LeaseWithLens(ctx context.Context, identity, family, role, lens string) (LeaseGrant, bool, error) {
 	q := url.Values{}
 	q.Set("identity", identity)
 	q.Set("model_family", family)
 	if role != "" {
 		q.Set("role", role)
+	}
+	if lens != "" {
+		q.Set("lens", lens)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/v1/lease?"+q.Encode(), nil)
 	if err != nil {
@@ -142,6 +154,45 @@ func (c *Client) Review(ctx context.Context, jobID string, epoch int, idemKey, v
 	var out ReviewResponse
 	body := map[string]string{"verdict": verdict, "disposition": disposition}
 	st, err := c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/review", h, body, &out)
+	return out, st, err
+}
+
+// SpecSubmit posts the spec_author's draft prose (§11.6). Flowbee commits it and
+// computes the content hash; the response carries the hash the reviewer will bind
+// to. status is the HTTP status (409 = stale).
+func (c *Client) SpecSubmit(ctx context.Context, jobID string, epoch int, specMarkdown string, version int) (hash string, vers int, status int, err error) {
+	var out struct {
+		Accepted        bool   `json:"accepted"`
+		SpecContentHash string `json:"spec_content_hash"`
+		SpecVersion     int    `json:"spec_version"`
+	}
+	st, e := c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/spec", epochHeader(epoch),
+		map[string]any{"spec_markdown": specMarkdown, "version": version}, &out)
+	return out.SpecContentHash, out.SpecVersion, st, e
+}
+
+// SpecReviewResponse is the spec gate reply.
+type SpecReviewResponse struct {
+	Accepted   bool   `json:"accepted"`
+	JobState   string `json:"job_state"`
+	Minted     bool   `json:"minted"`
+	Superseded bool   `json:"superseded"`
+}
+
+// SpecReview posts a fenced spec-review verdict CLAIM + sub-checks + the hash it
+// judged (§11.5). The server's gate decides from the CURRENT bytes (I-9). status
+// is the HTTP status (409 = stale).
+func (c *Client) SpecReview(ctx context.Context, jobID string, epoch int, idemKey, decision, bindsTo string, meetsStyle, meetsReq bool) (SpecReviewResponse, int, error) {
+	h := epochHeader(epoch)
+	if idemKey != "" {
+		h["Idempotency-Key"] = idemKey
+	}
+	var out SpecReviewResponse
+	body := map[string]any{
+		"decision": decision, "binds_to": bindsTo,
+		"meets_style": meetsStyle, "meets_requirements": meetsReq,
+	}
+	st, err := c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/spec-review", h, body, &out)
 	return out, st, err
 }
 

@@ -39,6 +39,15 @@ const (
 	// M6 reconcile-IN event kinds (Domain-B-driven transitions; actor='reconcile').
 	KindFactsReconciled EventKind = "facts_reconciled" // a sweep/refetch wrote Domain-B facts (audit)
 	KindSuperseded      EventKind = "superseded"       // SHA move re-armed the job to ready (I-5, §6.2.4)
+	// M7 spec-flow + project-OUT event kinds.
+	KindSpecAuthored      EventKind = "spec_authored"       // Flowbee committed spec.md, opened spec_review (§11.6)
+	KindSpecClaim         EventKind = "spec_claim"          // the spec reviewer's CLAIM (untrusted, I-9)
+	KindSpecSignoffMinted EventKind = "spec_signoff_minted" // the gate MINTED a content-hash-bound spec sign-off (§11.5)
+	KindSpecBounced       EventKind = "spec_bounced"        // spec_review -> spec_authoring (changes_requested)
+	KindSpecSuperseded    EventKind = "spec_superseded"     // a spec edit voided the sign-off; gate re-armed (§11.5)
+	KindIssueMaterialized EventKind = "issue_materialized"  // a signed-off spec materialized a GitHub issue (§11)
+	KindPROpened          EventKind = "pr_opened"           // Flowbee opened the PR and stamped # (§7.3, §8.2.1)
+	KindAdopted           EventKind = "adopted"             // a pre-existing issue/PR imported quiescent (I-16)
 )
 
 // Event is one appended ledger row. Payload holds kind-specific RESOLVED facts as
@@ -83,6 +92,13 @@ type Payload struct {
 	VerdictClaim job.VerdictValue `json:",omitempty"`
 	Disposition  job.Disposition  `json:",omitempty"`
 	Verdict      *job.Verdict     `json:",omitempty"`
+
+	// spec flow (M7): the spec content hash + version + the minted sign-off (§11).
+	SpecContentHash string           `json:",omitempty"`
+	SpecVersion     int              `json:",omitempty"`
+	SpecSignoff     *job.SpecSignoff `json:",omitempty"`
+	IssueNumber     int              `json:",omitempty"`
+	PRNumber        int              `json:",omitempty"`
 }
 
 // Fold replays events into the jobs projection. PURE: no clock, no RNG, no I/O.
@@ -212,6 +228,65 @@ func Fold(events []Event) (job.Job, error) {
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""
+
+		case KindSpecAuthored:
+			// Flowbee committed spec.md and opened the spec_review gate: record the
+			// content hash + version it bound to. The lease is released (the author
+			// stage handed off the draft).
+			j.State = e.ToState
+			j.SpecContentHash = e.Payload.SpecContentHash
+			j.SpecVersion = e.Payload.SpecVersion
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindSpecClaim:
+			// the untrusted spec-review claim is recorded for audit; it changes no
+			// projection field (a worker can never write a sign-off, I-9).
+		case KindSpecSignoffMinted:
+			// the gate minted a content-hash-bound spec sign-off. The spec job is
+			// done; the sign-off is stamped + the build gate it authorizes opens.
+			j.State = e.ToState
+			j.SpecSignoff = e.Payload.SpecSignoff
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindSpecBounced:
+			// spec_review -> spec_authoring: changes_requested. Increment bounces,
+			// release the gate lease, re-arm the author stage.
+			j.State = e.ToState
+			j.Bounces += e.Payload.BouncesDelta
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindSpecSuperseded:
+			// a spec edit landed mid-review: the prior sign-off (if any) is void; the
+			// gate re-arms against the new bytes. The new hash rides the event.
+			j.State = e.ToState
+			j.SpecSignoff = nil
+			if e.Payload.SpecContentHash != "" {
+				j.SpecContentHash = e.Payload.SpecContentHash
+				j.SpecVersion = e.Payload.SpecVersion
+			}
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindIssueMaterialized:
+			// project-OUT created the GitHub issue; Flowbee stamped the number.
+			j.IssueNum = e.Payload.IssueNumber
+		case KindPROpened:
+			// Flowbee opened the PR and stamped the number (§7.3). The worker never
+			// supplies a PR field; Domain B owns existence.
+			j.PRNumber = e.Payload.PRNumber
+		case KindAdopted:
+			// a pre-existing issue/PR imported quiescent (I-16). State is the imported
+			// quiescent marker; no scheduling.
+			j.State = e.ToState
+			if e.Payload.PRNumber != 0 {
+				j.PRNumber = e.Payload.PRNumber
+			}
+			if e.Payload.IssueNumber != 0 {
+				j.IssueNum = e.Payload.IssueNumber
+			}
 		}
 		j.JobSeq = e.JobSeq
 	}

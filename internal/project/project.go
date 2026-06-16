@@ -1,0 +1,202 @@
+// Package project is the project-OUT loop (DESIGN §3.3, §8.2): the ONLY writer to
+// GitHub (R4). It drains the transactional outbox through a SINGLE serialized
+// sender — ≤1 in-flight GitHub mutation at a time (§8.2.4) — under the single
+// installation identity. Every action is keyed (job_id, action, head_sha) for
+// idempotent dedupe; a drained row writes exactly one audit-log entry keyed the
+// same way (§3.3). It honors Retry-After by parking the WHOLE outbox.
+//
+// It suppresses every action on an ADOPT-quiescent job (the §8.2.3 exception,
+// I-16): a human's label on a quiescent job is not drift, so Flowbee never
+// reasserts a rendering over human-owned in-flight work.
+//
+// It is NOT a deterministic-core package (it does network I/O via the GitHub
+// Writer and reads a clock); archcheck forbids the core from importing it.
+package project
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	gh "github.com/samhotchkiss/flowbee/internal/github"
+	"github.com/samhotchkiss/flowbee/internal/store"
+)
+
+// Clock is the injected clock (DESIGN: Flowbee is the sole clock).
+type Clock interface{ Now() time.Time }
+
+// Publisher surfaces a project-OUT action live on the SSE feed (optional).
+type Publisher interface {
+	PublishReconcile(jobID, event string)
+}
+
+// Sender drains the outbox to GitHub. There is exactly ONE sender (§8.2.4), so
+// the read-send-mark loop needs no cross-sender locking.
+type Sender struct {
+	store *store.Store
+	gh    gh.Writer
+	clock Clock
+	pub   Publisher
+
+	// parkedUntil is the Retry-After park horizon (§8.2.4): while now < it, the
+	// WHOLE outbox is parked. Single-sender, so a plain field is safe (Drain is
+	// not called concurrently with itself).
+	parkedUntil time.Time
+}
+
+// New builds a Sender over a github.Writer (real or fake).
+func New(st *store.Store, w gh.Writer, clk Clock, pub Publisher) *Sender {
+	return &Sender{store: st, gh: w, clock: clk, pub: pub}
+}
+
+// DrainOnce drains every currently-pending outbox row, oldest first, ≤1 in-flight
+// (§8.2.4). It stops early if a Retry-After parks the outbox or a send errors
+// transiently (the row stays pending for the next drain). It returns the number of
+// rows successfully sent. The drain is the project-OUT tick the runtime calls on a
+// timer + after each state change.
+func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
+	if now := s.clock.Now(); now.Before(s.parkedUntil) {
+		return 0, nil // the whole outbox is parked (§8.2.4)
+	}
+	sent := 0
+	for {
+		row, ok, err := s.store.NextPendingOutbox(ctx)
+		if err != nil {
+			return sent, err
+		}
+		if !ok {
+			return sent, nil
+		}
+		// §8.2.3 / I-16: suppress every action on an adopted-quiescent job. Mark the
+		// row abandoned so it never renders over human-owned in-flight work.
+		quiescent, qerr := s.store.IsQuiescent(ctx, row.JobID)
+		if qerr == nil && quiescent {
+			// abandon WITHOUT auditing: a suppressed action never happened (§8.2.3).
+			if err := s.store.MarkOutboxSuppressed(ctx, row.ID); err != nil {
+				return sent, err
+			}
+			continue
+		}
+
+		detail, err := s.send(ctx, row)
+		if err != nil {
+			var ra *gh.ErrRetryAfter
+			if errors.As(err, &ra) {
+				// authoritative secondary limit: park the WHOLE outbox (§8.2.4) and
+				// leave the row pending for the next drain after the park expires.
+				s.parkedUntil = s.clock.Now().Add(ra.RetryAfter)
+				_ = s.store.BumpOutboxAttempts(ctx, row.ID)
+				return sent, nil
+			}
+			// a transient error: bump attempts, leave pending, stop this drain.
+			_ = s.store.BumpOutboxAttempts(ctx, row.ID)
+			return sent, err
+		}
+		if err := s.store.MarkOutboxSent(ctx, row.ID, detail); err != nil {
+			return sent, err
+		}
+		if s.pub != nil {
+			s.pub.PublishReconcile(row.JobID, "project_out:"+row.Action)
+		}
+		sent++
+	}
+}
+
+// send performs the single outbound GitHub mutation for one outbox row and
+// returns an audit detail string. The PR/issue-number-returning actions stamp the
+// returned number back onto the job (Flowbee opens the PR and stamps #, §7.3).
+func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) {
+	var p map[string]any
+	_ = json.Unmarshal([]byte(row.Payload), &p)
+	now := s.clock.Now()
+
+	switch row.Action {
+	case store.ActionOpenPR:
+		number, err := s.gh.OpenPR(ctx, gh.OpenPRInput{
+			Title:   fmt.Sprintf("flowbee: %s", row.JobID),
+			Body:    "Opened by Flowbee from the eng_worker patch (§7.3).",
+			HeadRef: str(p, "head_ref"), BaseRef: orDefault(str(p, "base_ref"), "main"), Draft: true,
+		})
+		if err != nil {
+			return "", err
+		}
+		if err := s.store.StampPRNumber(ctx, row.JobID, number, row.HeadSHA, str(p, "base_ref"), now); err != nil {
+			return "", fmt.Errorf("stamp pr: %w", err)
+		}
+		return fmt.Sprintf("pr=%d", number), nil
+
+	case store.ActionCreateIssue:
+		number, err := s.gh.CreateIssue(ctx, gh.CreateIssueInput{
+			Title:  fmt.Sprintf("flowbee spec: %s", row.JobID),
+			Body:   "Materialized from the signed-off spec.md (§11).",
+			Labels: []string{"flowbee:spec"},
+		})
+		if err != nil {
+			return "", err
+		}
+		if err := s.store.StampIssueNumber(ctx, row.JobID, number, now); err != nil {
+			return "", fmt.Errorf("stamp issue: %w", err)
+		}
+		return fmt.Sprintf("issue=%d", number), nil
+
+	case store.ActionSetLabels:
+		number, _ := s.store.JobPR(ctx, row.JobID)
+		labels := strSlice(p, "labels")
+		if err := s.gh.SetLabels(ctx, number, labels); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("labels=%v", labels), nil
+
+	case store.ActionCreateCheck:
+		if err := s.gh.CreateCheck(ctx, row.HeadSHA, str(p, "name"), orDefault(str(p, "conclusion"), "success")); err != nil {
+			return "", err
+		}
+		return str(p, "name"), nil
+
+	case store.ActionEnqueueMerge:
+		number, _ := s.store.JobPR(ctx, row.JobID)
+		if number == 0 {
+			if n, ok := p["pr_number"].(float64); ok {
+				number = int(n)
+			}
+		}
+		if err := s.gh.EnqueueMergeQueue(ctx, number); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("merge_enqueue pr=%d", number), nil
+
+	default:
+		// an unknown action is dropped to sent (audited) so the queue never wedges.
+		return "noop:" + row.Action, nil
+	}
+}
+
+func str(m map[string]any, k string) string {
+	if v, ok := m[k].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func strSlice(m map[string]any, k string) []string {
+	v, ok := m[k].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(v))
+	for _, e := range v {
+		if s, ok := e.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}

@@ -23,6 +23,11 @@ const (
 	TriggerBounceExhausted Trigger = "bounce_exhausted" // code_review -> needs_human (max_bounces)
 	TriggerHandoff         Trigger = "handoff"          // mergeable -> merge_handoff (distinct merger arm)
 	TriggerSelfMerge       Trigger = "self_merge"       // mergeable -> merging (reviewer-attributed)
+	// M7 spec-flow gate triggers (§11).
+	TriggerSpecReviewClaimed Trigger = "spec_review_claimed" // spec_authoring -> spec_review (reviewer leases)
+	TriggerSpecSignedOff     Trigger = "spec_signed_off"     // spec_review -> done (sign-off minted; issue materialized)
+	TriggerSpecSuperseded    Trigger = "spec_superseded"     // spec edit voided the sign-off; re-arm the gate
+	TriggerSpecAuthored      Trigger = "spec_authored"       // spec_authoring -> spec_review (author submitted draft)
 )
 
 // ErrIllegalTransition is returned for any (state, trigger) pair not in the table.
@@ -73,6 +78,18 @@ var transitions = map[transitionKey]State{
 	// the branch point after a passing gate (§5.4):
 	{StateMergeable, TriggerHandoff}:   StateMergeHandoff,
 	{StateMergeable, TriggerSelfMerge}: StateMerging,
+
+	// M7 spec-flow edges (§11). The spec_author drafts in spec_authoring; on
+	// submit the gate stage spec_review opens; a minted sign-off completes the
+	// spec job (-> done, having materialized the issue); changes_requested bounces
+	// back to spec_authoring; a spec edit supersedes a sign-off and re-arms.
+	{StateSpecAuthoring, TriggerSpecAuthored}:   StateSpecReview,
+	{StateSpecReview, TriggerSpecSignedOff}:     StateDone,
+	{StateSpecReview, TriggerBounce}:            StateSpecAuthoring,
+	{StateSpecReview, TriggerBounceExhausted}:   StateNeedsHuman,
+	{StateSpecReview, TriggerSpecSuperseded}:    StateSpecAuthoring,
+	{StateSpecReview, TriggerReleased}:          StateSpecAuthoring,
+	{StateSpecReview, TriggerLeaseExpiredRetry}: StateSpecAuthoring,
 }
 
 // Next is the pure §6.2 state machine: (state, trigger) -> next state. It is a

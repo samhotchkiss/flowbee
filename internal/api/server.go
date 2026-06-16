@@ -17,6 +17,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/lease"
 	"github.com/samhotchkiss/flowbee/internal/scheduler"
+	"github.com/samhotchkiss/flowbee/internal/spec"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/ulid"
 	"github.com/samhotchkiss/flowbee/internal/worker"
@@ -126,6 +127,8 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{job}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /v1/jobs/{job}/result", s.result)
 	mux.HandleFunc("POST /v1/jobs/{job}/review", s.review)
+	mux.HandleFunc("POST /v1/jobs/{job}/spec", s.specSubmit)
+	mux.HandleFunc("POST /v1/jobs/{job}/spec-review", s.specReview)
 	mux.HandleFunc("POST /v1/jobs/{job}/release", s.release)
 	mux.HandleFunc("GET /v1/events", s.eventsHandler)
 	mux.HandleFunc("GET /v1/budget", s.budgetJSON)
@@ -208,6 +211,11 @@ type LeaseGrant struct {
 	Provisioning string `json:"provisioning"`
 	MirrorPath   string `json:"mirror_path"`
 	PushTarget   string `json:"push_target"`
+	// Spec-flow inputs (§11): the content hash the reviewer must bind its verdict
+	// to. The spec_review lease carries it so the reviewer judges the EXACT bytes
+	// (a stale binding is rejected as superseded, §11.5).
+	SpecContentHash string `json:"spec_content_hash,omitempty"`
+	SpecVersion     int    `json:"spec_version,omitempty"`
 }
 
 // lease long-polls: rank `ready` candidates (scheduler: priority + aging +
@@ -231,18 +239,27 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	if role == "" {
 		role = job.RoleEngWorker
 	}
+	lens := r.URL.Query().Get("lens")
 	reviewing := role == job.RoleCodeReviewer
+	specAuthoring := role == job.RoleSpecAuthor
+	specReviewing := role == job.RoleSpecReviewer
 
 	deadline := time.Now().Add(s.longPollWait)
 	for {
-		// the gate stage (code_review) is claimed from review_pending jobs; every
-		// other role claims `ready` jobs. The atomic claim is the correctness
-		// backstop in both cases (§6.3.1).
+		// each role claims from its own source state: code_review from review_pending,
+		// spec_author from spec_authoring, spec_review from spec_review, every other
+		// (eng_worker) from `ready`. The atomic claim is the correctness backstop in
+		// every case (§6.3.1).
 		var cands []scheduler.Candidate
 		var err error
-		if reviewing {
+		switch {
+		case reviewing:
 			cands, err = s.store.ReviewPendingCandidates(r.Context())
-		} else {
+		case specAuthoring:
+			cands, err = s.store.SpecAuthoringCandidates(r.Context())
+		case specReviewing:
+			cands, err = s.store.SpecReviewCandidates(r.Context())
+		default:
 			cands, err = s.store.ReadyCandidates(r.Context())
 		}
 		if err != nil {
@@ -251,12 +268,23 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, cand := range scheduler.Order(cands, attested, s.clock.Now()) {
 			var ls *lease.Lease
-			if reviewing {
+			switch {
+			case reviewing:
 				ls, err = s.store.ClaimReviewJob(r.Context(), store.ClaimReviewParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
 					ModelFamily: family, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
 				})
-			} else {
+			case specAuthoring:
+				ls, err = s.store.ClaimSpecAuthor(r.Context(), store.ClaimSpecAuthorParams{
+					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
+					ModelFamily: family, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+				})
+			case specReviewing:
+				ls, err = s.store.ClaimSpecReview(r.Context(), store.ClaimSpecReviewParams{
+					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
+					ModelFamily: family, Lens: lens, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+				})
+			default:
 				ls, err = s.store.ClaimReadyJob(r.Context(), store.ClaimParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
 					ModelFamily: family, Role: role, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
@@ -269,6 +297,7 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 					JobID: cand.JobID, Kind: string(j.Kind), Role: string(j.Role),
 					BaseSHA: j.BaseSHA, LeaseID: ls.LeaseID, LeaseEpoch: ls.Epoch,
 					LeaseTTLS: int(s.leaseTTL / time.Second), Deadline: ls.Deadline.Format(time.RFC3339Nano),
+					SpecContentHash: j.SpecContentHash, SpecVersion: j.SpecVersion,
 				}
 				// same-box `worktree` provisioning hints (§7.4): only for build jobs
 				// that carry a base_sha and only when a local mirror is configured.
@@ -345,6 +374,89 @@ func (s *Server) review(w http.ResponseWriter, r *http.Request) {
 			s.broker.Publish(LifeEvent{JobID: jobID, State: string(final), Event: "merge_dispatched", Epoch: epoch})
 		}
 	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// specSubmit is the spec_author's work-product submission (§11.6): the author
+// POSTs the spec_doc prose; FLOWBEE — never the worker — commits it (computes the
+// BLAKE3 content hash) and opens the spec_review gate. The author cannot
+// self-address its artifact (§11.1). Fenced by the author's lease epoch.
+func (s *Server) specSubmit(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job")
+	epoch, ok := epochFromHeader(r)
+	if !ok {
+		http.Error(w, "missing X-Lease-Epoch", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		SpecMarkdown string `json:"spec_markdown"`
+		Version      int    `json:"version"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	version := body.Version
+	if version == 0 {
+		version = 1
+	}
+	// Flowbee owns the hash (§11.1): the author submits bytes, Flowbee addresses them.
+	hash := spec.ContentHash([]byte(body.SpecMarkdown))
+	if err := s.store.MaterializeSpec(r.Context(), store.MaterializeSpecParams{
+		JobID: jobID, ContentHash: hash, Version: version, Epoch: epoch, Now: s.clock.Now(),
+	}); err != nil {
+		s.writeFenceError(w, err)
+		return
+	}
+	s.broker.Publish(LifeEvent{JobID: jobID, State: string(job.StateSpecReview), Event: "spec_authored", Epoch: epoch})
+	writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "spec_content_hash": hash, "spec_version": version})
+}
+
+// specReviewRequest is the spec reviewer's verdict CLAIM + the two §11.3 sub-checks
+// + the content hash it judged. Untrusted (I-9): the gate decides from the bytes.
+type specReviewRequest struct {
+	Decision          string `json:"decision"`           // signed_off | changes_requested
+	BindsTo           string `json:"binds_to"`           // the spec_content_hash the worker judged
+	MeetsStyle        bool   `json:"meets_style"`        // Q1
+	MeetsRequirements bool   `json:"meets_requirements"` // Q2
+}
+
+// specReview runs the I-9 spec gate for a fenced spec-review result (§11.5). The
+// worker's claim is recorded untrusted; the gate mints (or refuses) the
+// content-hash-bound sign-off from the CURRENT spec bytes. On a sign-off it
+// enqueues materialize_issues (project-OUT renders the issue). Stale epoch -> 409.
+func (s *Server) specReview(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job")
+	epoch, ok := epochFromHeader(r)
+	if !ok {
+		http.Error(w, "missing X-Lease-Epoch", http.StatusBadRequest)
+		return
+	}
+	var req specReviewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	resp, err := s.store.SpecReviewResult(r.Context(), store.SpecReviewResultParams{
+		JobID: jobID, Epoch: epoch,
+		Claim:             job.VerdictValue(req.Decision),
+		BindsTo:           req.BindsTo,
+		MeetsStyle:        req.MeetsStyle,
+		MeetsRequirements: req.MeetsRequirements,
+		IdempotencyKey:    r.Header.Get("Idempotency-Key"),
+		Now:               s.clock.Now(),
+	})
+	if err != nil {
+		s.writeFenceError(w, err)
+		return
+	}
+	ev := "spec_bounced"
+	if resp.Minted {
+		ev = "spec_signoff_minted"
+	} else if resp.Superseded {
+		ev = "spec_superseded"
+	}
+	s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: ev, Epoch: epoch})
 	writeJSON(w, http.StatusOK, resp)
 }
 
