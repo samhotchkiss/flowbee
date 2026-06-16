@@ -558,22 +558,35 @@ func (s *Store) Release(ctx context.Context, p ReleaseParams) error {
 		if dec.Reject != nil {
 			return lease.ErrStaleEpoch
 		}
+		// re-arm to the state the transition table says a release lands in: a build
+		// lease (leased/building) -> ready (a re-buildable abandon), a GATE lease
+		// (code_review / spec_review / spec_authoring) -> back to its gate state. A
+		// release that hard-coded 'ready' would re-arm the BUILD when a reviewer
+		// merely let go — rebuilding good work. Only a build abandon burns an attempt.
+		toState, terr := job.Next(j.State, job.TriggerReleased)
+		if terr != nil {
+			toState = job.StateReady
+		}
+		attemptsDelta := 0
+		if toState == job.StateReady {
+			attemptsDelta = 1
+		}
 		nextSeq := seq + 1
 		ev := ledger.Event{
 			JobID: p.JobID, JobSeq: nextSeq, Kind: ledger.KindLeaseReleased,
-			FromState: j.State, ToState: job.StateReady, LeaseEpoch: j.LeaseEpoch,
+			FromState: j.State, ToState: toState, LeaseEpoch: j.LeaseEpoch,
 			Actor: j.BoundIdentity, CreatedAt: p.Now,
-			Payload: ledger.Payload{AttemptsDelta: 1},
+			Payload: ledger.Payload{AttemptsDelta: attemptsDelta},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs
-			   SET state = 'ready', lease_id = NULL, bound_identity = NULL,
+			   SET state = ?, lease_id = NULL, bound_identity = NULL,
 			       bound_model_family = NULL, lease_hb_due = NULL,
-			       attempts = attempts + 1, updated_at = datetime('now')
-			 WHERE id = ?`, p.JobID); err != nil {
+			       attempts = attempts + ?, updated_at = datetime('now')
+			 WHERE id = ?`, string(toState), attemptsDelta, p.JobID); err != nil {
 			return fmt.Errorf("apply release projection: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `
