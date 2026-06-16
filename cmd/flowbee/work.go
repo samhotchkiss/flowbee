@@ -40,6 +40,11 @@ func runWork(args []string) error {
 	fs := flag.NewFlagSet("work", flag.ContinueOnError)
 	stub := fs.Bool("stub", false, "run the built-in echo stub worker (no worktree)")
 	once := fs.Bool("once", false, "run a single lease cycle, then exit")
+	// credential-less BUNDLE mode (F3): a REMOTE worker holds no GitHub creds and no
+	// mirror — it fetches a read-only bundle of base_sha over the worker channel,
+	// returns ONLY a diff, and the control plane does all git writes (push/PR/merge).
+	// Set on workers across the network (the serve must run FLOWBEE_BUNDLE_PROVISIONING).
+	bundle := fs.Bool("bundle", os.Getenv("FLOWBEE_BUNDLE") != "", "credential-less bundle mode for remote workers (control plane does git writes)")
 	identity := fs.String("identity", envOr("FLOWBEE_IDENTITY", "worker"), "worker identity")
 	family := fs.String("model-family", envOr("FLOWBEE_MODEL_TAG", "stub"), "model family tag")
 	role := fs.String("role", envOr("FLOWBEE_ROLE", ""), "role filter")
@@ -51,8 +56,21 @@ func runWork(args []string) error {
 	modelSlots := fs.String("model-slots", envOr("FLOWBEE_MODEL_SLOTS", ""), "per-model concurrency, e.g. claude:3,codex:3")
 	weight := fs.Int("weight", 0, "per-box distribution weight (default 1)")
 	accounts := fs.String("accounts", envOr("FLOWBEE_ACCOUNTS", ""), "named accounts: account:model:ceiling_pct:rank,...")
+	// --remote: a build box that keeps its OWN local mirror + worktrees per job (many
+	// workers in parallel) and returns a diff for the control plane to push/PR/merge.
+	// Needs only repo READ; --mirror is its local bare mirror, --repo-url where to
+	// clone/pull it from (defaults from FLOWBEE_GITHUB_OWNER/REPO).
+	remote := fs.Bool("remote", os.Getenv("FLOWBEE_REMOTE") != "", "remote build box: own local mirror + per-job worktrees, diff back to the control plane")
+	mirror := fs.String("mirror", envOr("FLOWBEE_MIRROR_PATH", ""), "local bare mirror path (--remote)")
+	repoURL := fs.String("repo-url", envOr("FLOWBEE_REPO_URL", ""), "git URL to clone/pull the local mirror from (--remote)")
+	branch := fs.String("branch", envOr("FLOWBEE_GITHUB_DEFAULT_BRANCH", "main"), "integration branch to track (--remote)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *repoURL == "" {
+		if o, r := os.Getenv("FLOWBEE_GITHUB_OWNER"), os.Getenv("FLOWBEE_GITHUB_REPO"); o != "" && r != "" {
+			*repoURL = "https://github.com/" + o + "/" + r + ".git"
+		}
 	}
 	slots := parseModelSlots(*modelSlots)
 	accts := parseAccounts(*accounts)
@@ -79,6 +97,7 @@ func runWork(args []string) error {
 		BaseURL: url, Identity: *identity, ModelFamily: *family, Role: *role,
 		AgentCmd: *agentCmd, BearerToken: token,
 		ModelSlots: slots, Weight: *weight, Accounts: accts,
+		MirrorPath: *mirror, RepoURL: *repoURL, Branch: *branch,
 	}
 	run := func() error {
 		// review/author roles emit a DECISION (verdict file) — not a patch — so they
@@ -86,9 +105,19 @@ func runWork(args []string) error {
 		// eng_worker (and conflict_resolver) run the worktree build harness.
 		var out worker.HarnessOutcome
 		var err error
-		if worker.IsReviewRole(*role) {
+		switch {
+		case worker.IsReviewRole(*role):
+			// review/author roles judge from context (diff/spec) + emit a verdict —
+			// no git, no creds, so they run identically local or remote.
 			out, err = worker.RunOnceReviewHarness(ctx, cfg)
-		} else {
+		case *remote:
+			// remote build box: own local mirror + per-job worktree, diff back.
+			out, err = worker.RunOnceHarnessRemote(ctx, cfg)
+		case *bundle:
+			// zero-trust remote: credential-less fetched bundle, diff back.
+			out, err = worker.RunOnceHarnessBundle(ctx, cfg)
+		default:
+			// same-box eng_worker: worktree off the control plane's shared mirror.
 			out, err = worker.RunOnceHarness(ctx, cfg)
 		}
 		if err != nil {

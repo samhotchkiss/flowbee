@@ -134,6 +134,15 @@ type HarnessConfig struct {
 	ModelSlots map[string]int
 	Weight     int
 	Accounts   []client.AccountSpecMsg
+	// MirrorPath + RepoURL drive --remote mode (RunOnceHarnessRemote): the worker
+	// keeps its OWN bare mirror at MirrorPath (cloned from RepoURL, fetched each job
+	// to stay current) and provisions a worktree per job off it — so many workers on
+	// one box build in parallel. It returns only a diff; the control plane (which
+	// alone holds write creds) does the GitHub writes. Branch is the integration
+	// branch to track (default main).
+	MirrorPath string
+	RepoURL    string
+	Branch     string
 }
 
 // HarnessOutcome reports what one lease cycle did.
@@ -437,6 +446,149 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		_ = err
 	}
 	return out, nil
+}
+
+// RunOnceHarnessRemote performs ONE build cycle for a REMOTE worker that keeps its
+// OWN local mirror (Sam's multi-box model): clone-if-absent + fetch the integration
+// branch to stay current, provision a per-job worktree off the shared local mirror
+// (so MANY workers on one box build in parallel, each in its own tree), run the
+// agent, and return ONLY a diff. The control plane — which alone holds write
+// credentials — applies the patch + pushes + opens the PR (R4). The worker needs
+// only repo READ (clone/pull); it never pushes to GitHub. Got=false on a 204.
+func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, error) {
+	arch, osName := cfg.Arch, cfg.OS
+	if arch == "" {
+		arch = runtime.GOARCH
+	}
+	if osName == "" {
+		osName = runtime.GOOS
+	}
+	role := cfg.Role
+	if role == "" {
+		role = "eng_worker"
+	}
+	caps := cfg.Capabilities
+	if len(caps) == 0 {
+		caps = []string{"role:" + role, "model_family:" + cfg.ModelFamily, "arch:" + arch, "os:" + osName}
+	}
+
+	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
+	if _, err := c.Register(ctx, client.Registration{
+		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
+		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
+	}); err != nil {
+		return HarnessOutcome{}, fmt.Errorf("register: %w", err)
+	}
+	grant, ok, err := c.Lease(ctx, cfg.Identity, cfg.ModelFamily, cfg.Role)
+	if err != nil {
+		return HarnessOutcome{}, fmt.Errorf("lease: %w", err)
+	}
+	if !ok {
+		return HarnessOutcome{Got: false}, nil
+	}
+	out := HarnessOutcome{Got: true, JobID: grant.JobID, LeaseEpoch: grant.LeaseEpoch}
+	if _, st, err := c.Heartbeat(ctx, grant.JobID, grant.LeaseEpoch); err != nil {
+		return out, fmt.Errorf("heartbeat: %w", err)
+	} else if st != 200 {
+		return out, fmt.Errorf("heartbeat status %d", st)
+	}
+
+	// the worker's OWN local mirror, kept current (clone if absent, else fetch).
+	mirrorPath := cfg.MirrorPath
+	if mirrorPath == "" {
+		mirrorPath = filepath.Join(os.TempDir(), "flowbee-worker-mirror.git")
+	}
+	branch := cfg.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	if err := ensureMirror(ctx, mirrorPath, cfg.RepoURL, branch); err != nil {
+		return out, fmt.Errorf("ensure mirror: %w", err)
+	}
+	mirror := gitops.Open(mirrorPath)
+
+	// per-job worktree off the shared local mirror — parallel-safe across workers.
+	workRoot := cfg.WorkRoot
+	if workRoot == "" {
+		workRoot, err = os.MkdirTemp("", "flowbee-rw-")
+		if err != nil {
+			return out, fmt.Errorf("mkdir workroot: %w", err)
+		}
+		defer os.RemoveAll(workRoot)
+	}
+	wsDir := gitops.WorktreeBase(workRoot, grant.JobID, grant.LeaseEpoch)
+	wt, err := mirror.AddWorktree(wsDir, grant.BaseSHA)
+	if err != nil {
+		return out, fmt.Errorf("provision worktree at %s: %w", grant.BaseSHA, err)
+	}
+	defer wt.Destroy()
+
+	taskEnv, err := writeTaskContext(wsDir, grant)
+	if err != nil {
+		return out, fmt.Errorf("write task context: %w", err)
+	}
+	if cfg.AgentCmd != "" {
+		cmd := exec.CommandContext(ctx, "sh", "-c", cfg.AgentCmd)
+		cmd.Dir = wsDir
+		cmd.Env = append(os.Environ(),
+			"FLOWBEE_JOB_ID="+grant.JobID, "FLOWBEE_BASE_SHA="+grant.BaseSHA, "FLOWBEE_ROLE="+grant.Role)
+		cmd.Env = append(cmd.Env, taskEnv...)
+		var errb strings.Builder
+		cmd.Stderr = &errb
+		if err := cmd.Run(); err != nil {
+			return out, fmt.Errorf("agent cmd: %v: %s", err, strings.TrimSpace(errb.String()))
+		}
+	}
+	_ = os.RemoveAll(filepath.Join(wsDir, ".flowbee"))
+	changed, err := wt.HasChanges()
+	if err != nil {
+		return out, fmt.Errorf("inspect worktree: %w", err)
+	}
+	if !changed {
+		_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
+		return out, fmt.Errorf("agent produced no changes")
+	}
+	diff, err := wt.Diff()
+	if err != nil {
+		return out, fmt.Errorf("diff: %w", err)
+	}
+
+	// return ONLY the diff (no pushed_ref): the control plane applies it, pushes the
+	// epoch ref, and opens the PR (R4 — only the control plane holds write creds).
+	idem := fmt.Sprintf("%s-e%d", grant.JobID, grant.LeaseEpoch)
+	body := map[string]any{
+		"kind": "patch", "base_sha": grant.BaseSHA, "diff": diff,
+		"blast_radius": map[string]any{"scope": "worktree", "paths": content.TouchedPaths(diff)},
+		"status":       "succeeded",
+	}
+	res, st, err := c.Result(ctx, grant.JobID, grant.LeaseEpoch, idem, body)
+	if err != nil {
+		return out, fmt.Errorf("result: %w", err)
+	}
+	if st != 200 {
+		return out, fmt.Errorf("result status %d", st)
+	}
+	out.JobState = res.JobState
+	if _, err := c.Release(ctx, grant.JobID, grant.LeaseEpoch); err != nil {
+		_ = err
+	}
+	return out, nil
+}
+
+// ensureMirror makes the worker's local bare mirror present + current: clone --bare
+// from repoURL if absent, else fetch the integration branch. Read-only — the worker
+// never needs write creds (the control plane does the GitHub writes).
+func ensureMirror(ctx context.Context, mirrorPath, repoURL, branch string) error {
+	if _, err := os.Stat(mirrorPath); err != nil {
+		if repoURL == "" {
+			return fmt.Errorf("no local mirror at %s and no --repo-url to clone from", mirrorPath)
+		}
+		if out, cerr := exec.CommandContext(ctx, "git", "clone", "--bare", "--quiet", repoURL, mirrorPath).CombinedOutput(); cerr != nil {
+			return fmt.Errorf("clone %s: %v: %s", repoURL, cerr, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	return gitops.Open(mirrorPath).FetchBranch(branch)
 }
 
 func hostname() string {
