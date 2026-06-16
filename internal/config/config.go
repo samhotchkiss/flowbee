@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/content"
 	"gopkg.in/yaml.v3"
 )
 
@@ -40,6 +41,37 @@ type Config struct {
 	// AuthLoopbackBypass lets same-box (127.0.0.1) workers skip the token even when
 	// WorkerAuthSecret is set (§12.4 "bearer fallback on loopback"). Default true.
 	AuthLoopbackBypass bool `yaml:"auth_loopback_bypass"`
+
+	// AllowSelfMerge is THE ONE DECISION (§14, F2): whether the MVP may merge without
+	// a human. Default false = Branch A (every approved job hands off to a human).
+	// true = Branch B (autonomous merge): an approved + denylist-clear + CI-green job
+	// is self_merge-eligible and Flowbee merges it itself. The safety net stays
+	// deterministic — content-integrity gate + CI-green-at-head + the reconciled,
+	// SHA-bound verdict. Set via FLOWBEE_ALLOW_SELF_MERGE.
+	AllowSelfMerge bool `yaml:"allow_self_merge"`
+
+	// ContentMaxDiffBytes / ContentMaxChangedFiles are the operator-configurable
+	// content-integrity ceilings (F2, §9.2c): a diff over either bound fails static
+	// checks and is forced to handoff. 0 => the shipped content.DefaultLimits.
+	ContentMaxDiffBytes    int `yaml:"content_max_diff_bytes"`
+	ContentMaxChangedFiles int `yaml:"content_max_changed_files"`
+	// ContentDenyExtra is an installation EXTRA path-prefix denylist (F2, §9.2a) that
+	// AUGMENTS — never replaces — the shipped, always-on protected set (CI config,
+	// lockfiles, secrets, Flowbee's own source). Any diff touching a configured prefix
+	// is forced to the human gate. Set via FLOWBEE_CONTENT_DENY_EXTRA (comma-separated).
+	ContentDenyExtra []string `yaml:"content_deny_extra"`
+}
+
+// ContentPolicy projects the content-integrity knobs into the content package's
+// operator Policy (F2). The zero config yields the zero Policy = shipped defaults.
+func (c Config) ContentPolicy() content.Policy {
+	return content.Policy{
+		Limits: content.Limits{
+			MaxDiffBytes:    c.ContentMaxDiffBytes,
+			MaxChangedFiles: c.ContentMaxChangedFiles,
+		},
+		ExtraDenyPrefixes: c.ContentDenyExtra,
+	}
 }
 
 func Default() Config {
@@ -130,6 +162,18 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("FLOWBEE_AUTH_LOOPBACK_BYPASS"); v != "" {
 		c.AuthLoopbackBypass = v == "1" || v == "true"
+	}
+	if v := os.Getenv("FLOWBEE_ALLOW_SELF_MERGE"); v != "" {
+		c.AllowSelfMerge = v == "1" || v == "true"
+	}
+	if v := envInt("FLOWBEE_CONTENT_MAX_DIFF_BYTES"); v > 0 {
+		c.ContentMaxDiffBytes = v
+	}
+	if v := envInt("FLOWBEE_CONTENT_MAX_CHANGED_FILES"); v > 0 {
+		c.ContentMaxChangedFiles = v
+	}
+	if v := os.Getenv("FLOWBEE_CONTENT_DENY_EXTRA"); v != "" {
+		c.ContentDenyExtra = splitCSV(v)
 	}
 }
 

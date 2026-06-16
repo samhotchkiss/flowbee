@@ -14,6 +14,7 @@ import (
 
 	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/clock"
+	"github.com/samhotchkiss/flowbee/internal/content"
 	"github.com/samhotchkiss/flowbee/internal/engine"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
@@ -81,6 +82,11 @@ type Config struct {
 	// a non-loopback listener MUST set it (bearer token or mTLS). The bound,
 	// unforgeable identity it returns overrides any self-asserted query param.
 	Authenticator auth.Authenticator
+	// ContentPolicy is the operator-configured content-integrity posture (F2): the
+	// size ceilings + an EXTRA denylist that AUGMENT the shipped protected set the
+	// content gate (§9.2, I-11) runs over a worker's untrusted diff. The zero value
+	// is exactly the shipped defaults. New() installs it on the store.
+	ContentPolicy content.Policy
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -104,6 +110,9 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		}
 		staleHB = 3 * hb
 	}
+	// F2: install the operator content-integrity Policy on the store so the gate
+	// (ReviewResult / DispatchMerge) runs the configured ceilings + extra denylist.
+	st.ContentPolicy = cfg.ContentPolicy
 	return &Server{
 		store:        st,
 		clock:        clk,

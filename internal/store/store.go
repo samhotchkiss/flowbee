@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/content"
 	_ "modernc.org/sqlite"
 )
 
@@ -20,6 +21,12 @@ type Store struct {
 	// worker before the no_eligible_worker alarm fires (I-6). Zero disables
 	// auto-arming on enqueue (tests arm timers explicitly). Set by the runtime.
 	NoEligibleWorkerDelay time.Duration
+
+	// ContentPolicy is the operator-configured content-integrity posture (F2): the
+	// size ceilings + an EXTRA denylist that augment the shipped, always-on protected
+	// set the content gate runs over a worker's untrusted diff (§9.2, I-11). The zero
+	// value is exactly the shipped defaults. Set by the runtime from config.
+	ContentPolicy content.Policy
 }
 
 // Open opens the SQLite database with WAL + a busy timeout. A single open

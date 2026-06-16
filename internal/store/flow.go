@@ -244,7 +244,7 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 		// stored (untrusted) patch + declared blast-radius and thread the Result into
 		// the pure engine. A denylist hit / blast-radius mismatch / failed static
 		// check forces handoff regardless of the reviewer's self_merge request.
-		chk, err := contentResultTx(ctx, tx, in.JobID)
+		chk, err := s.contentResultTx(ctx, tx, in.JobID)
 		if err != nil {
 			return err
 		}
@@ -407,7 +407,7 @@ func (s *Store) DispatchMerge(ctx context.Context, src FactSource, p job.Policy,
 		if err != nil {
 			return err
 		}
-		chk, err := contentResultTx(ctx, tx, in.JobID)
+		chk, err := s.contentResultTx(ctx, tx, in.JobID)
 		if err != nil {
 			return err
 		}

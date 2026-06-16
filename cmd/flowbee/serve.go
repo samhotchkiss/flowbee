@@ -16,6 +16,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/config"
 	"github.com/samhotchkiss/flowbee/internal/github"
+	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/reconcile"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/ulid"
@@ -70,7 +71,15 @@ func runServe(_ []string) error {
 		// (§7.4). Empty disables local provisioning hints.
 		MirrorPath:    os.Getenv("FLOWBEE_MIRROR_PATH"),
 		Authenticator: authn,
+		// THE ONE DECISION (§14, F2): Branch B (autonomous merge) when
+		// FLOWBEE_ALLOW_SELF_MERGE is set; default false = Branch A (handoff).
+		Policy: job.Policy{AllowSelfMerge: cfg.AllowSelfMerge},
+		// F2: the operator content-integrity posture (ceilings + extra denylist).
+		ContentPolicy: cfg.ContentPolicy(),
 	}, version)
+	if cfg.AllowSelfMerge {
+		logger.Info("autonomous merge enabled (Branch B): self_merge eligible jobs merge without a human gate")
+	}
 	healthSrv := &http.Server{Addr: cfg.HealthAddr, Handler: srv.HealthHandler()}
 	privateSrv := &http.Server{Addr: cfg.PrivateAddr, Handler: srv.PrivateHandler()}
 

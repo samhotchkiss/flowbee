@@ -120,17 +120,42 @@ func (l Limits) resolve() Limits {
 	return l
 }
 
+// Policy is the OPERATOR-CONFIGURABLE content-integrity posture (F2): the size
+// ceilings PLUS an installation-supplied EXTRA denylist of path prefixes that
+// augment the shipped, always-on protected set (denyMatchers). The shipped set is
+// non-negotiable (an agent must never weaken CI / lockfiles / secrets / Flowbee's
+// own source — see denyMatchers); ExtraDenyPrefixes only ever ADDS to it. A path
+// equal to, or beneath, any configured prefix is denylisted (forces the human gate,
+// §9.2a). The zero Policy is exactly the shipped defaults (no extra denylist), so a
+// caller may always pass a zero value and `Check` stays its backward-compatible self.
+type Policy struct {
+	Limits Limits
+	// ExtraDenyPrefixes are additional protected path prefixes (normalized; a leading
+	// "./" or "/" is stripped). They EXTEND — never replace — the shipped denylist.
+	ExtraDenyPrefixes []string
+}
+
 // Check runs the full content-integrity gate over a patch and returns the
 // deterministic Result. PURE: same (patch, limits) -> same Result, always. The
-// runtime calls it once and threads the Result into EngineState.
+// runtime calls it once and threads the Result into EngineState. It is the
+// zero-extra-denylist case of CheckWithPolicy (the shipped defaults).
 func Check(p Patch, lim Limits) Result {
-	lim = lim.resolve()
+	return CheckWithPolicy(p, Policy{Limits: lim})
+}
+
+// CheckWithPolicy is Check under an operator-configured Policy (F2): the same
+// deterministic gate, but with configurable size ceilings AND an installation
+// EXTRA denylist that augments the shipped protected set. PURE: same (patch,
+// policy) -> same Result, always.
+func CheckWithPolicy(p Patch, pol Policy) Result {
+	lim := pol.Limits.resolve()
 	touched := TouchedPaths(p.Diff)
 
 	r := Result{}
 
-	// (a) path denylist — §9.2(a). Any hit forces the human gate.
-	hits := DenylistHits(touched)
+	// (a) path denylist — §9.2(a). Any hit (shipped set OR the operator's extra
+	// prefixes) forces the human gate.
+	hits := denylistHitsWith(touched, pol.ExtraDenyPrefixes)
 	r.DenylistHits = hits
 	r.DenylistClear = len(hits) == 0
 
@@ -228,8 +253,17 @@ var denyMatchers = []struct {
 }
 
 // DenylistHits returns the denylist class names hit by the touched paths, sorted
-// and de-duplicated. Empty => denylist-clear.
+// and de-duplicated. Empty => denylist-clear. It uses only the shipped protected
+// set (no operator-configured extra prefixes).
 func DenylistHits(touched []string) []string {
+	return denylistHitsWith(touched, nil)
+}
+
+// denylistHitsWith is DenylistHits plus an operator-supplied EXTRA set of denied
+// path prefixes (F2). A touched path equal to, or beneath, an extra prefix is hit
+// under the synthetic class "configured". The extra set only ADDS to the shipped
+// denylist; it can never remove a shipped protection.
+func denylistHitsWith(touched, extraPrefixes []string) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, p := range touched {
@@ -245,9 +279,38 @@ func DenylistHits(touched []string) []string {
 				}
 			}
 		}
+		if matchesAnyPrefix(np, extraPrefixes) {
+			if !seen[np+"|configured"] {
+				seen[np+"|configured"] = true
+				out = append(out, "configured:"+np)
+			}
+		}
 	}
 	sort.Strings(out)
 	return out
+}
+
+// matchesAnyPrefix reports whether path equals, or sits beneath, any of the
+// normalized prefixes. An empty prefix matches nothing (a guard against an
+// accidental "deny everything").
+func matchesAnyPrefix(path string, prefixes []string) bool {
+	for _, raw := range prefixes {
+		np := normalizePath(raw)
+		if np == "" {
+			continue
+		}
+		if path == np {
+			return true
+		}
+		prefix := np
+		if !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsDenylisted reports whether a single path is in the protected set (a helper for
@@ -315,11 +378,11 @@ func declarationCovers(path string, decl BlastRadius) bool {
 // secretPatterns are known-pattern secret signatures (provider-agnostic credential
 // shapes). A match in an ADDED line fails the secret-scan.
 var secretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),                              // AWS access key id
-	regexp.MustCompile(`(?i)aws_secret_access_key\s*[=:]\s*[A-Za-z0-9/+]{20,}`), // AWS secret
-	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),            // PEM private key
-	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{30,}`),                    // GitHub token
-	regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`),                  // Slack token
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),                                                            // AWS access key id
+	regexp.MustCompile(`(?i)aws_secret_access_key\s*[=:]\s*[A-Za-z0-9/+]{20,}`),                       // AWS secret
+	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),                                          // PEM private key
+	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{30,}`),                                                  // GitHub token
+	regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`),                                                // Slack token
 	regexp.MustCompile(`(?i)(api[_-]?key|secret|token|password)\s*[=:]\s*["']?[A-Za-z0-9/+_\-]{24,}`), // generic
 }
 

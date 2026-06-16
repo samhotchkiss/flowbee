@@ -21,7 +21,7 @@ import (
 // harness pushes to the epoch ref and the result already required a real push, so
 // at this seam we treat the apply fact as UNKNOWN (not failed) unless a caller has
 // recorded a definite negative — keeping the gate a pure function of stored inputs.
-func contentResultTx(ctx context.Context, tx *sql.Tx, jobID string) (content.Result, error) {
+func (s *Store) contentResultTx(ctx context.Context, tx *sql.Tx, jobID string) (content.Result, error) {
 	var diff, declared string
 	err := tx.QueryRowContext(ctx,
 		`SELECT patch_diff, declared_blast_radius FROM jobs WHERE id = ?`, jobID).
@@ -29,22 +29,23 @@ func contentResultTx(ctx context.Context, tx *sql.Tx, jobID string) (content.Res
 	if err != nil {
 		return content.Result{}, err
 	}
-	return computeContent(diff, declared), nil
+	return computeContent(diff, declared, s.ContentPolicy), nil
 }
 
-// computeContent runs content.Check over the stored diff + declared blast-radius.
-// PURE. A blank declared blast-radius decodes to an empty BlastRadius (covers
-// nothing) — so any touched path is undeclared (the safe default; a worker must
-// declare what it touches).
-func computeContent(diff, declared string) content.Result {
+// computeContent runs the content-integrity gate over the stored diff + declared
+// blast-radius under the operator-configured content Policy (F2). PURE. A blank
+// declared blast-radius decodes to an empty BlastRadius (covers nothing) — so any
+// touched path is undeclared (the safe default; a worker must declare what it
+// touches). The zero Policy is exactly the shipped defaults.
+func computeContent(diff, declared string, pol content.Policy) content.Result {
 	var br content.BlastRadius
 	if declared != "" {
 		_ = json.Unmarshal([]byte(declared), &br)
 	}
-	return content.Check(content.Patch{
+	return content.CheckWithPolicy(content.Patch{
 		Diff:     diff,
 		Declared: br,
-	}, content.Limits{})
+	}, pol)
 }
 
 // persistContentResultTx caches the computed Result on the job row (audit + the
