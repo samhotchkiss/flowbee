@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/samhotchkiss/flowbee/client"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
@@ -95,6 +96,12 @@ func runWork(args []string) error {
 		}
 		if !out.Got {
 			fmt.Println("no work available (204)")
+			return nil
+		}
+		if out.Skipped {
+			// a code_review job whose CI isn't green yet: backed off, will retry.
+			fmt.Printf("skipped job %s (waiting for CI) — backing off\n", out.JobID)
+			time.Sleep(8 * time.Second)
 			return nil
 		}
 		fmt.Printf("completed job %s -> %s (epoch %d) pushed %s @ %s\n",

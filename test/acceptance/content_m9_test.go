@@ -76,6 +76,10 @@ func driveBuildWithPatch(t *testing.T, ctx context.Context, st *store.Store, url
 		t.Fatalf("after build result state=%s want review_pending", j.State)
 	}
 
+	// reconcile green facts BEFORE the reviewer leases — the review gate offers a
+	// job only once CI is reconciled green (tests re-seed the same facts harmlessly).
+	seedGreenFacts(t, ctx, st, jobID)
+
 	reviewer := client.New(url)
 	if _, err := reviewer.Register(ctx, client.Registration{
 		WorkerID: "wk-reviewer-bob", Identity: "reviewer-bob", Host: "t",

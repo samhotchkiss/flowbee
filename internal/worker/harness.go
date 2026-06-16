@@ -144,6 +144,10 @@ type HarnessOutcome struct {
 	JobState   string
 	PushedRef  string
 	PushedSHA  string
+	// Skipped is set when a review lease was released without acting (e.g. a
+	// code_review job whose CI is not yet green): the work loop should back off
+	// before retrying so it does not spin claiming+releasing the same job.
+	Skipped bool
 }
 
 // RunOnceHarness performs ONE full Mode-A cycle against a real lease (§7.1):

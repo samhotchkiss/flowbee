@@ -142,6 +142,10 @@ type LeaseContext struct {
 	// can judge the actual change (the review harness writes it to .flowbee/diff.patch
 	// + $FLOWBEE_DIFF). Empty for non-review roles.
 	Diff string `json:"diff,omitempty"`
+	// CIReady is true when the reconciled facts are green (PR exists, CI green): a
+	// code_reviewer should only judge once CI is green, else its approval can't mint
+	// and it bounces — so the harness skips+releases until this is true.
+	CIReady bool `json:"ci_ready,omitempty"`
 }
 
 // Lease long-polls for a lease. ok=false means a 204 (no work this round).

@@ -501,6 +501,9 @@ type LeaseContext struct {
 	// Diff is the eng_worker's build patch, shipped to a code_reviewer so its agent
 	// judges the actual change (the review harness writes .flowbee/diff.patch).
 	Diff string `json:"diff,omitempty"`
+	// CIReady is true when reconciled facts are green; a code_reviewer harness skips
+	// (releases) until then, so it never approves a not-green PR and thrashes.
+	CIReady bool `json:"ci_ready,omitempty"`
 }
 
 // lease long-polls: rank `ready` candidates (scheduler: priority + aging +
@@ -617,10 +620,15 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 					PriorVerdict:       j.Verdict,
 				}
 				// a code_reviewer judges the actual change: ship the build patch so its
-				// agent reads the diff (the review harness writes .flowbee/diff.patch).
+				// agent reads the diff (the review harness writes .flowbee/diff.patch),
+				// and ship CIReady so the harness skips until reconciled CI is green
+				// (an approval before then can't mint — it would bounce + rebuild-thrash).
 				if reviewing {
 					if d, derr := s.store.JobPatchDiff(r.Context(), cand.JobID); derr == nil {
 						grant.Context.Diff = d
+					}
+					if f, _, ferr := s.facts.Facts(r.Context(), cand.JobID); ferr == nil {
+						grant.Context.CIReady = f.PRExists && f.CIGreen && !f.Merged
 					}
 				}
 				// Repo provisioning hints (§7.4): only for build jobs that carry a

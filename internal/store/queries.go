@@ -618,18 +618,9 @@ func (s *Store) ReadyCandidates(ctx context.Context) ([]scheduler.Candidate, err
 // Candidate, for a code_reviewer's long-poll loop to rank and claim. The atomic
 // review claim's WHERE state='review_pending' remains the correctness guarantee.
 func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candidate, error) {
-	// Gate on reconciled facts: a review is only offered once the PR exists and CI
-	// is GREEN (and not yet merged). The gate cannot mint a verdict before that, so
-	// offering it earlier would only let a continuously-running code_reviewer
-	// (flowbee up) approve, get bounced for un-green facts, and re-arm the build —
-	// a thrash loop. A review_pending job with NO facts row yet is still offered
-	// (pre-reconcile / tests); only a job whose facts say ci_green=0 is withheld.
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT j.id, j.priority, j.enqueued_at, j.required_capabilities
-		  FROM jobs j
-		  LEFT JOIN domain_b_facts f ON f.job_id = j.id
-		 WHERE j.state='review_pending'
-		   AND (f.job_id IS NULL OR (f.ci_green=1 AND f.merged=0))`)
+		SELECT id, priority, enqueued_at, required_capabilities
+		  FROM jobs WHERE state='review_pending'`)
 	if err != nil {
 		return nil, err
 	}

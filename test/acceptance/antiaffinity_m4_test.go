@@ -73,6 +73,13 @@ func seedAndBuild(t *testing.T, ctx context.Context, st *store.Store, url, jobID
 	if j.State != job.StateReviewPending {
 		t.Fatalf("after build state=%s want review_pending", j.State)
 	}
+	// reconcile green facts so the review gate OFFERS the job (the §6.3.1
+	// anti-affinity exclusions still apply at CLAIM time; ci_green gates candidacy).
+	if err := st.UpsertDomainBFacts(ctx, jobID, job.DomainBFacts{
+		PRExists: true, PRNumber: 1, HeadSHA: "head1", BaseSHA: "base1", CIGreen: true,
+	}); err != nil {
+		t.Fatalf("seed green facts: %v", err)
+	}
 }
 
 func newM4Server(st *store.Store, clk clock.Clock) *api.Server {
