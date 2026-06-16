@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/auth"
@@ -759,11 +760,13 @@ func (s *Server) specSubmit(w http.ResponseWriter, r *http.Request) {
 // writes the spec.md and a distinct reviewer signs it off. Loopback admin route.
 func (s *Server) specCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID       string `json:"id"`
-		Title    string `json:"title"`    // human label / chat ref for the work item
-		Lens     string `json:"lens"`     // author lens (default product_speccer; distinct from the issue-reviewer lens)
-		Repo     string `json:"repo"`     // repos.id this work item belongs to (default "default")
-		Priority int    `json:"priority"`
+		ID         string `json:"id"`
+		Title      string `json:"title"`      // short human label / chat ref for the work item
+		Task       string `json:"task"`       // the work item the spec_author must spec ($FLOWBEE_TASK)
+		Acceptance string `json:"acceptance"` // optional done-when
+		Lens       string `json:"lens"`       // author lens (default product_speccer; distinct from the issue-reviewer lens)
+		Repo       string `json:"repo"`       // repos.id this work item belongs to (default "default")
+		Priority   int    `json:"priority"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -781,8 +784,15 @@ func (s *Server) specCreate(w http.ResponseWriter, r *http.Request) {
 	if repo == "" {
 		repo = "default"
 	}
+	// the task the author specs: prefer an explicit `task`, fall back to the title so
+	// a one-line "title only" ingest still gives the spec_author something to build.
+	task := body.Task
+	if strings.TrimSpace(task) == "" {
+		task = body.Title
+	}
 	j, err := s.store.SeedSpecJob(r.Context(), store.SeedSpecParams{
-		ID: id, ChatRef: body.Title, AuthorLens: lens, Priority: body.Priority, Repo: repo, Now: s.clock.Now(),
+		ID: id, ChatRef: body.Title, AuthorLens: lens, Priority: body.Priority, Repo: repo,
+		TaskText: task, AcceptanceCriteria: body.Acceptance, Now: s.clock.Now(),
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)

@@ -24,7 +24,11 @@ type SeedSpecParams struct {
 	AuthorLens string
 	Priority   int
 	Repo       string // F9 repo-scope handle (a repos.id); reconcile-IN/project-OUT drain per repo
-	Now        time.Time
+	// TaskText is the work item the spec_author must spec (shipped in its lease
+	// context as $FLOWBEE_TASK). AcceptanceCriteria is the optional done-when.
+	TaskText           string
+	AcceptanceCriteria string
+	Now                time.Time
 }
 
 // SeedSpecJob inserts a spec job in spec_authoring (§11.6). It is leasable by a
@@ -35,10 +39,12 @@ func (s *Store) SeedSpecJob(ctx context.Context, p SeedSpecParams) (job.Job, err
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO jobs (id, kind, flow, stage, state, role, chat_ref, author_lens, priority,
 			                  blocked_by, required_capabilities, enqueued_at,
-			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq, repo)
-			VALUES (?, 'spec', 'spec', 'author', 'spec_authoring', 'spec_author', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 3, 1, ?)`,
+			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq, repo,
+			                  task_text, acceptance_criteria)
+			VALUES (?, 'spec', 'spec', 'author', 'spec_authoring', 'spec_author', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 3, 1, ?, ?, ?)`,
 			p.ID, p.ChatRef, p.AuthorLens, p.Priority,
-			marshalStrings([]string{"role:spec_author"}), p.Now.Format(rfc3339), p.Repo)
+			marshalStrings([]string{"role:spec_author"}), p.Now.Format(rfc3339), p.Repo,
+			p.TaskText, p.AcceptanceCriteria)
 		if err != nil {
 			return fmt.Errorf("insert spec job: %w", err)
 		}
