@@ -59,6 +59,17 @@ func (m *Mirror) HeadSHA(ref string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+// FetchBranch force-updates a local branch from the mirror's origin (GitHub), so
+// after a merge advances main on GitHub the mirror tracks it and the NEXT build is
+// cut from the current tip (build-list: base_sha refresh after merge). Idempotent.
+func (m *Mirror) FetchBranch(branch string) error {
+	spec := "+refs/heads/" + branch + ":refs/heads/" + branch
+	if _, err := run("", "git", "--git-dir", m.Path, "fetch", "--quiet", "origin", spec); err != nil {
+		return fmt.Errorf("fetch %s: %w", branch, err)
+	}
+	return nil
+}
+
 // AddWorktree provisions a fresh, detached worktree at baseSHA under dir
 // (DESIGN §7.4: `git worktree add <ws> <base_sha>`). The worktree is one-shot
 // per lease (§7.5) — the caller destroys it after the result.

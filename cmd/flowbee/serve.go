@@ -109,6 +109,31 @@ func runServe(_ []string) error {
 	poller := alarm.New(st, clock.Real{}, time.Second, srv.Broker()).
 		WithLiveness(livenessCfg, store.DBFactSource{DB: st.DB}, srv.Broker())
 	go poller.Run(ctx)
+
+	// base_sha refresh (build-list): keep the local mirror's integration branch
+	// tracking GitHub, so a build seeded after a merge is cut from the CURRENT tip
+	// (not a stale base). Cheap public fetch every 45s; the next build then resolves
+	// base_sha = the fresh main. Only when a local mirror is configured.
+	if mp := os.Getenv("FLOWBEE_MIRROR_PATH"); mp != "" {
+		branch := os.Getenv("FLOWBEE_GITHUB_DEFAULT_BRANCH")
+		if branch == "" {
+			branch = "main"
+		}
+		go func() {
+			t := time.NewTicker(45 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if err := gitops.Open(mp).FetchBranch(branch); err != nil {
+						logger.Warn("mirror refresh", "branch", branch, "err", err)
+					}
+				}
+			}
+		}()
+	}
 	// the Rung-2 sweep + two-rung evaluation pass runs on the slower external-oracle
 	// cadence (§10.2 — Rung-2 only updates on the reconcile sweep).
 	go func() {
