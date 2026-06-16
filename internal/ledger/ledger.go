@@ -76,6 +76,16 @@ const (
 	KindEpochPromoted    EventKind = "epoch_promoted"    // Flowbee validated the live epoch + fast-forwarded its ref (§6.5.1)
 	KindCompensated      EventKind = "compensated"       // compensate(job, dead_epoch): dropped ref, cancelled CI, draft-back (§6.5.4)
 	KindUnattendedMerged EventKind = "unattended_merged" // self_merge: Flowbee enqueued+reconciled the merge with no human (§14 Branch B)
+
+	// F8 merge conflicts (§E). KindConflictDetected: a rebase onto current main hit
+	// a REAL conflict -> a conflict_resolver lease (resolving_conflict). KindRebased:
+	// a CLEAN rebase advanced the base with no conflict (auto, no agent). KindConflictResolved:
+	// the resolver returned the resolved diff -> back through review + re-CI at the new head.
+	// KindStackedRebased: a parent PR merged, so this descendant auto-rebased + re-armed.
+	KindConflictDetected EventKind = "conflict_detected" // real conflict on rebase -> resolving_conflict (conflict_resolver lease)
+	KindRebased          EventKind = "rebased"           // clean rebase onto current main; re-validate at the new head (no agent)
+	KindConflictResolved EventKind = "conflict_resolved" // resolver returned the resolved diff -> review_pending (re-review + re-CI)
+	KindStackedRebased   EventKind = "stacked_rebased"   // a parent PR merged -> auto-rebase + re-arm this descendant (supersede)
 )
 
 // Event is one appended ledger row. Payload holds kind-specific RESOLVED facts as
@@ -489,6 +499,58 @@ func Fold(events []Event) (job.Job, error) {
 		case KindTrackingLabelled:
 			// F7: the yellow `flowbee` umbrella + stage label was rendered OUT for an
 			// actively-tracked issue. No projection state change (audit/marker only).
+		case KindRebased:
+			// F8 (§E trivial case): a clean rebase onto current main advanced the base
+			// and superseded the SHA-bound verdict; the job re-arms review + CI at the
+			// new INTEGRATED head. Epoch bumped (rides the event), verdict invalidated,
+			// routed to review_pending as the code_review gate. No agent.
+			j.State = e.ToState
+			j.Role = job.RoleEngWorker
+			j.Stage = "build"
+			j.RequiredCapabilities = []string{"role:code_reviewer"}
+			j.LeaseEpoch = e.LeaseEpoch
+			j.Verdict = nil
+			j.HeadSHA = ""
+			if e.Payload.BaseSHA != "" {
+				j.BaseSHA = e.Payload.BaseSHA
+			}
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindConflictDetected:
+			// F8 (§E real conflict): a rebase onto current main hit overlapping edits;
+			// the job is leased to a conflict_resolver (resolving_conflict). Epoch bumped
+			// (fence any worker), verdict invalidated, the new base recorded, the resolve
+			// stage's capability requirement set.
+			j.State = e.ToState
+			j.Role = job.RoleConflictResolver
+			j.Stage = "resolve_conflict"
+			j.RequiredCapabilities = []string{"role:conflict_resolver"}
+			j.LeaseEpoch = e.LeaseEpoch
+			j.Verdict = nil
+			if e.Payload.BaseSHA != "" {
+				j.BaseSHA = e.Payload.BaseSHA
+			}
+			j.EnqueuedAt = e.CreatedAt
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindConflictResolved:
+			// F8: the conflict_resolver returned the resolved diff; it is re-reviewed +
+			// re-CI'd like any build (resolving_conflict -> review_pending). The verdict is
+			// cleared (the resolved diff must be re-judged); the gate stage opens.
+			j.State = e.ToState
+			j.Role = job.RoleEngWorker
+			j.Stage = "build"
+			j.RequiredCapabilities = []string{"role:code_reviewer"}
+			j.Verdict = nil
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindStackedRebased:
+			// F8: a parent PR merged, so this descendant auto-rebases + re-arms. The
+			// audit event records the new base + the parent PR; the actual re-arm rides a
+			// following rebased/conflict_detected event. No projection field changes here.
 		}
 		j.JobSeq = e.JobSeq
 	}

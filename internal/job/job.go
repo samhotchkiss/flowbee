@@ -48,6 +48,14 @@ const (
 	// rendered OUT (project-OUT suppressed) until deliberate opt-in. It holds no
 	// active lease, so it is absent from the one_active_lease_per_job index.
 	StateQuiescent State = "quiescent"
+	// StateResolvingConflict is the F8 merge-conflict resolution lease state (§E):
+	// a build whose rebase onto the CURRENT main hit a REAL conflict (overlapping
+	// edits a clean rebase could not resolve) is leased to a `conflict_resolver`
+	// agent, which rebases + resolves in a worktree and returns the RESOLVED diff.
+	// The resolved diff is untrusted code like any build product: it goes back
+	// through build-review + re-CI before re-merge (resolution is just another job).
+	// It holds an active lease (a worker is bound to it).
+	StateResolvingConflict State = "resolving_conflict"
 )
 
 // Role is the slot a worker is bound to for a stage (DESIGN §5.2).
@@ -59,6 +67,11 @@ const (
 	RoleEngWorker    Role = "eng_worker"
 	RoleCodeReviewer Role = "code_reviewer"
 	RoleMerger       Role = "merger"
+	// RoleConflictResolver is the F8 merge-conflict resolution slot (§E): an agent
+	// that rebases a build onto current main and resolves a REAL conflict in a
+	// worktree, returning the resolved diff. Its output is untrusted code re-reviewed
+	// + re-CI'd like any build (resolution is just another job).
+	RoleConflictResolver Role = "conflict_resolver"
 )
 
 // Kind is one of exactly two job kinds (DESIGN §6.1).
@@ -79,6 +92,10 @@ var ActiveLeaseStates = map[State]bool{
 	StateMergeHandoff:  true,
 	StateSpecAuthoring: true,
 	StateSpecReview:    true,
+	// StateResolvingConflict holds an active lease once a conflict_resolver claims it
+	// (a resolver is bound + working). It joins the one_active_lease_per_job index so
+	// the I-4 backstop still holds for the resolution stage.
+	StateResolvingConflict: true,
 }
 
 // HasActiveLease reports whether s is a state that holds an active lease.

@@ -74,6 +74,9 @@ func TestActiveLeaseStatesMatchIndex(t *testing.T) {
 		StateLeased: true, StateBuilding: true, StateCodeReview: true,
 		StateMerging: true, StateMergeHandoff: true,
 		StateSpecAuthoring: true, StateSpecReview: true,
+		// F8: the resolve_conflict stage holds an active lease (one_active_lease_per_job
+		// index updated in 0017_f8_merge_conflicts.sql).
+		StateResolvingConflict: true,
 	}
 	if len(want) != len(ActiveLeaseStates) {
 		t.Fatalf("active-lease set size drift: %d vs %d", len(want), len(ActiveLeaseStates))

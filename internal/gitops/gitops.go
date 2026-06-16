@@ -264,6 +264,97 @@ func (m *Mirror) ApplyPatchAndPushEpoch(jobID string, epoch int, baseSHA, diff, 
 	return sha, ref, nil
 }
 
+// RebaseOutcome reports whether a build's patch replays cleanly onto a new base
+// (F8 §E). Clean=true means the diff applied with no conflict (a trivial auto-rebase
+// Flowbee performs with no agent: re-validate CI/review at NewBaseSHA and merge).
+// Clean=false means a REAL conflict (overlapping edits) that needs a conflict_resolver
+// agent. NewSHA is the rebased commit on a clean rebase (the new head to re-validate);
+// empty on a conflict.
+type RebaseOutcome struct {
+	Clean      bool
+	NewSHA     string
+	NewBaseSHA string
+	// Conflicts lists the paths git reported as conflicting (best-effort, for the
+	// resolver's context). Empty on a clean rebase.
+	Conflicts []string
+}
+
+// TryRebasePatch attempts to replay a build's untrusted diff onto newBaseSHA in a
+// throwaway worktree (F8 §E "trivial case"): it `git apply`s the patch at the new
+// base. A CLEAN apply is a trivial auto-rebase — it commits the replayed change and
+// returns the new SHA (Flowbee re-validates CI/review at this head, no agent). A
+// FAILED apply is a REAL conflict — it returns Clean=false + the conflicting paths so
+// the caller can spawn a conflict_resolver job. The mirror is never mutated on a
+// conflict; on a clean rebase the new commit is pushed to the job's epoch ref.
+//
+// The patch is UNTRUSTED DATA: it is applied in a disposable worktree discarded on
+// any failure, so a hostile/malformed diff cannot corrupt the mirror.
+func (m *Mirror) TryRebasePatch(jobID string, epoch int, newBaseSHA, diff, message string) (RebaseOutcome, error) {
+	out := RebaseOutcome{NewBaseSHA: newBaseSHA}
+	if strings.TrimSpace(diff) == "" {
+		return out, fmt.Errorf("rebase: empty diff")
+	}
+	wsRoot, err := os.MkdirTemp("", "flowbee-rebase-")
+	if err != nil {
+		return out, err
+	}
+	defer os.RemoveAll(wsRoot)
+	wsDir := filepath.Join(wsRoot, "ws")
+	wt, err := m.AddWorktree(wsDir, newBaseSHA)
+	if err != nil {
+		return out, fmt.Errorf("rebase worktree: %w", err)
+	}
+	defer wt.Destroy()
+
+	patchFile := filepath.Join(wsRoot, "patch.diff")
+	if err := os.WriteFile(patchFile, []byte(diff), 0o644); err != nil {
+		return out, err
+	}
+	// dry-run first: does the diff apply cleanly at the NEW base? A failure here is
+	// the REAL-conflict signal (overlapping edits the new base changed underneath).
+	if _, err := run(wsDir, "git", "apply", "--check", "--whitespace=nowarn", patchFile); err != nil {
+		out.Clean = false
+		out.Conflicts = conflictPaths(diff)
+		return out, nil // a conflict is not an error: the caller spawns a resolver job
+	}
+	// clean: apply for real, commit, push the rebased epoch ref.
+	if _, err := run(wsDir, "git", "apply", "--index", "--whitespace=nowarn", patchFile); err != nil {
+		// raced from check to apply (shouldn't happen with MaxOpenConns=1): treat as conflict.
+		out.Clean = false
+		out.Conflicts = conflictPaths(diff)
+		return out, nil
+	}
+	sha, _, err := wt.CommitAndPushEpoch(jobID, epoch, message)
+	if err != nil {
+		return out, err
+	}
+	out.Clean = true
+	out.NewSHA = sha
+	return out, nil
+}
+
+// conflictPaths returns the touched paths of a diff (best-effort context for the
+// resolver). It reuses the diff-header scan rather than depending on internal/content
+// (which would create an import cycle for the deterministic core's consumers).
+func conflictPaths(diff string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "diff --git ") {
+			rest := strings.TrimPrefix(line, "diff --git ")
+			fields := strings.SplitN(rest, " ", 2)
+			if len(fields) == 2 {
+				p := strings.TrimPrefix(strings.TrimSpace(fields[1]), "b/")
+				if p != "" && !seen[p] {
+					seen[p] = true
+					out = append(out, p)
+				}
+			}
+		}
+	}
+	return out
+}
+
 // Worktree is a per-lease checkout off the mirror at a base SHA.
 type Worktree struct {
 	Dir     string

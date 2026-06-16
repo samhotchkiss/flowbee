@@ -544,6 +544,7 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	reviewing := role == job.RoleCodeReviewer
 	specAuthoring := role == job.RoleSpecAuthor
 	specReviewing := role == job.RoleSpecReviewer
+	resolvingConflict := role == job.RoleConflictResolver
 
 	deadline := time.Now().Add(s.longPollWait)
 	for {
@@ -560,8 +561,12 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 			cands, err = s.store.SpecAuthoringCandidates(r.Context())
 		case specReviewing:
 			cands, err = s.store.SpecReviewCandidates(r.Context())
+		case resolvingConflict:
+			cands, err = s.store.ResolvingConflictCandidates(r.Context())
 		default:
-			cands, err = s.store.ReadyCandidates(r.Context())
+			// eng_worker: F8 blast-radius reservations withhold a ready candidate whose
+			// declared write-set overlaps an in-flight build (avoid the conflict first).
+			cands, err = s.store.ReadyCandidatesReserved(r.Context())
 		}
 		if err != nil {
 			http.Error(w, "lease error", http.StatusInternalServerError)
@@ -584,6 +589,11 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 				ls, err = s.store.ClaimSpecReview(r.Context(), store.ClaimSpecReviewParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
 					ModelFamily: family, Lens: lens, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+				})
+			case resolvingConflict:
+				ls, err = s.store.ClaimConflictJob(r.Context(), store.ClaimConflictParams{
+					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
+					ModelFamily: family, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
 				})
 			default:
 				ls, err = s.store.ClaimReadyJob(r.Context(), store.ClaimParams{
