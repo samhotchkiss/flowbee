@@ -508,6 +508,10 @@ type LeaseContext struct {
 	// IssueBranch is the per-issue branch the node commits to (flowbee/issue-N): the
 	// worker-push harness fetches it, commits its work on top, and pushes it back.
 	IssueBranch string `json:"issue_branch,omitempty"`
+	// RepoURL is the job's repo clone/push URL (F9 multi-repo): the control plane tells
+	// a fungible worker which repo each job belongs to so worker-push targets the right
+	// remote. Empty in single-repo deployments.
+	RepoURL string `json:"repo_url,omitempty"`
 }
 
 // lease long-polls: rank `ready` candidates (scheduler: priority + aging +
@@ -628,6 +632,16 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 				// ancestor's materialized issue. Empty until an issue is bound.
 				if reviewing || role == job.RoleEngWorker || resolvingConflict {
 					grant.Context.IssueBranch = store.IssueBranch(s.store.ResolveIssueNum(r.Context(), cand.JobID), cand.JobID)
+					// F9: tell the (fungible) worker which repo this job belongs to so
+					// worker-push targets the right remote. Resolve the job's repo scope to
+					// its clone/push URL from the registry; the worker auths with its own
+					// git credential. Empty repo => single-repo deployment (worker uses its
+					// configured --repo-url).
+					if j.Repo != "" {
+						if rp, rerr := s.store.GetRepo(r.Context(), j.Repo); rerr == nil {
+							grant.Context.RepoURL = "https://github.com/" + rp.Owner + "/" + rp.Repo + ".git"
+						}
+					}
 				}
 				// a code_reviewer judges the actual change: ship the build patch so its
 				// agent reads the diff (the review harness writes .flowbee/diff.patch),

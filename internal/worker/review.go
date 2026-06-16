@@ -247,30 +247,30 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 // is swallowed (the issue comment + the ledger still record the review). A no-op when
 // the reviewer has no branch/remote configured (same-box / bundle deployments).
 func reviewerEmptyCommit(cfg HarnessConfig, grant client.LeaseGrant, verdict, notes string) {
-	issueBranch := ""
+	issueBranch, repoURL := "", cfg.RepoURL
 	if grant.Context != nil {
 		issueBranch = grant.Context.IssueBranch
+		if grant.Context.RepoURL != "" {
+			repoURL = grant.Context.RepoURL // F9: the job's repo, not a single configured one
+		}
 	}
-	if issueBranch == "" || cfg.RepoURL == "" {
+	if issueBranch == "" || repoURL == "" {
 		return
 	}
-	mirrorPath := cfg.MirrorPath
-	if mirrorPath == "" {
-		mirrorPath = filepath.Join(os.TempDir(), "flowbee-worker-mirror.git")
-	}
+	mirrorPath := workerMirrorFor(cfg.MirrorPath, repoURL)
 	branch := cfg.Branch
 	if branch == "" {
 		branch = "main"
 	}
-	if err := ensureMirror(context.Background(), mirrorPath, cfg.RepoURL, branch); err != nil {
+	if err := ensureMirror(context.Background(), mirrorPath, repoURL, branch); err != nil {
 		return
 	}
 	mirror := gitops.Open(mirrorPath)
-	tip, exists, err := mirror.RemoteBranchTip(cfg.RepoURL, issueBranch)
+	tip, exists, err := mirror.RemoteBranchTip(repoURL, issueBranch)
 	if err != nil || !exists || tip == "" {
 		return // nothing to stack the verdict on (no build commit yet)
 	}
-	if err := mirror.FetchRef(cfg.RepoURL, "refs/heads/"+issueBranch, "refs/flowbee/review-tip/"+grant.JobID); err != nil {
+	if err := mirror.FetchRef(repoURL, "refs/heads/"+issueBranch, "refs/flowbee/review-tip/"+grant.JobID); err != nil {
 		return
 	}
 	wsRoot, err := os.MkdirTemp("", "flowbee-rvc-")
@@ -299,7 +299,7 @@ func reviewerEmptyCommit(cfg HarnessConfig, grant client.LeaseGrant, verdict, no
 	if err != nil || sha == "" {
 		return
 	}
-	_ = wt.PushTo(cfg.RepoURL, issueBranch, false)
+	_ = wt.PushTo(repoURL, issueBranch, false)
 }
 
 func readVerdict(path string) (reviewVerdict, error) {

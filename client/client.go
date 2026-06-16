@@ -151,6 +151,12 @@ type LeaseContext struct {
 	// reviewer's empty findings-commit) on top, and pushes it back — so the branch
 	// history is the node-by-node story. Empty when the job has no bound issue yet.
 	IssueBranch string `json:"issue_branch,omitempty"`
+	// RepoURL is the git clone/push URL for THIS job's repo (F9 multi-repo). A
+	// fungible worker leases jobs across repos, so the control plane tells it which
+	// repo each job belongs to — the worker-push harness clones/fetches/pushes here
+	// (with its own git credential), and derives its local mirror path per repo. Empty
+	// in single-repo deployments (the worker falls back to its configured --repo-url).
+	RepoURL string `json:"repo_url,omitempty"`
 }
 
 // Lease long-polls for a lease. ok=false means a 204 (no work this round).

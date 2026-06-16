@@ -140,6 +140,31 @@ func nodeCommitMessage(wsDir, identity, role, jobID string, c *client.LeaseConte
 	return b.String()
 }
 
+// workerMirrorFor resolves the worker's local mirror path for a given repo URL (F9
+// multi-repo): a fungible worker keeps one mirror PER repo so flowbee + russ jobs
+// never share a clone. It places per-repo mirrors as siblings of the configured
+// --mirror (so `--mirror ~/dev/flowbee` => russ jobs land at `~/dev/russ`), or under
+// the system temp dir when nothing is configured. With no repo URL it returns the
+// configured path (single-repo) or a temp default.
+func workerMirrorFor(configured, repoURL string) string {
+	if repoURL == "" {
+		if configured != "" {
+			return configured
+		}
+		return filepath.Join(os.TempDir(), "flowbee-worker-mirror.git")
+	}
+	name := repoURL
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	name = strings.TrimSuffix(name, ".git")
+	base := os.TempDir()
+	if configured != "" {
+		base = filepath.Dir(configured)
+	}
+	return filepath.Join(base, name)
+}
+
 func firstLineOf(s string) string {
 	for _, line := range strings.Split(s, "\n") {
 		if t := strings.TrimSpace(line); t != "" {
@@ -532,16 +557,20 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		return out, fmt.Errorf("heartbeat status %d", st)
 	}
 
-	// the worker's OWN local mirror, kept current (clone if absent, else fetch).
-	mirrorPath := cfg.MirrorPath
-	if mirrorPath == "" {
-		mirrorPath = filepath.Join(os.TempDir(), "flowbee-worker-mirror.git")
+	// F9 multi-repo: a fungible worker leases jobs across repos, so it pushes to the
+	// repo the LEASE named (not a single configured one), and keeps a SEPARATE local
+	// mirror per repo. Fall back to the configured --repo-url / --mirror in single-repo
+	// deployments (the lease ships no repo URL).
+	repoURL := cfg.RepoURL
+	if grant.Context != nil && grant.Context.RepoURL != "" {
+		repoURL = grant.Context.RepoURL
 	}
+	mirrorPath := workerMirrorFor(cfg.MirrorPath, repoURL)
 	branch := cfg.Branch
 	if branch == "" {
 		branch = "main"
 	}
-	if err := ensureMirror(ctx, mirrorPath, cfg.RepoURL, branch); err != nil {
+	if err := ensureMirror(ctx, mirrorPath, repoURL, branch); err != nil {
 		return out, fmt.Errorf("ensure mirror: %w", err)
 	}
 	mirror := gitops.Open(mirrorPath)
@@ -564,9 +593,9 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		issueBranch = grant.Context.IssueBranch
 	}
 	startRef := grant.BaseSHA
-	if issueBranch != "" && cfg.RepoURL != "" {
-		if tip, exists, terr := mirror.RemoteBranchTip(cfg.RepoURL, issueBranch); terr == nil && exists && tip != "" {
-			if ferr := mirror.FetchRef(cfg.RepoURL, "refs/heads/"+issueBranch, "refs/flowbee/issue-tip/"+grant.JobID); ferr == nil {
+	if issueBranch != "" && repoURL != "" {
+		if tip, exists, terr := mirror.RemoteBranchTip(repoURL, issueBranch); terr == nil && exists && tip != "" {
+			if ferr := mirror.FetchRef(repoURL, "refs/heads/"+issueBranch, "refs/flowbee/issue-tip/"+grant.JobID); ferr == nil {
 				startRef = tip
 			}
 		}
@@ -622,12 +651,12 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	// GitHub with its key (build-list: "each node commits"). The control plane then
 	// only opens the PR (sole GitHub-API caller + merger). When no branch/remote is
 	// configured, fall back to returning ONLY the diff (the control plane applies it).
-	if issueBranch != "" && cfg.RepoURL != "" {
+	if issueBranch != "" && repoURL != "" {
 		sha, cerr := wt.CommitAuthored(cfg.Identity, commitMsg, false)
 		if cerr != nil {
 			return out, fmt.Errorf("commit: %w", cerr)
 		}
-		if perr := wt.PushTo(cfg.RepoURL, issueBranch, false); perr != nil {
+		if perr := wt.PushTo(repoURL, issueBranch, false); perr != nil {
 			// the branch moved under us (e.g. a rebase-before-review force-update): drop
 			// the lease so the job re-arms and the next attempt restarts from the new tip.
 			_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
