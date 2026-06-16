@@ -1041,7 +1041,7 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 	// for a retry and never fails the accepted result.
 	if resp.JobState == string(job.StateReviewPending) && s.pushRemoteURL != "" && s.mirrorPath != "" && pushedRef != "" {
 		if sha, ok := gitops.Open(s.mirrorPath).RefSHA(pushedRef); ok {
-			branch := store.PRBranch(jobID)
+			branch := store.IssueBranch(s.store.ResolveIssueNum(r.Context(), jobID), jobID)
 			if err := gitops.Open(s.mirrorPath).PushCommit(s.pushRemoteURL, sha, branch); err != nil {
 				s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "pr_branch_push_failed", Epoch: epoch})
 			} else if _, err := s.store.EnqueuePROpen(r.Context(), jobID, sha, "main"); err == nil {

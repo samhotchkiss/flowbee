@@ -15,6 +15,39 @@ import (
 // push side (result handler) and the PR-open side (project-OUT) so they agree.
 func PRBranch(jobID string) string { return "flowbee/" + jobID }
 
+// IssueBranch is the per-issue branch the whole pipeline commits to (build-list:
+// "each issue is a branch; each node commits to it so the history shows how we got
+// here"). It is deterministic and stable for an issue's whole life: `flowbee/issue-N`
+// when the job is bound to a materialized/adopted issue, falling back to the per-job
+// branch only when no issue is bound yet (defensive — a normal build always has one).
+func IssueBranch(issueNum int, jobID string) string {
+	if issueNum > 0 {
+		return fmt.Sprintf("flowbee/issue-%d", issueNum)
+	}
+	return PRBranch(jobID)
+}
+
+// ResolveIssueNum returns the GitHub issue a job belongs to: an adopted issue is
+// stamped on the build job itself; a spec-flow build descends from the spec job that
+// carries the materialized issue number (flow_id). 0 when none is bound yet. This is
+// the single resolution both the result handler (branch push) and project-OUT
+// (PR-open / issue-comment) use, so a job's branch + comments agree on one issue.
+func (s *Store) ResolveIssueNum(ctx context.Context, jobID string) int {
+	j, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return 0
+	}
+	if j.IssueNum > 0 {
+		return j.IssueNum
+	}
+	if j.FlowID != "" && j.FlowID != j.ID {
+		if spec, err := s.GetJob(ctx, j.FlowID); err == nil {
+			return spec.IssueNum
+		}
+	}
+	return 0
+}
+
 // EnqueuePROpen enqueues the canonical PR-open trigger (§7.3, §8.2.1): after an
 // eng_worker's build result lands review_pending and Flowbee has validated +
 // promoted the epoch ref, Flowbee opens the PR. The worker NEVER supplies a PR

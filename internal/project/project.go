@@ -182,7 +182,7 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		number, err := s.gh.OpenPR(ctx, gh.OpenPRInput{
 			Title:   prTitle(j, row.JobID),
 			Body:    s.prBody(ctx, j),
-			HeadRef: store.PRBranch(row.JobID),
+			HeadRef: store.IssueBranch(s.resolveIssueNum(ctx, j), row.JobID),
 			BaseRef: orDefault(str(p, "base_ref"), orDefault(s.baseBranch, "main")),
 			Draft:   false,
 		})
@@ -385,15 +385,7 @@ func (s *Sender) prBody(ctx context.Context, j job.Job) string {
 // that carries the materialized issue number (FlowID). Returns 0 when no issue is
 // bound yet (e.g. a build whose issue has not been materialized).
 func (s *Sender) resolveIssueNum(ctx context.Context, j job.Job) int {
-	if j.IssueNum > 0 {
-		return j.IssueNum
-	}
-	if j.FlowID != "" && j.FlowID != j.ID {
-		if spec, err := s.store.GetJob(ctx, j.FlowID); err == nil {
-			return spec.IssueNum
-		}
-	}
-	return 0
+	return s.store.ResolveIssueNum(ctx, j.ID)
 }
 
 // seedBuildFromSpec turns a just-materialized signed-off spec into a ready build

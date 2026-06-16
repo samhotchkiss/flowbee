@@ -595,8 +595,14 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
 	// the merge API — the batch-size-1 integration the design's merge queue models
 	// (one PR onto current main at a time). Flowbee only reaches here after its own
 	// gate minted a verdict bound to green, reconciled CI, so this is the safe write.
+	//
+	// merge_method "merge" (NOT squash): the per-issue branch carries the full
+	// node-by-node story — build, the reviewers' empty findings-commits, revisions —
+	// and a merge commit keeps that whole trail REACHABLE from main (so you can see
+	// how the change was built), while `git log --first-parent main` stays clean. A
+	// squash would discard the history the per-issue-branch model exists to preserve.
 	return c.rest(ctx, http.MethodPut, fmt.Sprintf("/pulls/%d/merge", number), map[string]any{
-		"merge_method": "squash",
+		"merge_method": "merge",
 	}, nil)
 }
 
