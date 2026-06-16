@@ -110,7 +110,15 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		case pr.Merged && j.State != job.StateDone:
 			// the terminal Domain-B fact: the job is done. No counter or verdict edit.
 			if err := reconcileTransitionTx(ctx, tx, &j, seq, job.StateDone,
-				ledger.KindJobCompleted, now); err != nil {
+				ledger.KindJobCompleted, now,
+				ledger.Payload{MergeProvenance: pr.MergeCommit}); err != nil {
+				return err
+			}
+			// build-list §F: on merge, enqueue the dedicated post-merge history
+			// write (docs/history/<id>.md + the regenerated TOC) in THIS tx, so the
+			// issue-archive projection lands atomically with the done transition and
+			// is never entangled with the feature PR. Flowbee is the sole writer.
+			if err := enqueueHistoryWriteTx(ctx, tx, jobID); err != nil {
 				return err
 			}
 			out.Done = true
@@ -170,14 +178,19 @@ func upsertDomainBFactsTx(ctx context.Context, tx *sql.Tx, jobID string, pr Reco
 }
 
 // reconcileTransitionTx appends a state-changed ledger event and applies the
-// projection, all in tx. Used for the merged->done terminal transition.
+// projection, all in tx. Used for the merged->done terminal transition. The
+// optional payload carries resolved facts the event should record (e.g. the
+// reconciled merge-commit on a merged->done, so the §F archive can fold it).
 func reconcileTransitionTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int,
-	to job.State, kind ledger.EventKind, now time.Time) error {
+	to job.State, kind ledger.EventKind, now time.Time, payload ...ledger.Payload) error {
 	nextSeq := seq + 1
 	ev := ledger.Event{
 		JobID: j.ID, JobSeq: nextSeq, Kind: kind,
 		FromState: j.State, ToState: to, LeaseEpoch: j.LeaseEpoch,
 		Actor: "reconcile", CreatedAt: now,
+	}
+	if len(payload) > 0 {
+		ev.Payload = payload[0]
 	}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return err

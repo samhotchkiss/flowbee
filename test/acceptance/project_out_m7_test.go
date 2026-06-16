@@ -390,6 +390,11 @@ func TestM7_BuildPatchToOpenPRStampToMergeToDone(t *testing.T) {
 		t.Fatalf("the human-merge fact must reconcile to done, got %s", j.State)
 	}
 
+	// the merge enqueued the F11 post-merge history write (docs/history/<id>.md + the
+	// TOC); drain it so the audit baseline below includes that one-time action and the
+	// idempotent-re-drain assertion measures only DUPLICATES.
+	e.drain(t, ctx)
+
 	// every GitHub action appears ONCE in the audit log keyed (job, action, head_sha).
 	audit, _ := e.st.AuditLog(ctx, buildJob)
 	if countAction(audit, store.ActionOpenPR) != 1 {

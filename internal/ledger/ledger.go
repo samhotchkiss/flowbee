@@ -238,6 +238,11 @@ func Fold(events []Event) (job.Job, error) {
 			j.BlockedBy = nil
 		case KindJobCompleted:
 			j.State = e.ToState
+			// the reconciled merge-commit (if the merge produced one) is recorded as
+			// provenance on the terminal transition — the §F archive folds it.
+			if e.Payload.MergeProvenance != "" {
+				j.MergeProvenance = e.Payload.MergeProvenance
+			}
 		case KindNoEligibleWorker:
 			// the alarm is an observability event; no projection field changes
 			// (the job stays `ready`). Recorded for replay/audit completeness.

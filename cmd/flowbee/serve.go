@@ -16,8 +16,10 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/config"
 	"github.com/samhotchkiss/flowbee/internal/github"
+	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/multirepo"
+	"github.com/samhotchkiss/flowbee/internal/project"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/ulid"
 	"github.com/samhotchkiss/flowbee/internal/webhook"
@@ -224,7 +226,18 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 		client := github.NewRealClient(r.Owner, r.Repo, func(context.Context) (string, error) { return tok, nil })
 		return client, client, nil
 	}
-	mgr, err := multirepo.New(ctx, st, clock.Real{}, srv.Broker(), factory)
+	// (3) F11 (build-list §F): wire the LOCAL-git history writer so each repo's
+	// project-OUT loop lands the dedicated post-merge issue-archive commit
+	// (docs/history/<id>.md + the TOC) on the integration branch. The shared bare
+	// mirror is the same one workers' worktrees/bundles come off; an unset mirror
+	// path leaves history.write rows as audited no-ops (the ledger stays canonical).
+	var historyOpt []multirepo.Option
+	if mp := os.Getenv("FLOWBEE_MIRROR_PATH"); mp != "" {
+		historyOpt = append(historyOpt, multirepo.WithHistory(func(store.Repo) project.HistoryWriter {
+			return gitops.Open(mp)
+		}))
+	}
+	mgr, err := multirepo.New(ctx, st, clock.Real{}, srv.Broker(), factory, historyOpt...)
 	if err != nil {
 		logger.Error("build multi-repo manager", "err", err)
 		return nil

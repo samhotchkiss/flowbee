@@ -21,6 +21,7 @@ import (
 	"time"
 
 	gh "github.com/samhotchkiss/flowbee/internal/github"
+	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
@@ -53,6 +54,31 @@ type Sender struct {
 	// WHOLE outbox is parked. Single-sender, so a plain field is safe (Drain is
 	// not called concurrently with itself).
 	parkedUntil time.Time
+
+	// history is the LOCAL-git writer for the issue-archive projection (build-list
+	// §F). The history.write action is a dedicated post-merge git commit (Flowbee
+	// the sole writer), NOT a GitHub mutation — so it goes through this writer, not
+	// gh. Optional: when nil, a history.write row is dropped to sent as a no-op (the
+	// ledger remains canonical; the markdown is simply not materialized). historyBranch
+	// is the branch the dedicated commit lands on (default "main").
+	history       HistoryWriter
+	historyBranch string
+}
+
+// HistoryWriter commits the issue-archive markdown projection as a dedicated commit
+// (build-list §F). Satisfied by *gitops.Mirror. Kept as an interface so the Sender
+// neither hard-depends on gitops nor reaches GitHub for an archive write.
+type HistoryWriter interface {
+	CommitHistory(branch, message string, files []gitops.HistoryFile) (sha string, ok bool, err error)
+}
+
+// WithHistory wires the local-git history writer + the branch its dedicated
+// post-merge commits land on (build-list §F). Returns the Sender for chaining. With
+// no writer wired, history.write rows drain as audited no-ops.
+func (s *Sender) WithHistory(w HistoryWriter, branch string) *Sender {
+	s.history = w
+	s.historyBranch = branch
+	return s
 }
 
 // New builds a Sender over a github.Writer for the legacy single-repo scope.
@@ -219,6 +245,34 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			return "", err
 		}
 		return fmt.Sprintf("draft_back pr=%d", number), nil
+
+	case store.ActionWriteHistory:
+		// build-list §F: the dedicated post-merge issue-archive commit. Flowbee folds
+		// the job's ledger into a curated card + regenerates the TOC, then commits both
+		// as ONE dedicated commit on the integration branch (the sole writer; never
+		// entangled with the feature PR). No GitHub call — a LOCAL git write.
+		arts, err := s.store.BuildHistoryArtifacts(ctx, row.JobID)
+		if err != nil {
+			return "", fmt.Errorf("build history: %w", err)
+		}
+		if s.history == nil {
+			// no writer wired: the ledger stays canonical, the markdown is just not
+			// materialized. Drop to sent (audited) so the queue never wedges.
+			return fmt.Sprintf("history:noop files=%d", len(arts)), nil
+		}
+		files := make([]gitops.HistoryFile, 0, len(arts))
+		for _, a := range arts {
+			files = append(files, gitops.HistoryFile{Path: a.Path, Content: a.Content})
+		}
+		sha, ok, err := s.history.CommitHistory(orDefault(s.historyBranch, "main"),
+			fmt.Sprintf("flowbee: archive history for %s", row.JobID), files)
+		if err != nil {
+			return "", fmt.Errorf("commit history: %w", err)
+		}
+		if !ok {
+			return "history:nochange", nil
+		}
+		return fmt.Sprintf("history sha=%s files=%d", sha, len(files)), nil
 
 	default:
 		// an unknown action is dropped to sent (audited) so the queue never wedges.

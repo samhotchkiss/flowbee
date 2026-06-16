@@ -65,10 +65,42 @@ type Manager struct {
 	order []string             // repo ids in stable (sorted) order
 }
 
+// HistoryWriter is the per-repo LOCAL-git writer that lands the F11 issue-archive
+// commit (build-list §F). Aliased from project so callers wiring the Manager need
+// not import project directly. Satisfied by *gitops.Mirror.
+type HistoryWriter = project.HistoryWriter
+
+// HistoryFactory builds the per-repo LOCAL-git history writer for the F11
+// issue-archive projection (build-list §F): given a repo, it returns the writer
+// that lands the dedicated post-merge `docs/history/<id>.md` + TOC commit on the
+// repo's integration branch, or nil to disable the archive for that repo. In
+// production this returns the repo's bare mirror (gitops.Open(mirrorPath)).
+type HistoryFactory func(r store.Repo) HistoryWriter
+
+// Option configures the Manager at construction (functional options keep New's
+// signature stable for existing callers/tests).
+type Option func(*managerConfig)
+
+type managerConfig struct {
+	history HistoryFactory
+}
+
+// WithHistory wires the F11 history writer per repo so each repo's project-OUT
+// sender lands the dedicated post-merge archive commit. Without it, history.write
+// rows drain as audited no-ops (the ledger stays canonical; the markdown is simply
+// not materialized).
+func WithHistory(f HistoryFactory) Option {
+	return func(c *managerConfig) { c.history = f }
+}
+
 // New builds a Manager over every ACTIVE registered repo, constructing each repo's
 // scoped reconcile-IN + project-OUT loop via the factory. Parked (active=0) repos
 // are skipped — their loops do not run and their jobs are not dispatched.
-func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory GitHubFactory) (*Manager, error) {
+func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory GitHubFactory, opts ...Option) (*Manager, error) {
+	var cfg managerConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	repos, err := st.ListRepos(ctx, true)
 	if err != nil {
 		return nil, fmt.Errorf("list repos: %w", err)
@@ -81,10 +113,22 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 		}
 		recClk := reconcileClock{clk}
 		projClk := projectClock{clk}
+		sender := project.NewForRepo(r.ID, r.DefaultBranch, st, writer, projClk, asProjectPub(pub))
+		// F11 (build-list §F): wire the per-repo history writer so the merged->done
+		// post-merge archive commit lands on the repo's integration branch.
+		if cfg.history != nil {
+			if hw := cfg.history(r); hw != nil {
+				branch := r.DefaultBranch
+				if branch == "" {
+					branch = "main"
+				}
+				sender = sender.WithHistory(hw, branch)
+			}
+		}
 		m.loops[r.ID] = &repoLoop{
 			repo:   r,
 			rec:    reconcile.NewForRepo(r.ID, st, client, recClk, asReconcilePub(pub)),
-			sender: project.NewForRepo(r.ID, r.DefaultBranch, st, writer, projClk, asProjectPub(pub)),
+			sender: sender,
 		}
 		m.order = append(m.order, r.ID)
 	}

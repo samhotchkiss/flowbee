@@ -453,3 +453,111 @@ func runEnv(dir string, extraEnv []string, name string, args ...string) (string,
 func WorktreeBase(root, jobID string, epoch int) string {
 	return filepath.Join(root, fmt.Sprintf("ws-%s-e%d", jobID, epoch))
 }
+
+// ReadFileAtRef returns the content of a repo-relative path as committed at ref
+// (e.g. "refs/heads/main"). ok=false if the path does not exist at that ref. Used
+// to read back Flowbee-authored files (e.g. the history archive) without a
+// worktree. No network, no credentials — a plain object read on the mirror.
+func (m *Mirror) ReadFileAtRef(ref, path string) (string, bool, error) {
+	out, err := run("", "git", "--git-dir", m.Path, "cat-file", "-p",
+		ref+":"+filepath.ToSlash(path))
+	if err != nil {
+		return "", false, nil // absent at ref (or bad path): not an error to the caller
+	}
+	return out, true, nil
+}
+
+// HistoryFile is one file the post-merge history commit writes (path relative to
+// the repo root + its content). Mirrors store.HistoryArtifact without importing it
+// (gitops is the I/O leaf; the control plane wires the two together).
+type HistoryFile struct {
+	Path    string
+	Content string
+}
+
+// CommitHistory lands the issue-archive markdown projection (build-list §F) as a
+// DEDICATED commit on branch (the default branch), authored as Flowbee — the sole
+// writer. It is NOT entangled with any feature PR: Flowbee checks out the branch in
+// a throwaway worktree, writes the curated card(s) + the regenerated TOC, commits
+// under the Flowbee identity, and advances the branch ref. A no-op (no file content
+// change) commits nothing and returns ok=false. Returns the new commit SHA on a
+// real write.
+//
+// The write is done in a disposable worktree off the mirror so it never disturbs a
+// live worktree, and the branch is advanced by the worktree's commit (a fast-forward
+// of the local branch ref). No network, no credentials — the archive lives in the
+// same mirror the rest of Flowbee's git writes use.
+func (m *Mirror) CommitHistory(branch, message string, files []HistoryFile) (sha string, ok bool, err error) {
+	if len(files) == 0 {
+		return "", false, nil
+	}
+	// fully-qualify the branch so `update-ref` writes refs/heads/<branch> (a bare
+	// `update-ref main` would create a stray top-level `main` ref, not the branch).
+	ref := branch
+	if !strings.HasPrefix(ref, "refs/") {
+		ref = "refs/heads/" + branch
+	}
+	baseSHA, hasBase := m.RefSHA(ref)
+	wsRoot, err := os.MkdirTemp("", "flowbee-history-")
+	if err != nil {
+		return "", false, err
+	}
+	defer os.RemoveAll(wsRoot)
+	wsDir := filepath.Join(wsRoot, "ws")
+
+	if hasBase {
+		// check out the current branch tip into a detached worktree so the commit's
+		// parent is the live branch head (the archive accumulates over merges).
+		if _, err := run("", "git", "--git-dir", m.Path, "worktree", "add", "--detach", wsDir, baseSHA); err != nil {
+			return "", false, fmt.Errorf("history worktree: %w", err)
+		}
+	} else {
+		// the branch does not exist yet (fresh repo): start an orphan history root.
+		if _, err := run("", "git", "--git-dir", m.Path, "worktree", "add", "--detach", wsDir); err != nil {
+			return "", false, fmt.Errorf("history worktree (orphan): %w", err)
+		}
+		if _, err := run(wsDir, "git", "checkout", "--orphan", "flowbee-history-tmp"); err != nil {
+			return "", false, fmt.Errorf("history orphan checkout: %w", err)
+		}
+		if _, err := run(wsDir, "git", "rm", "-rf", "--ignore-unmatch", "."); err != nil {
+			return "", false, fmt.Errorf("history orphan clean: %w", err)
+		}
+	}
+	defer func() { _, _ = run("", "git", "--git-dir", m.Path, "worktree", "remove", "--force", wsDir) }()
+
+	for _, f := range files {
+		full := filepath.Join(wsDir, filepath.FromSlash(f.Path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return "", false, err
+		}
+		if err := os.WriteFile(full, []byte(f.Content), 0o644); err != nil {
+			return "", false, err
+		}
+		if _, err := run(wsDir, "git", "add", "--", f.Path); err != nil {
+			return "", false, fmt.Errorf("history add %s: %w", f.Path, err)
+		}
+	}
+
+	// nothing changed? do not author an empty commit (idempotent re-drain).
+	if out, _ := run(wsDir, "git", "status", "--porcelain"); strings.TrimSpace(out) == "" {
+		return "", false, nil
+	}
+
+	env := []string{
+		"GIT_AUTHOR_NAME=flowbee", "GIT_AUTHOR_EMAIL=flowbee@flowbee.local",
+		"GIT_COMMITTER_NAME=flowbee", "GIT_COMMITTER_EMAIL=flowbee@flowbee.local",
+	}
+	if _, err := runEnv(wsDir, env, "git", "commit", "-m", message); err != nil {
+		return "", false, fmt.Errorf("history commit: %w", err)
+	}
+	head, err := run(wsDir, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return "", false, fmt.Errorf("history rev-parse: %w", err)
+	}
+	head = strings.TrimSpace(head)
+	// advance the real branch ref to the new commit (Flowbee's dedicated commit).
+	if _, err := run("", "git", "--git-dir", m.Path, "update-ref", ref, head); err != nil {
+		return "", false, fmt.Errorf("history advance %s: %w", ref, err)
+	}
+	return head, true, nil
+}
