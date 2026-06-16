@@ -179,9 +179,9 @@ func TestResultLandsReviewPending(t *testing.T) {
 		t.Fatalf("epoch must stay monotonic (%d), got %d", ls.Epoch, j.LeaseEpoch)
 	}
 	// a fresh lease attempt now finds no ready job.
-	id, _ := st.PickReadyJob(context.Background())
-	if id != "" {
-		t.Fatalf("no job should be ready, got %q", id)
+	cands, _ := st.ReadyCandidates(context.Background())
+	if len(cands) != 0 {
+		t.Fatalf("no job should be ready, got %d candidates", len(cands))
 	}
 }
 

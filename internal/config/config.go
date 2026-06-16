@@ -22,6 +22,9 @@ type Config struct {
 	LongPollWaitS      int    `yaml:"long_poll_wait_s"`
 	RiverMaxWorkers    int    `yaml:"river_max_workers"`
 	LogLevel           string `yaml:"log_level"`
+	// NoEligibleWorkerS is how long a `ready` job may sit with no compliant
+	// worker before the no_eligible_worker alarm fires (I-6, §6.6).
+	NoEligibleWorkerS int `yaml:"no_eligible_worker_s"`
 }
 
 func Default() Config {
@@ -35,7 +38,13 @@ func Default() Config {
 		LongPollWaitS:      30,
 		RiverMaxWorkers:    10,
 		LogLevel:           "info",
+		NoEligibleWorkerS:  120,
 	}
+}
+
+// NoEligibleWorker is the alarm window as a duration.
+func (c Config) NoEligibleWorker() time.Duration {
+	return time.Duration(c.NoEligibleWorkerS) * time.Second
 }
 
 // Load reads defaults, then flowbee.yaml (or $FLOWBEE_CONFIG), then FLOWBEE_* env
@@ -93,6 +102,9 @@ func applyEnv(c *Config) {
 	}
 	if v := envInt("FLOWBEE_RIVER_MAX_WORKERS"); v > 0 {
 		c.RiverMaxWorkers = v
+	}
+	if v := envInt("FLOWBEE_NO_ELIGIBLE_WORKER_S"); v > 0 {
+		c.NoEligibleWorkerS = v
 	}
 }
 

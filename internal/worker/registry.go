@@ -5,7 +5,9 @@ package worker
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/store"
@@ -65,4 +67,24 @@ func (r *Registry) Register(ctx context.Context, reg Registration, now time.Time
 		AttestedCapabilities: reg.Capabilities,
 		AttestationExpires:   expires.Format(time.RFC3339Nano),
 	}, nil
+}
+
+// AttestedFor returns the most-recently-enrolled attested capability set for an
+// identity (M1: attested := claimed). Used by the scheduler at lease time to match
+// a job's required_capabilities (§6.6). Unknown identity -> empty set.
+func (r *Registry) AttestedFor(ctx context.Context, identity string) ([]string, error) {
+	var blob string
+	err := r.st.DB.QueryRowContext(ctx,
+		`SELECT attested_capabilities FROM workers WHERE identity = ?`, identity).Scan(&blob)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var caps []string
+	if err := json.Unmarshal([]byte(blob), &caps); err != nil {
+		return nil, err
+	}
+	return caps, nil
 }

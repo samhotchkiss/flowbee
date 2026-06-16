@@ -15,6 +15,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/lease"
+	"github.com/samhotchkiss/flowbee/internal/scheduler"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/ulid"
 	"github.com/samhotchkiss/flowbee/internal/worker"
@@ -118,39 +119,50 @@ type LeaseGrant struct {
 	Deadline   string `json:"lease_deadline"`
 }
 
-// lease long-polls: loop the atomic claim up to LongPollWait. On grant -> 200 +
-// envelope; on timeout / persistent lost-race -> 204.
+// lease long-polls: rank `ready` candidates (scheduler: priority + aging +
+// capability match), try them best-first via the atomic claim up to LongPollWait.
+// On grant -> 200 + envelope; on timeout / persistent lost-race / no eligible
+// candidate -> 204. A worker lacking a job's required capability is never offered
+// it (the claim also rejects, belt-and-suspenders), so the job stays `ready` and
+// its no_eligible_worker alarm can fire (I-6).
 func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	identity := r.URL.Query().Get("identity")
 	family := r.URL.Query().Get("model_family")
 	roleFilter := job.Role(r.URL.Query().Get("role"))
 
+	attested, err := s.registry.AttestedFor(r.Context(), identity)
+	if err != nil {
+		http.Error(w, "lease error", http.StatusInternalServerError)
+		return
+	}
+
 	deadline := time.Now().Add(s.longPollWait)
 	for {
-		jobID, err := s.store.PickReadyJob(r.Context())
+		cands, err := s.store.ReadyCandidates(r.Context())
 		if err != nil {
 			http.Error(w, "lease error", http.StatusInternalServerError)
 			return
 		}
-		if jobID != "" {
-			role := roleFilter
-			if role == "" {
-				role = job.RoleEngWorker
-			}
+		role := roleFilter
+		if role == "" {
+			role = job.RoleEngWorker
+		}
+		for _, cand := range scheduler.Order(cands, attested, s.clock.Now()) {
 			ls, err := s.store.ClaimReadyJob(r.Context(), store.ClaimParams{
-				JobID:       jobID,
+				JobID:       cand.JobID,
 				LeaseID:     s.minter.New(),
 				Identity:    identity,
 				ModelFamily: family,
 				Role:        role,
+				Attested:    attested,
 				TTL:         s.leaseTTL,
 				Now:         s.clock.Now(),
 			})
 			if err == nil {
-				j, _ := s.store.GetJob(r.Context(), jobID)
-				s.broker.Publish(LifeEvent{JobID: jobID, State: string(j.State), Event: "lease_claimed", Epoch: ls.Epoch})
+				j, _ := s.store.GetJob(r.Context(), cand.JobID)
+				s.broker.Publish(LifeEvent{JobID: cand.JobID, State: string(j.State), Event: "lease_claimed", Epoch: ls.Epoch})
 				writeJSON(w, http.StatusOK, LeaseGrant{
-					JobID: jobID, Kind: string(j.Kind), Role: string(j.Role),
+					JobID: cand.JobID, Kind: string(j.Kind), Role: string(j.Role),
 					BaseSHA: j.BaseSHA, LeaseID: ls.LeaseID, LeaseEpoch: ls.Epoch,
 					LeaseTTLS: int(s.leaseTTL / time.Second), Deadline: ls.Deadline.Format(time.RFC3339Nano),
 				})
@@ -160,7 +172,7 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "claim error", http.StatusInternalServerError)
 				return
 			}
-			// lost race: fall through and keep polling.
+			// lost race / lost on capability: try the next candidate.
 		}
 		if time.Now().After(deadline) {
 			w.WriteHeader(http.StatusNoContent)

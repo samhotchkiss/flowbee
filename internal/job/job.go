@@ -4,6 +4,8 @@
 // passed IN as values; the type `time.Time` is used only as a value, never read.
 package job
 
+import "time"
+
 // State is the §6.2.1 state-machine catalogue. M1 exercises the build subset.
 type State string
 
@@ -59,6 +61,39 @@ var ActiveLeaseStates = map[State]bool{
 // HasActiveLease reports whether s is a state that holds an active lease.
 func HasActiveLease(s State) bool { return ActiveLeaseStates[s] }
 
+// CapabilitiesSatisfy reports whether the attested capability set satisfies every
+// required capability tag. This is the pure §6.6 capability match (matching is on
+// the attested set; the loop wires it into the atomic claim). Required tags are
+// matched exactly, except a "model_family:*" requirement is satisfied by any
+// "model_family:" capability (a role that accepts any family, §5.3).
+func CapabilitiesSatisfy(attested, required []string) bool {
+	have := make(map[string]bool, len(attested))
+	for _, c := range attested {
+		have[c] = true
+	}
+	for _, req := range required {
+		if req == "model_family:*" {
+			if !hasPrefix(attested, "model_family:") {
+				return false
+			}
+			continue
+		}
+		if !have[req] {
+			return false
+		}
+	}
+	return true
+}
+
+func hasPrefix(caps []string, prefix string) bool {
+	for _, c := range caps {
+		if len(c) >= len(prefix) && c[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
+}
+
 // Job is the projection folded from job_events (Domain A). M1 carries the lease
 // columns + counters the lease thread needs; later milestones extend it.
 type Job struct {
@@ -81,7 +116,16 @@ type Job struct {
 	HeadSHA string
 
 	// scheduling
-	Priority int
+	BlockedBy []string // DAG predecessors; job is `ready` only when all are `done`
+	Priority  int
+	// EnqueuedAt is the instant the job entered `ready` (for aging, §6.6). It is a
+	// resolved fact recorded in the ledger, never read from a clock at fold time.
+	EnqueuedAt time.Time
+
+	// RequiredCapabilities are the capability tags a worker MUST attest to win
+	// this job's lease (§6.6 capability match on claimed-as-attested). Empty =>
+	// any worker may win.
+	RequiredCapabilities []string
 
 	// LIVE lease columns
 	LeaseID          string

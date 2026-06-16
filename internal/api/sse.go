@@ -47,6 +47,12 @@ func (b *Broker) unsubscribe(id int) {
 	}
 }
 
+// PublishAlarm surfaces a fired scheduler alarm (e.g. no_eligible_worker) live on
+// the SSE feed. Satisfies alarm.Publisher so the poller can surface I-6 alarms.
+func (b *Broker) PublishAlarm(jobID, kind string) {
+	b.Publish(LifeEvent{JobID: jobID, State: "ready", Event: kind})
+}
+
 // Publish broadcasts a lifecycle event to all subscribers (non-blocking).
 func (b *Broker) Publish(e LifeEvent) {
 	blob, err := json.Marshal(e)

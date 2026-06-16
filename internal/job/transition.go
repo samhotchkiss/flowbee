@@ -12,6 +12,9 @@ const (
 	TriggerReleased            Trigger = "released"
 	TriggerLeaseExpiredRetry   Trigger = "lease_expired_retry"
 	TriggerLeaseExpiredExhaust Trigger = "lease_expired_exhausted"
+	// M2 scheduler/DAG triggers.
+	TriggerDepsCleared Trigger = "deps_cleared" // blocked -> ready (all blocked_by done)
+	TriggerCompleted   Trigger = "completed"    // review_pending -> done (M2: hand-driven completion)
 )
 
 // ErrIllegalTransition is returned for any (state, trigger) pair not in the table.
@@ -39,6 +42,10 @@ var transitions = map[transitionKey]State{
 
 	{StateLeased, TriggerLeaseExpiredExhaust}:   StateNeedsHuman,
 	{StateBuilding, TriggerLeaseExpiredExhaust}: StateNeedsHuman,
+
+	// M2 DAG/scheduler edges.
+	{StateBlocked, TriggerDepsCleared}:     StateReady,
+	{StateReviewPending, TriggerCompleted}: StateDone,
 }
 
 // Next is the pure §6.2 state machine: (state, trigger) -> next state. It is a

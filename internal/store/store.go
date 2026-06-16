@@ -8,12 +8,18 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
 	DB *sql.DB
+
+	// NoEligibleWorkerDelay is how long a job may sit `ready` with no compliant
+	// worker before the no_eligible_worker alarm fires (I-6). Zero disables
+	// auto-arming on enqueue (tests arm timers explicitly). Set by the runtime.
+	NoEligibleWorkerDelay time.Duration
 }
 
 // Open opens the SQLite database with WAL + a busy timeout. A single open

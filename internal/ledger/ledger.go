@@ -24,6 +24,10 @@ const (
 	KindResultAccepted EventKind = "result_accepted"
 	KindLeaseReleased  EventKind = "lease_released"
 	KindStateChanged   EventKind = "state_changed"
+	// M2 scheduler/DAG event kinds.
+	KindDepsCleared      EventKind = "deps_cleared"       // blocked -> ready
+	KindJobCompleted     EventKind = "job_completed"      // review_pending -> done
+	KindNoEligibleWorker EventKind = "no_eligible_worker" // scheduler alarm fired (I-6)
 )
 
 // Event is one appended ledger row. Payload holds kind-specific RESOLVED facts as
@@ -44,12 +48,16 @@ type Event struct {
 // relevant to an event's kind are set; the rest are zero.
 type Payload struct {
 	// job_created
-	Kind     job.Kind
-	Flow     string
-	Stage    string
-	Role     job.Role
-	BaseSHA  string
-	Priority int
+	Kind                 job.Kind
+	Flow                 string
+	Stage                string
+	Role                 job.Role
+	BaseSHA              string
+	Priority             int
+	BlockedBy            []string `json:",omitempty"`
+	RequiredCapabilities []string `json:",omitempty"`
+	// CreatedReady records whether the job entered the ledger already `ready`
+	// (no unmet deps) vs `blocked`. Set on job_created; the fold reads ToState.
 
 	// lease_claimed
 	LeaseID          string
@@ -74,7 +82,14 @@ func Fold(events []Event) (job.Job, error) {
 			j.Role = e.Payload.Role
 			j.BaseSHA = e.Payload.BaseSHA
 			j.Priority = e.Payload.Priority
+			j.BlockedBy = e.Payload.BlockedBy
+			j.RequiredCapabilities = e.Payload.RequiredCapabilities
 			j.State = e.ToState
+			// EnqueuedAt: a job created already-`ready` is enqueued now (aging
+			// clock starts here); a `blocked` job starts aging when deps clear.
+			if e.ToState == job.StateReady {
+				j.EnqueuedAt = e.CreatedAt
+			}
 			// M1 default counters mirror the migration defaults.
 			j.MaxAttempts = 5
 			j.MaxBounces = 3
@@ -102,6 +117,16 @@ func Fold(events []Event) (job.Job, error) {
 			j.BoundModelFamily = ""
 		case KindStateChanged:
 			j.State = e.ToState
+		case KindDepsCleared:
+			// blocked -> ready: aging clock starts now (the job becomes leasable).
+			j.State = e.ToState
+			j.EnqueuedAt = e.CreatedAt
+			j.BlockedBy = nil
+		case KindJobCompleted:
+			j.State = e.ToState
+		case KindNoEligibleWorker:
+			// the alarm is an observability event; no projection field changes
+			// (the job stays `ready`). Recorded for replay/audit completeness.
 		}
 		j.JobSeq = e.JobSeq
 	}

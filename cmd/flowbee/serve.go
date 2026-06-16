@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/alarm"
 	"github.com/samhotchkiss/flowbee/internal/api"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/config"
@@ -40,6 +41,8 @@ func runServe(_ []string) error {
 	}
 	logger.Info("migrations applied")
 
+	st.NoEligibleWorkerDelay = cfg.NoEligibleWorker()
+
 	srv := api.New(st, clock.Real{}, ulid.NewMinter(nil), api.Config{
 		LeaseTTL:           cfg.LeaseTTL(),
 		HeartbeatInterval:  cfg.HeartbeatInterval(),
@@ -52,6 +55,11 @@ func runServe(_ []string) error {
 
 	go serveHTTP(logger, "health", healthSrv)
 	go serveHTTP(logger, "private", privateSrv)
+
+	// the single durable-timer polling goroutine (project override #2): drives the
+	// no_eligible_worker alarm, epoch-guarded.
+	poller := alarm.New(st, clock.Real{}, time.Second, srv.Broker())
+	go poller.Run(ctx)
 
 	logger.Info("flowbee serve started",
 		"version", version, "health", cfg.HealthAddr, "private", cfg.PrivateAddr)
