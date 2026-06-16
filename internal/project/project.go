@@ -189,7 +189,10 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		if err != nil {
 			return "", err
 		}
-		if err := s.store.StampPRNumber(ctx, row.JobID, number, row.HeadSHA, str(p, "base_ref"), now); err != nil {
+		// seed facts with the base SHA the build was cut from (j.BaseSHA), NOT the PR
+		// base_ref name ("main") — reconcile compares facts.base_sha to the PR's base
+		// OID, so a ref name there reads as a phantom base move and supersedes.
+		if err := s.store.StampPRNumber(ctx, row.JobID, number, row.HeadSHA, j.BaseSHA, now); err != nil {
 			return "", fmt.Errorf("stamp pr: %w", err)
 		}
 		return fmt.Sprintf("pr=%d", number), nil
