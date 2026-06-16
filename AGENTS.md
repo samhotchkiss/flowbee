@@ -112,12 +112,26 @@ agent it wraps, and reports back. It holds no GitHub creds.
 
 ## Step 6 — start it
 
-On the main machine:
+On the main machine, one command brings up the whole fleet — control plane plus a
+real-agent worker for every pipeline role (author, issue-review, build, code-review):
 
 ```bash
-flowbee migrate up      # create the SQLite schema
-flowbee serve &         # the control plane (board at http://localhost:7070)
+flowbee up --self-merge   # dashboard at http://localhost:7070/dashboard
 ```
+
+`flowbee up` clones the local mirror, starts the control plane, and starts each
+role's worker loop (spawning the configured agent CLI per job). `--self-merge`
+enables Branch-B autonomous merge (no human gate). For a multi-box fleet instead,
+run `flowbee serve &` on the main machine and `flowbee work --role … &` on each
+remote (same binary, no creds on the workers).
+
+### Giving Flowbee work
+
+- **From GitHub:** open an issue and add the **`flowbee:build`** label — Flowbee
+  adopts it, builds it, reviews it, merges it, and closes the issue.
+- **From a planner agent:** `POST /v1/specs` with `{"task": "...", "acceptance":
+  "..."}` — an author drafts the spec, a distinct-lens reviewer signs off, the
+  issue is materialized, and it flows to merge.
 
 ## Step 7 — confirm green
 
