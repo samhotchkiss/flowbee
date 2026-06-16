@@ -1,5 +1,14 @@
 {{define "board.html"}}
 <h1><span class="logo">🐝</span>Board</h1>
+{{if .Repos}}
+<div class="repo-filter" role="navigation" aria-label="filter by repo">
+  <a class="repo-chip{{if eq .SelectedRepo ""}} active{{end}}" href="/board">All</a>
+  {{$sel := .SelectedRepo}}
+  {{range .Repos}}
+  <a class="repo-chip{{if eq . $sel}} active{{end}}" href="/board?repo={{.}}">{{.}}</a>
+  {{end}}
+</div>
+{{end}}
 <div class="lanes">
 {{range .Lanes}}
   <section class="lane {{.Class}}" data-lane="{{.Key}}">

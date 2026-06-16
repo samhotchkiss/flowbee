@@ -60,6 +60,19 @@ h1 .logo{filter:drop-shadow(0 0 10px rgba(250,204,21,.4));margin-right:.4rem}
 h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.9px;color:var(--faint);margin:1.7rem 0 .7rem;font-weight:700}
 
 /* ── BOARD ── stage lanes left-to-right, dark panels, per-card timer ── */
+/* repo filter — a row of selectable repo chips (F9 multi-repo registry); the
+   active chip is the bee accent, "All" is the no-filter default. */
+.repo-filter{display:flex;flex-wrap:wrap;gap:.4rem;margin:0 0 .9rem}
+.repo-chip{
+  font-family:var(--mono);font-size:.72rem;color:var(--dim);text-decoration:none;
+  background:var(--inset);border:1px solid var(--line);border-radius:99px;
+  padding:.18rem .7rem;transition:border-color .2s,color .2s,background .2s;
+}
+.repo-chip:hover{color:var(--txt);border-color:#39415a}
+.repo-chip.active{
+  color:var(--bee);background:var(--bee-soft);
+  border-color:color-mix(in srgb,var(--bee) 45%,var(--line));
+}
 .lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:.75rem;align-items:start}
 .lane{
   background:linear-gradient(180deg,var(--panel2),var(--panel));
