@@ -11,7 +11,8 @@ var boardTmpl = template.Must(template.New("board").Parse(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Flowbee board</title>
 <style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse}
 td,th{border:1px solid #ccc;padding:4px 8px}th{background:#f3f3f3}</style></head>
-<body><h1>Flowbee board</h1>
+<body><nav style="margin:0 0 1.1rem;padding:.45rem .7rem;background:#fbf6dd;border:1px solid #ece3b0;border-radius:6px;font-weight:600">🐝 Flowbee &nbsp; <a href="/dashboard">Dashboard</a> &nbsp;·&nbsp; <a href="/">Board</a> &nbsp;·&nbsp; <a href="/roster">Roster</a> &nbsp;·&nbsp; <a href="/v1/events">Live feed</a></nav>
+<h1>Flowbee board</h1>
 <table><tr><th>job</th><th>kind</th><th>state</th><th>role</th><th>epoch</th><th>identity</th></tr>
 {{range .}}<tr><td>{{.ID}}</td><td>{{.Kind}}</td><td>{{.State}}</td><td>{{.Role}}</td><td>{{.LeaseEpoch}}</td><td>{{.Identity}}</td></tr>
 {{end}}</table>
@@ -30,7 +31,8 @@ var rosterTmpl = template.Must(template.New("roster").Parse(`<!doctype html>
 <style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse}
 td,th{border:1px solid #ccc;padding:4px 8px}th{background:#f3f3f3}
 .stale{color:#b00;font-weight:600}</style></head>
-<body><h1>Flowbee worker roster</h1>
+<body><nav style="margin:0 0 1.1rem;padding:.45rem .7rem;background:#fbf6dd;border:1px solid #ece3b0;border-radius:6px;font-weight:600">🐝 Flowbee &nbsp; <a href="/dashboard">Dashboard</a> &nbsp;·&nbsp; <a href="/">Board</a> &nbsp;·&nbsp; <a href="/roster">Roster</a> &nbsp;·&nbsp; <a href="/v1/events">Live feed</a></nav>
+<h1>Flowbee worker roster</h1>
 <table><tr><th>worker</th><th>identity</th><th>host</th><th>arch/os</th>
 <th>attested caps</th><th>lease</th><th>last hb</th></tr>
 {{range .}}<tr>
@@ -71,6 +73,7 @@ td,th{border:1px solid #ccc;padding:3px 7px;text-align:left}th{background:#f3f3f
 .stale,.over{color:#b00;font-weight:600}.gauge{font-weight:600}
 .panes{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem}</style></head>
 <body>
+<nav style="margin:0 0 1.1rem;padding:.45rem .7rem;background:#fbf6dd;border:1px solid #ece3b0;border-radius:6px;font-weight:600">🐝 Flowbee &nbsp; <a href="/dashboard">Dashboard</a> &nbsp;·&nbsp; <a href="/">Board</a> &nbsp;·&nbsp; <a href="/roster">Roster</a> &nbsp;·&nbsp; <a href="/v1/events">Live feed</a></nav>
 <h1>Flowbee dashboard</h1>
 <p class="gauge">GitHub budget: {{.Budget.Remaining}} / {{.Budget.Limit}} remaining
 (last sweep {{.Budget.LastSweep.Format "15:04:05"}})</p>
