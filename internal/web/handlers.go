@@ -43,6 +43,11 @@ type boardCard struct {
 
 type boardView struct {
 	Lanes []boardLane
+	// Repos is the set of distinct non-empty repo scopes present on the board (F9
+	// multi-repo registry), rendered as the filter chips. SelectedRepo is the active
+	// ?repo=<id> filter ("" => the "All" default, every repo shown).
+	Repos        []string
+	SelectedRepo string
 }
 
 // stageLanes is the ordered set of pipeline stage lanes (the flow left-to-right),
@@ -96,6 +101,16 @@ func (u *UI) board(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// the distinct repo scopes are gathered across ALL cards (before filtering) so
+	// every available repo gets a chip regardless of the current selection. The
+	// ?repo=<id> filter then keeps only the matching cards; "" means the "All"
+	// default and shows everything.
+	repos := distinctRepos(cards)
+	selRepo := r.URL.Query().Get("repo")
+	if selRepo != "" {
+		cards = filterByRepo(cards, selRepo)
+	}
+
 	lanes := map[string]*boardLane{}
 	order := []string{}
 	add := func(key, title, class string) *boardLane {
@@ -130,11 +145,41 @@ func (u *UI) board(w http.ResponseWriter, r *http.Request) {
 	// "needs full spec" flag) so it matches /v1/backlog exactly.
 	syncBacklog(lanes["backlog"], bl, now)
 
-	var view boardView
+	view := boardView{Repos: repos, SelectedRepo: selRepo}
 	for _, k := range order {
 		view.Lanes = append(view.Lanes, *lanes[k])
 	}
 	u.renderPage(w, r, page{Active: "board", Title: "Board", Board: &view})
+}
+
+// distinctRepos returns the sorted set of distinct non-empty repo scopes present
+// on the board cards (the F9 repo filter chips). Legacy single-repo jobs carry an
+// empty repo and are only reachable via the "All" default, so they contribute no
+// chip; when every card is empty-repo the chip row is effectively a no-op.
+func distinctRepos(cards []store.BoardCard) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range cards {
+		if c.Repo != "" && !seen[c.Repo] {
+			seen[c.Repo] = true
+			out = append(out, c.Repo)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// filterByRepo keeps only the cards whose repo scope matches repo (the ?repo=<id>
+// server-side board filter). An empty repo never matches here (it is the "All"
+// path), so selecting a repo hides the legacy single-repo cards.
+func filterByRepo(cards []store.BoardCard, repo string) []store.BoardCard {
+	out := cards[:0:0]
+	for _, c := range cards {
+		if c.Repo == repo {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // enrichNeedsYou stamps the design-fork reason onto needs-you cards that have one.

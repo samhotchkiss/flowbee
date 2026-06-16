@@ -25,6 +25,10 @@ type BoardCard struct {
 	Stage         string    `json:"stage"`
 	State         string    `json:"state"`
 	Role          string    `json:"role"`
+	// Repo is the F9 repo-scope handle (the repos.id this card's job belongs to).
+	// Empty is the legacy single-repo default. The board's repo filter chips are the
+	// distinct non-empty values, and ?repo=<id> keeps only the matching cards.
+	Repo          string    `json:"repo,omitempty"`
 	Identity      string    `json:"bound_identity"`
 	IssueNumber   int       `json:"issue_number,omitempty"`
 	EpicID        string    `json:"epic_id,omitempty"`
@@ -56,6 +60,7 @@ func (s *Store) BoardCards(ctx context.Context, now time.Time) ([]BoardCard, err
 		       COALESCE(j.issue_number,0), COALESCE(j.epic_id,''), COALESCE(j.is_epic,0),
 		       COALESCE(j.task_text,''), COALESCE(j.spec_text,''),
 		       j.priority, COALESCE(j.needs_full_spec,0), j.lease_epoch,
+		       COALESCE(j.repo,''),
 		       COALESCE((SELECT MAX(e.created_at) FROM job_events e
 		                  WHERE e.job_id = j.id AND e.to_state = j.state), j.updated_at)
 		  FROM jobs j
@@ -72,7 +77,7 @@ func (s *Store) BoardCards(ctx context.Context, now time.Time) ([]BoardCard, err
 		var task, spec, entered string
 		if err := rows.Scan(&c.JobID, &c.Kind, &c.Stage, &c.State, &c.Role, &c.Identity,
 			&c.IssueNumber, &c.EpicID, &isEpic, &task, &spec,
-			&c.Priority, &needs, &c.LeaseEpoch, &entered); err != nil {
+			&c.Priority, &needs, &c.LeaseEpoch, &c.Repo, &entered); err != nil {
 			return nil, err
 		}
 		c.IsEpic = isEpic != 0
@@ -223,7 +228,7 @@ func (s *Store) JobDetail(ctx context.Context, jobID string, now time.Time) (Job
 		JobID: j.ID, Kind: string(j.Kind), Stage: j.Stage, State: string(j.State),
 		Role: string(j.Role), Identity: j.BoundIdentity, IssueNumber: j.IssueNum,
 		EpicID: j.EpicID, IsEpic: j.IsEpic, Title: cardTitle(j.TaskText, j.SpecText, j.ID),
-		Priority: j.Priority, LeaseEpoch: j.LeaseEpoch,
+		Priority: j.Priority, LeaseEpoch: j.LeaseEpoch, Repo: j.Repo,
 	}
 	return JobDetail{Card: bc, Timings: timings, History: card}, nil
 }

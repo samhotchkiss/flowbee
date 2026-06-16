@@ -25,7 +25,11 @@
   function refresh() {
     var root = document.getElementById("fb-live");
     if (!root) { return; }
-    fetch(window.location.pathname + "?partial=1", { headers: { "Accept": "text/html" } })
+    // preserve the current query (e.g. the board's ?repo=<id> filter) so the live
+    // refresh keeps the same view; just append partial=1 to get the body fragment.
+    var params = new URLSearchParams(window.location.search);
+    params.set("partial", "1");
+    fetch(window.location.pathname + "?" + params.toString(), { headers: { "Accept": "text/html" } })
       .then(function (r) { return r.ok ? r.text() : null; })
       .then(function (html) {
         if (html === null) { return; }

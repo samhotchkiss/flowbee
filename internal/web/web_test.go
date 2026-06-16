@@ -196,6 +196,61 @@ func TestF12DashboardsRenderOffRealStore(t *testing.T) {
 	}
 }
 
+// TestBoardRepoFilter proves the F9 multi-repo board filter: the board surfaces a
+// chip per distinct repo, ?repo=<id> keeps only that repo's cards server-side (so
+// it works with the live SSE refresh and without JS), and the bare /board shows
+// every repo's cards.
+func TestBoardRepoFilter(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "alpha-1", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, TaskText: "alpha widget", Repo: "alpha", Now: now,
+	}); err != nil {
+		t.Fatalf("seed alpha: %v", err)
+	}
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "beta-1", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, TaskText: "beta gadget", Repo: "beta", Now: now,
+	}); err != nil {
+		t.Fatalf("seed beta: %v", err)
+	}
+	h := mountUI(t, st, fixedClock{t: now})
+
+	// bare /board: both repos' cards + a chip per repo + the "All" default.
+	code, body := getBody(t, h, "/board")
+	if code != http.StatusOK {
+		t.Fatalf("/board status = %d", code)
+	}
+	for _, want := range []string{
+		"data-job=\"alpha-1\"", "data-job=\"beta-1\"",
+		"class=\"repo-chip active\"",        // the "All" chip is active by default
+		"href=\"/board?repo=alpha\"",        // a chip link per repo
+		"href=\"/board?repo=beta\"",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/board missing %q\n---\n%s", want, body)
+		}
+	}
+
+	// /board?repo=alpha: only alpha's cards, and the alpha chip is active.
+	code, body = getBody(t, h, "/board?repo=alpha")
+	if code != http.StatusOK {
+		t.Fatalf("/board?repo=alpha status = %d", code)
+	}
+	if !strings.Contains(body, "data-job=\"alpha-1\"") {
+		t.Fatalf("/board?repo=alpha must keep alpha cards:\n%s", body)
+	}
+	if strings.Contains(body, "data-job=\"beta-1\"") {
+		t.Fatalf("/board?repo=alpha must hide beta cards:\n%s", body)
+	}
+	if !strings.Contains(body, "repo-chip active\" href=\"/board?repo=alpha\"") {
+		t.Fatalf("/board?repo=alpha must mark the alpha chip active:\n%s", body)
+	}
+}
+
 // TestF12PartialRefreshFragment proves the SSE refresh path: ?partial=1 returns
 // only the live body fragment (so the SSE hook swaps it in place without reloading
 // the page or dimming the open drawer). It must NOT carry the <html>/nav chrome.
