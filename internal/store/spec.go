@@ -187,6 +187,7 @@ type MaterializeSpecParams struct {
 	JobID       string
 	ContentHash string // BLAKE3 of spec.md, computed by Flowbee (internal/spec)
 	Version     int    // ordinal on the spec branch
+	Markdown    string // the authored spec.md bytes, retained so project-OUT renders the issue body
 	Epoch       int    // the author's lease epoch (fenced; stale -> 409)
 	Now         time.Time
 }
@@ -224,12 +225,12 @@ func (s *Store) MaterializeSpec(ctx context.Context, p MaterializeSpecParams) er
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs
 			   SET state = 'spec_review', stage = 'review', role = 'spec_reviewer',
-			       spec_content_hash = ?, spec_version = ?,
+			       spec_content_hash = ?, spec_version = ?, spec_text = ?,
 			       required_capabilities = ?,
 			       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 			       lease_hb_due = NULL, updated_at = datetime('now')
 			 WHERE id = ?`,
-			p.ContentHash, p.Version, marshalStrings([]string{"role:spec_reviewer"}), p.JobID); err != nil {
+			p.ContentHash, p.Version, p.Markdown, marshalStrings([]string{"role:spec_reviewer"}), p.JobID); err != nil {
 			return fmt.Errorf("materialize spec projection: %w", err)
 		}
 		return setJobSeq(ctx, tx, p.JobID, nextSeq)

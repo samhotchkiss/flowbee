@@ -210,6 +210,9 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{job}/design", s.resolveDesign)
 	mux.HandleFunc("POST /v1/jobs/{job}/promote", s.promoteBacklog)
 	mux.HandleFunc("POST /v1/jobs/{job}/adopt", s.adoptOptIn)
+	// the planner front-door (ingest): seed a spec-authoring job from a submitted
+	// work item so the spec flow (author -> issue-review -> materialize) can run.
+	mux.HandleFunc("POST /v1/specs", s.specCreate)
 	// the board's machine-readable snapshot (HTML clients hit the web UI's "/"; a
 	// JSON client uses this stable endpoint instead of content-negotiating "/").
 	mux.HandleFunc("GET /v1/board", s.boardJSON)
@@ -712,13 +715,47 @@ func (s *Server) specSubmit(w http.ResponseWriter, r *http.Request) {
 	// Flowbee owns the hash (§11.1): the author submits bytes, Flowbee addresses them.
 	hash := spec.ContentHash([]byte(body.SpecMarkdown))
 	if err := s.store.MaterializeSpec(r.Context(), store.MaterializeSpecParams{
-		JobID: jobID, ContentHash: hash, Version: version, Epoch: epoch, Now: s.clock.Now(),
+		JobID: jobID, ContentHash: hash, Version: version, Markdown: body.SpecMarkdown, Epoch: epoch, Now: s.clock.Now(),
 	}); err != nil {
 		s.writeFenceError(w, err)
 		return
 	}
 	s.broker.Publish(LifeEvent{JobID: jobID, State: string(job.StateSpecReview), Event: "spec_authored", Epoch: epoch})
 	writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "spec_content_hash": hash, "spec_version": version})
+}
+
+// specCreate is the planner front-door (ingest): it seeds a spec-authoring job
+// from a submitted work item so the spec flow can run (author -> issue-review ->
+// materialize -> GitHub issue). The planner names the work; an author worker
+// writes the spec.md and a distinct reviewer signs it off. Loopback admin route.
+func (s *Server) specCreate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID       string `json:"id"`
+		Title    string `json:"title"`     // human label / chat ref for the work item
+		Lens     string `json:"lens"`      // author lens (default engineering_manager)
+		Priority int    `json:"priority"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	id := body.ID
+	if id == "" {
+		id = ulid.New()
+	}
+	lens := body.Lens
+	if lens == "" {
+		lens = "engineering_manager"
+	}
+	j, err := s.store.SeedSpecJob(r.Context(), store.SeedSpecParams{
+		ID: id, ChatRef: body.Title, AuthorLens: lens, Priority: body.Priority, Now: s.clock.Now(),
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	s.broker.Publish(LifeEvent{JobID: j.ID, State: string(j.State), Event: "spec_ingested"})
+	writeJSON(w, http.StatusOK, map[string]any{"job_id": j.ID, "state": string(j.State)})
 }
 
 // specReviewRequest is the spec reviewer's verdict CLAIM + the two §11.3 sub-checks
