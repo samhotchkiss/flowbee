@@ -241,6 +241,13 @@ func TestM12_RestartRecoveryZeroJobLoss(t *testing.T) {
 	// re-reconcile Domain B (fake): a NEW reviewer leases the gate on the SAME job
 	// post-restart, approves; the human merges; reconcile-IN flips it to done. The
 	// job completes across the restart boundary with no loss.
+	// reconcile-IN supplies green facts BEFORE the reviewer leases post-restart (the
+	// review gate is offered only once CI is green).
+	if err := st2.UpsertDomainBFacts(ctx, jobID, job.DomainBFacts{
+		PRExists: true, PRNumber: prNum, HeadSHA: headSHA, BaseSHA: baseSHA, CIGreen: true,
+	}); err != nil {
+		t.Fatalf("reconcile facts: %v", err)
+	}
 	reviewer := client.New(ts2.URL)
 	if _, err := reviewer.Register(ctx, client.Registration{
 		Identity: "rev.opus", Host: "studio",
@@ -251,11 +258,6 @@ func TestM12_RestartRecoveryZeroJobLoss(t *testing.T) {
 	rg, ok2, err := reviewer.Lease(ctx, "rev.opus", "opus", string(job.RoleCodeReviewer))
 	if err != nil || !ok2 || rg.JobID != jobID {
 		t.Fatalf("post-restart reviewer lease ok=%v err=%v job=%s", ok2, err, rg.JobID)
-	}
-	if err := st2.UpsertDomainBFacts(ctx, jobID, job.DomainBFacts{
-		PRExists: true, PRNumber: prNum, HeadSHA: headSHA, BaseSHA: baseSHA, CIGreen: true,
-	}); err != nil {
-		t.Fatalf("reconcile facts: %v", err)
 	}
 	rv, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-restart", "approved", "handoff")
 	if err != nil || code != http.StatusOK || !rv.Minted {

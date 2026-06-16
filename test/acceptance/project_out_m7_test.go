@@ -337,6 +337,13 @@ func TestM7_BuildPatchToOpenPRStampToMergeToDone(t *testing.T) {
 
 	// the reviewer leases the gate; reconcile-IN supplies green Domain-B facts at the
 	// stamped PR. The reviewer approves; Branch A forces handoff.
+	// reconcile-IN supplies green facts BEFORE the reviewer leases (the review gate
+	// is offered only once CI is green, matching production ordering).
+	if err := e.st.UpsertDomainBFacts(ctx, buildJob, job.DomainBFacts{
+		PRExists: true, PRNumber: prNum, HeadSHA: headSHA, BaseSHA: "base-sha-0", CIGreen: true,
+	}); err != nil {
+		t.Fatalf("reconcile facts: %v", err)
+	}
 	reviewer := client.New(url)
 	if _, err := reviewer.Register(ctx, client.Registration{
 		WorkerID: "wk-rev", Identity: "rev", Host: "t",
@@ -351,11 +358,6 @@ func TestM7_BuildPatchToOpenPRStampToMergeToDone(t *testing.T) {
 	// the eng_worker may NOT review its own build (anti-affinity, I-10).
 	if g, ok, _ := builder.Lease(ctx, "bob", "codex", string(job.RoleCodeReviewer)); ok {
 		t.Fatalf("the builder must not win its own code_review, got %s", g.JobID)
-	}
-	if err := e.st.UpsertDomainBFacts(ctx, buildJob, job.DomainBFacts{
-		PRExists: true, PRNumber: prNum, HeadSHA: headSHA, BaseSHA: "base-sha-0", CIGreen: true,
-	}); err != nil {
-		t.Fatalf("reconcile facts: %v", err)
 	}
 	rv, code, err := reviewer.Review(ctx, buildJob, rg.LeaseEpoch, "rev-1", "approved", "handoff")
 	if err != nil || code != http.StatusOK {

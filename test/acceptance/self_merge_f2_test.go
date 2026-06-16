@@ -130,7 +130,16 @@ func driveApprovedCleanJob(t *testing.T, ctx context.Context, e *f2Env, jobID, d
 		t.Fatalf("Flowbee must open the PR and stamp the number")
 	}
 
-	// a DISTINCT reviewer leases the gate; reconcile-IN supplies GREEN facts.
+	// reconcile-IN supplies GREEN facts BEFORE the reviewer leases: the review gate
+	// is only offered once CI is green (ReviewPendingCandidates), matching production
+	// where reconcile writes facts before a code_reviewer would pick the job up.
+	if err := e.st.UpsertDomainBFacts(ctx, jobID, job.DomainBFacts{
+		PRExists: true, PRNumber: prNum, HeadSHA: headSHA, BaseSHA: "base-sha-0", CIGreen: true,
+	}); err != nil {
+		t.Fatalf("reconcile facts: %v", err)
+	}
+
+	// a DISTINCT reviewer leases the gate.
 	reviewer := client.New(url)
 	if _, err := reviewer.Register(ctx, client.Registration{
 		WorkerID: "wk-rev", Identity: "rev", Host: "t",
@@ -141,11 +150,6 @@ func driveApprovedCleanJob(t *testing.T, ctx context.Context, e *f2Env, jobID, d
 	rg, ok, err := reviewer.Lease(ctx, "rev", "opus", string(job.RoleCodeReviewer))
 	if err != nil || !ok || rg.JobID != jobID {
 		t.Fatalf("reviewer lease ok=%v err=%v", ok, err)
-	}
-	if err := e.st.UpsertDomainBFacts(ctx, jobID, job.DomainBFacts{
-		PRExists: true, PRNumber: prNum, HeadSHA: headSHA, BaseSHA: "base-sha-0", CIGreen: true,
-	}); err != nil {
-		t.Fatalf("reconcile facts: %v", err)
 	}
 
 	rv, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge")

@@ -323,17 +323,18 @@ func TestM11_ToggleOnCleanDiffMergesUnattended(t *testing.T) {
 		t.Fatalf("Flowbee must open the PR and stamp the number")
 	}
 
-	// the distinct reviewer leases the gate; reconcile-IN supplies green Domain-B
-	// facts at the stamped PR; the reviewer approves self_merge.
-	reviewer := registerCaps(t, ctx, url, "ren", "opus", []string{"role:code_reviewer", "model_family:opus"})
-	rg, ok, err := reviewer.Lease(ctx, "ren", "opus", string(job.RoleCodeReviewer))
-	if err != nil || !ok || rg.JobID != jobID {
-		t.Fatalf("reviewer lease ok=%v err=%v", ok, err)
-	}
+	// reconcile-IN supplies green Domain-B facts at the stamped PR BEFORE the
+	// reviewer leases (the review gate is offered only once CI is green); then the
+	// distinct reviewer leases the gate and approves self_merge.
 	if err := e.st.UpsertDomainBFacts(ctx, jobID, job.DomainBFacts{
 		PRExists: true, PRNumber: prNum, HeadSHA: headSHA, BaseSHA: e.base, CIGreen: true,
 	}); err != nil {
 		t.Fatalf("reconcile facts: %v", err)
+	}
+	reviewer := registerCaps(t, ctx, url, "ren", "opus", []string{"role:code_reviewer", "model_family:opus"})
+	rg, ok, err := reviewer.Lease(ctx, "ren", "opus", string(job.RoleCodeReviewer))
+	if err != nil || !ok || rg.JobID != jobID {
+		t.Fatalf("reviewer lease ok=%v err=%v", ok, err)
 	}
 	rv, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "r1", "approved", "self_merge")
 	if err != nil || code != http.StatusOK {
