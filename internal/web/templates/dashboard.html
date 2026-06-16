@@ -4,7 +4,6 @@
   <div class="stats">
     <div class="pill bee"><div class="n">{{.Budget.Remaining}}</div><div class="l">Remaining</div></div>
     <div class="pill"><div class="n">{{.Budget.Limit}}</div><div class="l">Limit</div></div>
-    {{if not .Budget.ResetAt.IsZero}}<div class="pill"><div class="n reset">{{abs .Budget.ResetAt}}</div><div class="l">Resets</div></div>{{end}}
   </div>
   <div class="gauge" title="GitHub identity-budget used">
     <div class="acct"><span class="name">▸ GitHub API budget</span><span>{{ratio .Budget.Remaining .Budget.Limit}}% remaining</span></div>
