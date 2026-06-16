@@ -95,8 +95,14 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		_ = tx.QueryRowContext(ctx,
 			`SELECT head_sha, base_sha FROM domain_b_facts WHERE job_id = ?`, jobID).
 			Scan(&prevHead, &prevBase)
-		shaMoved := !pr.Merged && prevHead != "" &&
-			(prevHead != pr.HeadSHA || (pr.BaseSHA != "" && prevBase != pr.BaseSHA))
+		// A move is a CHANGE from a previously-reconciled value — not the first time
+		// we LEARN one. Both terms therefore require the prior value to be non-empty:
+		// an early sweep can report a head but an empty base oid (or vice versa), and
+		// later filling it in must NOT read as a base move (which would spuriously
+		// supersede a perfectly good verdict and re-arm the build).
+		shaMoved := !pr.Merged &&
+			(prevHead != "" && prevHead != pr.HeadSHA ||
+				prevBase != "" && pr.BaseSHA != "" && prevBase != pr.BaseSHA)
 
 		// write the Domain-B facts (the ONLY columns reconcile-IN may touch).
 		if err := upsertDomainBFactsTx(ctx, tx, jobID, pr); err != nil {
