@@ -193,6 +193,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/audit", s.auditJSON)
 	mux.HandleFunc("GET /v1/cost", s.costJSON)
 	mux.HandleFunc("GET /v1/needs-human", s.needsHumanJSON)
+	mux.HandleFunc("GET /v1/needs-input", s.needsInputJSON)
 	mux.HandleFunc("GET /roster", s.rosterPage)
 	mux.HandleFunc("GET /dashboard", s.dashboard)
 	mux.HandleFunc("GET /", s.board)
@@ -238,6 +239,19 @@ func (s *Server) needsHumanJSON(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.store.NeedsHumanView(r.Context())
 	if err != nil {
 		http.Error(w, "needs_human error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
+// needsInputJSON serves the F4 needs-input surface (flow-pass §D): every job
+// parked in needs_design awaiting a human DESIGN decision (a design fork issue-review
+// could not resolve by amending). The user's board-check loop reads this, walks the
+// human through, posts the answer, and Flowbee resumes the spec_review gate.
+func (s *Server) needsInputJSON(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.store.NeedsInput(r.Context())
+	if err != nil {
+		http.Error(w, "needs_input error", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)
@@ -609,10 +623,16 @@ func (s *Server) specSubmit(w http.ResponseWriter, r *http.Request) {
 // specReviewRequest is the spec reviewer's verdict CLAIM + the two §11.3 sub-checks
 // + the content hash it judged. Untrusted (I-9): the gate decides from the bytes.
 type specReviewRequest struct {
-	Decision          string `json:"decision"`           // signed_off | changes_requested
+	Decision          string `json:"decision"`           // signed_off | amended | needs_design | changes_requested
 	BindsTo           string `json:"binds_to"`           // the spec_content_hash the worker judged
 	MeetsStyle        bool   `json:"meets_style"`        // Q1
 	MeetsRequirements bool   `json:"meets_requirements"` // Q2
+	// F4 amend-in-place: on decision=="amended" the issue-reviewer supplies the
+	// AMENDED spec prose. FLOWBEE — never the worker — commits it: the server computes
+	// the BLAKE3 content hash and the new version, and the gate mints a sign-off bound
+	// to the amended hash. Issue-review amends in place; it never bounces to the author.
+	AmendedSpecMarkdown string `json:"amended_spec_markdown,omitempty"`
+	AmendedVersion      int    `json:"amended_version,omitempty"`
 }
 
 // specReview runs the I-9 spec gate for a fenced spec-review result (§11.5). The
@@ -631,12 +651,21 @@ func (s *Server) specReview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	// F4 amend-in-place: Flowbee commits the reviewer's amended bytes (computes the
+	// BLAKE3 hash — the worker never self-addresses its artifact, §11.1). The new
+	// version defaults to one past the reviewed version if unspecified.
+	var amendedHash string
+	if job.VerdictValue(req.Decision) == job.VerdictAmended && req.AmendedSpecMarkdown != "" {
+		amendedHash = spec.ContentHash([]byte(req.AmendedSpecMarkdown))
+	}
 	resp, err := s.store.SpecReviewResult(r.Context(), store.SpecReviewResultParams{
 		JobID: jobID, Epoch: epoch,
 		Claim:             job.VerdictValue(req.Decision),
 		BindsTo:           req.BindsTo,
 		MeetsStyle:        req.MeetsStyle,
 		MeetsRequirements: req.MeetsRequirements,
+		AmendedHash:       amendedHash,
+		AmendedVersion:    req.AmendedVersion,
 		IdempotencyKey:    r.Header.Get("Idempotency-Key"),
 		Now:               s.clock.Now(),
 	})
@@ -645,9 +674,14 @@ func (s *Server) specReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ev := "spec_bounced"
-	if resp.Minted {
+	switch {
+	case resp.Amended:
+		ev = "spec_amended"
+	case resp.Minted:
 		ev = "spec_signoff_minted"
-	} else if resp.Superseded {
+	case resp.NeedsDesign:
+		ev = "spec_needs_design"
+	case resp.Superseded:
 		ev = "spec_superseded"
 	}
 	s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: ev, Epoch: epoch})

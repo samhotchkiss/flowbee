@@ -88,6 +88,49 @@ func TestSpecGateConjunctionAndLens(t *testing.T) {
 	}
 }
 
+// TestSpecGateAmendInPlace_Engine: the F4 amend arm. An `amended` claim with new
+// bytes mints a sign-off bound to the AMENDED hash and transitions spec_review->done
+// via spec_amended — NEVER spec_authoring (no author bounce).
+func TestSpecGateAmendInPlace_Engine(t *testing.T) {
+	s := specReviewState(4, "blake3:H2", "product_speccer", "engineering_manager")
+	dec := Decide(s, SpecReviewClaim{
+		Epoch: 4, Claim: job.VerdictAmended, ClaimBindsTo: "blake3:H2",
+		MeetsStyle: false, MeetsRequirements: false, // the spec was sub-standard
+		AmendedHash: "blake3:AMENDED", AmendedVersion: 3,
+	})
+	if dec.Reject != nil {
+		t.Fatalf("valid amend rejected: %+v", dec.Reject)
+	}
+	if dec.SpecMint == nil || !dec.SpecMint.Verify("blake3:AMENDED") {
+		t.Fatalf("amend must mint a sign-off bound to the amended hash: %+v", dec.SpecMint)
+	}
+	if len(dec.Transitions) != 1 || dec.Transitions[0].To != job.StateDone ||
+		dec.Transitions[0].Kind != ledger.KindSpecAmended {
+		t.Fatalf("amend must transition spec_review->done via spec_amended (no author bounce): %+v", dec.Transitions)
+	}
+	for _, tr := range dec.Transitions {
+		if tr.To == job.StateSpecAuthoring {
+			t.Fatal("amend must NEVER bounce to spec_authoring")
+		}
+	}
+}
+
+// TestSpecGateNeedsDesign_Engine: the F4 design-fork arm escalates to needs_design.
+func TestSpecGateNeedsDesign_Engine(t *testing.T) {
+	s := specReviewState(4, "blake3:H2", "product_speccer", "engineering_manager")
+	dec := Decide(s, SpecReviewClaim{
+		Epoch: 4, Claim: job.VerdictNeedsDesign, ClaimBindsTo: "blake3:H2",
+		MeetsStyle: true, MeetsRequirements: true,
+	})
+	if dec.SpecMint != nil {
+		t.Fatal("a design fork must not mint")
+	}
+	if len(dec.Transitions) != 1 || dec.Transitions[0].To != job.StateNeedsDesign ||
+		dec.Transitions[0].Kind != ledger.KindSpecNeedsDesign {
+		t.Fatalf("a design fork must transition spec_review->needs_design: %+v", dec.Transitions)
+	}
+}
+
 // TestSpecGateStaleEpoch: a stale lease epoch is rejected (409), never evaluated.
 func TestSpecGateStaleEpoch(t *testing.T) {
 	s := specReviewState(7, "blake3:H2", "product_speccer", "staff_engineer")

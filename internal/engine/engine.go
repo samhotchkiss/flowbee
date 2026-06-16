@@ -128,6 +128,12 @@ type SpecReviewClaim struct {
 	ClaimBindsTo      string // the spec_content_hash the worker judged
 	MeetsStyle        bool
 	MeetsRequirements bool
+	// F4 amend-in-place: on an `amended` claim the runtime has ALREADY committed the
+	// reviewer's amended spec bytes (Flowbee, never the worker, owns the commit) and
+	// passes the AMENDED content hash + version here. The gate mints a sign-off bound
+	// to the AMENDED hash — issue-review amends in place, never bounces to the author.
+	AmendedHash    string
+	AmendedVersion int
 }
 
 func (Heartbeat) isEngineEvent()       {}
@@ -427,6 +433,8 @@ func Decide(s EngineState, e Event) Decision {
 			AuthorLens:        s.Spec.AuthorLens,
 			Bounces:           s.Job.Bounces,
 			MaxBounce:         s.Job.MaxBounces,
+			AmendedHash:       ev.AmendedHash,
+			AmendedVersion:    ev.AmendedVersion,
 		})
 		switch out.Trigger {
 		case job.TriggerSpecSignedOff:
@@ -437,6 +445,23 @@ func Decide(s EngineState, e Event) Decision {
 					Kind: ledger.KindSpecSignoffMinted, SpecSignoff: out.Signoff,
 				}},
 			}
+		case job.TriggerSpecAmended:
+			// F4 amend-in-place: the spec advanced to the AMENDED hash in place; the
+			// gate minted a sign-off bound to it. spec_review -> done. NO author bounce.
+			return Decision{
+				SpecMint: out.Signoff,
+				Transitions: []Transition{{
+					From: job.StateSpecReview, To: job.StateDone,
+					Kind: ledger.KindSpecAmended, SpecSignoff: out.Signoff,
+				}},
+			}
+		case job.TriggerSpecNeedsDesign:
+			// F4 design fork: the spec needs human design input. spec_review ->
+			// needs_design (surfaced on /v1/needs-input), no sign-off, no author bounce.
+			return Decision{Transitions: []Transition{{
+				From: job.StateSpecReview, To: job.StateNeedsDesign,
+				Kind: ledger.KindSpecNeedsDesign,
+			}}}
 		case job.TriggerSpecSuperseded:
 			// the spec advanced mid-review: reject as superseded, re-arm the gate
 			// (back to spec_authoring to re-review the new bytes).

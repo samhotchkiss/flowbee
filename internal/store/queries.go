@@ -834,7 +834,8 @@ const jobSelect = `
 	       cost_tokens_in, cost_tokens_out, cost_micro_usd, cost_ceiling_micro_usd,
 	       over_budget, COALESCE(flow_id,''), COALESCE(escalation_reason,''),
 	       build_epoch, COALESCE(merge_provenance,''),
-	       COALESCE(task_text,''), COALESCE(spec_text,''), COALESCE(acceptance_criteria,'')
+	       COALESCE(task_text,''), COALESCE(spec_text,''), COALESCE(acceptance_criteria,''),
+	       COALESCE(epic_id,''), COALESCE(is_epic,0), COALESCE(epic_reviewed,0)
 	  FROM jobs`
 
 type rowScanner interface {
@@ -844,7 +845,7 @@ type rowScanner interface {
 func scanJob(row rowScanner) (job.Job, error) {
 	var j job.Job
 	var kind, role, blockedJSON, reqJSON, enqueued, verdictJSON, specSignoffJSON string
-	var overBudget int
+	var overBudget, isEpic, epicReviewed int
 	var ceiling sql.NullInt64
 	err := row.Scan(&j.ID, &kind, &j.Flow, &j.Stage, (*string)(&j.State), &role,
 		&j.BaseSHA, &j.HeadSHA, &j.Priority, &blockedJSON, &reqJSON, &enqueued,
@@ -857,10 +858,13 @@ func scanJob(row rowScanner) (job.Job, error) {
 		&j.CostTokensIn, &j.CostTokensOut, &j.CostMicroUSD, &ceiling,
 		&overBudget, &j.FlowID, &j.EscalationReason,
 		&j.BuildEpoch, &j.MergeProvenance,
-		&j.TaskText, &j.SpecText, &j.AcceptanceCriteria)
+		&j.TaskText, &j.SpecText, &j.AcceptanceCriteria,
+		&j.EpicID, &isEpic, &epicReviewed)
 	if err != nil {
 		return j, err
 	}
+	j.IsEpic = isEpic != 0
+	j.EpicReviewed = epicReviewed != 0
 	if ceiling.Valid {
 		c := ceiling.Int64
 		j.CostCeilingMicroUSD = &c

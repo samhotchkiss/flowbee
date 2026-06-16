@@ -256,10 +256,12 @@ func (c *Client) SpecSubmit(ctx context.Context, jobID string, epoch int, specMa
 
 // SpecReviewResponse is the spec gate reply.
 type SpecReviewResponse struct {
-	Accepted   bool   `json:"accepted"`
-	JobState   string `json:"job_state"`
-	Minted     bool   `json:"minted"`
-	Superseded bool   `json:"superseded"`
+	Accepted    bool   `json:"accepted"`
+	JobState    string `json:"job_state"`
+	Minted      bool   `json:"minted"`
+	Superseded  bool   `json:"superseded"`
+	Amended     bool   `json:"amended"`      // F4: amended in place + signed off (no author bounce)
+	NeedsDesign bool   `json:"needs_design"` // F4: design fork -> needs_design
 }
 
 // SpecReview posts a fenced spec-review verdict CLAIM + sub-checks + the hash it
@@ -275,6 +277,38 @@ func (c *Client) SpecReview(ctx context.Context, jobID string, epoch int, idemKe
 		"decision": decision, "binds_to": bindsTo,
 		"meets_style": meetsStyle, "meets_requirements": meetsReq,
 	}
+	st, err := c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/spec-review", h, body, &out)
+	return out, st, err
+}
+
+// SpecReviewAmend is the F4 issue-review AMEND-in-place result: the reviewer judges
+// the spec sub-standard and supplies the AMENDED prose rather than bouncing to the
+// author. Flowbee commits the bytes (computes the hash) and mints a sign-off bound to
+// the amended hash. Issue-review never bounces to the author.
+func (c *Client) SpecReviewAmend(ctx context.Context, jobID string, epoch int, idemKey, bindsTo, amendedMarkdown string, amendedVersion int) (SpecReviewResponse, int, error) {
+	h := epochHeader(epoch)
+	if idemKey != "" {
+		h["Idempotency-Key"] = idemKey
+	}
+	var out SpecReviewResponse
+	body := map[string]any{
+		"decision": "amended", "binds_to": bindsTo,
+		"amended_spec_markdown": amendedMarkdown, "amended_version": amendedVersion,
+	}
+	st, err := c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/spec-review", h, body, &out)
+	return out, st, err
+}
+
+// SpecReviewNeedsDesign is the F4 design-fork escalation: the reviewer flags that
+// the spec needs human DESIGN input (issue-review cannot resolve it by amending).
+// The job parks in needs_design (surfaced on /v1/needs-input).
+func (c *Client) SpecReviewNeedsDesign(ctx context.Context, jobID string, epoch int, idemKey, bindsTo string) (SpecReviewResponse, int, error) {
+	h := epochHeader(epoch)
+	if idemKey != "" {
+		h["Idempotency-Key"] = idemKey
+	}
+	var out SpecReviewResponse
+	body := map[string]any{"decision": "needs_design", "binds_to": bindsTo}
 	st, err := c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/spec-review", h, body, &out)
 	return out, st, err
 }

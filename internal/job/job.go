@@ -30,6 +30,18 @@ const (
 	// died (locally provable) -> straight to `failed`; compensation fires; the job
 	// re-queues subject to max_attempts. Distinct from a "kill" (a lease revocation).
 	StateFailed State = "failed"
+	// StateNeedsDesign is the F4 design-fork escalation sink: issue-review determined
+	// the spec needs HUMAN design input (a decision Flowbee cannot make by amending
+	// bytes). It holds NO active lease (it is not scheduled), is surfaced on
+	// GET /v1/needs-input so the user's board-check loop can answer it, and resumes
+	// (back to spec_review) once a human supplies the design decision. Distinct from
+	// needs_human (the §12.6.1 attempts/bounces/cost/stall chokepoint): needs_design
+	// is a deliberate "the machine should not decide this" signal, not a failure.
+	StateNeedsDesign State = "needs_design"
+	// StateBacklog is the tracked-but-NOT-scheduled state (flow-pass §D): a job that
+	// is visible on the board but carries "needs full spec" and is never leased until
+	// deliberately promoted. It holds no active lease.
+	StateBacklog State = "backlog"
 	// StateQuiescent is the ADOPT-mode mirrored-but-quiescent state (§12.7, I-16):
 	// a job imported from a pre-existing GitHub issue/PR on first boot. It is
 	// reconciled (full Domain-B facts) but NEVER scheduled (no lease) and NEVER
@@ -89,6 +101,10 @@ const (
 	EscalationBounces  EscalationReason = "bounces"
 	EscalationCost     EscalationReason = "cost"
 	EscalationStall    EscalationReason = "stall"
+	// EscalationDesign is the F4 design-fork escalation: issue-review determined the
+	// spec needs human design input. It deposits into the needs_design surface (not
+	// the needs_human chokepoint) — a deliberate "the machine should not decide this".
+	EscalationDesign EscalationReason = "design"
 )
 
 // CapabilitiesSatisfy reports whether the attested capability set satisfies every
@@ -140,6 +156,13 @@ type Job struct {
 	ParentJob string
 	IssueNum  int
 	PRNumber  int
+
+	// F4 epic grouping. EpicID groups the issues of one epic decomposition; IsEpic
+	// flags the epic-barrier job (the one the epic-level issue-review reviews as a
+	// whole). EpicReviewed records that the epic-level barrier has passed.
+	EpicID       string
+	IsEpic       bool
+	EpicReviewed bool
 
 	// SHA binding (build)
 	BaseSHA string

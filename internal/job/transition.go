@@ -29,6 +29,14 @@ const (
 	TriggerSpecSuperseded    Trigger = "spec_superseded"     // spec edit voided the sign-off; re-arm the gate
 	TriggerSpecAuthored      Trigger = "spec_authored"       // spec_authoring -> spec_review (author submitted draft)
 
+	// F4 issue-review edges. Issue-review AMENDS in place (commits the amended spec,
+	// mints a sign-off on the amended hash -> done) and never bounces to the author; a
+	// design fork escalates to needs_design (surfaced on /v1/needs-input) and resumes
+	// to spec_review when a human supplies the design decision.
+	TriggerSpecAmended     Trigger = "spec_amended"      // spec_review -> done (amended in place + signed off)
+	TriggerSpecNeedsDesign Trigger = "spec_needs_design" // spec_review -> needs_design (design fork)
+	TriggerDesignResolved  Trigger = "design_resolved"   // needs_design -> spec_review (human answered)
+
 	// M8 liveness triggers (§10.7). A "kill" is a lease REVOCATION (epoch++ +
 	// compensation), routed to `ready` for re-dispatch unless the Rung-4 governor
 	// ceiling holds it in `needs_human` (anti-thrash). The absolute-cap kill and a
@@ -102,6 +110,12 @@ var transitions = map[transitionKey]State{
 	{StateSpecReview, TriggerSpecSuperseded}:    StateSpecAuthoring,
 	{StateSpecReview, TriggerReleased}:          StateSpecAuthoring,
 	{StateSpecReview, TriggerLeaseExpiredRetry}: StateSpecAuthoring,
+
+	// F4 issue-review: AMEND in place completes the spec (-> done) without an author
+	// bounce; a design fork escalates to needs_design and resumes to spec_review.
+	{StateSpecReview, TriggerSpecAmended}:     StateDone,
+	{StateSpecReview, TriggerSpecNeedsDesign}: StateNeedsDesign,
+	{StateNeedsDesign, TriggerDesignResolved}: StateSpecReview,
 
 	// M8 liveness edges (§10.7). Every active-lease state can be killed (revoked) by
 	// the two-rung rule or the absolute cap, or fast-pathed to failed/cancelled. A

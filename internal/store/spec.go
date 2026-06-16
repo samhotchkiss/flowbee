@@ -279,6 +279,86 @@ func (s *Store) EditSpec(ctx context.Context, jobID, newHash string, newVersion 
 	})
 }
 
+// ResolveDesign records a human supplying the design decision for a job parked in
+// needs_design (F4). It re-arms the spec_review gate (a fresh review judges the
+// now-resolved spec), optionally advancing the spec to a new resolved hash/version
+// if the human edited the spec to encode the decision. This is the resume edge of
+// the design-fork escalation surfaced on /v1/needs-input. newHash may be "" to
+// re-review the SAME bytes (the human's answer rode in the chat, not the spec).
+func (s *Store) ResolveDesign(ctx context.Context, jobID, newHash string, newVersion int, now time.Time) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		j, seq, err := loadJobTx(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		if j.State != job.StateNeedsDesign {
+			return fmt.Errorf("resolve design: job %s not in needs_design (%s)", jobID, j.State)
+		}
+		nextSeq := seq + 1
+		hash := newHash
+		version := newVersion
+		if hash == "" {
+			hash = j.SpecContentHash
+			version = j.SpecVersion
+		}
+		ev := ledger.Event{
+			JobID: jobID, JobSeq: nextSeq, Kind: ledger.KindDesignResolved,
+			FromState: job.StateNeedsDesign, ToState: job.StateSpecReview,
+			LeaseEpoch: j.LeaseEpoch, Actor: "human", CreatedAt: now,
+			Payload: ledger.Payload{SpecContentHash: hash, SpecVersion: version},
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs
+			   SET state = 'spec_review', stage = 'review', role = 'spec_reviewer',
+			       spec_content_hash = ?, spec_version = ?, escalation_reason = '',
+			       required_capabilities = ?,
+			       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
+			       lease_hb_due = NULL, updated_at = datetime('now')
+			 WHERE id = ?`,
+			hash, version, marshalStrings([]string{"role:spec_reviewer"}), jobID); err != nil {
+			return fmt.Errorf("resolve design projection: %w", err)
+		}
+		return setJobSeq(ctx, tx, jobID, nextSeq)
+	})
+}
+
+// NeedsInputItem is one entry on the /v1/needs-input surface (F4 / flow-pass §D):
+// a job awaiting a human decision (a design fork). The user's board-check loop
+// reads these, walks the human through, posts the answer, and Flowbee resumes.
+type NeedsInputItem struct {
+	JobID           string `json:"job_id"`
+	State           string `json:"state"`
+	Reason          string `json:"reason"`
+	SpecContentHash string `json:"spec_content_hash,omitempty"`
+	ChatRef         string `json:"chat_ref,omitempty"`
+	EpicID          string `json:"epic_id,omitempty"`
+}
+
+// NeedsInput returns every job awaiting human input (needs_design), oldest first
+// (F4). It is the read-model behind GET /v1/needs-input.
+func (s *Store) NeedsInput(ctx context.Context) ([]NeedsInputItem, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, state, COALESCE(escalation_reason,''), COALESCE(spec_content_hash,''),
+		       COALESCE(chat_ref,''), COALESCE(epic_id,'')
+		  FROM jobs WHERE state = 'needs_design' ORDER BY id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NeedsInputItem
+	for rows.Next() {
+		var it NeedsInputItem
+		if err := rows.Scan(&it.JobID, &it.State, &it.Reason, &it.SpecContentHash, &it.ChatRef, &it.EpicID); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
 // ClaimSpecReviewParams describes a spec_reviewer claiming the spec_review gate.
 type ClaimSpecReviewParams struct {
 	JobID       string
@@ -375,20 +455,28 @@ func (s *Store) ClaimSpecReview(ctx context.Context, p ClaimSpecReviewParams) (*
 type SpecReviewResultParams struct {
 	JobID             string
 	Epoch             int
-	Claim             job.VerdictValue // signed_off | changes_requested
+	Claim             job.VerdictValue // signed_off | amended | needs_design | changes_requested
 	BindsTo           string           // the spec_content_hash the worker judged
 	MeetsStyle        bool
 	MeetsRequirements bool
-	IdempotencyKey    string
-	Now               time.Time
+	// F4 amend-in-place: the reviewer's amended spec bytes. When the claim is
+	// `amended`, FLOWBEE — never the worker — commits these bytes: the store computes
+	// the BLAKE3 content hash (AmendedHash) and the new version, and the gate mints a
+	// sign-off bound to the AMENDED hash. The author is never bounced.
+	AmendedHash    string // resolved by the caller (api) via spec.ContentHash
+	AmendedVersion int
+	IdempotencyKey string
+	Now            time.Time
 }
 
 // SpecReviewResultResponse is the spec gate's reply.
 type SpecReviewResultResponse struct {
-	Accepted   bool   `json:"accepted"`
-	JobState   string `json:"job_state"`
-	Minted     bool   `json:"minted"`     // a content-hash-bound sign-off was minted (I-9)
-	Superseded bool   `json:"superseded"` // the claim bound to a stale hash (§11.5)
+	Accepted    bool   `json:"accepted"`
+	JobState    string `json:"job_state"`
+	Minted      bool   `json:"minted"`       // a content-hash-bound sign-off was minted (I-9)
+	Superseded  bool   `json:"superseded"`   // the claim bound to a stale hash (§11.5)
+	Amended     bool   `json:"amended"`      // F4: the spec was amended in place + signed off (no author bounce)
+	NeedsDesign bool   `json:"needs_design"` // F4: the spec needs human design input (design fork)
 }
 
 // SpecReviewResult is the I-9 spec keystone (§11.5): a fenced spec-review result.
@@ -418,9 +506,10 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 			return err
 		}
 		var authorLens, reviewerLens string
+		var isEpic int
 		_ = tx.QueryRowContext(ctx,
-			`SELECT COALESCE(author_lens,''), COALESCE(reviewer_lens,'') FROM jobs WHERE id = ?`, in.JobID).
-			Scan(&authorLens, &reviewerLens)
+			`SELECT COALESCE(author_lens,''), COALESCE(reviewer_lens,''), COALESCE(is_epic,0) FROM jobs WHERE id = ?`, in.JobID).
+			Scan(&authorLens, &reviewerLens, &isEpic)
 
 		dec := engine.Decide(engine.EngineState{
 			Job: j, Now: in.Now, Epoch: j.LeaseEpoch,
@@ -431,6 +520,7 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 		}, engine.SpecReviewClaim{
 			Epoch: in.Epoch, Claim: in.Claim, ClaimBindsTo: in.BindsTo,
 			MeetsStyle: in.MeetsStyle, MeetsRequirements: in.MeetsRequirements,
+			AmendedHash: in.AmendedHash, AmendedVersion: in.AmendedVersion,
 		})
 		if dec.Reject != nil {
 			return lease.ErrStaleEpoch
@@ -452,13 +542,26 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 		// 2) apply the gate decision.
 		final := j.State
 		var minted *job.SpecSignoff
+		amended := false
+		needsDesign := false
 		for _, t := range dec.Transitions {
 			nextSeq++
+			pay := ledger.Payload{BouncesDelta: t.BouncesDelta, SpecSignoff: t.SpecSignoff}
+			// F4: an amend transition advances the spec to the AMENDED content address
+			// in place; record it on the event so Fold re-binds the hash/version.
+			if t.Kind == ledger.KindSpecAmended {
+				pay.SpecContentHash = in.AmendedHash
+				pay.SpecVersion = in.AmendedVersion
+				amended = true
+			}
+			if t.Kind == ledger.KindSpecNeedsDesign {
+				needsDesign = true
+			}
 			ev := ledger.Event{
 				JobID: in.JobID, JobSeq: nextSeq, Kind: t.Kind,
 				FromState: t.From, ToState: t.To, LeaseEpoch: j.LeaseEpoch,
 				Actor: "system", CreatedAt: in.Now,
-				Payload: ledger.Payload{BouncesDelta: t.BouncesDelta, SpecSignoff: t.SpecSignoff},
+				Payload: pay,
 			}
 			if err := appendEvent(ctx, tx, ev); err != nil {
 				return err
@@ -476,28 +579,68 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 
 		switch {
 		case minted != nil:
-			// 3a) a sign-off: stamp it + bind the hash, close the gate lease, and
-			// enqueue the materialize_issues outbox row (§11). The job is `done`.
+			// 3a) a sign-off (signed_off OR F4 amended-in-place): stamp it + bind the
+			// hash, advance the content address on an amend, close the gate lease. The
+			// job is `done`. On an amend the spec advanced IN PLACE to the AMENDED
+			// hash/version — no author bounce — so the projection moves the content
+			// address too.
 			blob, _ := json.Marshal(minted)
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE jobs
 				   SET state = 'done', spec_signoff = ?, spec_signoff_hash = ?,
+				       spec_content_hash = ?, spec_version = ?,
 				       bounces = bounces + ?,
 				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 				       lease_hb_due = NULL, updated_at = datetime('now')
 				 WHERE id = ?`,
-				string(blob), minted.SpecHash, bouncesDelta, in.JobID); err != nil {
+				string(blob), minted.SpecHash, minted.SpecHash, minted.SpecVersion,
+				bouncesDelta, in.JobID); err != nil {
 				return fmt.Errorf("apply spec signoff projection: %w", err)
 			}
-			// materialize_issues: enqueue the issues.create rendering (§8.2.1). The
-			// outbox key uses the content hash in place of a head_sha (spec is SHA-less).
-			if err := enqueueOutboxTx(ctx, tx, OutboxRow{
-				JobID: in.JobID, Action: ActionCreateIssue, HeadSHA: "",
-				Payload: outboxPayload(map[string]any{"spec_hash": minted.SpecHash, "version": minted.SpecVersion}),
-			}); err != nil {
-				return fmt.Errorf("enqueue materialize_issues: %w", err)
+			if isEpic == 1 {
+				// F4 epic-level barrier: the ONE issue-review over the whole epic passed
+				// (scope · coverage · dep-graph · standards). Mark the epic reviewed and
+				// record the barrier event; the issues fan out via EpicFanOut. An epic
+				// barrier materializes NO single issue (its children are the issues).
+				nextSeq++
+				erev := ledger.Event{
+					JobID: in.JobID, JobSeq: nextSeq, Kind: ledger.KindEpicReviewed,
+					FromState: job.StateSpecReview, ToState: job.StateDone,
+					LeaseEpoch: j.LeaseEpoch, Actor: "system", CreatedAt: in.Now,
+				}
+				if err := appendEvent(ctx, tx, erev); err != nil {
+					return err
+				}
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE jobs SET epic_reviewed = 1, updated_at = datetime('now') WHERE id = ?`, in.JobID); err != nil {
+					return fmt.Errorf("mark epic reviewed: %w", err)
+				}
+			} else {
+				// materialize_issues: enqueue the issues.create rendering (§8.2.1). The
+				// outbox key uses the content hash in place of a head_sha (spec is SHA-less).
+				if err := enqueueOutboxTx(ctx, tx, OutboxRow{
+					JobID: in.JobID, Action: ActionCreateIssue, HeadSHA: "",
+					Payload: outboxPayload(map[string]any{"spec_hash": minted.SpecHash, "version": minted.SpecVersion}),
+				}); err != nil {
+					return fmt.Errorf("enqueue materialize_issues: %w", err)
+				}
 			}
 			resp.Minted = true
+			resp.Amended = amended
+		case needsDesign:
+			// 3a') F4 design fork: park the job in needs_design (surfaced on
+			// /v1/needs-input), close the gate lease, record the escalation reason. No
+			// sign-off, no author bounce. A human resolves it via ResolveDesign.
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE jobs
+				   SET state = 'needs_design', escalation_reason = ?,
+				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
+				       lease_hb_due = NULL, updated_at = datetime('now')
+				 WHERE id = ?`,
+				string(job.EscalationDesign), in.JobID); err != nil {
+				return fmt.Errorf("apply spec needs_design projection: %w", err)
+			}
+			resp.NeedsDesign = true
 		case final == job.StateSpecAuthoring:
 			// 3b) a bounce / supersession: re-arm the author stage.
 			superseded := false

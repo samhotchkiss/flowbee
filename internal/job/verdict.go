@@ -15,6 +15,16 @@ const (
 	VerdictApproved         VerdictValue = "approved"
 	VerdictChangesRequested VerdictValue = "changes_requested"
 	VerdictSignedOff        VerdictValue = "signed_off" // spec flow (M7)
+	// VerdictAmended is the F4 issue-review verdict: the reviewer AMENDED the spec
+	// in place (it did not bounce to the author). Flowbee commits the amended bytes
+	// (a new content hash/version) and the gate mints a sign-off bound to the
+	// AMENDED hash. Issue-review never bounces to the user/spec_author (the flow-pass
+	// "amend vs bounce" decision); only build-review bounces (to the build agent).
+	VerdictAmended VerdictValue = "amended"
+	// VerdictNeedsDesign is the F4 design-fork escalation: the reviewer determined the
+	// spec needs HUMAN design input (a decision Flowbee cannot make by amending). It
+	// routes the job to needs_design (surfaced on GET /v1/needs-input), not a bounce.
+	VerdictNeedsDesign VerdictValue = "needs_design"
 )
 
 // Disposition is the code_review branch point (§5.4); only set for `approved`.
@@ -271,7 +281,7 @@ func (s SpecSignoff) Verify(currentSpecHash string) bool {
 // values. The claim's BindsTo MUST equal the spec branch's CURRENT content hash
 // (§11.5 step 2); a stale binding is rejected as superseded.
 type SpecGateInputs struct {
-	Claim             VerdictValue // signed_off | changes_requested (untrusted)
+	Claim             VerdictValue // signed_off | amended | needs_design | changes_requested (untrusted)
 	ClaimBindsTo      string       // the spec_content_hash the worker judged
 	MeetsStyle        bool         // Q1: engineering style (§11.3)
 	MeetsRequirements bool         // Q2: project requirements (§11.3)
@@ -281,13 +291,27 @@ type SpecGateInputs struct {
 	AuthorLens        string // §5.5 spec term: reviewer lens must differ from author lens
 	Bounces           int
 	MaxBounce         int
+
+	// F4 amend-in-place: when the reviewer AMENDS a sub-standard spec rather than
+	// bouncing it to the author, the runtime commits the amended bytes and passes the
+	// AMENDED content hash + the new version here. A non-empty AmendedHash on an
+	// `amended` claim makes the gate mint a sign-off bound to the AMENDED hash (the
+	// spec advanced in place), never a bounce. AmendedHash MUST differ from the
+	// reviewed CurrentSpecHash (an "amendment" that changed nothing is not an
+	// amendment — it falls through to the normal conjunction).
+	AmendedHash    string
+	AmendedVersion int
 }
 
 // SpecGateOutcome is the pure result of evaluating the spec_review gate.
 type SpecGateOutcome struct {
-	Trigger Trigger      // SpecSignedOff | Bounce | BounceExhausted | Superseded
+	Trigger Trigger      // SpecSignedOff | SpecAmended | SpecNeedsDesign | Bounce | BounceExhausted | Superseded
 	Signoff *SpecSignoff // non-nil ONLY when a sign-off was minted
-	Reason  string
+	// AmendedHash/Version ride an amend outcome so the runtime records the new
+	// content address the sign-off bound to (the spec advanced in place, F4).
+	AmendedHash    string
+	AmendedVersion int
+	Reason         string
 }
 
 // EvaluateSpecGate is the pure §11.5 spec-review gate. It NEVER trusts the claim
@@ -304,10 +328,34 @@ func EvaluateSpecGate(in SpecGateInputs) SpecGateOutcome {
 	}
 	// §5.5 spec anti-affinity term, enforced at mint time too (defense in depth):
 	// the reviewer lens must differ from the author lens. (The scheduler also
-	// enforces it at lease time.)
+	// enforces it at lease time.) This holds for EVERY verdict arm — an author-lens
+	// reviewer may neither sign off NOR amend NOR escalate.
 	if in.AuthorLens != "" && in.ReviewerLens == in.AuthorLens {
 		return SpecGateOutcome{Trigger: TriggerBounce, Reason: "reviewer lens must differ from author lens (§5.5)"}
 	}
+
+	// F4 design fork: the reviewer flagged that the spec needs HUMAN design input —
+	// a decision Flowbee cannot resolve by amending bytes. Route to needs_design
+	// (surfaced on /v1/needs-input), never a bounce to the author.
+	if in.Claim == VerdictNeedsDesign {
+		return SpecGateOutcome{Trigger: TriggerSpecNeedsDesign, Reason: "needs human design input (design fork)"}
+	}
+
+	// F4 amend-in-place: the reviewer AMENDED a sub-standard spec rather than bouncing
+	// it to the author. The runtime committed the amended bytes; the AMENDED hash is
+	// the spec's new content address. The gate mints a sign-off bound to the AMENDED
+	// hash (the spec advanced IN PLACE) — issue-review NEVER bounces to the author.
+	// An "amendment" that changed nothing (AmendedHash == reviewed hash) is not an
+	// amendment; fall through to the normal conjunction below.
+	if in.Claim == VerdictAmended && in.AmendedHash != "" && in.AmendedHash != in.CurrentSpecHash {
+		s := MintSpecSignoff(in.AmendedHash, in.AmendedVersion, in.ReviewerLens)
+		return SpecGateOutcome{
+			Trigger: TriggerSpecAmended, Signoff: &s,
+			AmendedHash: in.AmendedHash, AmendedVersion: in.AmendedVersion,
+			Reason: "amended in place + signed off from amended bytes (F4)",
+		}
+	}
+
 	// §11.3 the conjunction: a sign-off requires decision==signed_off AND both
 	// sub-checks pass. A blocking requirements finding forces changes_requested
 	// regardless of the worker's decision (the decision is a claim; Flowbee
@@ -316,7 +364,9 @@ func EvaluateSpecGate(in SpecGateInputs) SpecGateOutcome {
 		s := MintSpecSignoff(in.CurrentSpecHash, in.SpecVersion, in.ReviewerLens)
 		return SpecGateOutcome{Trigger: TriggerSpecSignedOff, Signoff: &s, Reason: "signed off from reviewed bytes"}
 	}
-	// otherwise changes_requested -> bounce (or exhaust at max_bounces, I-6).
+	// otherwise changes_requested -> bounce (or exhaust at max_bounces, I-6). This is
+	// the LEGACY spec-flow bounce path (kept for the build flow); issue-review proper
+	// uses amend/needs_design above and never reaches it.
 	if in.Bounces+1 >= in.MaxBounce {
 		return SpecGateOutcome{Trigger: TriggerBounceExhausted, Reason: "max_bounces reached"}
 	}

@@ -46,8 +46,13 @@ const (
 	KindSpecBounced       EventKind = "spec_bounced"        // spec_review -> spec_authoring (changes_requested)
 	KindSpecSuperseded    EventKind = "spec_superseded"     // a spec edit voided the sign-off; gate re-armed (§11.5)
 	KindIssueMaterialized EventKind = "issue_materialized"  // a signed-off spec materialized a GitHub issue (§11)
-	KindPROpened          EventKind = "pr_opened"           // Flowbee opened the PR and stamped # (§7.3, §8.2.1)
-	KindAdopted           EventKind = "adopted"             // a pre-existing issue/PR imported quiescent (I-16)
+	// F4 issue-review amend-in-place + design fork + epic-level barrier.
+	KindSpecAmended     EventKind = "spec_amended"      // issue-review committed an amended spec + minted a sign-off (no author bounce)
+	KindSpecNeedsDesign EventKind = "spec_needs_design" // issue-review flagged a design fork -> needs_design
+	KindDesignResolved  EventKind = "design_resolved"   // a human supplied the design decision; needs_design -> spec_review re-armed
+	KindEpicReviewed    EventKind = "epic_reviewed"     // the epic-level issue-review barrier passed; the epic's issues fan out
+	KindPROpened        EventKind = "pr_opened"         // Flowbee opened the PR and stamped # (§7.3, §8.2.1)
+	KindAdopted         EventKind = "adopted"           // a pre-existing issue/PR imported quiescent (I-16)
 	// M8 liveness event kinds (§10.7). A stall kill / absolute-cap revoke / fast-path
 	// each emits its own audit event; the lease_revoked event carries the bumped
 	// epoch (the zombie's fence) and the governor counter delta.
@@ -316,6 +321,40 @@ func Fold(events []Event) (job.Job, error) {
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""
+		case KindSpecAmended:
+			// F4: issue-review AMENDED the spec in place (committed amended bytes) and
+			// the gate minted a sign-off bound to the AMENDED hash. The spec advanced in
+			// place (new hash/version), the sign-off is stamped, the job is done. NEVER an
+			// author bounce.
+			j.State = e.ToState
+			if e.Payload.SpecContentHash != "" {
+				j.SpecContentHash = e.Payload.SpecContentHash
+				j.SpecVersion = e.Payload.SpecVersion
+			}
+			j.SpecSignoff = e.Payload.SpecSignoff
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindSpecNeedsDesign:
+			// F4: issue-review flagged a design fork. The job parks in needs_design
+			// (surfaced on /v1/needs-input), the gate lease is released. No sign-off.
+			j.State = e.ToState
+			j.EscalationReason = string(job.EscalationDesign)
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindDesignResolved:
+			// F4: a human supplied the design decision. The job re-arms to spec_review
+			// (a fresh review judges the now-resolved spec). The escalation reason clears.
+			j.State = e.ToState
+			j.EscalationReason = ""
+			if e.Payload.SpecContentHash != "" {
+				j.SpecContentHash = e.Payload.SpecContentHash
+				j.SpecVersion = e.Payload.SpecVersion
+			}
+		case KindEpicReviewed:
+			// F4: the epic-level issue-review barrier passed. Recorded on the epic job;
+			// the runtime fans out the epic's issues (no per-job projection change here).
 		case KindIssueMaterialized:
 			// project-OUT created the GitHub issue; Flowbee stamped the number.
 			j.IssueNum = e.Payload.IssueNumber
