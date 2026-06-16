@@ -62,6 +62,7 @@ type Server struct {
 	// (worker pushed only a local epoch ref). Single-repo for now; multi-repo routes
 	// per job repo later.
 	pushRemoteURL string
+	workerGitSSH  bool
 	// staleHB is the roster's stale-heartbeat threshold (§12.6.2).
 	staleHB time.Duration
 	// authn is the worker-transport authenticator (§7.6). Nil = loopback-only dev
@@ -117,6 +118,11 @@ type Config struct {
 	// the control plane publishes a build commit to as a branch so a PR can open
 	// (build-list F3). Empty disables auto PR-open after a build result.
 	PushRemoteURL string
+	// WorkerGitSSH makes the per-job repo URL the lease ships to workers an SSH
+	// remote (git@github.com:owner/repo.git) instead of HTTPS — for fleets whose
+	// boxes authenticate to GitHub with SSH keys (no HTTPS credential helper / no
+	// token at rest). Default false (HTTPS).
+	WorkerGitSSH bool
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -159,6 +165,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		mirrorPath:         cfg.MirrorPath,
 		bundleProvisioning: cfg.BundleProvisioning,
 		pushRemoteURL:      cfg.PushRemoteURL,
+		workerGitSSH:       cfg.WorkerGitSSH,
 		staleHB:            staleHB,
 		authn:              cfg.Authenticator,
 		ui:                 ui,
@@ -639,7 +646,7 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 					// configured --repo-url).
 					if j.Repo != "" {
 						if rp, rerr := s.store.GetRepo(r.Context(), j.Repo); rerr == nil {
-							grant.Context.RepoURL = "https://github.com/" + rp.Owner + "/" + rp.Repo + ".git"
+							grant.Context.RepoURL = workerRepoURL(rp.Owner, rp.Repo, s.workerGitSSH)
 						}
 					}
 				}
@@ -691,6 +698,17 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(s.pollInterval):
 		}
 	}
+}
+
+// workerRepoURL builds the per-job clone/push URL the lease ships to a worker. SSH
+// (git@github.com:owner/repo.git) for fleets that auth with SSH keys (no token at
+// rest); else HTTPS. The worker uses its OWN credential — the control plane never
+// embeds a token in this URL.
+func workerRepoURL(owner, repo string, ssh bool) string {
+	if ssh {
+		return "git@github.com:" + owner + "/" + repo + ".git"
+	}
+	return "https://github.com/" + owner + "/" + repo + ".git"
 }
 
 // renderReviewComment renders the reviewer's verdict + findings as the markdown

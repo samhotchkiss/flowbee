@@ -110,6 +110,10 @@ func runServe(_ []string) error {
 		// publishes a build commit to (as a branch) so a PR can open after a build
 		// result. Built from the single-repo GitHub creds; empty disables auto PR-open.
 		PushRemoteURL: githubPushURL(),
+		// FLOWBEE_GIT_REMOTE=ssh makes the lease ship SSH repo URLs to workers
+		// (git@github.com:owner/repo.git) — for fleets whose boxes auth with SSH keys
+		// (no HTTPS credential helper / no token at rest). Default HTTPS.
+		WorkerGitSSH: strings.EqualFold(os.Getenv("FLOWBEE_GIT_REMOTE"), "ssh"),
 	}, version)
 	if cfg.AllowSelfMerge {
 		logger.Info("autonomous merge enabled (Branch B): self_merge eligible jobs merge without a human gate")
