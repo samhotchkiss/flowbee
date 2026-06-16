@@ -695,6 +695,14 @@ func (s *Server) review(w http.ResponseWriter, r *http.Request) {
 		if final, derr := s.store.DispatchMerge(r.Context(), s.facts, s.policy, store.DispatchMergeParams{JobID: jobID, Now: s.clock.Now()}); derr == nil {
 			resp.JobState = string(final)
 			s.broker.Publish(LifeEvent{JobID: jobID, State: string(final), Event: "merge_dispatched", Epoch: epoch})
+			// Branch B autonomous merge (build-list §8.5): once the gate dispatches to
+			// `merging`, enqueue the GitHub merge so project-OUT integrates the PR. No
+			// human gate — this is the magic. handoff (Branch A) enqueues nothing.
+			if final == job.StateMerging {
+				if _, merr := s.store.EnqueueMergeForJob(r.Context(), jobID, s.clock.Now()); merr == nil {
+					s.broker.Publish(LifeEvent{JobID: jobID, State: string(final), Event: "merge_enqueued", Epoch: epoch})
+				}
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

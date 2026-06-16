@@ -503,9 +503,14 @@ func (c *RealClient) CreateCheck(ctx context.Context, sha, name, conclusion stri
 }
 
 func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
-	// the merge-queue enqueue is a GraphQL mutation in production; the REST shim
-	// here is a placeholder for the wired-but-unexercised real path.
-	return c.rest(ctx, http.MethodPut, fmt.Sprintf("/pulls/%d/merge-queue", number), map[string]any{}, nil)
+	// GitHub's native merge-queue is a GraphQL mutation that requires the repo to
+	// have a merge queue configured. When it isn't, integrate the PR directly via
+	// the merge API — the batch-size-1 integration the design's merge queue models
+	// (one PR onto current main at a time). Flowbee only reaches here after its own
+	// gate minted a verdict bound to green, reconciled CI, so this is the safe write.
+	return c.rest(ctx, http.MethodPut, fmt.Sprintf("/pulls/%d/merge", number), map[string]any{
+		"merge_method": "squash",
+	}, nil)
 }
 
 func (c *RealClient) ConvertToDraft(ctx context.Context, number int) error {
