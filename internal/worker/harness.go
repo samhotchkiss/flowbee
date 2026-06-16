@@ -147,22 +147,46 @@ func nodeCommitMessage(wsDir, identity, role, jobID string, c *client.LeaseConte
 // the system temp dir when nothing is configured. With no repo URL it returns the
 // configured path (single-repo) or a temp default.
 func workerMirrorFor(configured, repoURL string) string {
-	if repoURL == "" {
+	name := repoNameFromURL(repoURL)
+	if name == "" {
+		// single-repo, no lease URL: `configured` is the specific bare mirror.
 		if configured != "" {
 			return configured
 		}
 		return filepath.Join(os.TempDir(), "flowbee-worker-mirror.git")
 	}
+	// per-repo BARE mirror, ".git"-suffixed so it NEVER collides with a working-tree
+	// checkout at <dir>/<repo> (Sam keeps working clones at ~/dev/<repo>; `git
+	// --git-dir <working-tree>` fails — the worker needs its OWN bare mirror). --mirror
+	// is the mirrors DIRECTORY (a bare-mirror path ending in .git uses its parent);
+	// default ~/.flowbee/mirrors.
+	return filepath.Join(mirrorsDir(configured), name+".git")
+}
+
+// repoNameFromURL extracts the bare repo name ("russ") from a clone URL.
+func repoNameFromURL(repoURL string) string {
+	if repoURL == "" {
+		return ""
+	}
 	name := repoURL
 	if i := strings.LastIndex(name, "/"); i >= 0 {
 		name = name[i+1:]
 	}
-	name = strings.TrimSuffix(name, ".git")
-	base := os.TempDir()
+	return strings.TrimSuffix(name, ".git")
+}
+
+// mirrorsDir resolves the directory the worker keeps its per-repo bare mirrors in.
+func mirrorsDir(configured string) string {
 	if configured != "" {
-		base = filepath.Dir(configured)
+		if strings.HasSuffix(configured, ".git") {
+			return filepath.Dir(configured) // a bare-mirror path -> its parent dir
+		}
+		return configured // a directory
 	}
-	return filepath.Join(base, name)
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".flowbee", "mirrors")
+	}
+	return filepath.Join(os.TempDir(), "flowbee-mirrors")
 }
 
 func firstLineOf(s string) string {
@@ -695,6 +719,13 @@ func ensureMirror(ctx context.Context, mirrorPath, repoURL, branch string) error
 			return fmt.Errorf("clone %s: %v: %s", repoURL, cerr, strings.TrimSpace(string(out)))
 		}
 		return nil
+	}
+	// the path exists: it MUST be a bare repo. A working-tree checkout here (e.g.
+	// --mirror pointed at ~/dev/<repo>) makes `git --git-dir <path>` fail cryptically
+	// at worktree-add time; catch it now with an actionable error.
+	if out, berr := exec.CommandContext(ctx, "git", "--git-dir", mirrorPath, "rev-parse", "--is-bare-repository").CombinedOutput(); berr != nil || strings.TrimSpace(string(out)) != "true" {
+		return fmt.Errorf("mirror path %s exists but is not a bare repository (is-bare=%q) — point --mirror at a mirrors DIRECTORY (e.g. ~/.flowbee/mirrors) so Flowbee manages per-repo bare mirrors, NOT a working checkout like ~/dev/<repo>",
+			mirrorPath, strings.TrimSpace(string(out)))
 	}
 	// fetch latest — best-effort: with several parallel builders sharing one mirror a
 	// concurrent fetch can briefly lose the git lock; another builder's fetch wins, and

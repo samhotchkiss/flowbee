@@ -29,7 +29,7 @@ import (
 func runFleet(args []string) error {
 	fs := flag.NewFlagSet("fleet", flag.ContinueOnError)
 	url := fs.String("url", envOr("FLOWBEE_URL", ""), "control-plane URL, e.g. http://100.67.2.108:7070")
-	mirror := fs.String("mirror", envOr("FLOWBEE_MIRROR_PATH", "/tmp/flowbee-worker-mirror.git"), "local bare mirror shared by this box's build workers")
+	mirror := fs.String("mirror", envOr("FLOWBEE_WORKER_MIRRORS_DIR", ""), "directory for the worker's per-repo BARE mirrors (default ~/.flowbee/mirrors; NOT a working checkout)")
 	builders := fs.Int("builders", 1, "parallel build workers on this box (each gets its own worktree off the shared mirror)")
 	defaultAgent := `claude -p "$(cat "$FLOWBEE_TASK_FILE")" --dangerously-skip-permissions`
 	buildAgent := `claude -p "$(cat "$FLOWBEE_TASK_FILE")

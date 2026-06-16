@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -343,20 +342,10 @@ func runSubmit(args []string) error {
 // repo can't be derived (the harness then falls back to a temp mirror). Overridable
 // via --mirror / FLOWBEE_MIRROR_PATH.
 func defaultWorkerMirror(repoURL string) string {
-	repo := os.Getenv("FLOWBEE_GITHUB_REPO")
-	if repo == "" && repoURL != "" {
-		base := repoURL
-		if i := strings.LastIndex(base, "/"); i >= 0 {
-			base = base[i+1:]
-		}
-		repo = strings.TrimSuffix(base, ".git")
-	}
-	if repo == "" {
-		return ""
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return ""
-	}
-	return filepath.Join(home, "dev", repo)
+	// Leave empty: the harness derives a managed PER-REPO BARE mirror
+	// (~/.flowbee/mirrors/<repo>.git) from the lease's repo URL. The old default
+	// (~/dev/<repo>) pointed at a working-tree CHECKOUT, which `git --git-dir` cannot
+	// use as a mirror — Flowbee keeps its own bare mirrors, separate from your clones.
+	_ = repoURL
+	return ""
 }
