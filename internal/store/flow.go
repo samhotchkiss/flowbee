@@ -249,6 +249,19 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			return err
 		}
 
+		// M11 (§6.5.2, I-12): (job, epoch)-scoped CI gating. When epoch CI is in use
+		// for this job, the live gate honors ONLY the LIVE build epoch's CI — a zombie
+		// that pushed to a STALE epoch and turned its CI green wrote a row for the dead
+		// epoch, so the live gate stays red. AND the reconciled CIGreen with the live
+		// epoch's verdict; a non-promoted/stale epoch then can't satisfy the gate.
+		inUse, liveGreen, err := epochGatedCITx(ctx, tx, in.JobID)
+		if err != nil {
+			return err
+		}
+		if inUse {
+			facts.CIGreen = facts.CIGreen && liveGreen
+		}
+
 		dec := engine.Decide(engine.EngineState{
 			Job: j, Now: in.Now, Epoch: j.LeaseEpoch, GitHub: facts, Policy: p, Content: &chk,
 		}, engine.ReviewClaim{Epoch: in.Epoch, Value: in.Claim, Disposition: in.Disposition})

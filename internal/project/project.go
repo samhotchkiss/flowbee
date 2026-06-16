@@ -167,6 +167,22 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		}
 		return fmt.Sprintf("merge_enqueue pr=%d", number), nil
 
+	case store.ActionDraftPR:
+		// M11 compensation (§6.5.4): never leave a revoked zombie's PR ready-for-review.
+		number, _ := s.store.JobPR(ctx, row.JobID)
+		if number == 0 {
+			if n, ok := p["pr_number"].(float64); ok {
+				number = int(n)
+			}
+		}
+		if number == 0 {
+			return "draft:no-pr", nil // nothing was opened for the dead attempt
+		}
+		if err := s.gh.ConvertToDraft(ctx, number); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("draft_back pr=%d", number), nil
+
 	default:
 		// an unknown action is dropped to sent (audited) so the queue never wedges.
 		return "noop:" + row.Action, nil

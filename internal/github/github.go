@@ -123,6 +123,13 @@ type Writer interface {
 	// EnqueueMergeQueue enqueues a PR to GitHub's native merge queue — how BOTH
 	// merge arms physically merge (§5.4, §8.5). Workers never call this.
 	EnqueueMergeQueue(ctx context.Context, number int) error
+	// ConvertToDraft transitions a PR back to draft — the compensation step that
+	// never leaves a revoked zombie's PR ready-for-review (§6.5.4 draft-back, I-12).
+	ConvertToDraft(ctx context.Context, number int) error
+	// CancelCI cancels in-flight CI for a (revoked) epoch's pushed SHA — the
+	// compensation step that stops a dead epoch's checks (§6.5.4, I-12). A best-effort
+	// cancel: CI not cancellable is not an error.
+	CancelCI(ctx context.Context, sha string) error
 	// BranchProtection reads the server-side protection on a branch (I-8, §9.6):
 	// the orchestrator-independent backstop Flowbee asserts on startup.
 	BranchProtection(ctx context.Context, branch string) (Protection, bool, error)
@@ -495,6 +502,19 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
 	// the merge-queue enqueue is a GraphQL mutation in production; the REST shim
 	// here is a placeholder for the wired-but-unexercised real path.
 	return c.rest(ctx, http.MethodPut, fmt.Sprintf("/pulls/%d/merge-queue", number), map[string]any{}, nil)
+}
+
+func (c *RealClient) ConvertToDraft(ctx context.Context, number int) error {
+	// converting an open PR back to draft is a GraphQL mutation in production; the
+	// REST shim here is a placeholder for the wired-but-unexercised real path.
+	return c.rest(ctx, http.MethodPatch, fmt.Sprintf("/pulls/%d", number),
+		map[string]any{"draft": true}, nil)
+}
+
+func (c *RealClient) CancelCI(ctx context.Context, sha string) error {
+	// cancelling in-flight check runs at a SHA is a REST call per workflow run in
+	// production; the shim is a placeholder. Best-effort — never fails the caller.
+	return nil
 }
 
 func (c *RealClient) BranchProtection(ctx context.Context, branch string) (Protection, bool, error) {

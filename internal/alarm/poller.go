@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/clock"
+	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
@@ -47,6 +48,13 @@ type Poller struct {
 	// breakerTripped is the last fleet-wide Rung-2 circuit-breaker state, refreshed
 	// each Rung-2 sweep and fed into the deadline-driven evaluations.
 	breakerTripped bool
+
+	// M11 compensation wiring (§6.5.4, I-12). When set, a kill that revokes a lease
+	// triggers compensate(job, dead_epoch): drop the dead epoch's ref, cancel its CI,
+	// draft-back any PR opened for the dead attempt. The mirror is the shared bare repo
+	// the dead epoch ref lives on (nil-safe: records the compensation intent).
+	compensateOn bool
+	mirror       *gitops.Mirror
 }
 
 // New builds a poller. interval is how often it scans for due timers.
@@ -66,6 +74,27 @@ func (p *Poller) WithLiveness(cfg store.LivenessConfig, facts FactSource, pub Li
 	p.facts = facts
 	p.livePub = pub
 	return p
+}
+
+// WithCompensation enables the M11 explicit compensation on every lease revocation
+// (§6.5.4, I-12): a kill drops the dead epoch's ref, cancels its (job, epoch) CI, and
+// drafts-back any PR opened for the dead attempt. The mirror may be nil (the ref-drop
+// is then recorded intent only — the epoch bump from the revoke is itself the fence).
+func (p *Poller) WithCompensation(m *gitops.Mirror) *Poller {
+	p.compensateOn = true
+	p.mirror = m
+	return p
+}
+
+// compensateKill runs compensation for a kill result (the dead epoch is NewEpoch-1).
+func (p *Poller) compensateKill(ctx context.Context, res store.LivenessResult, now time.Time) {
+	if !p.compensateOn || !res.Killed || res.NewEpoch <= 0 {
+		return
+	}
+	_, _ = p.store.Compensate(ctx, store.CompensateParams{
+		JobID: res.JobID, DeadEpoch: res.NewEpoch - 1, Reason: res.Reason,
+		Mirror: p.mirror, EnqueueDraftBack: true, Now: now,
+	})
 }
 
 // Run blocks until ctx is cancelled, scanning for due timers each interval and
@@ -105,8 +134,11 @@ func (p *Poller) Tick(ctx context.Context) {
 				continue
 			}
 			res, err := p.store.FireLeaseDeadline(ctx, d, now, p.livenessCfg, p.breakerTripped)
-			if err == nil && res.Killed && p.livePub != nil {
-				p.livePub.PublishLiveness(res.JobID, "stall_revoked")
+			if err == nil && res.Killed {
+				p.compensateKill(ctx, res, now)
+				if p.livePub != nil {
+					p.livePub.PublishLiveness(res.JobID, "stall_revoked")
+				}
 			}
 		}
 	}
@@ -134,8 +166,11 @@ func (p *Poller) Rung2Tick(ctx context.Context) {
 	}
 	for _, id := range ids {
 		res, err := p.store.EvaluateLiveness(ctx, id, now, p.livenessCfg, tripped)
-		if err == nil && res.Killed && p.livePub != nil {
-			p.livePub.PublishLiveness(res.JobID, "stall_revoked")
+		if err == nil && res.Killed {
+			p.compensateKill(ctx, res, now)
+			if p.livePub != nil {
+				p.livePub.PublishLiveness(res.JobID, "stall_revoked")
+			}
 		}
 	}
 }

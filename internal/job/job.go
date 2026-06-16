@@ -193,6 +193,13 @@ type Job struct {
 	// chokepoint surfaces all four triggers: attempts | bounces | cost | stall).
 	EscalationReason string
 
+	// M11 epoch-namespaced side-effects (§3.5/§6.5, I-12). BuildEpoch is the epoch
+	// whose ref Flowbee last PROMOTED onto the real branch (the live build epoch); a
+	// result from a stale epoch is never promoted. MergeProvenance is the reconciled
+	// merge-commit SHA recorded on an unattended self_merge (Branch B).
+	BuildEpoch      int
+	MergeProvenance string
+
 	// verdict (gate stages only; written ONLY by gate logic, never a worker, I-9)
 	Verdict *Verdict
 

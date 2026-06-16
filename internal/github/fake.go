@@ -27,6 +27,8 @@ type Fake struct {
 	labels     map[int][]string
 	checks     []string // "name@sha=conclusion"
 	enqueued   []int    // PR numbers enqueued to the merge queue
+	drafted    []int    // PR numbers converted back to draft (compensation, §6.5.4)
+	cancelled  []string // SHAs whose CI was cancelled (compensation, §6.5.4)
 	protection map[string]Protection
 
 	// retryAfter, when >0, makes the NEXT write return *ErrRetryAfter (§8.2.4),
@@ -221,6 +223,43 @@ func (f *Fake) EnqueueMergeQueue(ctx context.Context, number int) error {
 	}
 	f.enqueued = append(f.enqueued, number)
 	return nil
+}
+
+func (f *Fake) ConvertToDraft(ctx context.Context, number int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("ConvertToDraft(%d)", number))
+	if err := f.retryGate(); err != nil {
+		return err
+	}
+	f.drafted = append(f.drafted, number)
+	if pr, ok := f.prs[number]; ok {
+		pr.IsDraft = true
+		f.prs[number] = pr
+	}
+	return nil
+}
+
+func (f *Fake) CancelCI(ctx context.Context, sha string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("CancelCI(%s)", sha))
+	f.cancelled = append(f.cancelled, sha)
+	return nil
+}
+
+// Drafted returns the PR numbers converted back to draft (compensation assertions).
+func (f *Fake) Drafted() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.drafted...)
+}
+
+// Cancelled returns the SHAs whose CI was cancelled (compensation assertions).
+func (f *Fake) Cancelled() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.cancelled...)
 }
 
 func (f *Fake) BranchProtection(ctx context.Context, branch string) (Protection, bool, error) {

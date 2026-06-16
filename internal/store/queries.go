@@ -823,7 +823,8 @@ const jobSelect = `
 	       COALESCE(spec_content_hash,''), COALESCE(spec_version,0), COALESCE(spec_signoff,''),
 	       COALESCE(issue_number,0), COALESCE(pr_number,0),
 	       cost_tokens_in, cost_tokens_out, cost_micro_usd, cost_ceiling_micro_usd,
-	       over_budget, COALESCE(flow_id,''), COALESCE(escalation_reason,'')
+	       over_budget, COALESCE(flow_id,''), COALESCE(escalation_reason,''),
+	       build_epoch, COALESCE(merge_provenance,'')
 	  FROM jobs`
 
 type rowScanner interface {
@@ -844,7 +845,8 @@ func scanJob(row rowScanner) (job.Job, error) {
 		&j.SpecContentHash, &j.SpecVersion, &specSignoffJSON,
 		&j.IssueNum, &j.PRNumber,
 		&j.CostTokensIn, &j.CostTokensOut, &j.CostMicroUSD, &ceiling,
-		&overBudget, &j.FlowID, &j.EscalationReason)
+		&overBudget, &j.FlowID, &j.EscalationReason,
+		&j.BuildEpoch, &j.MergeProvenance)
 	if err != nil {
 		return j, err
 	}

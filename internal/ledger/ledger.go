@@ -60,6 +60,10 @@ const (
 	// (epoch++, the worker's fence) and routes the job to needs_human + over-budget.
 	KindCostMetered   EventKind = "cost_metered"   // a {tokens_in,tokens_out,$} report folded into the meter
 	KindCostEscalated EventKind = "cost_escalated" // cost ceiling crossed: active -> needs_human (I-15)
+	// M11 epoch-namespaced side-effects + compensation event kinds (§3.5/§6.5, I-12).
+	KindEpochPromoted    EventKind = "epoch_promoted"    // Flowbee validated the live epoch + fast-forwarded its ref (§6.5.1)
+	KindCompensated      EventKind = "compensated"       // compensate(job, dead_epoch): dropped ref, cancelled CI, draft-back (§6.5.4)
+	KindUnattendedMerged EventKind = "unattended_merged" // self_merge: Flowbee enqueued+reconciled the merge with no human (§14 Branch B)
 )
 
 // Event is one appended ledger row. Payload holds kind-specific RESOLVED facts as
@@ -126,6 +130,14 @@ type Payload struct {
 	// EscalationReason records WHY a cost_escalated event routed to needs_human
 	// (always "cost" for I-15); recorded for the §12.6.1 chokepoint replay.
 	EscalationReason string `json:",omitempty"`
+
+	// M11 epoch-namespaced side-effects + compensation (§3.5/§6.5, I-12).
+	// BuildEpoch is the epoch whose ref was promoted (epoch_promoted). DeadEpoch is
+	// the orphaned epoch a compensation acted on (compensated). MergeProvenance is the
+	// reconciled merge-commit SHA recorded on an unattended self_merge (Branch B).
+	BuildEpoch      int    `json:",omitempty"`
+	DeadEpoch       int    `json:",omitempty"`
+	MergeProvenance string `json:",omitempty"`
 }
 
 // Fold replays events into the jobs projection. PURE: no clock, no RNG, no I/O.
@@ -369,6 +381,23 @@ func Fold(events []Event) (job.Job, error) {
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""
+		case KindEpochPromoted:
+			// M11 (§6.5.1): Flowbee validated the live epoch and fast-forwarded its
+			// epoch-namespaced ref onto the real branch. Records the promoted build
+			// epoch; no state change (the promotion is a git side-effect, not a state
+			// transition — review_pending was already reached by result_accepted).
+			j.BuildEpoch = e.Payload.BuildEpoch
+		case KindCompensated:
+			// M11 (§6.5.4): compensate(job, dead_epoch) ran — the dead epoch's ref was
+			// dropped, its CI cancelled, any draft PR drafted-back. No projection field
+			// changes (the epoch bump rode the revoke/supersede event that triggered it);
+			// recorded for replay/audit completeness.
+		case KindUnattendedMerged:
+			// M11 (§14 Branch B): a clean/in-budget/denylist-clear/unmoved-SHA diff
+			// merged unattended via the queue. The reconciled merge commit is recorded
+			// as provenance; the state move to done rides the reconciled merged fact
+			// (job_completed), so this event only stamps provenance.
+			j.MergeProvenance = e.Payload.MergeProvenance
 		case KindAdopted:
 			// a pre-existing issue/PR imported quiescent (I-16). State is the imported
 			// quiescent marker; no scheduling.

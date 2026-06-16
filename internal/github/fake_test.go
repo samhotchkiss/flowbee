@@ -51,3 +51,29 @@ func TestFakeRecordsAndScripts(t *testing.T) {
 		}
 	}
 }
+
+// TestFakeCompensationWrites covers the M11 compensation Writer methods (§6.5.4):
+// ConvertToDraft drafts a PR back; CancelCI records the cancelled SHA. Both are
+// recorded for the once-per-action audit + compensation assertions.
+func TestFakeCompensationWrites(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+	f.SetPR(PullRequest{Number: 7, HeadRefOid: "h7", BaseRefOid: "main", IsDraft: false})
+
+	if err := f.ConvertToDraft(ctx, 7); err != nil {
+		t.Fatalf("convert to draft: %v", err)
+	}
+	if d := f.Drafted(); len(d) != 1 || d[0] != 7 {
+		t.Fatalf("PR 7 must be drafted back, got %v", d)
+	}
+	if pr, _ := f.PRState(7); !pr.IsDraft {
+		t.Fatalf("the drafted-back PR must read IsDraft=true")
+	}
+
+	if err := f.CancelCI(ctx, "dead-sha"); err != nil {
+		t.Fatalf("cancel ci: %v", err)
+	}
+	if c := f.Cancelled(); len(c) != 1 || c[0] != "dead-sha" {
+		t.Fatalf("the dead SHA's CI must be cancelled, got %v", c)
+	}
+}

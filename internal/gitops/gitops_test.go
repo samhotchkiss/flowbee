@@ -84,6 +84,50 @@ func TestWorktreeDiffCommitPushPromote(t *testing.T) {
 	}
 }
 
+// TestDropRefOrphansEpochRef proves the M11 compensation primitive (§6.5.4, I-12):
+// dropping a dead epoch's ref orphans the zombie's work so it can never be promoted.
+// Dropping a missing ref is a no-op (idempotent compensation).
+func TestDropRefOrphansEpochRef(t *testing.T) {
+	m, base := newFixture(t)
+
+	ws := WorktreeBase(t.TempDir(), "job-z", 1)
+	wt, err := m.AddWorktree(ws, base)
+	if err != nil {
+		t.Fatalf("add worktree: %v", err)
+	}
+	defer wt.Destroy()
+	mustWrite(t, filepath.Join(ws, "zombie.txt"), "by zombie\n")
+	_, ref, err := wt.CommitAndPushEpoch("job-z", 1, "zombie build")
+	if err != nil {
+		t.Fatalf("commit+push: %v", err)
+	}
+	if _, ok := m.RefSHA(ref); !ok {
+		t.Fatalf("epoch ref must exist before drop")
+	}
+
+	// drop the dead epoch ref: it is orphaned, gone from the mirror.
+	if err := m.DropRef(ref); err != nil {
+		t.Fatalf("drop ref: %v", err)
+	}
+	if _, ok := m.RefSHA(ref); ok {
+		t.Fatalf("the dead epoch ref must be gone after DropRef")
+	}
+	// a promotion of the orphaned ref now fails (there is nothing to promote).
+	if err := m.PromoteEpochRef(ref, "refs/heads/never"); err == nil {
+		t.Fatalf("promoting an orphaned ref must fail (nothing to fast-forward)")
+	}
+	if _, ok := m.RefSHA("refs/heads/never"); ok {
+		t.Fatalf("the real branch must never advance from an orphaned ref")
+	}
+	// dropping again (or dropping a never-existed ref) is a no-op (idempotent).
+	if err := m.DropRef(ref); err != nil {
+		t.Fatalf("re-drop must be a no-op: %v", err)
+	}
+	if err := m.DropRef(EpochRef("job-z", 99)); err != nil {
+		t.Fatalf("dropping a missing ref must be a no-op: %v", err)
+	}
+}
+
 func mustGit(t *testing.T, dir string, name string, args ...string) {
 	t.Helper()
 	cmd := exec.Command(name, args...)

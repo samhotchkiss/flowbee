@@ -85,6 +85,21 @@ func (m *Mirror) PromoteEpochRef(epochRef, branch string) error {
 	return nil
 }
 
+// DropRef deletes a ref from the mirror — the compensation step that ORPHANS a
+// dead epoch's work (§6.5.4: `drop refs/flowbee/<job>/epoch-<dead_epoch>`). A
+// revoked-but-running zombie that pushed to its stale epoch ref leaves that ref
+// behind; compensation drops it so it can never be promoted. Deleting a missing
+// ref is a no-op (idempotent compensation).
+func (m *Mirror) DropRef(ref string) error {
+	if _, ok := m.RefSHA(ref); !ok {
+		return nil // already gone: idempotent
+	}
+	if _, err := run("", "git", "--git-dir", m.Path, "update-ref", "-d", ref); err != nil {
+		return fmt.Errorf("drop ref %s: %w", ref, err)
+	}
+	return nil
+}
+
 // RefSHA resolves any ref in the mirror to its commit SHA, or "" if absent.
 func (m *Mirror) RefSHA(ref string) (string, bool) {
 	out, err := run("", "git", "--git-dir", m.Path, "rev-parse", "--verify", "--quiet", ref)
