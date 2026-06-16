@@ -1148,7 +1148,11 @@ func (s *Server) release(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing X-Lease-Epoch", http.StatusBadRequest)
 		return
 	}
-	if err := s.store.Release(r.Context(), store.ReleaseParams{JobID: jobID, Epoch: epoch, Now: s.clock.Now()}); err != nil {
+	// ?keep=1 re-arms without burning an attempt (a non-failure abandon, e.g. a
+	// worker-push fast-forward race lost to a branch move). Default burns (a real
+	// build abandon).
+	noPenalty := r.URL.Query().Get("keep") == "1"
+	if err := s.store.Release(r.Context(), store.ReleaseParams{JobID: jobID, Epoch: epoch, Now: s.clock.Now(), NoPenalty: noPenalty}); err != nil {
 		s.writeFenceError(w, err)
 		return
 	}

@@ -371,6 +371,15 @@ func (c *Client) Release(ctx context.Context, jobID string, epoch int) (status i
 	return c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/release", epochHeader(epoch), nil, &out)
 }
 
+// ReleaseNoPenalty re-arms WITHOUT burning an attempt — for a non-failure abandon
+// (the worker built fine but lost a fast-forward race to a branch move). Keeps the
+// attempt budget for genuine build failures so re-validation churn can't escalate a
+// good change to needs_human.
+func (c *Client) ReleaseNoPenalty(ctx context.Context, jobID string, epoch int) (status int, err error) {
+	var out map[string]bool
+	return c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/release?keep=1", epochHeader(epoch), nil, &out)
+}
+
 func epochHeader(epoch int) map[string]string {
 	return map[string]string{"X-Lease-Epoch": strconv.Itoa(epoch)}
 }

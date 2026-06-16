@@ -657,9 +657,12 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 			return out, fmt.Errorf("commit: %w", cerr)
 		}
 		if perr := wt.PushTo(repoURL, issueBranch, false); perr != nil {
-			// the branch moved under us (e.g. a rebase-before-review force-update): drop
-			// the lease so the job re-arms and the next attempt restarts from the new tip.
-			_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
+			// the branch moved under us (e.g. a rebase-before-review force-update): the
+			// build SUCCEEDED, we just lost the fast-forward race. Re-arm WITHOUT burning
+			// an attempt (re-validation churn must not exhaust the failure budget and
+			// escalate a good change to needs_human) — the next attempt restarts from the
+			// new tip.
+			_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
 			return out, fmt.Errorf("push %s: %w", issueBranch, perr)
 		}
 		body["pushed_branch"] = issueBranch

@@ -544,6 +544,12 @@ type ReleaseParams struct {
 	JobID string
 	Epoch int
 	Now   time.Time
+	// NoPenalty re-arms WITHOUT burning an attempt: for an abandon that is not a build
+	// failure — e.g. the worker built successfully but lost a fast-forward race when
+	// the issue branch moved under it (a rebase-before-review). Counting re-validation
+	// churn as failures can exhaust max_attempts and escalate a GOOD change to
+	// needs_human; this keeps the attempt budget for genuine build failures.
+	NoPenalty bool
 }
 
 // Release applies engine.Decide for a fenced release: state -> ready, attempts++,
@@ -568,7 +574,7 @@ func (s *Store) Release(ctx context.Context, p ReleaseParams) error {
 			toState = job.StateReady
 		}
 		attemptsDelta := 0
-		if toState == job.StateReady {
+		if toState == job.StateReady && !p.NoPenalty {
 			attemptsDelta = 1
 		}
 		nextSeq := seq + 1
