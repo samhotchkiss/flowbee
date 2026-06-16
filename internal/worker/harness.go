@@ -588,7 +588,12 @@ func ensureMirror(ctx context.Context, mirrorPath, repoURL, branch string) error
 		}
 		return nil
 	}
-	return gitops.Open(mirrorPath).FetchBranch(branch)
+	// fetch latest — best-effort: with several parallel builders sharing one mirror a
+	// concurrent fetch can briefly lose the git lock; another builder's fetch wins, and
+	// if base_sha is genuinely absent the AddWorktree below fails clearly + the worker
+	// retries. So a fetch error never fails the job.
+	_ = gitops.Open(mirrorPath).FetchBranch(branch)
+	return nil
 }
 
 func hostname() string {
