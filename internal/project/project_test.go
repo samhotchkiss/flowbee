@@ -73,6 +73,71 @@ func TestDrainIdempotentAuditOncePerKey(t *testing.T) {
 	}
 }
 
+// TestIssueCommentPostsReviewFindings: an issues.comment outbox row drains to a
+// single GitHub issue comment on the job's bound issue (build-list §F: the issue is
+// the durable record of the review). A job with no bound issue drains as an audited
+// no-op — never a stray comment.
+func TestIssueCommentPostsReviewFindings(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+
+	// a build job carrying an adopted GitHub issue number (issue 42).
+	if _, err := st.DB.ExecContext(ctx, `
+		INSERT INTO jobs (id, kind, flow, stage, state, role, issue_number, blocked_by, required_capabilities,
+		                  enqueued_at, lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq)
+		VALUES ('jc', 'build', 'build', 'review', 'review_pending', 'code_reviewer', 42, '[]', '[]',
+		        datetime('now'), 0, 0, 5, 0, 3, 1)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	body := "### 🐝 Flowbee code review — CHANGES REQUESTED 🔁\n\nMissing a test for the error path."
+	if _, err := st.EnqueueIssueComment(ctx, "jc", body, "review-e1"); err != nil {
+		t.Fatalf("enqueue comment: %v", err)
+	}
+	if n, err := sender.DrainOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("drain n=%d err=%v want 1", n, err)
+	}
+	if got := fake.Comments(42); len(got) != 1 || got[0] != body {
+		t.Fatalf("issue 42 comments = %v, want exactly the findings body", got)
+	}
+
+	// a retried submission (same dedupe key) posts no second comment.
+	if _, err := st.EnqueueIssueComment(ctx, "jc", body, "review-e1"); err != nil {
+		t.Fatalf("re-enqueue: %v", err)
+	}
+	_, _ = sender.DrainOnce(ctx)
+	if got := fake.Comments(42); len(got) != 1 {
+		t.Fatalf("retry duplicated the comment: %d", len(got))
+	}
+
+	// a NEW review epoch (new key) posts again.
+	if _, err := st.EnqueueIssueComment(ctx, "jc", "approved", "review-e2"); err != nil {
+		t.Fatalf("enqueue e2: %v", err)
+	}
+	_, _ = sender.DrainOnce(ctx)
+	if got := fake.Comments(42); len(got) != 2 {
+		t.Fatalf("new-epoch review should post a second comment: %d", len(got))
+	}
+
+	// a job with NO bound issue drains as an audited no-op, not a stray comment.
+	seedReviewPending(t, st, "noissue")
+	if _, err := st.EnqueueIssueComment(ctx, "noissue", "x", "review-e1"); err != nil {
+		t.Fatalf("enqueue noissue: %v", err)
+	}
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain noissue: %v", err)
+	}
+	comments := 0
+	for _, c := range fake.Calls() {
+		if len(c) >= 12 && c[:12] == "IssueComment" {
+			comments++
+		}
+	}
+	if comments != 2 {
+		t.Fatalf("IssueComment API called %d times, want 2 (the no-issue job must not call it)", comments)
+	}
+}
+
 // TestRetryAfterParksWholeOutbox: a Retry-After parks the WHOLE outbox until the
 // clock passes the horizon (§8.2.4).
 func TestRetryAfterParksWholeOutbox(t *testing.T) {

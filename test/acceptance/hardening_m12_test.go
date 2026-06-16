@@ -259,7 +259,7 @@ func TestM12_RestartRecoveryZeroJobLoss(t *testing.T) {
 	if err != nil || !ok2 || rg.JobID != jobID {
 		t.Fatalf("post-restart reviewer lease ok=%v err=%v job=%s", ok2, err, rg.JobID)
 	}
-	rv, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-restart", "approved", "handoff")
+	rv, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-restart", "approved", "handoff", "")
 	if err != nil || code != http.StatusOK || !rv.Minted {
 		t.Fatalf("post-restart review code=%d minted=%v err=%v", code, rv.Minted, err)
 	}

@@ -120,6 +120,11 @@ type Writer interface {
 	OpenPR(ctx context.Context, in OpenPRInput) (number int, err error)
 	// CreateIssue materializes a GitHub issue and returns its number (§11).
 	CreateIssue(ctx context.Context, in CreateIssueInput) (number int, err error)
+	// IssueComment posts a comment on an issue (or PR — same REST surface). This is
+	// how a reviewer's findings + verdict are written into the GitHub issue so it is
+	// the durable, human-readable record of the build's review history (build-list
+	// §F). Workers never call this — the control plane is the sole GitHub writer (R4).
+	IssueComment(ctx context.Context, number int, body string) error
 	// SetLabels replaces the flowbee:* label set on a PR/issue (a rendering of
 	// Domain-A stage; §8.2.1).
 	SetLabels(ctx context.Context, number int, labels []string) error
@@ -493,6 +498,11 @@ func (c *RealClient) CreateIssue(ctx context.Context, in CreateIssueInput) (int,
 		"title": in.Title, "body": in.Body, "labels": in.Labels,
 	}, &out)
 	return out.Number, err
+}
+
+func (c *RealClient) IssueComment(ctx context.Context, number int, body string) error {
+	return c.rest(ctx, http.MethodPost, fmt.Sprintf("/issues/%d/comments", number),
+		map[string]any{"body": body}, nil)
 }
 
 func (c *RealClient) SetLabels(ctx context.Context, number int, labels []string) error {

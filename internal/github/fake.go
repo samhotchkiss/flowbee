@@ -25,6 +25,7 @@ type Fake struct {
 	nextPR     int
 	nextIssue  int
 	issues     map[int]CreateIssueInput
+	comments   map[int][]string // issue/PR number -> comment bodies in order (reviewer findings, §F)
 	labels     map[int][]string
 	checks     []string // "name@sha=conclusion"
 	enqueued   []int    // PR numbers enqueued to the merge queue
@@ -46,6 +47,7 @@ func NewFake() *Fake {
 		nextPR:      1000,
 		nextIssue:   2000,
 		issues:      map[int]CreateIssueInput{},
+		comments:    map[int][]string{},
 		labels:      map[int][]string{},
 		protection:  map[string]Protection{},
 	}
@@ -200,6 +202,25 @@ func (f *Fake) CreateIssue(ctx context.Context, in CreateIssueInput) (int, error
 	f.issues[n] = in
 	f.labels[n] = append([]string(nil), in.Labels...)
 	return n, nil
+}
+
+func (f *Fake) IssueComment(ctx context.Context, number int, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("IssueComment(%d)", number))
+	if err := f.retryGate(); err != nil {
+		return err
+	}
+	f.comments[number] = append(f.comments[number], body)
+	return nil
+}
+
+// Comments returns the comment bodies posted to an issue/PR number, in order (a
+// copy) — the §F reviewer-findings record assertions read this.
+func (f *Fake) Comments(number int) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.comments[number]...)
 }
 
 func (f *Fake) SetLabels(ctx context.Context, number int, labels []string) error {

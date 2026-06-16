@@ -48,6 +48,28 @@ func (s *Store) EnqueuePROpen(ctx context.Context, jobID, headSHA, baseRef strin
 	return enqueued, err
 }
 
+// EnqueueIssueComment enqueues an issues.comment action (build-list §F): the
+// reviewer's verdict + findings, rendered to markdown, posted into the originating
+// GitHub issue so the issue is the durable human-readable record of the review. The
+// dedupeKey becomes the outbox head_sha so the (job, action, head_sha) idempotency
+// key collapses a retried submission to one comment, while a NEW review (a fresh
+// epoch -> a new key) posts again. The control plane is the sole GitHub writer (R4);
+// the body is pre-rendered by the caller from the reviewer's own findings.
+func (s *Store) EnqueueIssueComment(ctx context.Context, jobID, body, dedupeKey string) (bool, error) {
+	enqueued := false
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := enqueueOutboxTx(ctx, tx, OutboxRow{
+			JobID: jobID, Action: ActionComment, HeadSHA: dedupeKey,
+			Payload: outboxPayload(map[string]any{"body": body}),
+		}); err != nil {
+			return err
+		}
+		enqueued = true
+		return nil
+	})
+	return enqueued, err
+}
+
 // StampPRNumber records the GitHub PR number a pulls.create drain returned (§7.3):
 // Flowbee opened the PR and stamps the number. pr_number is GitHub-owned; written
 // ONLY by this PR-open path / reconcile binding — never by a worker. It also seeds

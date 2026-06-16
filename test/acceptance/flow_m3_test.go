@@ -112,7 +112,7 @@ func TestM3ApprovedMintsVerdictAndHandsOff(t *testing.T) {
 
 	// the reviewer claims approved + self_merge — but policy is OFF, so the gate
 	// mints a verdict bound to the reconciled SHA pair and forces handoff.
-	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge")
+	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge", "")
 	if err != nil || code != http.StatusOK {
 		t.Fatalf("review code=%d err=%v", code, err)
 	}
@@ -185,7 +185,7 @@ func TestM3HostileApprovalOverRedFactsNeverMints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-h", "approved", "handoff")
+	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-h", "approved", "handoff", "")
 	if err != nil || code != http.StatusOK {
 		t.Fatalf("review code=%d err=%v", code, err)
 	}
@@ -221,7 +221,7 @@ func TestM3ChangesRequestedBouncesAndExhausts(t *testing.T) {
 	reviewer, rg := driveToCodeReview(t, ctx, st, ts.URL, jobID)
 
 	// bounce #1: changes_requested -> ready (re-armed build stage), bounces=1.
-	resp, _, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "cr-1", "changes_requested", "")
+	resp, _, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "cr-1", "changes_requested", "", "")
 	if err != nil {
 		t.Fatalf("review #1: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestM3ChangesRequestedBouncesAndExhausts(t *testing.T) {
 	for i := 2; i <= 3; i++ {
 		rebuildToReviewPending(t, ctx, st, ts.URL, jobID, i)
 		rv := rereview(t, ctx, st, ts.URL, jobID)
-		resp, _, err := rv.cl.Review(ctx, jobID, rv.epoch, "", "changes_requested", "")
+		resp, _, err := rv.cl.Review(ctx, jobID, rv.epoch, "", "changes_requested", "", "")
 		if err != nil {
 			t.Fatalf("review #%d: %v", i, err)
 		}
@@ -285,7 +285,7 @@ func TestM3SelfMergeWhenPolicyOn(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	resp, _, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "sm-1", "approved", "self_merge")
+	resp, _, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "sm-1", "approved", "self_merge", "")
 	if err != nil {
 		t.Fatalf("review: %v", err)
 	}

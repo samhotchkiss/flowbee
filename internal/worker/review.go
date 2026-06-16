@@ -214,7 +214,7 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		if disp == "" {
 			disp = "self_merge"
 		}
-		resp, st, err := c.Review(ctx, grant.JobID, grant.LeaseEpoch, idem, verdict, disp)
+		resp, st, err := c.Review(ctx, grant.JobID, grant.LeaseEpoch, idem, verdict, disp, v.Notes)
 		if err != nil {
 			return out, fmt.Errorf("review: %w", err)
 		}

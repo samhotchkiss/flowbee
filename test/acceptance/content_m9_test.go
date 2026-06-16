@@ -132,7 +132,7 @@ func TestM9WorkflowPatchForcedToHandoff(t *testing.T) {
 		content.BlastRadius{Paths: []string{".github/workflows/ci.yml"}})
 	seedGreenFacts(t, ctx, st, jobID)
 
-	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge")
+	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge", "")
 	if err != nil || code != http.StatusOK {
 		t.Fatalf("review code=%d err=%v", code, err)
 	}
@@ -177,7 +177,7 @@ func TestM9BlastRadiusExceededIsTamper(t *testing.T) {
 		content.BlastRadius{Paths: []string{"pkg/a.go"}})
 	seedGreenFacts(t, ctx, st, jobID)
 
-	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge")
+	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge", "")
 	if err != nil || code != http.StatusOK {
 		t.Fatalf("review code=%d err=%v", code, err)
 	}
@@ -209,7 +209,7 @@ func TestM9SecretTrippingPatchFailsStaticChecks(t *testing.T) {
 		content.BlastRadius{Paths: []string{"config.go"}})
 	seedGreenFacts(t, ctx, st, jobID)
 
-	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge")
+	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge", "")
 	if err != nil || code != http.StatusOK {
 		t.Fatalf("review code=%d err=%v", code, err)
 	}
@@ -240,7 +240,7 @@ func TestM9ToggleOffCleanDiffUnchanged(t *testing.T) {
 		content.BlastRadius{Paths: []string{"pkg/foo.go"}})
 	seedGreenFacts(t, ctx, st, jobID)
 
-	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge")
+	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge", "")
 	if err != nil || code != http.StatusOK {
 		t.Fatalf("review code=%d err=%v", code, err)
 	}
@@ -274,7 +274,7 @@ func TestM9ToggleOnCleanDiffSelfMerges(t *testing.T) {
 		content.BlastRadius{Paths: []string{"pkg/foo.go"}})
 	seedGreenFacts(t, ctx, st, jobID)
 
-	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge")
+	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-1", "approved", "self_merge", "")
 	if err != nil || code != http.StatusOK {
 		t.Fatalf("review code=%d err=%v", code, err)
 	}

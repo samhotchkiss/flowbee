@@ -228,6 +228,21 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		}
 		return detail, nil
 
+	case store.ActionComment:
+		// build-list §F: post the reviewer's findings + verdict into the originating
+		// GitHub issue. Resolve the issue from the job (an adopted issue is stamped on
+		// the build; a spec-flow build descends from the spec job that carries the
+		// materialized issue number). No issue to comment on => audited no-op.
+		j, _ := s.store.GetJob(ctx, row.JobID)
+		number := s.resolveIssueNum(ctx, j)
+		if number == 0 {
+			return "comment:no-issue", nil
+		}
+		if err := s.gh.IssueComment(ctx, number, str(p, "body")); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("comment issue=%d", number), nil
+
 	case store.ActionSetLabels:
 		// Prefer the job's stamped PR number; fall back to the payload `number` (an
 		// actively-tracked ISSUE has an issue number but no PR — F7 umbrella labels).
@@ -355,21 +370,30 @@ func prTitle(j job.Job, jobID string) string {
 // issue number lives on the spec job the build descends from (FlowID).
 func (s *Sender) prBody(ctx context.Context, j job.Job) string {
 	var b strings.Builder
-	// link the originating issue so the merge closes it: an adopted GitHub issue is
-	// stamped on the build job itself; a spec-flow build descends from the spec job
-	// that carries the materialized issue number (FlowID).
-	issueNum := j.IssueNum
-	if issueNum == 0 && j.FlowID != "" && j.FlowID != j.ID {
-		if spec, err := s.store.GetJob(ctx, j.FlowID); err == nil {
-			issueNum = spec.IssueNum
-		}
-	}
+	// link the originating issue so the merge closes it.
+	issueNum := s.resolveIssueNum(ctx, j)
 	if issueNum > 0 {
 		fmt.Fprintf(&b, "Closes #%d\n\n", issueNum)
 	}
 	b.WriteString("Implements the signed-off spec.\n\n---\n")
 	b.WriteString("_Opened by Flowbee from the eng_worker patch (§7.3); Flowbee performed the git write, not the worker._")
 	return b.String()
+}
+
+// resolveIssueNum finds the GitHub issue a job belongs to: an adopted GitHub issue
+// is stamped on the build job itself; a spec-flow build descends from the spec job
+// that carries the materialized issue number (FlowID). Returns 0 when no issue is
+// bound yet (e.g. a build whose issue has not been materialized).
+func (s *Sender) resolveIssueNum(ctx context.Context, j job.Job) int {
+	if j.IssueNum > 0 {
+		return j.IssueNum
+	}
+	if j.FlowID != "" && j.FlowID != j.ID {
+		if spec, err := s.store.GetJob(ctx, j.FlowID); err == nil {
+			return spec.IssueNum
+		}
+	}
+	return 0
 }
 
 // seedBuildFromSpec turns a just-materialized signed-off spec into a ready build

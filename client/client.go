@@ -270,13 +270,13 @@ type ReviewResponse struct {
 // Review posts a fenced code-review result: the reviewer's verdict CLAIM +
 // requested disposition (untrusted; the server's gate decides from reconciled
 // facts, I-9). status is the HTTP status (409 = stale).
-func (c *Client) Review(ctx context.Context, jobID string, epoch int, idemKey, verdict, disposition string) (ReviewResponse, int, error) {
+func (c *Client) Review(ctx context.Context, jobID string, epoch int, idemKey, verdict, disposition, notes string) (ReviewResponse, int, error) {
 	h := epochHeader(epoch)
 	if idemKey != "" {
 		h["Idempotency-Key"] = idemKey
 	}
 	var out ReviewResponse
-	body := map[string]string{"verdict": verdict, "disposition": disposition}
+	body := map[string]string{"verdict": verdict, "disposition": disposition, "notes": notes}
 	st, err := c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/review", h, body, &out)
 	return out, st, err
 }

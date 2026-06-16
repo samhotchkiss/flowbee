@@ -8,6 +8,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -669,11 +670,30 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// renderReviewComment renders the reviewer's verdict + findings as the markdown
+// body Flowbee posts into the GitHub issue (build-list §F). It mirrors the empty
+// findings-commit message the reviewer node lands on the branch, so the issue and
+// the git history tell the same story. Findings are the reviewer's own words; the
+// header is Flowbee's deterministic framing.
+func renderReviewComment(verdictLabel, notes string, epoch int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "### 🐝 Flowbee code review — %s\n\n", verdictLabel)
+	if n := strings.TrimSpace(notes); n != "" {
+		b.WriteString(n)
+		b.WriteString("\n\n")
+	} else {
+		b.WriteString("_No findings recorded._\n\n")
+	}
+	fmt.Fprintf(&b, "---\n_Review epoch %d. Posted by Flowbee from the reviewer's verdict (R4: the control plane is the sole GitHub writer)._", epoch)
+	return b.String()
+}
+
 // reviewRequest is the code-review result body: the reviewer's verdict CLAIM +
 // requested disposition. Untrusted (I-9): the gate decides from reconciled facts.
 type reviewRequest struct {
 	Verdict     string `json:"verdict"`     // approved | changes_requested
 	Disposition string `json:"disposition"` // self_merge | handoff (only meaningful on approved)
+	Notes       string `json:"notes"`       // the reviewer's findings — posted into the GitHub issue + the §F record
 }
 
 // review runs the I-9 code-review gate for a fenced code_review result. The
@@ -707,6 +727,20 @@ func (s *Server) review(w http.ResponseWriter, r *http.Request) {
 		ev = "verdict_minted"
 	}
 	s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: ev, Epoch: epoch})
+
+	// the GitHub issue is the durable record of the review (build-list §F): post the
+	// reviewer's verdict + findings into the issue as a comment. Both arms record —
+	// an approval and a changes-requested are equally part of the history. Dedupe per
+	// review epoch so a retried submission posts exactly once. Control plane is the
+	// sole GitHub writer (R4): the worker only declared the claim, Flowbee writes it.
+	verdictLabel := "CHANGES REQUESTED 🔁"
+	if resp.Minted {
+		verdictLabel = "APPROVED ✅"
+	}
+	body := renderReviewComment(verdictLabel, req.Notes, epoch)
+	if _, cerr := s.store.EnqueueIssueComment(r.Context(), jobID, body, fmt.Sprintf("review-e%d", epoch)); cerr == nil {
+		s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "review_comment_enqueued", Epoch: epoch})
+	}
 
 	// on a passing gate, advance the branch point (§5.4) so the job reaches its
 	// terminal-for-M3 arm (merge_handoff by default; merging under self_merge).

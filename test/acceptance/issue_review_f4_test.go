@@ -366,7 +366,7 @@ func TestF4_BuildReviewStillBouncesToBuildAgent(t *testing.T) {
 	if err != nil || !ok || rg.JobID != buildJob {
 		t.Fatalf("reviewer lease ok=%v err=%v", ok, err)
 	}
-	rv, code, err := reviewer.Review(ctx, buildJob, rg.LeaseEpoch, "rv-1", "changes_requested", "")
+	rv, code, err := reviewer.Review(ctx, buildJob, rg.LeaseEpoch, "rv-1", "changes_requested", "", "")
 	if err != nil || code != http.StatusOK {
 		t.Fatalf("review code=%d err=%v", code, err)
 	}
