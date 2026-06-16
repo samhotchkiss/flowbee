@@ -6,11 +6,11 @@ on:
 
 jobs:
   build-test:
-    # self-hosted runner on our own infra (imac-flowbee-1), not GitHub-hosted —
-    # the whole loop (build/review/merge AND CI) runs on Sam's boxes. GitHub still
-    # orchestrates the check + reports status, which is what Flowbee reconciles to
-    # gate the merge.
-    runs-on: [self-hosted, flowbee-ci]
+    # GitHub-hosted runners: free for public repos, parallel (no single-runner
+    # queue), and faster than one self-hosted box. Flowbee gates the merge on this
+    # check going green either way — only the execution location differs. (A
+    # self-hosted runner makes sense for a PRIVATE repo to avoid Actions minutes.)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
