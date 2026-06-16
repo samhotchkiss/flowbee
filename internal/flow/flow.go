@@ -37,6 +37,15 @@ type Role struct {
 }
 
 // Stage binds a role within a flow's DAG.
+//
+// F5 extends Stage with configurable-flow surface: Optional marks a droppable
+// stage (a flow without it simply omits it — e.g. a build flow with no
+// issue_review); Identity is the per-stage identity override (precedence:
+// role default < flow < epic < job); Reviewers + Decision express a
+// multi-reviewer fan-out (N reviewers, distinct lenses, one aggregated verdict).
+// These fields are DATA references (identity ids, a decision enum) and are NOT
+// control-position tokens under the §5.6 neutrality lint — they reference the
+// seeded identity files, which legitimately carry model literals as data.
 type Stage struct {
 	Role       string   `yaml:"role"`
 	Needs      []string `yaml:"needs"`
@@ -44,7 +53,41 @@ type Stage struct {
 	When       string   `yaml:"when"`
 	Context    string   `yaml:"context"`
 	MaxBounces int      `yaml:"max_bounces"`
+
+	// Optional marks a stage a flow may legally drop. A flow that omits an
+	// optional stage entirely just skips it; one that lists it with optional:true
+	// keeps it. Resolve treats a missing optional stage as "skip", never an error.
+	Optional bool `yaml:"optional"`
+
+	// Identity is the flow-level identity override for this stage (an id resolved
+	// against the identity registry). Empty falls back to the role default.
+	Identity string `yaml:"identity"`
+
+	// Decision is the multi-reviewer aggregation rule for a fan-out gate stage:
+	// all_pass | majority | any_veto. Empty defaults to all_pass.
+	Decision string `yaml:"decision"`
+
+	// Reviewers is the fan-out roster for a multi-reviewer build-review: each
+	// reviewer is a distinct identity + lens. An empty list means the single-
+	// reviewer (Identity/Role) form.
+	Reviewers []ReviewerSlot `yaml:"reviewers"`
 }
+
+// ReviewerSlot is one reviewer in a multi-reviewer fan-out: a distinct identity
+// staffing the stage's role under a distinct review lens (correctness | tests |
+// security | …). Anti-affinity holds identity ≠ builder and identity ≠ every
+// other reviewer in the same fan-out.
+type ReviewerSlot struct {
+	Identity string `yaml:"identity"`
+	Lens     string `yaml:"lens"`
+}
+
+// Decision enumerates the multi-reviewer aggregation rules.
+const (
+	DecisionAllPass  = "all_pass"  // every reviewer must pass (default)
+	DecisionMajority = "majority"  // strict majority of reviewers must pass
+	DecisionAnyVeto  = "any_veto"  // any single fail vetoes (== all_pass for boolean verdicts)
+)
 
 // Signoff describes a flow's tamper-evident sign-off rule (§5.5).
 type Signoff struct {

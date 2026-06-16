@@ -144,6 +144,11 @@ type ClaimParams struct {
 	LeaseID     string
 	Identity    string
 	ModelFamily string
+	// Lens is the resolved review lens (F5) the worker is fenced to apply for this
+	// lease (correctness|tests|security|""). It is part of the resolved identity
+	// the flow layer fences into the lease so a multi-reviewer fan-out's reviewers
+	// each carry their own lens. Empty for non-review stages.
+	Lens string
 	Role        job.Role
 	// Attested is the worker's attested capability set; the claim only succeeds
 	// if it satisfies the job's required_capabilities (§6.6). A worker lacking a
@@ -191,6 +196,7 @@ func (s *Store) ClaimReadyJob(ctx context.Context, p ClaimParams) (*lease.Lease,
 			   SET state              = 'leased',
 			       bound_identity     = ?,
 			       bound_model_family = ?,
+			       bound_lens         = ?,
 			       lease_epoch        = lease_epoch + 1,
 			       lease_id           = ?,
 			       lease_deadline     = ?,
@@ -209,7 +215,7 @@ func (s *Store) ClaimReadyJob(ctx context.Context, p ClaimParams) (*lease.Lease,
 			           AND ? = 'merger'
 			           AND sib.bound_identity = ? )
 			RETURNING lease_epoch, job_seq`,
-			p.Identity, p.ModelFamily, p.LeaseID,
+			p.Identity, p.ModelFamily, p.Lens, p.LeaseID,
 			deadline.Format(rfc3339), hbDue.Format(rfc3339),
 			p.JobID,
 			string(p.Role), p.Identity, p.ModelFamily,

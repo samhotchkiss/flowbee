@@ -79,9 +79,13 @@ type ClaimReviewParams struct {
 	LeaseID     string
 	Identity    string
 	ModelFamily string
-	Attested    []string
-	TTL         time.Duration
-	Now         time.Time
+	// Lens is the resolved review lens (F5) fenced into the lease for this
+	// reviewer (correctness|tests|security). It records WHICH lens of a
+	// multi-reviewer fan-out this reviewer is acting under.
+	Lens     string
+	Attested []string
+	TTL      time.Duration
+	Now      time.Time
 }
 
 // ClaimReviewJob runs the atomic claim for the code_review gate stage:
@@ -125,6 +129,7 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 			       stage              = 'review',
 			       bound_identity     = ?,
 			       bound_model_family = ?,
+			       bound_lens         = ?,
 			       lease_epoch        = lease_epoch + 1,
 			       lease_id           = ?,
 			       lease_deadline     = ?,
@@ -138,7 +143,7 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 			           AND ( sib.builder_identity     = ?
 			              OR sib.builder_model_family = ? ) )
 			RETURNING lease_epoch, job_seq`,
-			p.Identity, p.ModelFamily, p.LeaseID,
+			p.Identity, p.ModelFamily, p.Lens, p.LeaseID,
 			deadline.Format(rfc3339), deadline.Format(rfc3339),
 			p.JobID, p.Identity, p.ModelFamily,
 		)
