@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -272,7 +273,12 @@ func ensureControlMirror(logger *slog.Logger) {
 	logger.Info("provisioning control-plane mirror from GitHub", "path", mp)
 	if out, err := exec.Command("git", "clone", "--bare", "--quiet", url, mp).CombinedOutput(); err != nil {
 		logger.Error("clone control-plane mirror", "err", err, "out", strings.TrimSpace(string(out)))
+		return
 	}
+	// the mirror's origin URL embeds the token (needed for private-repo fetch/push);
+	// lock the mirror down so that credential isn't world/group-readable on the box.
+	_ = os.Chmod(mp, 0o700)
+	_ = os.Chmod(filepath.Join(mp, "config"), 0o600)
 }
 
 // githubPushURL builds the credential-bearing https remote the control plane
