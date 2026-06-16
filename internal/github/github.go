@@ -52,11 +52,15 @@ type PullRequest struct {
 	Labels      []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
 }
 
-// Issue is the Domain-B snapshot of one open issue from a BoardSweep.
+// Issue is the Domain-B snapshot of one open issue from a BoardSweep. Title/Body
+// are read so a flowbee:adopt opt-in can seed the single-issue flow's task context
+// (F7); they are GitHub-owned facts, never written back by Flowbee.
 type Issue struct {
 	Number    int
 	UpdatedAt time.Time
 	Labels    []string
+	Title     string
+	Body      string
 }
 
 // RateLimit is the single installation token's budget (I-14): one bucket to watch.

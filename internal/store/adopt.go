@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gh "github.com/samhotchkiss/flowbee/internal/github"
+	"github.com/samhotchkiss/flowbee/internal/intake"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
@@ -78,6 +79,63 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 			}
 			adopted = append(adopted, id)
 		}
+		// F7: direct-to-GitHub ISSUES are mirrored-but-quiescent by default. An issue
+		// with a flowbee:adopt label opts in to a STANDALONE single-issue flow entering
+		// at issue-review (spec_review over the issue body as the spec). The rest stay
+		// quiescent — Flowbee never seizes an issue it didn't originate.
+		for _, iss := range snap.Issues {
+			id := fmt.Sprintf("adopt-issue-%d", iss.Number)
+			var existing string
+			err := tx.QueryRowContext(ctx,
+				`SELECT id FROM jobs WHERE id = ? OR issue_number = ? LIMIT 1`, id, iss.Number).Scan(&existing)
+			if err == nil {
+				continue // already known (originated or previously adopted)
+			}
+			if err != sql.ErrNoRows {
+				return fmt.Errorf("adopt lookup issue %d: %w", iss.Number, err)
+			}
+			optIn := hasLabel(iss.Labels, "flowbee:adopt")
+			state := job.StateQuiescent
+			stage, role := "review", "code_reviewer" // placeholder for a quiescent issue
+			optInI := 0
+			kind := ledger.KindAdopted
+			if optIn {
+				// opt-in: enter a single-issue flow at issue-review (spec_review). The
+				// issue body becomes the spec/task the reviewer judges + amends.
+				state = job.StateSpecReview
+				stage, role = "review", string(job.RoleSpecReviewer)
+				optInI = 1
+				kind = ledger.KindIssueAdopted
+			}
+			t := intake.TaskFromIssueBody(iss.Body)
+			var issueCol any = iss.Number
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO jobs (id, kind, flow, stage, state, role, issue_number,
+				                  blocked_by, required_capabilities, enqueued_at,
+				                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
+				                  adopted, opted_in, task_text, spec_text, acceptance_criteria)
+				VALUES (?, 'spec', 'spec', ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 3, 1, 1, ?, ?, ?, ?)`,
+				id, stage, string(state), role, issueCol,
+				marshalStrings([]string{"role:" + role}), now.Format(rfc3339), optInI,
+				t.Text, t.Spec, t.AcceptanceCriteria); err != nil {
+				return fmt.Errorf("insert adopted issue %d: %w", iss.Number, err)
+			}
+			ev := ledger.Event{
+				JobID: id, JobSeq: 1, Kind: kind,
+				ToState: state, Actor: "adopt", CreatedAt: now,
+				Payload: ledger.Payload{
+					IssueNumber: iss.Number, Stage: stage, Role: job.Role(role),
+					TaskText: t.Text, SpecText: t.Spec, AcceptanceCriteria: t.AcceptanceCriteria,
+				},
+			}
+			if err := appendEvent(ctx, tx, ev); err != nil {
+				return err
+			}
+			if err := setJobSeq(ctx, tx, id, 1); err != nil {
+				return err
+			}
+			adopted = append(adopted, id)
+		}
 		return nil
 	})
 	if err != nil {
@@ -100,7 +158,12 @@ func (s *Store) IsQuiescent(ctx context.Context, jobID string) (bool, error) {
 
 // OptIn promotes a quiescent adopted job into Flowbee's control (§12.7): the
 // operator's deliberate decision, one item at a time. It leaves quiescent and
-// enters the normal DAG (review_pending). project-OUT now renders it.
+// enters the normal DAG. project-OUT now renders it.
+//
+// An adopted PR opts in to review_pending (its PR exists; awaiting review). An
+// adopted ISSUE (F7) — no PR — opts in to a standalone single-issue flow entering
+// at issue-review (spec_review over the issue body), via the quiescent ->
+// spec_review edge (TriggerAdoptedForReview).
 func (s *Store) OptIn(ctx context.Context, jobID string, now time.Time) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		j, seq, err := loadJobTx(ctx, tx, jobID)
@@ -111,6 +174,28 @@ func (s *Store) OptIn(ctx context.Context, jobID string, now time.Time) error {
 			return nil // already in the DAG
 		}
 		nextSeq := seq + 1
+		// route by what was adopted: an issue (no PR) enters issue-review; a PR
+		// enters review_pending.
+		if j.PRNumber == 0 && j.IssueNum != 0 {
+			to := job.StateSpecReview
+			ev := ledger.Event{
+				JobID: jobID, JobSeq: nextSeq, Kind: ledger.KindIssueAdopted,
+				FromState: job.StateQuiescent, ToState: to,
+				LeaseEpoch: j.LeaseEpoch, Actor: "operator", CreatedAt: now,
+				Payload: ledger.Payload{IssueNumber: j.IssueNum, Stage: "review", Role: job.RoleSpecReviewer},
+			}
+			if err := appendEvent(ctx, tx, ev); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE jobs SET state='spec_review', stage='review', role='spec_reviewer',
+				                required_capabilities=?, opted_in=1, enqueued_at=?, updated_at=datetime('now')
+				 WHERE id = ?`,
+				marshalStrings([]string{"role:spec_reviewer"}), now.Format(rfc3339), jobID); err != nil {
+				return fmt.Errorf("opt in issue: %w", err)
+			}
+			return setJobSeq(ctx, tx, jobID, nextSeq)
+		}
 		ev := ledger.Event{
 			JobID: jobID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
 			FromState: job.StateQuiescent, ToState: job.StateReviewPending,

@@ -15,10 +15,11 @@ import (
 // It is safe for concurrent use (the control plane sweeps from one goroutine but
 // tests may drive it from several).
 type Fake struct {
-	mu    sync.Mutex
-	prs   map[int]PullRequest
-	rate  RateLimit
-	calls []string // "BoardSweep" / "PullRequest(N)" / "OpenPR" / ... in order, for assertions
+	mu          sync.Mutex
+	prs         map[int]PullRequest
+	boardIssues map[int]Issue // open issues the BoardSweep returns (F7 direct-to-GitHub issues)
+	rate        RateLimit
+	calls       []string // "BoardSweep" / "PullRequest(N)" / "OpenPR" / ... in order, for assertions
 
 	// project-OUT write state (§8.2).
 	nextPR     int
@@ -39,13 +40,14 @@ type Fake struct {
 // NewFake builds an empty Fake with a healthy starting rate-limit budget.
 func NewFake() *Fake {
 	return &Fake{
-		prs:        map[int]PullRequest{},
-		rate:       RateLimit{Limit: 5000, Remaining: 5000},
-		nextPR:     1000,
-		nextIssue:  2000,
-		issues:     map[int]CreateIssueInput{},
-		labels:     map[int][]string{},
-		protection: map[string]Protection{},
+		prs:         map[int]PullRequest{},
+		boardIssues: map[int]Issue{},
+		rate:        RateLimit{Limit: 5000, Remaining: 5000},
+		nextPR:      1000,
+		nextIssue:   2000,
+		issues:      map[int]CreateIssueInput{},
+		labels:      map[int][]string{},
+		protection:  map[string]Protection{},
 	}
 }
 
@@ -56,6 +58,15 @@ func (f *Fake) SetPR(pr PullRequest) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.prs[pr.Number] = pr
+}
+
+// SetIssue scripts (or replaces) one OPEN issue in the fake's board — the
+// direct-to-GitHub issue the F7 adopt sweep imports mirrored-quiescent (a
+// flowbee:adopt label opts it in to a single-issue flow at issue-review).
+func (f *Fake) SetIssue(iss Issue) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.boardIssues[iss.Number] = iss
 }
 
 // SetRateLimit scripts the budget gauge the sweep self-meters (I-14).
@@ -80,6 +91,9 @@ func (f *Fake) BoardSweep(ctx context.Context) (BoardSnapshot, error) {
 	var snap BoardSnapshot
 	for _, pr := range f.prs {
 		snap.PullRequests = append(snap.PullRequests, pr)
+	}
+	for _, iss := range f.boardIssues {
+		snap.Issues = append(snap.Issues, iss)
 	}
 	snap.RateLimit = f.rate
 	return snap, nil

@@ -6,6 +6,24 @@ import (
 	"time"
 )
 
+// TestFakeBoardSweepReturnsIssues: the fake returns scripted OPEN issues (F7
+// direct-to-GitHub issues) alongside PRs, so the adopt sweep can import them.
+func TestFakeBoardSweepReturnsIssues(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+	f.SetIssue(Issue{Number: 42, UpdatedAt: time.Unix(1, 0), Labels: []string{"flowbee:adopt"}, Title: "t", Body: "b"})
+	snap, err := f.BoardSweep(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(snap.Issues) != 1 || snap.Issues[0].Number != 42 {
+		t.Fatalf("sweep issues: %+v", snap.Issues)
+	}
+	if snap.Issues[0].Body != "b" || len(snap.Issues[0].Labels) != 1 {
+		t.Fatalf("issue facts not scripted: %+v", snap.Issues[0])
+	}
+}
+
 // TestFakeRecordsAndScripts: the fake returns scripted PRs and records calls for
 // dedupe/idempotency assertions, and a re-SetPR replaces (CI flip / SHA move).
 func TestFakeRecordsAndScripts(t *testing.T) {

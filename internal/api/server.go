@@ -196,7 +196,14 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/cost", s.costJSON)
 	mux.HandleFunc("GET /v1/needs-human", s.needsHumanJSON)
 	mux.HandleFunc("GET /v1/needs-input", s.needsInputJSON)
+	mux.HandleFunc("GET /v1/backlog", s.backlogJSON)
 	mux.HandleFunc("GET /v1/fleet", s.fleetJSON)
+	// F7 board-lifecycle write edges (operator / user-agent loop). These are the
+	// deliberate human/agent decisions: answer a needs_design item (resume it),
+	// promote a backlog item into its flow, opt a quiescent adopted item in.
+	mux.HandleFunc("POST /v1/jobs/{job}/design", s.resolveDesign)
+	mux.HandleFunc("POST /v1/jobs/{job}/promote", s.promoteBacklog)
+	mux.HandleFunc("POST /v1/jobs/{job}/adopt", s.adoptOptIn)
 	mux.HandleFunc("GET /roster", s.rosterPage)
 	mux.HandleFunc("GET /dashboard", s.dashboard)
 	mux.HandleFunc("GET /", s.board)
@@ -258,6 +265,80 @@ func (s *Server) needsInputJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)
+}
+
+// backlogJSON serves the F7 Backlog lane (flow-pass §D): every tracked-but-NOT-
+// scheduled job, with its "needs full spec" flag. The user-agent's board-check
+// loop reads this (+ /v1/needs-input) to decide what to promote.
+func (s *Server) backlogJSON(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.store.Backlog(r.Context())
+	if err != nil {
+		http.Error(w, "backlog error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
+// resolveDesignRequest is the user-agent loop's answer to a needs_design item
+// (F7): the human's design decision, optionally encoded as an edited spec. With
+// an AmendedSpecMarkdown, Flowbee commits it (computes the BLAKE3 hash — the human
+// never self-addresses the artifact) and the re-armed gate judges the new bytes;
+// without it, the SAME bytes are re-reviewed (the answer rode in the chat).
+type resolveDesignRequest struct {
+	AmendedSpecMarkdown string `json:"amended_spec_markdown,omitempty"`
+	AmendedVersion      int    `json:"amended_version,omitempty"`
+}
+
+// resolveDesign is the resume edge of the user-agent board-check loop (F7): a
+// human (via their agent) supplies the design decision for a job parked in
+// needs_design, and Flowbee resumes it to spec_review (a fresh issue-review judges
+// the now-resolved spec). This closes the loop "post an answer -> needs_design ->
+// issue_review".
+func (s *Server) resolveDesign(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job")
+	var req resolveDesignRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req) // an empty body = re-review same bytes
+	}
+	var newHash string
+	if req.AmendedSpecMarkdown != "" {
+		newHash = spec.ContentHash([]byte(req.AmendedSpecMarkdown))
+	}
+	if err := s.store.ResolveDesign(r.Context(), jobID, newHash, req.AmendedVersion, s.clock.Now()); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	s.broker.Publish(LifeEvent{JobID: jobID, State: string(job.StateSpecReview), Event: "design_resolved"})
+	writeJSON(w, http.StatusOK, map[string]any{"resumed": true, "state": string(job.StateSpecReview)})
+}
+
+// promoteBacklog is the deliberate "promote when ready" edge (F7): an operator /
+// user-agent releases a tracked-but-not-scheduled backlog item into its flow (a
+// needs-full-spec item into spec_authoring, a ready-to-build item into ready).
+// Before this the item was never leasable.
+func (s *Server) promoteBacklog(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job")
+	to, err := s.store.PromoteBacklog(r.Context(), jobID, s.clock.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	s.broker.Publish(LifeEvent{JobID: jobID, State: string(to), Event: "promoted"})
+	writeJSON(w, http.StatusOK, map[string]any{"promoted": true, "state": string(to)})
+}
+
+// adoptOptIn is the deliberate opt-in edge (F7 / §12.7): an operator promotes a
+// quiescent adopted item (an issue or PR) into Flowbee's control. An adopted issue
+// enters a standalone single-issue flow at issue-review; an adopted PR enters
+// review_pending. The flowbee:adopt label opts an issue in automatically on the
+// adopt sweep; this is the manual edge.
+func (s *Server) adoptOptIn(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job")
+	if err := s.store.OptIn(r.Context(), jobID, s.clock.Now()); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"opted_in": true})
 }
 
 // dashboard renders the finished operator UI (§12.6): board + roster + budget +

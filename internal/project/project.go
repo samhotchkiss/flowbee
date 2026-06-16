@@ -142,7 +142,14 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		return fmt.Sprintf("issue=%d", number), nil
 
 	case store.ActionSetLabels:
+		// Prefer the job's stamped PR number; fall back to the payload `number` (an
+		// actively-tracked ISSUE has an issue number but no PR — F7 umbrella labels).
 		number, _ := s.store.JobPR(ctx, row.JobID)
+		if number == 0 {
+			if n, ok := p["number"].(float64); ok {
+				number = int(n)
+			}
+		}
 		labels := strSlice(p, "labels")
 		if err := s.gh.SetLabels(ctx, number, labels); err != nil {
 			return "", err

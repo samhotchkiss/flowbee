@@ -37,6 +37,16 @@ const (
 	TriggerSpecNeedsDesign Trigger = "spec_needs_design" // spec_review -> needs_design (design fork)
 	TriggerDesignResolved  Trigger = "design_resolved"   // needs_design -> spec_review (human answered)
 
+	// F7 board-lifecycle edges. A `backlog` job is tracked + visible but NEVER
+	// leased until deliberately PROMOTED: a needs-full-spec item promotes into the
+	// spec flow (-> spec_authoring), a ready-to-build item promotes straight to
+	// `ready`. A direct-to-GitHub issue adopted mirrored-quiescent opts IN via the
+	// flowbee:adopt label into a standalone single-issue flow at issue-review
+	// (quiescent -> spec_review).
+	TriggerPromotedToSpec   Trigger = "promoted_to_spec"   // backlog -> spec_authoring (needs full spec)
+	TriggerPromotedToReady  Trigger = "promoted_to_ready"  // backlog -> ready (ready to build)
+	TriggerAdoptedForReview Trigger = "adopted_for_review" // quiescent -> spec_review (issue opt-in)
+
 	// M8 liveness triggers (§10.7). A "kill" is a lease REVOCATION (epoch++ +
 	// compensation), routed to `ready` for re-dispatch unless the Rung-4 governor
 	// ceiling holds it in `needs_human` (anti-thrash). The absolute-cap kill and a
@@ -116,6 +126,12 @@ var transitions = map[transitionKey]State{
 	{StateSpecReview, TriggerSpecAmended}:     StateDone,
 	{StateSpecReview, TriggerSpecNeedsDesign}: StateNeedsDesign,
 	{StateNeedsDesign, TriggerDesignResolved}: StateSpecReview,
+
+	// F7 board-lifecycle edges: a backlog item is promoted into a flow (never
+	// leased until then); an adopted issue opts in to a single-issue review.
+	{StateBacklog, TriggerPromotedToSpec}:     StateSpecAuthoring,
+	{StateBacklog, TriggerPromotedToReady}:    StateReady,
+	{StateQuiescent, TriggerAdoptedForReview}: StateSpecReview,
 
 	// M8 liveness edges (§10.7). Every active-lease state can be killed (revoked) by
 	// the two-rung rule or the absolute cap, or fast-pathed to failed/cancelled. A

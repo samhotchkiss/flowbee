@@ -53,6 +53,13 @@ const (
 	KindEpicReviewed    EventKind = "epic_reviewed"     // the epic-level issue-review barrier passed; the epic's issues fan out
 	KindPROpened        EventKind = "pr_opened"         // Flowbee opened the PR and stamped # (§7.3, §8.2.1)
 	KindAdopted         EventKind = "adopted"           // a pre-existing issue/PR imported quiescent (I-16)
+	// F7 board-lifecycle event kinds (flow-pass §D). A backlog item is tracked but
+	// NOT scheduled until deliberately promoted; an adopted issue opts in to a
+	// single-issue review; the yellow `flowbee` umbrella label is rendered OUT.
+	KindBacklogged       EventKind = "backlogged"        // a job seeded into `backlog` (tracked, not scheduled)
+	KindPromoted         EventKind = "promoted"          // backlog -> spec_authoring | ready (deliberate promotion)
+	KindIssueAdopted     EventKind = "issue_adopted"     // a direct-to-GitHub issue opted in -> single-issue review
+	KindTrackingLabelled EventKind = "tracking_labelled" // the yellow `flowbee` umbrella + stage label rendered OUT
 	// M8 liveness event kinds (§10.7). A stall kill / absolute-cap revoke / fast-path
 	// each emits its own audit event; the lease_revoked event carries the bumped
 	// epoch (the zombie's fence) and the governor counter delta.
@@ -454,6 +461,34 @@ func Fold(events []Event) (job.Job, error) {
 			if e.Payload.IssueNumber != 0 {
 				j.IssueNum = e.Payload.IssueNumber
 			}
+		case KindBacklogged:
+			// F7: a job seeded into `backlog` — tracked + visible but NOT scheduled.
+			// It carries the human intent so a later promotion ships a real spec/task.
+			j.State = e.ToState
+			j.TaskText = e.Payload.TaskText
+			j.SpecText = e.Payload.SpecText
+			j.AcceptanceCriteria = e.Payload.AcceptanceCriteria
+			if e.Payload.IssueNumber != 0 {
+				j.IssueNum = e.Payload.IssueNumber
+			}
+		case KindPromoted:
+			// F7: backlog -> spec_authoring | ready. The deliberate promotion releases
+			// the job into its flow; before it the job was never leasable.
+			j.State = e.ToState
+			j.Stage = e.Payload.Stage
+			j.Role = e.Payload.Role
+			if e.ToState == job.StateReady {
+				j.EnqueuedAt = e.CreatedAt
+			}
+		case KindIssueAdopted:
+			// F7: a direct-to-GitHub issue opted in (flowbee:adopt) -> single-issue
+			// review (spec_review). It leaves quiescent and enters the DAG.
+			j.State = e.ToState
+			j.Stage = e.Payload.Stage
+			j.Role = e.Payload.Role
+		case KindTrackingLabelled:
+			// F7: the yellow `flowbee` umbrella + stage label was rendered OUT for an
+			// actively-tracked issue. No projection state change (audit/marker only).
 		}
 		j.JobSeq = e.JobSeq
 	}
