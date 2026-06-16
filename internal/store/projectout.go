@@ -10,6 +10,11 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
 
+// PRBranch is the deterministic GitHub branch name the control plane publishes a
+// job's build commit to (and opens the PR from). Computed the same way on both the
+// push side (result handler) and the PR-open side (project-OUT) so they agree.
+func PRBranch(jobID string) string { return "flowbee/" + jobID }
+
 // EnqueuePROpen enqueues the canonical PR-open trigger (§7.3, §8.2.1): after an
 // eng_worker's build result lands review_pending and Flowbee has validated +
 // promoted the epoch ref, Flowbee opens the PR. The worker NEVER supplies a PR

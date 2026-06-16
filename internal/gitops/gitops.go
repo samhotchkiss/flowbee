@@ -100,6 +100,19 @@ func (m *Mirror) DropRef(ref string) error {
 	return nil
 }
 
+// PushCommit publishes a commit that exists in this mirror to a remote as
+// refs/heads/<branch>. This is the control-plane's credential-bearing write to
+// GitHub (R4, build-list F3): the eng_worker pushed only a local epoch ref and
+// holds no credential, so Flowbee — under its own token, baked into remoteURL —
+// publishes the build commit as a branch a PR can be opened against. Force-updates
+// the branch so a re-arm at a new epoch republishes cleanly.
+func (m *Mirror) PushCommit(remoteURL, sha, branch string) error {
+	if _, err := run("", "git", "--git-dir", m.Path, "push", "--force", remoteURL, sha+":refs/heads/"+branch); err != nil {
+		return fmt.Errorf("push commit to %s: %w", branch, err)
+	}
+	return nil
+}
+
 // RefSHA resolves any ref in the mirror to its commit SHA, or "" if absent.
 func (m *Mirror) RefSHA(ref string) (string, bool) {
 	out, err := run("", "git", "--git-dir", m.Path, "rev-parse", "--verify", "--quiet", ref)

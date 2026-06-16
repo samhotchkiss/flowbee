@@ -175,10 +175,16 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 
 	switch row.Action {
 	case store.ActionOpenPR:
+		// the head branch was published to GitHub by the control plane (result
+		// handler) under the deterministic name store.PRBranch(jobID); the payload's
+		// epoch ref is not a GitHub branch, so reference the published branch here.
+		j, _ := s.store.GetJob(ctx, row.JobID)
 		number, err := s.gh.OpenPR(ctx, gh.OpenPRInput{
-			Title:   fmt.Sprintf("flowbee: %s", row.JobID),
-			Body:    "Opened by Flowbee from the eng_worker patch (§7.3).",
-			HeadRef: str(p, "head_ref"), BaseRef: orDefault(str(p, "base_ref"), orDefault(s.baseBranch, "main")), Draft: true,
+			Title:   prTitle(j, row.JobID),
+			Body:    s.prBody(ctx, j),
+			HeadRef: store.PRBranch(row.JobID),
+			BaseRef: orDefault(str(p, "base_ref"), orDefault(s.baseBranch, "main")),
+			Draft:   false,
 		})
 		if err != nil {
 			return "", err
@@ -328,6 +334,32 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// prTitle renders the PR title from the build job's task/spec (the issue title),
+// falling back to the job id.
+func prTitle(j job.Job, jobID string) string {
+	for _, s := range []string{j.TaskText, j.SpecText} {
+		if line := firstNonEmptyLine(s); line != "" {
+			return strings.TrimSpace(strings.TrimLeft(line, "# "))
+		}
+	}
+	return "flowbee: " + jobID
+}
+
+// prBody links the PR to the originating issue with a "Closes #N" so the merge
+// auto-closes it, then notes Flowbee as the author of the eng_worker patch. The
+// issue number lives on the spec job the build descends from (FlowID).
+func (s *Sender) prBody(ctx context.Context, j job.Job) string {
+	var b strings.Builder
+	if j.FlowID != "" {
+		if spec, err := s.store.GetJob(ctx, j.FlowID); err == nil && spec.IssueNum > 0 {
+			fmt.Fprintf(&b, "Closes #%d\n\n", spec.IssueNum)
+		}
+	}
+	b.WriteString("Implements the signed-off spec.\n\n---\n")
+	b.WriteString("_Opened by Flowbee from the eng_worker patch (§7.3); Flowbee performed the git write, not the worker._")
+	return b.String()
 }
 
 // seedBuildFromSpec turns a just-materialized signed-off spec into a ready build

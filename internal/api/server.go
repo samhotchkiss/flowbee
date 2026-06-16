@@ -54,6 +54,12 @@ type Server struct {
 	// diff, and the CONTROL PLANE applies the patch + pushes the epoch ref + opens
 	// the PR. When false, build leases default to same-box `worktree`.
 	bundleProvisioning bool
+	// pushRemoteURL is the credential-bearing GitHub remote (https with the token
+	// baked in) the control plane publishes an eng_worker's build commit to as a
+	// branch, so a PR can be opened (build-list F3/§7.3). Empty = no auto PR-open
+	// (worker pushed only a local epoch ref). Single-repo for now; multi-repo routes
+	// per job repo later.
+	pushRemoteURL string
 	// staleHB is the roster's stale-heartbeat threshold (§12.6.2).
 	staleHB time.Duration
 	// authn is the worker-transport authenticator (§7.6). Nil = loopback-only dev
@@ -105,6 +111,10 @@ type Config struct {
 	// content gate (§9.2, I-11) runs over a worker's untrusted diff. The zero value
 	// is exactly the shipped defaults. New() installs it on the store.
 	ContentPolicy content.Policy
+	// PushRemoteURL is the credential-bearing GitHub remote (https with the token)
+	// the control plane publishes a build commit to as a branch so a PR can open
+	// (build-list F3). Empty disables auto PR-open after a build result.
+	PushRemoteURL string
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -146,6 +156,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		pollInterval: poll,
 		mirrorPath:         cfg.MirrorPath,
 		bundleProvisioning: cfg.BundleProvisioning,
+		pushRemoteURL:      cfg.PushRemoteURL,
 		staleHB:            staleHB,
 		authn:              cfg.Authenticator,
 		ui:                 ui,
@@ -951,6 +962,22 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeFenceError(w, err)
 		return
+	}
+	// build result -> PR open (build-list §7.3, the EnqueuePROpen trigger): once a
+	// build lands review_pending, the control plane PUBLISHES the commit the worker
+	// produced (only a local epoch ref so far) to GitHub as a branch under its own
+	// token, then enqueues the PR-open. The worker holds no credential; Flowbee does
+	// the GitHub write. Best-effort: a publish failure leaves the job review_pending
+	// for a retry and never fails the accepted result.
+	if resp.JobState == string(job.StateReviewPending) && s.pushRemoteURL != "" && s.mirrorPath != "" && pushedRef != "" {
+		if sha, ok := gitops.Open(s.mirrorPath).RefSHA(pushedRef); ok {
+			branch := store.PRBranch(jobID)
+			if err := gitops.Open(s.mirrorPath).PushCommit(s.pushRemoteURL, sha, branch); err != nil {
+				s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "pr_branch_push_failed", Epoch: epoch})
+			} else if _, err := s.store.EnqueuePROpen(r.Context(), jobID, sha, "main"); err == nil {
+				s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "pr_open_enqueued", Epoch: epoch})
+			}
+		}
 	}
 	s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "result_accepted", Epoch: epoch})
 	writeJSON(w, http.StatusOK, resp)

@@ -83,6 +83,10 @@ func runServe(_ []string) error {
 		Policy: job.Policy{AllowSelfMerge: cfg.AllowSelfMerge},
 		// F2: the operator content-integrity posture (ceilings + extra denylist).
 		ContentPolicy: cfg.ContentPolicy(),
+		// build-list §7.3: the credential-bearing GitHub remote the control plane
+		// publishes a build commit to (as a branch) so a PR can open after a build
+		// result. Built from the single-repo GitHub creds; empty disables auto PR-open.
+		PushRemoteURL: githubPushURL(),
 	}, version)
 	if cfg.AllowSelfMerge {
 		logger.Info("autonomous merge enabled (Branch B): self_merge eligible jobs merge without a human gate")
@@ -186,6 +190,17 @@ func runServe(_ []string) error {
 // wireMultiRepo seeds the F9 repos registry from config (or the legacy single-repo
 // env) and builds the per-repo reconcile/project Manager. Returns nil when no repo
 // is configured (dev/CI with no creds), so the control plane runs without GitHub.
+// githubPushURL builds the credential-bearing https remote the control plane
+// pushes build branches to (so a PR can open), from the single-repo GitHub env.
+// Empty when any of owner/repo/token is unset — auto PR-open is then disabled.
+func githubPushURL() string {
+	owner, repo, tok := os.Getenv("FLOWBEE_GITHUB_OWNER"), os.Getenv("FLOWBEE_GITHUB_REPO"), os.Getenv("FLOWBEE_GITHUB_TOKEN")
+	if owner == "" || repo == "" || tok == "" {
+		return ""
+	}
+	return "https://x-access-token:" + tok + "@github.com/" + owner + "/" + repo + ".git"
+}
+
 func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, st *store.Store, srv *api.Server) *multirepo.Manager {
 	// (1) seed the registry. cfg.Repos (structured list) wins; else fall back to the
 	// single-repo FLOWBEE_GITHUB_OWNER/REPO env path (registered under id "default").
