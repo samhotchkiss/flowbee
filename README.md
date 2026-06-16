@@ -62,15 +62,37 @@ go install github.com/samhotchkiss/flowbee/cmd/flowbee@latest
 # scaffold config into your repo (committed + versioned)
 cd my-project && flowbee init
 
-# give it access, then run
-export FLOWBEE_GITHUB_TOKEN=github_pat_...    # repo-scoped, fine-grained
-flowbee serve &       # the control plane
-flowbee work  &       # a worker — or /loop a Claude session as one
+# give it access
+export FLOWBEE_GITHUB_OWNER=you FLOWBEE_GITHUB_REPO=my-project
+export FLOWBEE_GITHUB_TOKEN=github_pat_...    # fine-grained: contents + PRs + issues (write)
 
-flowbee doctor        # ✅ green? you're live.
+# bring up the WHOLE fleet in one command:
+# control plane + a real-agent worker for every role (author, review, build, code-review)
+flowbee up --self-merge
 ```
 
-Submit an epic, then watch the board at **localhost:7070**.
+`flowbee up` clones a local mirror, starts the control plane, and starts one
+worker loop per pipeline role (each spawning your agent CLI — `claude -p` /
+`codex` — per job), then prints the dashboard URL. Watch it at **localhost:7070/dashboard**.
+
+*(Multi-box? Run `flowbee serve` on one host and `flowbee work --role …` on each
+remote instead — same binary, no creds on the workers.)*
+
+### Give it work — two ways
+
+```bash
+# 1. From GitHub: open an issue and label it `flowbee:build`.
+#    Flowbee adopts it → builds → reviews → merges → closes the issue. That's it.
+
+# 2. From your planner agent: POST a work item to the front door.
+curl -X POST localhost:7070/v1/specs -H 'content-type: application/json' \
+  -d '{"task":"Add request timeouts to the HTTP client","acceptance":"all outbound calls have a 30s deadline"}'
+#    An author drafts the spec → a distinct-lens reviewer signs off →
+#    issue is materialized → build → review → merge. No human in the loop.
+```
+
+With `--self-merge`, an approved change that's CI-green and passes the
+content-integrity gate **merges to `main` autonomously** — no human gate.
 
 ## Under the hood
 
@@ -83,7 +105,7 @@ Go deeper: **[DESIGN.md](./DESIGN.md)** — the full architecture · **[BUILD.md
 
 ## Status
 
-Early, and moving fast — the control plane, fenced leasing, the flow engine, GitHub sync, and liveness are landing milestone by milestone. Built, fittingly, by a fleet of agents.
+Working end-to-end. The control plane, fenced leasing, the flow engine, GitHub sync, liveness, the content-integrity gate, and the full pipeline are built — and **proven on this very repo**: a work item goes from intake → spec → issue-review → build → code-review → **autonomous merge**, with a real agent at every step and no human in the loop. Built, fittingly, by a fleet of agents.
 
 ## License
 
