@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>🐝 Flowbee — Board</title>
+<style>
+  :root{
+    --bg:#0a0b0f; --panel:#13151c; --panel2:#171a22; --line:#242936; --inset:#0e1017;
+    --txt:#e7e9ee; --dim:#8b92a6; --faint:#5b6273;
+    --bee:#facc15; --bee-dim:#a8870f; --warn:#f59e0b; --bad:#ef4444; --ok:#34d399;
+    --e1:#facc15; --e2:#3b82f6; --e3:#a855f7;
+    --building:#3b82f6; --review:#a855f7; --merge:#22c55e; --gate:#facc15;
+    --drawerW:520px;
+    --mono:'SF Mono','JetBrains Mono',ui-monospace,Menlo,monospace;
+    --sans:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box} html,body{margin:0;height:100%}
+  body{background:radial-gradient(1100px 600px at 80% -10%,rgba(250,204,21,.05),transparent 60%),var(--bg);
+    color:var(--txt);font-family:var(--sans);-webkit-font-smoothing:antialiased}
+  /* full width; shifts left when the drawer is open so the board stays fully visible + clickable */
+  .wrap{width:100%;padding:24px 22px 60px;transition:padding-right .34s cubic-bezier(.2,.8,.2,1)}
+  body.drawer-open .wrap{padding-right:calc(var(--drawerW) + 26px)}
+  @media(max-width:880px){body.drawer-open .wrap{padding-right:22px}}
+
+  header{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:18px}
+  .brand{display:flex;align-items:center;gap:12px}
+  .logo{font-size:28px;filter:drop-shadow(0 0 12px rgba(250,204,21,.5));animation:bob 4s ease-in-out infinite}
+  @keyframes bob{50%{transform:translateY(-3px) rotate(-4deg)}}
+  .brand h1{font-size:19px;margin:0;font-weight:700}
+  .brand .sub{color:var(--dim);font-size:12px;font-family:var(--mono);margin-top:2px}
+  .legend{display:flex;gap:14px;font-family:var(--mono);font-size:11px;color:var(--dim);flex-wrap:wrap}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;vertical-align:middle}
+
+  .needs{border:1px solid color-mix(in srgb,var(--warn) 40%,var(--line));border-radius:14px;
+    background:linear-gradient(180deg,rgba(245,158,11,.08),rgba(245,158,11,.02));padding:13px 15px;margin-bottom:18px}
+  .needs.empty{display:none}
+  .needs h2{margin:0 0 3px;font-size:13px;font-weight:700;color:var(--warn);display:flex;align-items:center;gap:9px}
+  .needs h2 .b{font-family:var(--mono);font-size:10px;background:var(--warn);color:#1a1205;border-radius:99px;padding:2px 8px;font-weight:800;animation:pulse 1.6s ease-in-out infinite}
+  @keyframes pulse{50%{box-shadow:0 0 0 6px rgba(245,158,11,.18)}}
+  .needs .ep{font-size:11px;color:var(--faint);font-family:var(--mono);margin-bottom:9px}
+  .nrow{display:flex;gap:10px;flex-wrap:wrap}
+  .ncard{flex:1 1 300px;background:var(--inset);border:1px solid color-mix(in srgb,var(--warn) 30%,var(--line));border-radius:11px;padding:10px 12px;cursor:pointer;transition:border-color .2s}
+  .ncard:hover{border-color:var(--warn)}
+  .ncard .t{font-size:13px;font-weight:600;margin-bottom:4px}
+  .ncard .r{font-size:12px;color:var(--dim);margin-bottom:7px}
+  .ncard .e{font-family:var(--mono);font-size:10px;color:var(--faint)}
+
+  /* full-width grid; collapses to a single vertical column below the min width */
+  .cols{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;align-items:start}
+  @media(max-width:1080px){.cols{grid-template-columns:1fr;gap:10px}}
+  .col{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:14px;padding:11px 10px;min-height:90px}
+  .col h3{margin:0 0 10px;font-size:11px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);display:flex;align-items:center;justify-content:space-between}
+  .col h3 .c{font-family:var(--mono);background:#0e1017;border:1px solid var(--line);border-radius:99px;padding:1px 8px;font-size:10px;color:var(--faint)}
+  .col.done h3{color:var(--ok)} .col.backlog h3{color:var(--faint)}
+  /* in vertical mode, lay cards out in a wrapping row to use the width */
+  .stack{display:flex;flex-direction:column;gap:8px}
+  @media(max-width:1080px){.stack{flex-direction:row;flex-wrap:wrap}.stack .card{flex:1 1 260px}}
+
+  .card{position:relative;background:var(--inset);border:1px solid var(--line);border-radius:10px;padding:9px 10px 9px 13px;overflow:hidden;cursor:pointer;
+    animation:rise .4s cubic-bezier(.2,.8,.2,1) both;transition:transform .2s,border-color .2s,box-shadow .2s}
+  @keyframes rise{from{opacity:0;transform:translateY(8px)}}
+  .card:hover{transform:translateY(-2px);border-color:#39415a}
+  .card.active{border-color:var(--bee);box-shadow:0 0 0 1px var(--bee),0 0 18px -6px rgba(250,204,21,.5)}
+  .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--ec)}
+  .card .top{display:flex;align-items:center;gap:7px;margin-bottom:5px}
+  .bee{width:9px;height:9px;border-radius:2px;background:var(--bee);box-shadow:0 0 7px rgba(250,204,21,.5);flex:0 0 auto}
+  .card .n{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .card .ep{font-family:var(--mono);font-size:9.5px;color:var(--ec);margin-left:auto;text-transform:uppercase;letter-spacing:.5px}
+  .card .t{font-size:12.5px;line-height:1.3;color:var(--txt)}
+  .card .bot{margin-top:7px;display:flex;align-items:center;justify-content:space-between;gap:6px}
+  .who{font-family:var(--mono);font-size:10px;color:var(--faint);display:flex;align-items:center;gap:6px;min-width:0}
+  .who .live{width:6px;height:6px;border-radius:50%;background:var(--ok);animation:breathe 1.6s infinite;flex:0 0 auto}
+  @keyframes breathe{50%{opacity:.3;transform:scale(.6)}}
+  .timer{font-family:var(--mono);font-size:10px;color:var(--faint);background:#0c0e14;border:1px solid var(--line);border-radius:6px;padding:2px 6px;white-space:nowrap;flex:0 0 auto}
+  .timer.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 35%,var(--line))}
+  .timer.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 35%,var(--line))}
+  .card.spec{opacity:.62}
+  .flash{animation:flash .7s ease}
+  @keyframes flash{0%{background:rgba(250,204,21,.16)}100%{background:var(--inset)}}
+
+  /* drawer — no scrim, board stays interactive */
+  .drawer{position:fixed;top:0;right:0;height:100%;width:var(--drawerW);max-width:94vw;
+    background:linear-gradient(180deg,#14161e,#0f1117);border-left:1px solid var(--line);
+    box-shadow:-30px 0 60px -25px rgba(0,0,0,.75);transform:translateX(101%);
+    transition:transform .34s cubic-bezier(.2,.8,.2,1);z-index:10;display:flex;flex-direction:column}
+  .drawer.on{transform:none}
+  .dhead{padding:18px 20px 14px;border-bottom:1px solid var(--line)}
+  .dhead .row1{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+  .dhead .n{font-family:var(--mono);font-size:12px;color:var(--faint)}
+  .dhead .ep{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:2px 8px;border-radius:6px;border:1px solid var(--ec);color:var(--ec)}
+  .dhead .x{margin-left:auto;cursor:pointer;color:var(--faint);font-size:20px;line-height:1;padding:2px 8px;border-radius:6px}
+  .dhead .x:hover{background:#1c2130;color:var(--txt)}
+  .dhead h2{margin:2px 0 0;font-size:17px;font-weight:700;line-height:1.25}
+  .chips{display:flex;gap:7px;flex-wrap:wrap;margin-top:11px}
+  .chip{font-family:var(--mono);font-size:10.5px;padding:3px 8px;border-radius:7px;border:1px solid var(--line);color:var(--dim);background:#0e1017}
+  .chip.stage{color:var(--sc);border-color:color-mix(in srgb,var(--sc) 40%,var(--line))}
+  .chip.bee{color:var(--bee);border-color:var(--bee-dim)}
+  .dbody{padding:16px 20px 28px;overflow:auto}
+  #dcontent{animation:fadein .25s ease}
+  @keyframes fadein{from{opacity:0;transform:translateY(4px)}}
+  .sect{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--faint);margin:18px 0 11px;font-weight:700}
+  .kv{display:grid;grid-template-columns:120px 1fr;gap:6px 10px;font-size:12.5px}
+  .kv .k{color:var(--faint);font-family:var(--mono);font-size:11px}
+  .kv .v{color:var(--txt);font-family:var(--mono);font-size:11.5px}
+
+  /* per-stage timeline with absolute enter/leave times */
+  .tl{display:flex;flex-direction:column;gap:2px}
+  .grp{position:relative;padding:0 0 14px 18px}
+  .grp::before{content:"";position:absolute;left:4px;top:5px;bottom:-2px;width:2px;background:var(--line)}
+  .grp:last-child::before{display:none}
+  .grp::after{content:"";position:absolute;left:0;top:4px;width:9px;height:9px;border-radius:50%;background:var(--dc);border:2px solid #0f1117;box-shadow:0 0 8px var(--dc)}
+  .gname{font-size:12.5px;font-weight:700;color:var(--txt);text-transform:capitalize}
+  .gtimes{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin:2px 0 6px}
+  .gtimes b{color:var(--dim)} .gtimes .here{color:var(--bee)}
+  .gev{font-size:12px;color:var(--dim);display:flex;justify-content:space-between;gap:10px;padding:2px 0}
+  .gev .who2{color:var(--faint);font-family:var(--mono);font-size:10.5px}
+  .gev .ets{font-family:var(--mono);font-size:10px;color:var(--faint);flex:0 0 auto}
+
+  footer{margin-top:24px;display:flex;gap:10px;color:var(--faint);font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--line);padding-top:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand"><div class="logo">🐝</div>
+      <div><h1>Flowbee · Board</h1><div class="sub" id="sub">epics & issues</div><div class="sub" style="margin-top:5px"><a href="flowbee-dashboard.html" style="color:#8b92a6;text-decoration:none">Fleet ↗</a> &nbsp; <a href="flowbee-board.html" style="color:#facc15;text-decoration:none;font-weight:600">● Board</a></div></div></div>
+    <div class="legend">
+      <span><i style="background:var(--e1)"></i>OAuth</span><span><i style="background:var(--e2)"></i>Billing</span>
+      <span><i style="background:var(--e3)"></i>Search</span><span><i style="background:var(--bee)"></i>flowbee-managed</span>
+    </div>
+  </header>
+  <section class="needs empty" id="needs">
+    <h2>⚠ Needs you <span class="b" id="needs-c">0</span></h2>
+    <div class="ep">flagged for human design input · your agent pulls these at <b>GET /v1/needs-input</b></div>
+    <div class="nrow" id="needs-rows"></div>
+  </section>
+  <div class="cols" id="cols"></div>
+  <footer><span>click any card for details + per-stage timing · click card→card to flip through · “check the board” → /v1/needs-input</span></footer>
+</div>
+<aside class="drawer" id="drawer"></aside>
+
+<script>
+const COLS=[['backlog','Backlog'],['issue_review','Issue review'],['building','Building'],['build_review','Build review'],['merge','Merge'],['done','Done']];
+const EP={OAuth:'var(--e1)',Billing:'var(--e2)',Search:'var(--e3)'};
+const FLOW=['backlog','issue_review','building','build_review','merge','done'];
+const SC={backlog:'var(--faint)',issue_review:'var(--gate)',building:'var(--building)',build_review:'var(--review)',merge:'var(--merge)',done:'var(--ok)'};
+const WHO={building:['Feller · codex','Buncher · codex'],build_review:['Buncher · claude · security','Feller · claude · correctness'],issue_review:['issue-reviewer'],merge:['flowbee · merge-queue'],done:[]};
+const rint=(a,b)=>a+Math.floor(Math.random()*(b-a+1)),rnd=a=>a[Math.floor(Math.random()*a.length)],now=()=>Date.now();
+function fmt(ms){const s=Math.max(0,Math.floor(ms/1000)),d=s/86400|0,h=s%86400/3600|0,m=s%3600/60|0;if(d)return d+'d '+h+'h';if(h)return h+'h '+m+'m';if(m)return m+'m';return (s%60)+'s';}
+function clock(ts){return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+
+let id=1287;
+function mk(epic,t,stage,opts={}){const o={epic,t,stage,n:id++,needs:false,reason:'',spec:!!opts.spec,enteredAt:0,history:[]};seed(o);return o;}
+function seed(o){const idx=FLOW.indexOf(o.stage);let t=now()-rint(40,150)*60000;
+  const push=(stg,txt,who)=>{o.history.push({ts:t,stage:stg,what:txt,who:who||''});t+=rint(6,30)*60000;};
+  push('backlog','Created from epic '+o.epic,o.epic+' · spec_author');
+  if(idx>=1)push('issue_review','Issue-review approved (epic gate)','issue-reviewer · opus');
+  if(idx>=2)push('building','Leased for build','Feller · codex');
+  if(idx>=3){push('building','Build complete → PR opened','Feller · codex');push('build_review','Review started','Buncher · claude · security');
+    if(Math.random()<0.5){push('build_review','changes_requested → bounce','Buncher · claude');push('building','Rebuild leased','Feller · codex');push('build_review','Review re-armed','Buncher · claude · correctness');}}
+  if(idx>=4){push('build_review','Approved (reconciled @ a1b2c3)','Buncher · claude');push('build_review','CI green @ a1b2c3 (arm64 E2E)','M1 · playwright');push('merge','Entered merge queue','flowbee');}
+  if(idx>=5)push('done','Merged → done','flowbee · merge-queue');
+  o.enteredAt=o.history.length?o.history[o.history.length-1].ts:now();}
+
+let issues=[mk('OAuth','OAuth provider config','merge'),mk('OAuth','Login UI + session middleware','build_review'),
+  mk('OAuth','2FA enrolment flow','building'),mk('OAuth','arm64 E2E: full login journey','building'),
+  mk('Billing','Stripe webhook reconciler','build_review'),mk('Billing','Invoice PDF generation','issue_review'),
+  mk('Billing','Dunning / retry schedule','backlog',{spec:true}),mk('Search','Index pipeline + backfill','building'),
+  mk('Search','Typo-tolerant ranking','backlog',{spec:true}),mk('Search','Faceted filters UI','backlog',{spec:true}),
+  mk('OAuth','SSO / SAML support','done')];
+issues[5].needs=true;issues[5].reason='Which providers ship in v1 — Google + GitHub only, or also Apple/Microsoft?';
+
+const colsEl=document.getElementById('cols');
+COLS.forEach(([k,label])=>{const c=document.createElement('div');c.className='col '+k;c.id='col-'+k;
+  c.innerHTML=`<h3>${label}<span class="c" data-c>0</span></h3><div class="stack" id="stack-${k}"></div>`;colsEl.appendChild(c)});
+
+let openN=null;
+function tcls(ms){const m=ms/60000;return m>90?'bad':m>45?'warn':''}
+function render(){
+  COLS.forEach(([k])=>document.getElementById('stack-'+k).innerHTML='');
+  const counts={};
+  issues.forEach(it=>{counts[it.stage]=(counts[it.stage]||0)+1;
+    const el=document.createElement('div');el.className='card'+(it.spec?' spec':'')+(it.n===openN?' active':'');el.style.setProperty('--ec',EP[it.epic]);
+    el.dataset.n=it.n;el.onclick=()=>openDrawer(it);
+    const who=(it.stage!=='backlog'&&WHO[it.stage]&&WHO[it.stage].length)?`<span class="who"><span class="live"></span>${rnd(WHO[it.stage])}</span>`:it.spec?`<span class="who">needs full spec</span>`:`<span class="who"></span>`;
+    const dt=now()-it.enteredAt;
+    const timer=it.stage!=='backlog'?`<span class="timer ${tcls(dt)}" data-timer>${fmt(dt)} in stage</span>`:`<span class="timer" data-timer>parked ${fmt(now()-it.history[0].ts)}</span>`;
+    el.innerHTML=`<div class="top"><span class="bee"></span><span class="n">#${it.n}</span><span class="ep">${it.epic}</span></div><div class="t">${it.t}</div><div class="bot">${who}${timer}</div>`;
+    document.getElementById('stack-'+it.stage).appendChild(el);});
+  COLS.forEach(([k])=>document.querySelector('#col-'+k+' [data-c]').textContent=counts[k]||0);
+  renderNeeds();
+  document.getElementById('sub').textContent=`3 epics · ${issues.length} issues · ${issues.filter(i=>i.stage==='done').length} done`;
+}
+function renderNeeds(){const n=issues.filter(i=>i.needs),box=document.getElementById('needs');
+  box.classList.toggle('empty',n.length===0);document.getElementById('needs-c').textContent=n.length;
+  const rows=document.getElementById('needs-rows');rows.innerHTML='';
+  n.forEach(it=>{const d=document.createElement('div');d.className='ncard';d.onclick=()=>openDrawer(it);
+    d.innerHTML=`<div class="t">#${it.n} · ${it.t}</div><div class="r">${it.reason}</div><div class="e">${it.epic} · flagged by issue-review · awaiting your input</div>`;rows.appendChild(d);});}
+function tickTimers(){document.querySelectorAll('.card').forEach(el=>{const it=issues.find(i=>i.n==el.dataset.n);if(!it)return;
+  const sp=el.querySelector('[data-timer]');if(!sp)return;
+  if(it.stage==='backlog'){sp.textContent='parked '+fmt(now()-it.history[0].ts);return;}
+  const dt=now()-it.enteredAt;sp.textContent=fmt(dt)+' in stage';sp.className='timer '+tcls(dt);});
+  if(openN!=null){const it=issues.find(i=>i.n===openN);if(it)refreshLive(it);}}
+
+// group history into contiguous stage runs → entered/left per stage
+function groups(it){const g=[];it.history.forEach(e=>{const last=g[g.length-1];
+  if(last&&last.stage===e.stage)last.events.push(e);else g.push({stage:e.stage,enter:e.ts,events:[e]});});
+  g.forEach((x,i)=>x.leave=g[i+1]?g[i+1].enter:null);return g;}
+
+function openDrawer(it){openN=it.n;document.body.classList.add('drawer-open');document.getElementById('drawer').classList.add('on');
+  document.querySelectorAll('.card').forEach(c=>c.classList.toggle('active',c.dataset.n==it.n));renderDrawer(it);}
+function closeDrawer(){openN=null;document.body.classList.remove('drawer-open');document.getElementById('drawer').classList.remove('on');
+  document.querySelectorAll('.card.active').forEach(c=>c.classList.remove('active'));}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDrawer()});
+function refreshLive(it){const el=document.getElementById('live-dur');if(el)el.textContent=fmt(now()-it.enteredAt);}
+
+function renderDrawer(it){
+  const dt=it.stage==='backlog'?(now()-it.history[0].ts):(now()-it.enteredAt);
+  const gs=groups(it);
+  const tl=gs.map(g=>{const dur=(g.leave||now())-g.enter;const live=!g.leave;
+    const evs=g.events.map(e=>`<div class="gev"><span>${e.what}${e.who?` · <span class="who2">${e.who}</span>`:''}</span><span class="ets">${clock(e.ts)}</span></div>`).join('');
+    return `<div class="grp" style="--dc:${SC[g.stage]}">
+      <div class="gname">${g.stage.replace('_',' ')}</div>
+      <div class="gtimes">entered <b>${clock(g.enter)}</b> ${g.leave?`· left <b>${clock(g.leave)}</b>`:`· <span class="here">here now</span>`} · ${live?`<span id="live-dur">${fmt(dur)}</span>`:fmt(dur)}</div>
+      ${evs}</div>`;}).join('');
+  document.getElementById('drawer').innerHTML=`
+    <div class="dhead">
+      <div class="row1"><span class="n">#${it.n}</span><span class="ep" style="--ec:${EP[it.epic]}">${it.epic}</span><span class="x" onclick="closeDrawer()">×</span></div>
+      <h2>${it.t}</h2>
+      <div class="chips"><span class="chip bee">flowbee</span><span class="chip stage" style="--sc:${SC[it.stage]}">${it.stage.replace('_',' ')}</span>
+        <span class="chip">${fmt(dt)} in stage</span>${it.needs?'<span class="chip" style="color:var(--warn);border-color:var(--warn)">needs you</span>':''}</div>
+    </div>
+    <div class="dbody"><div id="dcontent">
+      ${it.needs?`<div style="color:var(--warn);font-size:13px;line-height:1.5">⚠ ${it.reason}</div>`:''}
+      <div class="sect">Details</div>
+      <div class="kv"><span class="k">epic</span><span class="v">${it.epic}</span>
+        <span class="k">stage</span><span class="v">${it.stage.replace('_',' ')}</span>
+        <span class="k">base_sha</span><span class="v">a1b2c3d</span>
+        <span class="k">PR</span><span class="v">${FLOW.indexOf(it.stage)>=3?'#22'+it.n:'—'}</span>
+        <span class="k">created</span><span class="v">${clock(it.history[0].ts)}</span></div>
+      <div class="sect">Build history · entered / left each stage</div>
+      <div class="tl">${tl}</div>
+    </div></div>`;
+}
+
+function flash(n){const el=document.querySelector(`.card[data-n="${n}"]`);if(el){el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash')}}
+function advance(it){const i=FLOW.indexOf(it.stage);if(i>=FLOW.length-1)return;const next=FLOW[i+1];
+  it.history.push({ts:now(),stage:next,what:'entered '+next.replace('_',' '),who:(WHO[next]&&WHO[next][0])||'flowbee'});it.stage=next;it.enteredAt=now();}
+function step(){
+  const movers=issues.filter(i=>!i.needs&&i.stage!=='done'&&i.stage!=='backlog'&&Math.random()<0.5);
+  if(movers.length){const it=rnd(movers);advance(it);render();flash(it.n);if(it.n===openN)renderDrawer(it);}
+  if(Math.random()<0.25){const b=issues.find(i=>i.stage==='backlog'&&!i.spec);if(b){advance(b);render();flash(b.n);}}
+  if(Math.random()<0.18){const s=issues.find(i=>i.stage==='backlog'&&i.spec);if(s){s.spec=false;render();}}
+  if(Math.random()<0.22){const it=issues.find(i=>i.needs);if(it){it.needs=false;it.reason='';it.history.push({ts:now(),stage:'issue_review',what:'human input received → resumed',who:'you · via user-agent'});it.stage='issue_review';it.enteredAt=now();render();flash(it.n);if(it.n===openN)renderDrawer(it);}}
+  if(Math.random()<0.14&&issues.filter(i=>i.needs).length<2){const c=issues.find(i=>!i.needs&&(i.stage==='issue_review'||i.stage==='backlog'));
+    if(c){c.needs=true;c.reason=rnd(['Need a decision on the data model before this can be scoped.','Two valid approaches — which do we commit to?','Depends on an external API we haven’t chosen yet.']);render();}}
+}
+render();setInterval(tickTimers,1000);setInterval(step,2700);
+</script>
+</body>
+</html>
