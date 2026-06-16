@@ -268,9 +268,11 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 		b.WriteString("**Output:** write the full spec markdown to the file at $FLOWBEE_SPEC_FILE " +
 			"(or as the `spec_markdown` field of a JSON object at $FLOWBEE_VERDICT_FILE).\n")
 	case "spec_reviewer":
-		b.WriteString("You are the issue-reviewer. Judge the spec below for scope, coverage, clarity, and standards. " +
-			"Prefer `signed_off` if it is buildable; use `amended` to FIX it in place (supply the full corrected spec); " +
-			"use `needs_design` ONLY if it needs human design input.\n\n")
+		b.WriteString("You are the issue-reviewer. Judge ONE thing: could an engineer BUILD this spec as-is? " +
+			"Default to `signed_off` — a spec is signable if it is clear enough to implement, even if imperfect. " +
+			"Use `amended` to fix small gaps yourself in place (supply the full corrected spec as spec_markdown). " +
+			"Use `needs_design` ONLY when the work genuinely needs a human PRODUCT/design decision you cannot make " +
+			"— this is rare; do NOT use it merely because a spec is simple or could be more detailed.\n\n")
 		writeIf("Spec under review", c.Spec)
 		writeIf("Task", c.Task)
 		writeIf("Acceptance criteria", c.AcceptanceCriteria)
