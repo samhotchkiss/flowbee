@@ -15,6 +15,14 @@ const (
 	// M2 scheduler/DAG triggers.
 	TriggerDepsCleared Trigger = "deps_cleared" // blocked -> ready (all blocked_by done)
 	TriggerCompleted   Trigger = "completed"    // review_pending -> done (M2: hand-driven completion)
+	// M3 build-flow gate triggers (§6.2).
+	TriggerReviewClaimed   Trigger = "review_claimed"   // review_pending -> code_review (reviewer leases)
+	TriggerReviewStarted   Trigger = "review_started"   // code_review lease -> work begins (no state move)
+	TriggerApproved        Trigger = "approved"         // code_review -> mergeable (gate minted a verdict)
+	TriggerBounce          Trigger = "bounce"           // code_review -> building (changes_requested; bounce++)
+	TriggerBounceExhausted Trigger = "bounce_exhausted" // code_review -> needs_human (max_bounces)
+	TriggerHandoff         Trigger = "handoff"          // mergeable -> merge_handoff (distinct merger arm)
+	TriggerSelfMerge       Trigger = "self_merge"       // mergeable -> merging (reviewer-attributed)
 )
 
 // ErrIllegalTransition is returned for any (state, trigger) pair not in the table.
@@ -46,6 +54,25 @@ var transitions = map[transitionKey]State{
 	// M2 DAG/scheduler edges.
 	{StateBlocked, TriggerDepsCleared}:     StateReady,
 	{StateReviewPending, TriggerCompleted}: StateDone,
+
+	// M3 build-flow gate edges (§6.2). review_pending holds no active lease;
+	// claiming it as a code_reviewer enters code_review (an active-lease state).
+	{StateReviewPending, TriggerReviewClaimed}: StateCodeReview,
+	// the code_review gate, driven by reconciled facts + a minted verdict (I-9).
+	// A bounce returns the job to `ready` (re-leasable by an eng_worker to rebuild
+	// against the same base) — NOT `building`, which is an active-lease state with
+	// no worker. This matches the §6.2.2 diagram (the bounce arrow re-arms `ready`)
+	// and keeps the one_active_lease_per_job index honest.
+	{StateCodeReview, TriggerApproved}:        StateMergeable,
+	{StateCodeReview, TriggerBounce}:          StateReady,
+	{StateCodeReview, TriggerBounceExhausted}: StateNeedsHuman,
+	// a code_review lease can expire/release back to review_pending (not ready):
+	// the review attempt failed but the build product still stands.
+	{StateCodeReview, TriggerReleased}:          StateReviewPending,
+	{StateCodeReview, TriggerLeaseExpiredRetry}: StateReviewPending,
+	// the branch point after a passing gate (§5.4):
+	{StateMergeable, TriggerHandoff}:   StateMergeHandoff,
+	{StateMergeable, TriggerSelfMerge}: StateMerging,
 }
 
 // Next is the pure §6.2 state machine: (state, trigger) -> next state. It is a

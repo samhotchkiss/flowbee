@@ -13,12 +13,15 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
 
-// EngineState is an immutable snapshot folded from persisted facts ONLY (M1
-// subset). The core reads nothing else.
+// EngineState is an immutable snapshot folded from persisted facts ONLY. The core
+// reads nothing else. M3 adds the reconciled Domain-B facts + policy the build-flow
+// gate consumes — both passed IN as values (the engine never fetches them, I-9).
 type EngineState struct {
-	Job   job.Job
-	Now   time.Time // injected clock reading — passed IN, never read by the core
-	Epoch int       // the live lease epoch of the job (the fence in force)
+	Job    job.Job
+	Now    time.Time        // injected clock reading — passed IN, never read by the core
+	Epoch  int              // the live lease epoch of the job (the fence in force)
+	GitHub job.DomainBFacts // reconciled-IN facts (M3: from a stubbed FactSource)
+	Policy job.Policy       // THE ONE DECISION (§14): AllowSelfMerge
 }
 
 // Event is the closed set of triggers the core understands (M1 subset).
@@ -36,9 +39,26 @@ type WorkResult struct {
 // Release is a fenced voluntary release of the lease back to `ready`.
 type Release struct{ Epoch int }
 
-func (Heartbeat) isEngineEvent()  {}
-func (WorkResult) isEngineEvent() {}
-func (Release) isEngineEvent()    {}
+// ReviewClaim is a fenced code-review work-product CLAIM (I-9). The verdict Value
+// and Disposition are the reviewer's *claim* — never authoritative. The engine
+// runs the pure gate over the reconciled facts in EngineState and either mints a
+// SHA-bound verdict (approved) or bounces (changes_requested / failed reconcile).
+type ReviewClaim struct {
+	Epoch       int
+	Value       job.VerdictValue
+	Disposition job.Disposition
+}
+
+// MergeDispatch advances a `mergeable` job onto its branch-point arm (§5.4),
+// decided by the minted verdict's disposition under policy. Not a worker call —
+// the runtime fires it after the gate mints an approval.
+type MergeDispatch struct{}
+
+func (Heartbeat) isEngineEvent()     {}
+func (WorkResult) isEngineEvent()    {}
+func (Release) isEngineEvent()       {}
+func (ReviewClaim) isEngineEvent()   {}
+func (MergeDispatch) isEngineEvent() {}
 
 // Directive is the continue|cancel reply to a heartbeat.
 type Directive string
@@ -51,16 +71,25 @@ const (
 // RejectReason describes a rejected fenced call (mapped to HTTP 409).
 type RejectReason struct{ Reason string }
 
-// Transition is a state move plus the ledger event kind to append for it.
+// Transition is a state move plus the ledger event kind to append for it. The
+// optional deltas/verdict ride along so the runtime applies the projection
+// mutation atomically with the state move.
 type Transition struct {
-	From job.State
-	To   job.State
-	Kind ledger.EventKind
+	From          job.State
+	To            job.State
+	Kind          ledger.EventKind
+	BouncesDelta  int          // increment applied to the bounces counter
+	AttemptsDelta int          // increment applied to the attempts counter
+	Verdict       *job.Verdict // the minted, tamper-evident sign-off (I-9); nil if none
 }
 
 // Decision is DATA describing intent. The runtime applies it; the core never acts.
 type Decision struct {
 	Transitions []Transition
+	// VerdictMint is the tamper-evident verdict the gate minted from reconciled
+	// facts (I-9), if any. The runtime persists it into jobs.verdict. It is also
+	// carried on the minting transition so a single apply covers both.
+	VerdictMint *job.Verdict
 	Directive   *Directive
 	Reject      *RejectReason
 }
@@ -117,9 +146,75 @@ func Decide(s EngineState, e Event) Decision {
 		if !job.HasActiveLease(s.Job.State) {
 			return Decision{Reject: &RejectReason{Reason: "job not in an active lease state"}}
 		}
+		// a code_review lease releases back to review_pending (the build product
+		// stands); other active states release back to ready.
+		to := job.StateReady
+		if s.Job.State == job.StateCodeReview {
+			to = job.StateReviewPending
+		}
 		return Decision{Transitions: []Transition{
-			{From: s.Job.State, To: job.StateReady, Kind: ledger.KindLeaseReleased},
+			{From: s.Job.State, To: to, Kind: ledger.KindLeaseReleased, AttemptsDelta: 1},
 		}}
+
+	case ReviewClaim:
+		if r := staleEpoch(ev.Epoch, s.Epoch); r != nil {
+			return Decision{Reject: r}
+		}
+		// the reviewer must be on the gate stage. A claim on any other state is a
+		// protocol error, not a verdict.
+		if s.Job.State != job.StateCodeReview {
+			return Decision{Reject: &RejectReason{Reason: "job not in code_review"}}
+		}
+		// I-9: run the PURE gate over the RECONCILED facts (s.GitHub), NOT the
+		// claim. The claim's value/disposition are inputs to the gate, never the
+		// authority — a hostile `approved` over red facts bounces, never approves.
+		out := job.EvaluateGate(job.GateInputs{
+			Claim:     ev.Value,
+			Disp:      ev.Disposition,
+			Facts:     s.GitHub,
+			Bounces:   s.Job.Bounces,
+			MaxBounce: s.Job.MaxBounces,
+			Policy:    s.Policy,
+		})
+		switch out.Trigger {
+		case job.TriggerApproved:
+			return Decision{
+				VerdictMint: out.Verdict,
+				Transitions: []Transition{{
+					From: job.StateCodeReview, To: job.StateMergeable,
+					Kind: ledger.KindVerdictMinted, Verdict: out.Verdict,
+				}},
+			}
+		case job.TriggerBounce:
+			return Decision{Transitions: []Transition{{
+				From: job.StateCodeReview, To: job.StateReady,
+				Kind: ledger.KindReviewBounced, BouncesDelta: 1,
+			}}}
+		case job.TriggerBounceExhausted:
+			return Decision{Transitions: []Transition{{
+				From: job.StateCodeReview, To: job.StateNeedsHuman,
+				Kind: ledger.KindBounceExhausted, BouncesDelta: 1,
+			}}}
+		default:
+			return Decision{Reject: &RejectReason{Reason: "gate produced no transition"}}
+		}
+
+	case MergeDispatch:
+		// the branch point (§5.4): a `mergeable` job moves onto its arm, decided
+		// by the minted verdict's disposition under policy. self_merge is only
+		// reachable when the policy enabled it AND the verdict carried it.
+		if s.Job.State != job.StateMergeable {
+			return Decision{Reject: &RejectReason{Reason: "job not mergeable"}}
+		}
+		if s.Policy.AllowSelfMerge && s.Job.Verdict != nil &&
+			s.Job.Verdict.Disposition == job.DispositionSelfMerge {
+			return Decision{Transitions: []Transition{{
+				From: job.StateMergeable, To: job.StateMerging, Kind: ledger.KindMergeStarted,
+			}}}
+		}
+		return Decision{Transitions: []Transition{{
+			From: job.StateMergeable, To: job.StateMergeHandoff, Kind: ledger.KindMergeHandoff,
+		}}}
 	}
 
 	return Decision{Reject: &RejectReason{Reason: "unknown event"}}

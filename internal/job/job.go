@@ -141,6 +141,9 @@ type Job struct {
 	MaxBounces       int
 	StallRevocations int
 
+	// verdict (gate stages only; written ONLY by gate logic, never a worker, I-9)
+	Verdict *Verdict
+
 	// fold cursor: latest job_events.job_seq applied
 	JobSeq int
 }

@@ -116,6 +116,28 @@ func (c *Client) Result(ctx context.Context, jobID string, epoch int, idemKey st
 	return out, st, err
 }
 
+// ReviewResponse is the code-review gate reply.
+type ReviewResponse struct {
+	Accepted bool   `json:"accepted"`
+	JobState string `json:"job_state"`
+	Verdict  string `json:"verdict"`
+	Minted   bool   `json:"minted"`
+}
+
+// Review posts a fenced code-review result: the reviewer's verdict CLAIM +
+// requested disposition (untrusted; the server's gate decides from reconciled
+// facts, I-9). status is the HTTP status (409 = stale).
+func (c *Client) Review(ctx context.Context, jobID string, epoch int, idemKey, verdict, disposition string) (ReviewResponse, int, error) {
+	h := epochHeader(epoch)
+	if idemKey != "" {
+		h["Idempotency-Key"] = idemKey
+	}
+	var out ReviewResponse
+	body := map[string]string{"verdict": verdict, "disposition": disposition}
+	st, err := c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/review", h, body, &out)
+	return out, st, err
+}
+
 // Release posts a fenced release. status is the HTTP status (409 = stale).
 func (c *Client) Release(ctx context.Context, jobID string, epoch int) (status int, err error) {
 	var out map[string]bool

@@ -193,8 +193,11 @@ func seedM2(t *testing.T, st *store.Store, id string, blockedBy, req []string, n
 func registerWorker(t *testing.T, ctx context.Context, url, identity, family string) *client.Client {
 	t.Helper()
 	c := client.New(url)
+	// a stable worker_id per identity so re-registration (e.g. a builder re-leasing
+	// a bounced job) refreshes the row via ON CONFLICT(worker_id) instead of
+	// colliding on the UNIQUE(identity) constraint.
 	if _, err := c.Register(ctx, client.Registration{
-		Identity: identity, Host: "test",
+		WorkerID: "wk-" + identity, Identity: identity, Host: "test",
 		Capabilities: []string{"role:eng_worker", "model_family:" + family},
 	}); err != nil {
 		t.Fatalf("register %s: %v", identity, err)

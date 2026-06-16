@@ -354,8 +354,25 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 		if n := len(dec.Transitions); n > 0 {
 			final = dec.Transitions[n-1].To
 		}
-		// apply the projection: clear the live lease, advance state.
-		if _, err := tx.ExecContext(ctx, `
+		// apply the projection: clear the live lease, advance state. When a build
+		// job lands review_pending, the NEXT stage is the code_review gate — so the
+		// job's required capabilities flip to the reviewer role's (§5.2). This is
+		// what makes the gate leasable by a code_reviewer and NOT by an eng_worker,
+		// and lets M4's anti-affinity exclusion bite on a distinct reviewer.
+		if final == job.StateReviewPending {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE jobs
+				   SET state = ?, role = 'eng_worker',
+				       required_capabilities = ?,
+				       lease_id = NULL, bound_identity = NULL,
+				       bound_model_family = NULL, lease_hb_due = NULL,
+				       eng_worker_job = COALESCE(eng_worker_job, id),
+				       updated_at = datetime('now')
+				 WHERE id = ?`,
+				string(final), marshalStrings([]string{"role:code_reviewer"}), p.JobID); err != nil {
+				return fmt.Errorf("apply result projection: %w", err)
+			}
+		} else if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs
 			   SET state = ?, lease_id = NULL, bound_identity = NULL,
 			       bound_model_family = NULL, lease_hb_due = NULL,
@@ -446,6 +463,33 @@ func (s *Store) ReadyCandidates(ctx context.Context) ([]scheduler.Candidate, err
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT id, priority, enqueued_at, required_capabilities
 		  FROM jobs WHERE state='ready'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []scheduler.Candidate
+	for rows.Next() {
+		var c scheduler.Candidate
+		var enqueued, reqJSON string
+		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON); err != nil {
+			return nil, err
+		}
+		if ts, perr := time.Parse(rfc3339, enqueued); perr == nil {
+			c.EnqueuedAt = ts
+		}
+		c.RequiredCapabilities = unmarshalStrings(reqJSON)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ReviewPendingCandidates returns every `review_pending` job as a scheduler
+// Candidate, for a code_reviewer's long-poll loop to rank and claim. The atomic
+// review claim's WHERE state='review_pending' remains the correctness guarantee.
+func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candidate, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, priority, enqueued_at, required_capabilities
+		  FROM jobs WHERE state='review_pending'`)
 	if err != nil {
 		return nil, err
 	}
@@ -679,7 +723,8 @@ const jobSelect = `
 	       priority, blocked_by, required_capabilities, enqueued_at,
 	       COALESCE(lease_id,''), lease_epoch,
 	       COALESCE(bound_identity,''), COALESCE(bound_model_family,''), COALESCE(bound_lens,''),
-	       attempts, max_attempts, bounces, max_bounces, stall_revocations, job_seq
+	       attempts, max_attempts, bounces, max_bounces, stall_revocations,
+	       COALESCE(verdict,''), job_seq
 	  FROM jobs`
 
 type rowScanner interface {
@@ -688,12 +733,13 @@ type rowScanner interface {
 
 func scanJob(row rowScanner) (job.Job, error) {
 	var j job.Job
-	var kind, role, blockedJSON, reqJSON, enqueued string
+	var kind, role, blockedJSON, reqJSON, enqueued, verdictJSON string
 	err := row.Scan(&j.ID, &kind, &j.Flow, &j.Stage, (*string)(&j.State), &role,
 		&j.BaseSHA, &j.HeadSHA, &j.Priority, &blockedJSON, &reqJSON, &enqueued,
 		&j.LeaseID, &j.LeaseEpoch,
 		&j.BoundIdentity, &j.BoundModelFamily, &j.BoundLens,
-		&j.Attempts, &j.MaxAttempts, &j.Bounces, &j.MaxBounces, &j.StallRevocations, &j.JobSeq)
+		&j.Attempts, &j.MaxAttempts, &j.Bounces, &j.MaxBounces, &j.StallRevocations,
+		&verdictJSON, &j.JobSeq)
 	if err != nil {
 		return j, err
 	}
@@ -703,6 +749,12 @@ func scanJob(row rowScanner) (job.Job, error) {
 	j.RequiredCapabilities = unmarshalStrings(reqJSON)
 	if ts, perr := time.Parse(rfc3339, enqueued); perr == nil {
 		j.EnqueuedAt = ts
+	}
+	if verdictJSON != "" && verdictJSON != "null" {
+		var v job.Verdict
+		if json.Unmarshal([]byte(verdictJSON), &v) == nil && v.Value != "" {
+			j.Verdict = &v
+		}
 	}
 	return j, nil
 }

@@ -29,6 +29,9 @@ type Server struct {
 	broker   *Broker
 	version  string
 
+	facts  store.FactSource
+	policy job.Policy
+
 	leaseTTL     time.Duration
 	longPollWait time.Duration
 	pollInterval time.Duration
@@ -41,10 +44,21 @@ type Config struct {
 	LongPollWait       time.Duration
 	LeaseTTLS          int
 	HeartbeatIntervalS int
+	// Policy is THE ONE DECISION surface (§14): AllowSelfMerge default false =
+	// Branch A (every approval -> handoff -> human).
+	Policy job.Policy
+	// Facts is the reconciled-fact source the I-9 gate consumes. If nil it
+	// defaults to the DB-backed source (domain_b_facts), which reconcile-IN writes
+	// (M3 tests seed it directly via store.UpsertDomainBFacts).
+	Facts store.FactSource
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
 	poll := 25 * time.Millisecond
+	facts := cfg.Facts
+	if facts == nil {
+		facts = store.DBFactSource{DB: st.DB}
+	}
 	return &Server{
 		store:        st,
 		clock:        clk,
@@ -52,6 +66,8 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		registry:     worker.NewRegistry(st, cfg.LeaseTTLS, cfg.HeartbeatIntervalS),
 		broker:       NewBroker(),
 		version:      version,
+		facts:        facts,
+		policy:       cfg.Policy,
 		leaseTTL:     cfg.LeaseTTL,
 		longPollWait: cfg.LongPollWait,
 		pollInterval: poll,
@@ -75,6 +91,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/lease", s.lease)
 	mux.HandleFunc("POST /v1/jobs/{job}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /v1/jobs/{job}/result", s.result)
+	mux.HandleFunc("POST /v1/jobs/{job}/review", s.review)
 	mux.HandleFunc("POST /v1/jobs/{job}/release", s.release)
 	mux.HandleFunc("GET /v1/events", s.eventsHandler)
 	mux.HandleFunc("GET /", s.board)
@@ -136,28 +153,41 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	role := roleFilter
+	if role == "" {
+		role = job.RoleEngWorker
+	}
+	reviewing := role == job.RoleCodeReviewer
+
 	deadline := time.Now().Add(s.longPollWait)
 	for {
-		cands, err := s.store.ReadyCandidates(r.Context())
+		// the gate stage (code_review) is claimed from review_pending jobs; every
+		// other role claims `ready` jobs. The atomic claim is the correctness
+		// backstop in both cases (§6.3.1).
+		var cands []scheduler.Candidate
+		var err error
+		if reviewing {
+			cands, err = s.store.ReviewPendingCandidates(r.Context())
+		} else {
+			cands, err = s.store.ReadyCandidates(r.Context())
+		}
 		if err != nil {
 			http.Error(w, "lease error", http.StatusInternalServerError)
 			return
 		}
-		role := roleFilter
-		if role == "" {
-			role = job.RoleEngWorker
-		}
 		for _, cand := range scheduler.Order(cands, attested, s.clock.Now()) {
-			ls, err := s.store.ClaimReadyJob(r.Context(), store.ClaimParams{
-				JobID:       cand.JobID,
-				LeaseID:     s.minter.New(),
-				Identity:    identity,
-				ModelFamily: family,
-				Role:        role,
-				Attested:    attested,
-				TTL:         s.leaseTTL,
-				Now:         s.clock.Now(),
-			})
+			var ls *lease.Lease
+			if reviewing {
+				ls, err = s.store.ClaimReviewJob(r.Context(), store.ClaimReviewParams{
+					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
+					ModelFamily: family, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+				})
+			} else {
+				ls, err = s.store.ClaimReadyJob(r.Context(), store.ClaimParams{
+					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
+					ModelFamily: family, Role: role, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+				})
+			}
 			if err == nil {
 				j, _ := s.store.GetJob(r.Context(), cand.JobID)
 				s.broker.Publish(LifeEvent{JobID: cand.JobID, State: string(j.State), Event: "lease_claimed", Epoch: ls.Epoch})
@@ -184,6 +214,56 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(s.pollInterval):
 		}
 	}
+}
+
+// reviewRequest is the code-review result body: the reviewer's verdict CLAIM +
+// requested disposition. Untrusted (I-9): the gate decides from reconciled facts.
+type reviewRequest struct {
+	Verdict     string `json:"verdict"`     // approved | changes_requested
+	Disposition string `json:"disposition"` // self_merge | handoff (only meaningful on approved)
+}
+
+// review runs the I-9 code-review gate for a fenced code_review result. The
+// worker's claim is recorded as untrusted; the gate mints (or refuses) the
+// tamper-evident verdict from reconciled facts. Stale epoch -> 409.
+func (s *Server) review(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job")
+	epoch, ok := epochFromHeader(r)
+	if !ok {
+		http.Error(w, "missing X-Lease-Epoch", http.StatusBadRequest)
+		return
+	}
+	var req reviewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	resp, err := s.store.ReviewResult(r.Context(), s.facts, s.policy, store.ReviewResultParams{
+		JobID: jobID, Epoch: epoch,
+		Claim:          job.VerdictValue(req.Verdict),
+		Disposition:    job.Disposition(req.Disposition),
+		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+		Now:            s.clock.Now(),
+	})
+	if err != nil {
+		s.writeFenceError(w, err)
+		return
+	}
+	ev := "review_bounced"
+	if resp.Minted {
+		ev = "verdict_minted"
+	}
+	s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: ev, Epoch: epoch})
+
+	// on a passing gate, advance the branch point (§5.4) so the job reaches its
+	// terminal-for-M3 arm (merge_handoff by default; merging under self_merge).
+	if resp.Minted {
+		if final, derr := s.store.DispatchMerge(r.Context(), s.policy, store.DispatchMergeParams{JobID: jobID, Now: s.clock.Now()}); derr == nil {
+			resp.JobState = string(final)
+			s.broker.Publish(LifeEvent{JobID: jobID, State: string(final), Event: "merge_dispatched", Epoch: epoch})
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
