@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/samhotchkiss/flowbee/client"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
@@ -41,9 +43,18 @@ func runWork(args []string) error {
 	family := fs.String("model-family", envOr("FLOWBEE_MODEL_TAG", "stub"), "model family tag")
 	role := fs.String("role", envOr("FLOWBEE_ROLE", ""), "role filter")
 	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", ""), "agent CLI to spawn per lease (reads $FLOWBEE_TASK_FILE / .flowbee/task.md)")
+	// F6 capacity advertisement (optional). --model-slots "claude:3,codex:3" is the
+	// box's PER-MODEL concurrency; --weight is the per-box distribution bias;
+	// --accounts "claude-primary:claude:90:0,claude-fallback:claude:90:1" is the
+	// named per-model rollover chain (account:model:ceiling_pct:rank).
+	modelSlots := fs.String("model-slots", envOr("FLOWBEE_MODEL_SLOTS", ""), "per-model concurrency, e.g. claude:3,codex:3")
+	weight := fs.Int("weight", 0, "per-box distribution weight (default 1)")
+	accounts := fs.String("accounts", envOr("FLOWBEE_ACCOUNTS", ""), "named accounts: account:model:ceiling_pct:rank,...")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	slots := parseModelSlots(*modelSlots)
+	accts := parseAccounts(*accounts)
 	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
 	ctx := context.Background()
 
@@ -67,6 +78,7 @@ func runWork(args []string) error {
 		out, err := worker.RunOnceHarness(ctx, worker.HarnessConfig{
 			BaseURL: url, Identity: *identity, ModelFamily: *family, Role: *role,
 			AgentCmd: *agentCmd, BearerToken: token,
+			ModelSlots: slots, Weight: *weight, Accounts: accts,
 		})
 		if err != nil {
 			return err
@@ -91,6 +103,66 @@ func runWork(args []string) error {
 }
 
 func envErr() *os.File { return os.Stderr }
+
+// parseModelSlots parses the F6 per-model concurrency advertisement
+// "claude:3,codex:3" into a map. Malformed entries are skipped.
+func parseModelSlots(s string) map[string]int {
+	if s == "" {
+		return nil
+	}
+	out := map[string]int{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(kv[1]))
+		if err != nil {
+			continue
+		}
+		out[strings.TrimSpace(kv[0])] = n
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// parseAccounts parses the F6 rollover chain "account:model:ceiling_pct:rank,..."
+// into client account specs. ceiling_pct/rank default to 90/0 when omitted.
+func parseAccounts(s string) []client.AccountSpecMsg {
+	if s == "" {
+		return nil
+	}
+	var out []client.AccountSpecMsg
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		f := strings.Split(part, ":")
+		if len(f) < 2 || f[0] == "" || f[1] == "" {
+			continue
+		}
+		a := client.AccountSpecMsg{AccountID: f[0], ModelFamily: f[1], CeilingPct: 90}
+		if len(f) >= 3 {
+			if n, err := strconv.Atoi(f[2]); err == nil {
+				a.CeilingPct = n
+			}
+		}
+		if len(f) >= 4 {
+			if n, err := strconv.Atoi(f[3]); err == nil {
+				a.PreferenceRank = n
+			}
+		}
+		out = append(out, a)
+	}
+	return out
+}
 
 // runLease is the Mode-B thin client: one GET /v1/lease, print JSON.
 func runLease(args []string) error {

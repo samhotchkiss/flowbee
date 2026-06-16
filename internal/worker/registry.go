@@ -35,6 +35,23 @@ type Registration struct {
 	// Handshake fields the registry attests arch:*/os:* against (§7.2).
 	Arch string `json:"arch"`
 	OS   string `json:"os"`
+	// F6 capacity advertisement. ModelSlots is the box's PER-MODEL concurrency
+	// (claude:3, codex:3) replacing the single max_concurrent_leases. Weight is the
+	// per-box distribution bias (default 1). Accounts are the named per-model
+	// credentials (the rollover chain) this box can dispatch against. All optional:
+	// an empty advertisement keeps the legacy single-slot, accountless behavior.
+	ModelSlots map[string]int   `json:"model_slots,omitempty"`
+	Weight     int              `json:"weight,omitempty"`
+	Accounts   []AccountSpecMsg `json:"accounts,omitempty"`
+}
+
+// AccountSpecMsg is one named per-model account advertised at registration (§C):
+// a credential with a ceiling and an ordered preference (the rollover chain).
+type AccountSpecMsg struct {
+	AccountID      string `json:"account_id"`
+	ModelFamily    string `json:"model_family"`
+	CeilingPct     int    `json:"ceiling_pct"`
+	PreferenceRank int    `json:"preference_rank"`
 }
 
 // RegisterResponse is returned by POST /v1/workers/register.
@@ -145,6 +162,28 @@ func (r *Registry) Register(ctx context.Context, reg Registration, now time.Time
 	if err != nil {
 		return RegisterResponse{}, err
 	}
+
+	// F6: persist the box's per-model concurrency + distribution weight + named
+	// accounts (the rollover chain). All optional — an empty advertisement leaves
+	// the legacy single-slot, accountless behavior intact.
+	if len(reg.ModelSlots) > 0 || reg.Weight > 0 {
+		if err := r.st.SetWorkerModelSlots(ctx, reg.WorkerID, reg.ModelSlots, reg.Weight, now); err != nil {
+			return RegisterResponse{}, err
+		}
+	}
+	if len(reg.Accounts) > 0 {
+		specs := make([]store.AccountSpec, 0, len(reg.Accounts))
+		for _, a := range reg.Accounts {
+			specs = append(specs, store.AccountSpec{
+				AccountID: a.AccountID, ModelFamily: a.ModelFamily,
+				CeilingPct: a.CeilingPct, PreferenceRank: a.PreferenceRank,
+			})
+		}
+		if err := r.st.UpsertAccounts(ctx, specs, now); err != nil {
+			return RegisterResponse{}, err
+		}
+	}
+
 	return RegisterResponse{
 		WorkerID:             reg.WorkerID,
 		LeaseTTLS:            r.leaseTTLS,

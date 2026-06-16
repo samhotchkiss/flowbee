@@ -50,6 +50,39 @@ type Registration struct {
 	Capabilities []string `json:"capabilities"`
 	Arch         string   `json:"arch,omitempty"`
 	OS           string   `json:"os,omitempty"`
+	// F6 capacity advertisement: per-model concurrency (claude:3, codex:3), the
+	// per-box distribution weight, and the named per-model accounts (rollover chain).
+	ModelSlots map[string]int   `json:"model_slots,omitempty"`
+	Weight     int              `json:"weight,omitempty"`
+	Accounts   []AccountSpecMsg `json:"accounts,omitempty"`
+}
+
+// AccountSpecMsg is one named per-model account advertised at registration (F6):
+// a credential with a ceiling_pct gate and an ordered preference (rollover chain).
+type AccountSpecMsg struct {
+	AccountID      string `json:"account_id"`
+	ModelFamily    string `json:"model_family"`
+	CeilingPct     int    `json:"ceiling_pct"`
+	PreferenceRank int    `json:"preference_rank"`
+}
+
+// UsageReport is one per-account usage observation a box reports to POST
+// /v1/workers/usage (~15 min, immediate on a 429). UsagePct is the account's usage
+// percent; RateLimited marks a 429-triggered report (pins the account out of
+// dispatch until it cools).
+type UsageReport struct {
+	AccountID   string `json:"account_id"`
+	ModelFamily string `json:"model_family,omitempty"`
+	UsagePct    int    `json:"usage_pct"`
+	RateLimited bool   `json:"rate_limited,omitempty"`
+}
+
+// ReportUsage posts per-account usage to the control plane (F6). The control plane
+// folds it into the shared per-account buckets the ceiling gate reads at dispatch.
+func (c *Client) ReportUsage(ctx context.Context, reports []UsageReport) (int, error) {
+	var out map[string]any
+	return c.postJSONStatus(ctx, "/v1/workers/usage", nil,
+		map[string]any{"reports": reports}, &out)
 }
 
 type RegisterResponse struct {

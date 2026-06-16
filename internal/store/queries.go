@@ -144,6 +144,10 @@ type ClaimParams struct {
 	LeaseID     string
 	Identity    string
 	ModelFamily string
+	// WorkerID is the box claiming (F6): used to gate the claim on the box's
+	// advertised PER-MODEL slot budget (don't start a 4th claude job on a box that
+	// advertised claude:3). Empty skips the slot gate (legacy single-slot worker).
+	WorkerID string
 	// Lens is the resolved review lens (F5) the worker is fenced to apply for this
 	// lease (correctness|tests|security|""). It is part of the resolved identity
 	// the flow layer fences into the lease so a multi-reviewer fan-out's reviewers
@@ -189,6 +193,29 @@ func (s *Store) ClaimReadyJob(ctx context.Context, p ClaimParams) (*lease.Lease,
 			return lease.ErrLostRace
 		}
 
+		// F6 per-model SLOT gate: the box may not exceed its advertised concurrency
+		// for this model (claude:3 means at most 3 concurrent claude leases on the
+		// box). A full slot budget returns ErrNoCapacity -> the lease loop treats it
+		// like a lost race (the job stays leasable; another box can take it).
+		if err := modelSlotGateTx(ctx, tx, p.WorkerID, p.Identity, p.ModelFamily); err != nil {
+			if errors.Is(err, ErrNoCapacity) {
+				return lease.ErrLostRace
+			}
+			return err
+		}
+		// F6 ceiling-gated account selection (ROLLOVER): pick the lowest-rank account
+		// for the model that is BELOW its ceiling. If every account is at/over ceiling
+		// the box waits (ErrNoCapacity -> lost race -> the job stays `ready` and the
+		// no_eligible_worker alarm can fire). The chosen account is bound on the job so
+		// per-account usage attribution and slot accounting are exact.
+		acct, aerr := selectAccountTx(ctx, tx, p.ModelFamily)
+		if aerr != nil {
+			if errors.Is(aerr, ErrNoCapacity) {
+				return lease.ErrLostRace
+			}
+			return aerr
+		}
+
 		// §6.3.1 atomic claim. The anti-affinity NOT EXISTS clauses are inert in
 		// M1 (null sibling pointers) but wired for M4.
 		row := tx.QueryRowContext(ctx, `
@@ -197,6 +224,7 @@ func (s *Store) ClaimReadyJob(ctx context.Context, p ClaimParams) (*lease.Lease,
 			       bound_identity     = ?,
 			       bound_model_family = ?,
 			       bound_lens         = ?,
+			       bound_account      = ?,
 			       lease_epoch        = lease_epoch + 1,
 			       lease_id           = ?,
 			       lease_deadline     = ?,
@@ -215,7 +243,7 @@ func (s *Store) ClaimReadyJob(ctx context.Context, p ClaimParams) (*lease.Lease,
 			           AND ? = 'merger'
 			           AND sib.bound_identity = ? )
 			RETURNING lease_epoch, job_seq`,
-			p.Identity, p.ModelFamily, p.Lens, p.LeaseID,
+			p.Identity, p.ModelFamily, p.Lens, acct.AccountID, p.LeaseID,
 			deadline.Format(rfc3339), hbDue.Format(rfc3339),
 			p.JobID,
 			string(p.Role), p.Identity, p.ModelFamily,

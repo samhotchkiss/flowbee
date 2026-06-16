@@ -126,6 +126,12 @@ type HarnessConfig struct {
 	// BearerToken is the signed per-worker token (§7.6) for a non-loopback
 	// (cross-box) listener. Empty on loopback (the server's loopback bypass).
 	BearerToken string
+	// F6 capacity advertisement. ModelSlots is the box's PER-MODEL concurrency
+	// (claude:3, codex:3); Weight is the per-box distribution bias; Accounts are
+	// the named per-model credentials (the rollover chain). All optional.
+	ModelSlots map[string]int
+	Weight     int
+	Accounts   []client.AccountSpecMsg
 }
 
 // HarnessOutcome reports what one lease cycle did.
@@ -159,6 +165,7 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	if _, err := c.Register(ctx, client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
+		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
 	}); err != nil {
 		return HarnessOutcome{}, fmt.Errorf("register: %w", err)
 	}
@@ -314,6 +321,7 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	if _, err := c.Register(ctx, client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
+		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
 	}); err != nil {
 		return HarnessOutcome{}, fmt.Errorf("register: %w", err)
 	}

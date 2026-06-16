@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/auth"
+	"github.com/samhotchkiss/flowbee/internal/capacity"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/content"
 	"github.com/samhotchkiss/flowbee/internal/engine"
@@ -165,6 +166,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	// the authenticated worker-protocol surface (every mutating call + lease).
 	worker := http.NewServeMux()
 	worker.HandleFunc("POST /v1/workers/register", s.register)
+	worker.HandleFunc("POST /v1/workers/usage", s.usage)
 	worker.HandleFunc("GET /v1/lease", s.lease)
 	worker.HandleFunc("POST /v1/jobs/{job}/heartbeat", s.heartbeat)
 	worker.HandleFunc("POST /v1/jobs/{job}/result", s.result)
@@ -178,7 +180,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux := http.NewServeMux()
 	// worker-protocol routes go through the authenticated surface.
 	for _, p := range []string{
-		"POST /v1/workers/register", "GET /v1/lease",
+		"POST /v1/workers/register", "POST /v1/workers/usage", "GET /v1/lease",
 		"POST /v1/jobs/{job}/heartbeat", "POST /v1/jobs/{job}/result",
 		"POST /v1/jobs/{job}/review", "POST /v1/jobs/{job}/spec",
 		"POST /v1/jobs/{job}/spec-review", "POST /v1/jobs/{job}/release",
@@ -194,6 +196,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/cost", s.costJSON)
 	mux.HandleFunc("GET /v1/needs-human", s.needsHumanJSON)
 	mux.HandleFunc("GET /v1/needs-input", s.needsInputJSON)
+	mux.HandleFunc("GET /v1/fleet", s.fleetJSON)
 	mux.HandleFunc("GET /roster", s.rosterPage)
 	mux.HandleFunc("GET /dashboard", s.dashboard)
 	mux.HandleFunc("GET /", s.board)
@@ -341,6 +344,41 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// usage folds per-account usage reports (F6, POST /v1/workers/usage): a box reports
+// its accounts' usage best-effort (~15 min) or IMMEDIATELY on a 429. Usage is
+// PER ACCOUNT (shared across boxes on the same login), so the report updates the
+// canonical bucket the ceiling gate reads at dispatch. The response echoes which
+// accounts are now at/over ceiling (a capacity-alarm surface).
+func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Reports []capacity.UsageReport `json:"reports"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	atCeiling, err := s.store.RecordUsage(r.Context(), body.Reports, s.clock.Now())
+	if err != nil {
+		http.Error(w, "usage error", http.StatusInternalServerError)
+		return
+	}
+	for _, id := range atCeiling {
+		s.broker.Publish(LifeEvent{JobID: "", State: "capacity", Event: "account_at_ceiling:" + id})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "at_ceiling": atCeiling})
+}
+
+// fleetJSON serves the §G fleet view source: per-account usage gauges with their
+// ceiling line + whether each account is currently gated out (the rollover state).
+func (s *Server) fleetJSON(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.store.AllAccountUsage(r.Context())
+	if err != nil {
+		http.Error(w, "fleet error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, rows)
 }
 
 // LeaseGrant is the §7.2 lease envelope returned to a worker on GET /v1/lease.
