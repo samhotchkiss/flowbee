@@ -18,10 +18,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	gh "github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
+	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
@@ -184,10 +186,17 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		return fmt.Sprintf("pr=%d", number), nil
 
 	case store.ActionCreateIssue:
+		// Render the issue from the signed-off spec content (build-list §B): title
+		// is the spec's first heading/line, body is the spec prose + acceptance
+		// criteria — not a placeholder. Flowbee is the sole author.
+		j, err := s.store.GetJob(ctx, row.JobID)
+		if err != nil {
+			return "", fmt.Errorf("load job for issue: %w", err)
+		}
 		number, err := s.gh.CreateIssue(ctx, gh.CreateIssueInput{
-			Title:  fmt.Sprintf("flowbee spec: %s", row.JobID),
-			Body:   "Materialized from the signed-off spec.md (§11).",
-			Labels: []string{"flowbee:spec"},
+			Title:  issueTitle(j),
+			Body:   issueBody(j),
+			Labels: []string{"flowbee", "flowbee:spec"},
 		})
 		if err != nil {
 			return "", err
@@ -306,4 +315,47 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// issueTitle derives a human GitHub issue title from a signed-off spec job: the
+// first non-empty line of the task (then spec), with a leading markdown heading
+// marker stripped ("# Add X" -> "Add X"), falling back to the job id.
+func issueTitle(j job.Job) string {
+	for _, s := range []string{j.TaskText, j.SpecText} {
+		if line := firstNonEmptyLine(s); line != "" {
+			return strings.TrimSpace(strings.TrimLeft(line, "# "))
+		}
+	}
+	return j.ID
+}
+
+// issueBody renders the issue body from the spec prose + acceptance criteria,
+// with a footer marking Flowbee as the materializing author (build-list §B/§F).
+func issueBody(j job.Job) string {
+	var b strings.Builder
+	if s := strings.TrimSpace(j.SpecText); s != "" {
+		b.WriteString(s)
+		b.WriteString("\n\n")
+	} else if t := strings.TrimSpace(j.TaskText); t != "" {
+		b.WriteString(t)
+		b.WriteString("\n\n")
+	}
+	if ac := strings.TrimSpace(j.AcceptanceCriteria); ac != "" {
+		b.WriteString("## Acceptance criteria\n\n")
+		b.WriteString(ac)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("---\n")
+	fmt.Fprintf(&b, "_Materialized by Flowbee from the signed-off spec (job `%s`)._", j.ID)
+	return b.String()
+}
+
+// firstNonEmptyLine returns the first line of s with non-whitespace content.
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			return t
+		}
+	}
+	return ""
 }
