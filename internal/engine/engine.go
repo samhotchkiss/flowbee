@@ -11,6 +11,7 @@ import (
 
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
+	"github.com/samhotchkiss/flowbee/internal/liveness"
 )
 
 // EngineState is an immutable snapshot folded from persisted facts ONLY. The core
@@ -39,8 +40,40 @@ type SpecState struct {
 // Event is the closed set of triggers the core understands (M1 subset).
 type Event interface{ isEngineEvent() }
 
-// Heartbeat is a fenced liveness ping. Epoch is the caller's claimed fence.
-type Heartbeat struct{ Epoch int }
+// Heartbeat is a fenced liveness ping. Epoch is the caller's claimed fence. The
+// observations feed the lower, gameable rungs (§10.2) — explicitly HINTS — except
+// the two locally-provable fast-paths (§10.6): agent_exited_zombie / awaiting_input,
+// which yield a `cancel` directive on their face (a dead/blocked agent, not a kill).
+type Heartbeat struct {
+	Epoch int
+	// Health is the Rung-0 worker-local supervisor enum (hint). HealthZombie /
+	// AgentExited drive the agent_exited fast-path -> failed.
+	Health liveness.AgentHealth
+	// AwaitingInput is the §10.6 awaiting_input fast-path: the agent is blocked on
+	// human/interactive input that will never come -> directive: cancel.
+	AwaitingInput bool
+	// AgentExited is the Rung-0 locally-provable exit (supervisor waitpid'd, agent PID
+	// died) -> directive: cancel / state failed. The richest standing for a Rung-0
+	// signal precisely because the worker proved it on its own machine.
+	AgentExited bool
+}
+
+// LivenessVerdict is the runtime's folded rung snapshot for an ACTIVE-lease job,
+// driven by a Rung-3 clock comparison (done by the runtime against Flowbee's clock)
+// + the last Rung-2 sweep verdict + the last heartbeat's Rung-0/1 hints. The engine
+// runs the PURE two-rung kill rule over it (I-13) and returns either a revoke
+// transition (re-dispatch, or needs_human at the governor ceiling) or a no-op. The
+// runtime resolves the retry-vs-exhausted arm via the governor ceiling, passed in.
+type LivenessVerdict struct {
+	Rungs liveness.RungSet
+	// GovernorCeilingReached is the Rung-4 anti-thrash decision (§10.7), resolved by
+	// the runtime from stall_revocations vs the ceiling: when true, a stall kill
+	// routes to needs_human (held against thrash) rather than re-dispatching.
+	GovernorCeilingReached bool
+	// AttemptsExhausted is the §6.7 max_attempts decision for an absolute-cap kill,
+	// resolved by the runtime: when true, the cap routes to needs_human.
+	AttemptsExhausted bool
+}
 
 // WorkResult is a fenced work-product CLAIM (never a verdict, I-9). Epoch is the
 // caller's claimed fence.
@@ -81,6 +114,7 @@ type SpecReviewClaim struct {
 }
 
 func (Heartbeat) isEngineEvent()       {}
+func (LivenessVerdict) isEngineEvent() {}
 func (WorkResult) isEngineEvent()      {}
 func (Release) isEngineEvent()         {}
 func (ReviewClaim) isEngineEvent()     {}
@@ -109,6 +143,13 @@ type Transition struct {
 	AttemptsDelta int              // increment applied to the attempts counter
 	Verdict       *job.Verdict     // the minted, tamper-evident sign-off (I-9); nil if none
 	SpecSignoff   *job.SpecSignoff // the minted, content-hash-bound spec sign-off (§11.5); nil if none
+	// M8 liveness deltas. StallRevocationsDelta increments the Rung-4 governor
+	// counter on a stall kill; BumpEpoch tells the runtime this transition revokes
+	// the lease (epoch++, the zombie's fence) and fires compensation. RevokeReason
+	// records WHY (absolute_cap / two_rung_stall / awaiting_input / agent_exited).
+	StallRevocationsDelta int
+	BumpEpoch             bool
+	RevokeReason          string
 }
 
 // Decision is DATA describing intent. The runtime applies it; the core never acts.
@@ -124,6 +165,21 @@ type Decision struct {
 	SpecMint  *job.SpecSignoff
 	Directive *Directive
 	Reject    *RejectReason
+}
+
+// redispatchTarget is the state a revoked/cancelled active-lease job returns to for
+// re-dispatch (§10.7): a code_review revoke returns to review_pending (the build
+// product still stands); spec stages return to spec_authoring; every build stage
+// (leased/building) returns to ready. Mirrors the release/expiry edges.
+func redispatchTarget(from job.State) job.State {
+	switch from {
+	case job.StateCodeReview:
+		return job.StateReviewPending
+	case job.StateSpecAuthoring, job.StateSpecReview:
+		return job.StateSpecAuthoring
+	default:
+		return job.StateReady
+	}
 }
 
 // fenced checks the caller's epoch against the live fence. It returns a non-nil
@@ -148,8 +204,71 @@ func Decide(s EngineState, e Event) Decision {
 		if !job.HasActiveLease(s.Job.State) {
 			return Decision{Reject: &RejectReason{Reason: "job not in an active lease state"}}
 		}
+		// §10.6 two free fast-paths, evaluated BEFORE the ladder (conclusive on their
+		// face — not "kills"). agent_exited_zombie -> failed (the agent is already
+		// dead, locally proven); awaiting_input -> cancel + clean re-dispatch.
+		switch liveness.EvaluateFastPath(ev.Health, ev.AwaitingInput, ev.AgentExited) {
+		case liveness.FastPathFailed:
+			d := DirectiveCancel
+			return Decision{
+				Directive: &d,
+				Transitions: []Transition{{
+					From: s.Job.State, To: job.StateFailed, Kind: ledger.KindAgentExited,
+					BumpEpoch: true, RevokeReason: "agent_exited",
+				}},
+			}
+		case liveness.FastPathCancel:
+			to := redispatchTarget(s.Job.State)
+			d := DirectiveCancel
+			return Decision{
+				Directive: &d,
+				Transitions: []Transition{{
+					From: s.Job.State, To: to, Kind: ledger.KindFastCancelled,
+					AttemptsDelta: 1, BumpEpoch: true, RevokeReason: "awaiting_input",
+				}},
+			}
+		}
 		d := DirectiveContinue
 		return Decision{Directive: &d}
+
+	case LivenessVerdict:
+		// only an active-lease job is subject to the ladder. A non-active job has
+		// nothing to revoke.
+		if !job.HasActiveLease(s.Job.State) {
+			return Decision{Reject: &RejectReason{Reason: "job not in an active lease state"}}
+		}
+		kd := liveness.EvaluateKill(ev.Rungs)
+		if !kd.Kill {
+			// no two-rung agreement (or Rung-2 abstains, or the breaker tripped): the
+			// job survives. §10.4 bias — a stalled job running a little long is the
+			// cheaper error than killing healthy work.
+			return Decision{}
+		}
+		// A kill IS a lease revocation (§10.3): bump the epoch (fence the zombie) and
+		// fire compensation. The absolute cap is unilateral; a two-rung stall kill is
+		// governed by Rung-4 anti-thrash.
+		reason := "two_rung_stall"
+		if kd.Unilateral {
+			reason = "absolute_cap"
+		}
+		// Rung-4 governor (§10.7): a repeatedly killed-and-resumed job is held in
+		// needs_human rather than re-armed. The absolute cap also escalates when
+		// attempts are exhausted (§6.7). The runtime resolves the ceiling/attempts
+		// booleans; the engine picks the arm.
+		escalate := ev.GovernorCeilingReached
+		if kd.Unilateral {
+			escalate = ev.AttemptsExhausted || ev.GovernorCeilingReached
+		}
+		if escalate {
+			return Decision{Transitions: []Transition{{
+				From: s.Job.State, To: job.StateNeedsHuman, Kind: ledger.KindStallEscalated,
+				StallRevocationsDelta: 1, BumpEpoch: true, RevokeReason: reason,
+			}}}
+		}
+		return Decision{Transitions: []Transition{{
+			From: s.Job.State, To: redispatchTarget(s.Job.State), Kind: ledger.KindLeaseRevoked,
+			AttemptsDelta: 1, StallRevocationsDelta: 1, BumpEpoch: true, RevokeReason: reason,
+		}}}
 
 	case WorkResult:
 		if r := staleEpoch(ev.Epoch, s.Epoch); r != nil {

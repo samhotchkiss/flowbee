@@ -28,6 +28,18 @@ const (
 	TriggerSpecSignedOff     Trigger = "spec_signed_off"     // spec_review -> done (sign-off minted; issue materialized)
 	TriggerSpecSuperseded    Trigger = "spec_superseded"     // spec edit voided the sign-off; re-arm the gate
 	TriggerSpecAuthored      Trigger = "spec_authored"       // spec_authoring -> spec_review (author submitted draft)
+
+	// M8 liveness triggers (§10.7). A "kill" is a lease REVOCATION (epoch++ +
+	// compensation), routed to `ready` for re-dispatch unless the Rung-4 governor
+	// ceiling holds it in `needs_human` (anti-thrash). The absolute-cap kill and a
+	// two-rung stall kill share these edges; the runtime picks retry-vs-exhausted by
+	// the governor / attempts counters, keeping Next pure.
+	TriggerStallRevokedRetry   Trigger = "stall_revoked_retry"     // active -> ready (revoke; re-dispatch)
+	TriggerStallRevokedExhaust Trigger = "stall_revoked_exhausted" // active -> needs_human (governor ceiling)
+	TriggerLeaseCappedRetry    Trigger = "lease_capped_retry"      // active -> ready (absolute cap; re-dispatch)
+	TriggerLeaseCappedExhaust  Trigger = "lease_capped_exhausted"  // active -> needs_human (max_attempts at cap)
+	TriggerAgentExited         Trigger = "agent_exited"            // active -> failed (zombie fast-path, §10.6)
+	TriggerAwaitingInputCancel Trigger = "awaiting_input_cancel"   // active -> ready (awaiting-input fast-path, §10.6)
 )
 
 // ErrIllegalTransition is returned for any (state, trigger) pair not in the table.
@@ -90,6 +102,55 @@ var transitions = map[transitionKey]State{
 	{StateSpecReview, TriggerSpecSuperseded}:    StateSpecAuthoring,
 	{StateSpecReview, TriggerReleased}:          StateSpecAuthoring,
 	{StateSpecReview, TriggerLeaseExpiredRetry}: StateSpecAuthoring,
+
+	// M8 liveness edges (§10.7). Every active-lease state can be killed (revoked) by
+	// the two-rung rule or the absolute cap, or fast-pathed to failed/cancelled. A
+	// revoke routes to `ready` for re-dispatch (anti-affinity still holds) unless the
+	// governor ceiling holds it in `needs_human`. A build-stage revoke returns to
+	// `ready`; a review-stage (code_review) revoke returns to `review_pending` (the
+	// build product still stands), mirroring the release/expiry edges above.
+	{StateLeased, TriggerStallRevokedRetry}:        StateReady,
+	{StateBuilding, TriggerStallRevokedRetry}:      StateReady,
+	{StateCodeReview, TriggerStallRevokedRetry}:    StateReviewPending,
+	{StateSpecAuthoring, TriggerStallRevokedRetry}: StateSpecAuthoring,
+	{StateSpecReview, TriggerStallRevokedRetry}:    StateSpecAuthoring,
+
+	{StateLeased, TriggerStallRevokedExhaust}:        StateNeedsHuman,
+	{StateBuilding, TriggerStallRevokedExhaust}:      StateNeedsHuman,
+	{StateCodeReview, TriggerStallRevokedExhaust}:    StateNeedsHuman,
+	{StateSpecAuthoring, TriggerStallRevokedExhaust}: StateNeedsHuman,
+	{StateSpecReview, TriggerStallRevokedExhaust}:    StateNeedsHuman,
+
+	{StateLeased, TriggerLeaseCappedRetry}:        StateReady,
+	{StateBuilding, TriggerLeaseCappedRetry}:      StateReady,
+	{StateCodeReview, TriggerLeaseCappedRetry}:    StateReviewPending,
+	{StateSpecAuthoring, TriggerLeaseCappedRetry}: StateSpecAuthoring,
+	{StateSpecReview, TriggerLeaseCappedRetry}:    StateSpecAuthoring,
+
+	{StateLeased, TriggerLeaseCappedExhaust}:        StateNeedsHuman,
+	{StateBuilding, TriggerLeaseCappedExhaust}:      StateNeedsHuman,
+	{StateCodeReview, TriggerLeaseCappedExhaust}:    StateNeedsHuman,
+	{StateSpecAuthoring, TriggerLeaseCappedExhaust}: StateNeedsHuman,
+	{StateSpecReview, TriggerLeaseCappedExhaust}:    StateNeedsHuman,
+
+	// agent_exited_zombie fast-path (§10.6): straight to `failed` (terminal for the
+	// attempt; compensation re-queues subject to max_attempts).
+	{StateLeased, TriggerAgentExited}:        StateFailed,
+	{StateBuilding, TriggerAgentExited}:      StateFailed,
+	{StateCodeReview, TriggerAgentExited}:    StateFailed,
+	{StateSpecAuthoring, TriggerAgentExited}: StateFailed,
+	{StateSpecReview, TriggerAgentExited}:    StateFailed,
+
+	// awaiting_input fast-path (§10.6): clean cancel, route per policy (re-dispatch).
+	{StateLeased, TriggerAwaitingInputCancel}:        StateReady,
+	{StateBuilding, TriggerAwaitingInputCancel}:      StateReady,
+	{StateCodeReview, TriggerAwaitingInputCancel}:    StateReviewPending,
+	{StateSpecAuthoring, TriggerAwaitingInputCancel}: StateSpecAuthoring,
+	{StateSpecReview, TriggerAwaitingInputCancel}:    StateSpecAuthoring,
+
+	// re-dispatch from a needs_human stall after deliberate human resume: stays in
+	// `failed` -> ready edge for the zombie re-queue path.
+	{StateFailed, TriggerLeaseExpiredRetry}: StateReady,
 }
 
 // Next is the pure §6.2 state machine: (state, trigger) -> next state. It is a

@@ -25,6 +25,11 @@ const (
 	StateNeedsHuman    State = "needs_human"
 	StateSuperseded    State = "superseded"
 	StateCancelled     State = "cancelled"
+	// StateFailed is the terminal-for-the-attempt sink of the agent_exited_zombie
+	// fast-path (§10.6): the worker-local supervisor waitpid'd and saw the agent PID
+	// died (locally provable) -> straight to `failed`; compensation fires; the job
+	// re-queues subject to max_attempts. Distinct from a "kill" (a lease revocation).
+	StateFailed State = "failed"
 	// StateQuiescent is the ADOPT-mode mirrored-but-quiescent state (§12.7, I-16):
 	// a job imported from a pre-existing GitHub issue/PR on first boot. It is
 	// reconciled (full Domain-B facts) but NEVER scheduled (no lease) and NEVER

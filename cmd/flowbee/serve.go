@@ -64,9 +64,31 @@ func runServe(_ []string) error {
 	go serveHTTP(logger, "private", privateSrv)
 
 	// the single durable-timer polling goroutine (project override #2): drives the
-	// no_eligible_worker alarm, epoch-guarded.
-	poller := alarm.New(st, clock.Real{}, time.Second, srv.Broker())
+	// no_eligible_worker alarm + the M8 liveness deadlines (Rung-3), epoch-guarded.
+	livenessCfg := store.LivenessConfig{
+		PhaseBudget:                   cfg.LeaseTTL() / 2, // soft deadline ~ half the TTL window
+		AbsoluteCap:                   cfg.LeaseTTL(),     // the un-gameable Rung-3 floor
+		Rung2Window:                   cfg.LeaseTTL() / 2,
+		GovernorCeiling:               3, // Rung-4 anti-thrash (distinct from max_attempts)
+		CircuitBreakerAbstainFraction: 0.8,
+	}
+	poller := alarm.New(st, clock.Real{}, time.Second, srv.Broker()).
+		WithLiveness(livenessCfg, store.DBFactSource{DB: st.DB}, srv.Broker())
 	go poller.Run(ctx)
+	// the Rung-2 sweep + two-rung evaluation pass runs on the slower external-oracle
+	// cadence (§10.2 — Rung-2 only updates on the reconcile sweep).
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				poller.Rung2Tick(ctx)
+			}
+		}
+	}()
 
 	// reconcile-IN (M6, §8.1): Flowbee is the SINGLE GitHub caller (R4). Wired only
 	// when GitHub App config is present (FLOWBEE_GITHUB_OWNER/REPO/TOKEN); there are

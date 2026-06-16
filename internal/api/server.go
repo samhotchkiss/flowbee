@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/clock"
+	"github.com/samhotchkiss/flowbee/internal/engine"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/lease"
+	"github.com/samhotchkiss/flowbee/internal/liveness"
 	"github.com/samhotchkiss/flowbee/internal/scheduler"
 	"github.com/samhotchkiss/flowbee/internal/spec"
 	"github.com/samhotchkiss/flowbee/internal/store"
@@ -460,6 +462,16 @@ func (s *Server) specReview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// heartbeatRequest carries the §10 liveness observations a worker reports on each
+// heartbeat (all HINTS, never authoritative kills, I-13) plus the two fast-path
+// flags (§10.6). The body is optional — an empty heartbeat is a bare liveness ping.
+type heartbeatRequest struct {
+	AgentHealth   string `json:"agent_health"`   // Rung-0 enum (ok|zombie|stdin_block|cpu_spin|oom|hung_child)
+	Rung1Class    string `json:"rung1_class"`    // Rung-1 (working|frozen|spinning)
+	AwaitingInput bool   `json:"awaiting_input"` // §10.6 fast-path -> cancel
+	AgentExited   bool   `json:"agent_exited"`   // §10.6 fast-path -> failed
+}
+
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("job")
 	epoch, ok := epochFromHeader(r)
@@ -467,10 +479,22 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing X-Lease-Epoch", http.StatusBadRequest)
 		return
 	}
-	dir, err := s.store.Heartbeat(r.Context(), store.HeartbeatParams{JobID: jobID, Epoch: epoch, Now: s.clock.Now()})
+	var req heartbeatRequest
+	_ = json.NewDecoder(r.Body).Decode(&req) // optional body
+	dir, err := s.store.Heartbeat(r.Context(), store.HeartbeatParams{
+		JobID: jobID, Epoch: epoch, Now: s.clock.Now(),
+		Health:        liveness.AgentHealth(req.AgentHealth),
+		Rung1:         liveness.Rung1Class(req.Rung1Class),
+		AwaitingInput: req.AwaitingInput,
+		AgentExited:   req.AgentExited,
+	})
 	if err != nil {
 		s.writeFenceError(w, err)
 		return
+	}
+	if dir == engine.DirectiveCancel {
+		j, _ := s.store.GetJob(r.Context(), jobID)
+		s.broker.Publish(LifeEvent{JobID: jobID, State: string(j.State), Event: "fast_path_cancel", Epoch: epoch})
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"directive": string(dir)})
 }

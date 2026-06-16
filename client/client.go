@@ -108,12 +108,28 @@ func (c *Client) LeaseWithLens(ctx context.Context, identity, family, role, lens
 	return g, true, nil
 }
 
-// Heartbeat sends a fenced heartbeat. status is the HTTP status (409 = stale).
+// Heartbeat sends a bare fenced heartbeat. status is the HTTP status (409 = stale).
 func (c *Client) Heartbeat(ctx context.Context, jobID string, epoch int) (directive string, status int, err error) {
+	return c.HeartbeatWith(ctx, jobID, epoch, HeartbeatObs{})
+}
+
+// HeartbeatObs carries the §10 liveness observations a worker reports (all HINTS,
+// I-13) + the two §10.6 fast-path flags. The zero value is a bare ping.
+type HeartbeatObs struct {
+	AgentHealth   string `json:"agent_health,omitempty"`
+	Rung1Class    string `json:"rung1_class,omitempty"`
+	AwaitingInput bool   `json:"awaiting_input,omitempty"`
+	AgentExited   bool   `json:"agent_exited,omitempty"`
+}
+
+// HeartbeatWith sends a fenced heartbeat carrying liveness observations. A `cancel`
+// directive (§10.6 fast-path, or a two-rung kill that already revoked) tells the
+// worker to stop. status is the HTTP status (409 = stale).
+func (c *Client) HeartbeatWith(ctx context.Context, jobID string, epoch int, obs HeartbeatObs) (directive string, status int, err error) {
 	var out struct {
 		Directive string `json:"directive"`
 	}
-	st, err := c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/heartbeat", epochHeader(epoch), nil, &out)
+	st, err := c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/heartbeat", epochHeader(epoch), obs, &out)
 	return out.Directive, st, err
 }
 

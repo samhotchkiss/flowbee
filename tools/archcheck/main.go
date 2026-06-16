@@ -17,6 +17,7 @@ var corePackages = []string{
 	"github.com/samhotchkiss/flowbee/internal/job",
 	"github.com/samhotchkiss/flowbee/internal/ledger",
 	"github.com/samhotchkiss/flowbee/internal/lease",
+	"github.com/samhotchkiss/flowbee/internal/liveness",
 }
 
 // Forbidden import path prefixes. (time is intentionally allowed: the core uses

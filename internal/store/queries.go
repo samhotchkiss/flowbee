@@ -12,6 +12,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/lease"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
+	"github.com/samhotchkiss/flowbee/internal/liveness"
 	"github.com/samhotchkiss/flowbee/internal/scheduler"
 )
 
@@ -247,16 +248,26 @@ func (s *Store) ClaimReadyJob(ctx context.Context, p ClaimParams) (*lease.Lease,
 	return result, nil
 }
 
-// HeartbeatParams is a fenced heartbeat.
+// HeartbeatParams is a fenced heartbeat. The liveness observations (§10.2) feed the
+// lower, gameable rungs (HINTS) and the two free fast-paths (§10.6): a Rung-0
+// agent_exited_zombie -> failed; awaiting_input -> cancel + clean re-dispatch.
 type HeartbeatParams struct {
 	JobID string
 	Epoch int
 	Now   time.Time
+	// Rung-0/1 hints (worker-reported; never kill alone, I-13). Recorded so a later
+	// Rung-2/Rung-3 corroboration can satisfy the two-rung rule.
+	Health        liveness.AgentHealth
+	Rung1         liveness.Rung1Class
+	AwaitingInput bool // §10.6 fast-path: directive cancel
+	AgentExited   bool // §10.6 fast-path: zombie -> failed
 }
 
 // Heartbeat applies engine.Decide for a fenced heartbeat. Stale epoch ->
-// lease.ErrStaleEpoch (409). On continue it extends lease_hb_due and appends a
-// heartbeat event.
+// lease.ErrStaleEpoch (409). On continue it extends lease_hb_due, records the
+// Rung-0/1 hints, and appends a heartbeat event. The two free fast-paths (§10.6)
+// short-circuit to a cancel directive + the revoke transition (agent_exited ->
+// failed; awaiting_input -> ready), applied transactionally with the epoch bump.
 func (s *Store) Heartbeat(ctx context.Context, p HeartbeatParams) (engine.Directive, error) {
 	var dir engine.Directive
 	err := s.tx(ctx, func(tx *sql.Tx) error {
@@ -264,18 +275,36 @@ func (s *Store) Heartbeat(ctx context.Context, p HeartbeatParams) (engine.Direct
 		if err != nil {
 			return err
 		}
-		dec := engine.Decide(engine.EngineState{Job: j, Now: p.Now, Epoch: j.LeaseEpoch}, engine.Heartbeat{Epoch: p.Epoch})
+		dec := engine.Decide(
+			engine.EngineState{Job: j, Now: p.Now, Epoch: j.LeaseEpoch},
+			engine.Heartbeat{
+				Epoch: p.Epoch, Health: p.Health,
+				AwaitingInput: p.AwaitingInput, AgentExited: p.AgentExited,
+			})
 		if dec.Reject != nil {
 			return lease.ErrStaleEpoch
 		}
 		if dec.Directive != nil {
 			dir = *dec.Directive
 		}
-		// record liveness: bump last-seen (the absolute lease deadline is unchanged;
-		// per-phase heartbeat-window enforcement lands with the timer table in M8).
+		// §10.6 fast-path: the heartbeat carried a conclusive signal. Apply the revoke
+		// transition (epoch++ + compensation) transactionally and return the cancel.
+		if len(dec.Transitions) > 0 {
+			t := dec.Transitions[0]
+			newEpoch := j.LeaseEpoch
+			if t.BumpEpoch {
+				newEpoch = j.LeaseEpoch + 1
+			}
+			return applyRevokeTx(ctx, tx, &j, seq, t, newEpoch, p.Now)
+		}
+		// record liveness: bump last-seen + the Rung-0/1 hints (the absolute lease
+		// deadline is unchanged — only the un-gameable Rung-3 clock can move it).
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE jobs SET lease_hb_due = ?, updated_at = datetime('now') WHERE id = ?`,
-			p.Now.Format(rfc3339), p.JobID); err != nil {
+			`UPDATE jobs SET lease_hb_due = ?, last_heartbeat_at = ?,
+			                agent_health = ?, rung1_class = ?, updated_at = datetime('now')
+			 WHERE id = ?`,
+			p.Now.Format(rfc3339), p.Now.Format(rfc3339),
+			string(p.Health), string(p.Rung1), p.JobID); err != nil {
 			return fmt.Errorf("extend heartbeat: %w", err)
 		}
 		// bump the bound worker's last_seen so the roster's stale-hb badge clears on

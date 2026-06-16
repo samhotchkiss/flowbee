@@ -48,6 +48,13 @@ const (
 	KindIssueMaterialized EventKind = "issue_materialized"  // a signed-off spec materialized a GitHub issue (§11)
 	KindPROpened          EventKind = "pr_opened"           // Flowbee opened the PR and stamped # (§7.3, §8.2.1)
 	KindAdopted           EventKind = "adopted"             // a pre-existing issue/PR imported quiescent (I-16)
+	// M8 liveness event kinds (§10.7). A stall kill / absolute-cap revoke / fast-path
+	// each emits its own audit event; the lease_revoked event carries the bumped
+	// epoch (the zombie's fence) and the governor counter delta.
+	KindLeaseRevoked   EventKind = "lease_revoked"   // two-rung kill OR absolute cap: epoch++, re-dispatch
+	KindStallEscalated EventKind = "stall_escalated" // Rung-4 governor ceiling: active -> needs_human
+	KindAgentExited    EventKind = "agent_exited"    // agent_exited_zombie fast-path -> failed (§10.6)
+	KindFastCancelled  EventKind = "fast_cancelled"  // awaiting_input fast-path -> ready (§10.6)
 )
 
 // Event is one appended ledger row. Payload holds kind-specific RESOLVED facts as
@@ -87,6 +94,12 @@ type Payload struct {
 	// counter deltas (lease_released / state_changed / review_bounced)
 	AttemptsDelta int
 	BouncesDelta  int
+	// stall_revocations governor counter delta (M8, §10.7); set on lease_revoked /
+	// stall_escalated. Distinct from attempts/bounces.
+	StallRevocationsDelta int `json:",omitempty"`
+	// RevokeReason records WHY a lease was revoked (M8): "absolute_cap" |
+	// "two_rung_stall" | "awaiting_input" | "agent_exited", for replay/audit.
+	RevokeReason string `json:",omitempty"`
 
 	// gate (M3): the reviewer's claim (untrusted) and the minted verdict (I-9).
 	VerdictClaim job.VerdictValue `json:",omitempty"`
@@ -277,6 +290,48 @@ func Fold(events []Event) (job.Job, error) {
 			// Flowbee opened the PR and stamped the number (§7.3). The worker never
 			// supplies a PR field; Domain B owns existence.
 			j.PRNumber = e.Payload.PRNumber
+		case KindLeaseRevoked:
+			// M8 (§10.7): a two-rung kill or absolute-cap revoke. The epoch was bumped
+			// (the zombie's fence rides the event), the live lease cleared, the
+			// governor counter incremented, the build re-armed (-> ready /
+			// review_pending). attempts++ on a re-dispatch.
+			j.State = e.ToState
+			j.LeaseEpoch = e.LeaseEpoch
+			j.Attempts += e.Payload.AttemptsDelta
+			j.StallRevocations += e.Payload.StallRevocationsDelta
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+			if e.ToState == job.StateReady && e.Payload.Role != "" {
+				j.Role = e.Payload.Role
+			}
+		case KindStallEscalated:
+			// M8 (§10.7): the Rung-4 governor ceiling routed the job to needs_human
+			// (anti-thrash) rather than re-dispatching forever. Epoch bumped, counter
+			// incremented, lease cleared.
+			j.State = e.ToState
+			j.LeaseEpoch = e.LeaseEpoch
+			j.StallRevocations += e.Payload.StallRevocationsDelta
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindAgentExited:
+			// M8 (§10.6): the agent_exited_zombie fast-path -> failed. Epoch bumped
+			// (the dead agent's zombie successor is fenced), lease cleared.
+			j.State = e.ToState
+			j.LeaseEpoch = e.LeaseEpoch
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindFastCancelled:
+			// M8 (§10.6): the awaiting_input fast-path -> ready (clean cancel). Epoch
+			// bumped, lease cleared, build re-armed.
+			j.State = e.ToState
+			j.LeaseEpoch = e.LeaseEpoch
+			j.Attempts += e.Payload.AttemptsDelta
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
 		case KindAdopted:
 			// a pre-existing issue/PR imported quiescent (I-16). State is the imported
 			// quiescent marker; no scheduling.

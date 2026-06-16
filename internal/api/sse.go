@@ -60,6 +60,13 @@ func (b *Broker) PublishReconcile(jobID, event string) {
 	b.Publish(LifeEvent{JobID: jobID, Event: event})
 }
 
+// PublishLiveness surfaces a liveness outcome (stall_revoked / fast_path_cancel)
+// live on the SSE feed (§10). Satisfies alarm.LivenessPublisher so the poller can
+// surface a two-rung kill / absolute-cap revoke.
+func (b *Broker) PublishLiveness(jobID, event string) {
+	b.Publish(LifeEvent{JobID: jobID, Event: event})
+}
+
 // Publish broadcasts a lifecycle event to all subscribers (non-blocking).
 func (b *Broker) Publish(e LifeEvent) {
 	blob, err := json.Marshal(e)
