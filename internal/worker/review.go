@@ -221,9 +221,10 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		out.JobState = resp.JobState
 	}
 
-	if _, err := c.Release(ctx, grant.JobID, grant.LeaseEpoch); err != nil {
-		_ = err
-	}
+	// NO trailing Release: the verdict POST (/spec, /spec-review, /review) already
+	// consumed the lease and transitioned the job. An extra release would re-arm a
+	// just-advanced job (spec_review -> ready). A failed POST leaves the lease to
+	// expire on TTL and re-arm for a clean retry.
 	return out, nil
 }
 
