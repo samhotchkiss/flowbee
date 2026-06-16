@@ -21,6 +21,10 @@ func main() {
 	cmd, args := os.Args[1], os.Args[2:]
 	var err error
 	switch cmd {
+	case "init":
+		err = runInit(args)
+	case "doctor":
+		err = runDoctor(args)
 	case "serve":
 		err = runServe(args)
 	case "migrate":
@@ -47,5 +51,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <serve|migrate|work|lease|submit|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|serve|migrate|work|lease|submit|seed|version>")
 }

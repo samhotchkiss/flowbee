@@ -1,0 +1,52 @@
+# Flowbee default configurable flow (F5, backlog §B). This is the OPERATOR flow:
+# which stages run, which identities staff them, and how a multi-reviewer
+# build-review fan-out decides. Identities are referenced by id and resolved
+# against flows/identities/*.yaml (seeded from `hire`). Per-stage identity
+# overrides obey the precedence: role default < flow < epic < per-job.
+#
+# Models/identity ids are DATA here (the file is NOT run through the §5.6
+# control-position neutrality lint, which guards flows/flows.yaml only). Provider
+# literals therefore legitimately appear inside seeded identity model fields.
+
+flow: default
+
+stages:
+  # issue-review AMENDS the issue in place (M7 amend, §B). Optional: a flow may
+  # drop this stage by omitting it (the build flow then enters at build).
+  issue_review:
+    role: issue_reviewer
+    optional: true
+    identity: issue-reviewer
+
+  build:
+    role: eng_worker
+    identity: builder
+    needs: [issue_review]
+
+  # build-review is a MULTI-REVIEWER fan-out: N reviewers, each a distinct lens
+  # and (by anti-affinity) a distinct identity + model_family from the builder and
+  # from each other. decision aggregates their verdicts.
+  build_review:
+    role: code_reviewer
+    needs: [build]
+    gate: true
+    decision: all_pass        # all_pass | majority | any_veto
+    reviewers:
+      - identity: reviewer-correctness
+        lens: correctness
+      - identity: reviewer-tests
+        lens: tests
+      - identity: reviewer-security
+        lens: security
+
+  merge:
+    role: merger
+    needs: [build_review]
+    when: "build_review.disposition == 'handoff'"
+
+# Anti-affinity axis = identity + model_family + fresh context, NOT the machine
+# (M4). Holds builder≠each-reviewer and reviewer≠reviewer.
+independence:
+  - "eng_worker.identity != code_reviewer.identity"
+  - "eng_worker.model_family != code_reviewer.model_family"
+  - "code_reviewer.identity != code_reviewer.identity"   # distinct reviewers fan-out

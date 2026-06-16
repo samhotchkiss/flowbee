@@ -1,0 +1,87 @@
+# Flowbee default flows & roles (DESIGN §5.3). Provider-agnostic: a provider name
+# may appear ONLY in a model_family:* capability tag or a lens.prompt_ref path
+# (§5.6). The §5.6 neutrality lint (tools/providerlint) fails the build on any
+# provider literal in a control position.
+
+roles:
+  spec_author:
+    requires: ["role:spec_author", "model_family:*"]
+    lens:
+      persona: product_speccer
+      focus: completeness+testability
+      prompt_ref: lenses/spec_author.md
+    emits: spec_doc
+
+  spec_reviewer:
+    requires: ["role:spec_reviewer", "model_family:*"]
+    lens:
+      persona: staff_engineer
+      focus: eng_style+project_requirements
+      prompt_ref: lenses/spec_review.md
+    gate: true
+    context: spec_and_diff_only
+    emits: verdict
+
+  eng_worker:
+    requires: ["role:eng_worker", "model_family:*"]
+    lens:
+      persona: implementer
+      focus: make_it_pass_the_spec
+      prompt_ref: lenses/eng_worker.md
+    emits: patch
+
+  code_reviewer:
+    requires: ["role:code_reviewer", "model_family:*"]
+    lens:
+      persona: critical_reviewer
+      focus: spec_match+code_standards+ci
+      prompt_ref: lenses/code_review.md
+    gate: true
+    grants: ["merge_request_authority"]
+    context: diff_only
+    emits: verdict
+
+  merger:
+    requires: ["role:merger", "model_family:*"]
+    lens:
+      persona: integrator
+      focus: clean_merge_only
+      prompt_ref: lenses/merger.md
+    emits: merge_request
+
+flows:
+  spec:
+    entry: chat
+    stages:
+      author:
+        role: spec_author
+      review:
+        role: spec_reviewer
+        needs: ["author"]
+        gate: true
+        max_bounces: 3
+    independence:
+      - "spec_author.lens != spec_reviewer.lens"
+
+  build:
+    entry: signed_off_issue
+    stages:
+      build:
+        role: eng_worker
+      review:
+        role: code_reviewer
+        needs: ["build"]
+        gate: true
+        context: diff_only
+        max_bounces: 3
+      merge:
+        role: merger
+        when: "review.disposition == 'handoff'"
+    independence:
+      - "eng_worker.identity != code_reviewer.identity"
+      - "eng_worker.model_family != code_reviewer.model_family"
+      - "code_reviewer.identity != merger.identity"
+    signoff:
+      kind: tamper_evident
+      source: reconciled_github_state
+      binds: ["head_sha", "base_sha"]

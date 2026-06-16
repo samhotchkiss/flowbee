@@ -192,11 +192,23 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 	repos := cfg.Repos
 	tokenEnv := map[string]string{} // repo id -> token env-var name ("" = shared default)
 	if len(repos) == 0 {
+		// env wins (legacy path); else fall back to the flowbee.yaml coords
+		// `flowbee init` prefills (F13).
 		owner, repo := os.Getenv("FLOWBEE_GITHUB_OWNER"), os.Getenv("FLOWBEE_GITHUB_REPO")
+		if owner == "" {
+			owner = cfg.GithubOwner
+		}
+		if repo == "" {
+			repo = cfg.GithubRepo
+		}
 		if owner == "" || repo == "" {
 			return nil // nothing configured: no GitHub loops
 		}
-		repos = []config.RepoConfig{{ID: "default", Owner: owner, Repo: repo, DefaultBranch: "main"}}
+		branch := cfg.GithubDefaultBranch
+		if branch == "" {
+			branch = "main"
+		}
+		repos = []config.RepoConfig{{ID: "default", Owner: owner, Repo: repo, DefaultBranch: branch}}
 	}
 	for _, rc := range repos {
 		id := rc.ID

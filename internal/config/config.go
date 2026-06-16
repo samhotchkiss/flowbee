@@ -61,6 +61,15 @@ type Config struct {
 	// is forced to the human gate. Set via FLOWBEE_CONTENT_DENY_EXTRA (comma-separated).
 	ContentDenyExtra []string `yaml:"content_deny_extra"`
 
+	// GithubOwner / GithubRepo are the single-repo coordinates `flowbee init`
+	// prefills from the git remote (F13). They are the config-file form of the
+	// legacy FLOWBEE_GITHUB_OWNER/REPO env path: when Repos is empty, serve uses
+	// these (env still overrides). Empty + no env + no Repos = no GitHub loops
+	// (dev/CI with no creds). DefaultBranch defaults to "main".
+	GithubOwner         string `yaml:"github_owner"`
+	GithubRepo          string `yaml:"github_repo"`
+	GithubDefaultBranch string `yaml:"github_default_branch"`
+
 	// Repos is the F9 multi-repo registry: one control plane manages a SET of repos,
 	// each with its own GitHub coords + integration branch + its own reconcile-IN /
 	// project-OUT loop, over a SHARED, repo-agnostic worker fleet and a GLOBAL
@@ -200,6 +209,15 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("FLOWBEE_CONTENT_DENY_EXTRA"); v != "" {
 		c.ContentDenyExtra = splitCSV(v)
+	}
+	if v := os.Getenv("FLOWBEE_GITHUB_OWNER"); v != "" {
+		c.GithubOwner = v
+	}
+	if v := os.Getenv("FLOWBEE_GITHUB_REPO"); v != "" {
+		c.GithubRepo = v
+	}
+	if v := os.Getenv("FLOWBEE_GITHUB_DEFAULT_BRANCH"); v != "" {
+		c.GithubDefaultBranch = v
 	}
 }
 

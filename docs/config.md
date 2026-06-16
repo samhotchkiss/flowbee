@@ -1,0 +1,101 @@
+# `flowbee.yaml` — configuration reference
+
+Flowbee loads config in three layers, last-wins:
+
+1. **built-in defaults** (`config.Default()`),
+2. **`flowbee.yaml`** in the working directory (or `$FLOWBEE_CONFIG`),
+3. **`FLOWBEE_*` environment variables**.
+
+Secrets (the GitHub PAT, the worker-auth HMAC key) go in the environment, never
+in the file. `flowbee init` scaffolds a `flowbee.yaml` with sane defaults and
+your repo coords prefilled.
+
+---
+
+## GitHub coordinates
+
+| key | env override | default | meaning |
+|-----|--------------|---------|---------|
+| `github_owner` | `FLOWBEE_GITHUB_OWNER` | — | GitHub owner/org, prefilled by `init` from the `origin` remote |
+| `github_repo` | `FLOWBEE_GITHUB_REPO` | — | GitHub repo name |
+| `github_default_branch` | `FLOWBEE_GITHUB_DEFAULT_BRANCH` | `main` | the integration branch (PR base + branch-protection target) |
+
+The token itself is **not** a config key — it lives in `FLOWBEE_GITHUB_TOKEN`
+(a fine-grained, repo-scoped PAT). Workers never receive it; Flowbee is the only
+GitHub caller.
+
+When the multi-repo `repos:` block (below) is present, it wins and these
+single-repo keys are ignored.
+
+## Store and listeners
+
+| key | env override | default | meaning |
+|-----|--------------|---------|---------|
+| `database_url` | `FLOWBEE_DATABASE_URL` | `flowbee.db` | SQLite file (WAL). No database server. Gitignored + litestream'd. |
+| `private_addr` | `FLOWBEE_PRIVATE_ADDR` | `:7070` | the worker API — keep it on loopback / Tailscale |
+| `health_addr` | `FLOWBEE_HEALTH_ADDR` | `:7001` | `/healthz` |
+| `webhook_addr` | `FLOWBEE_WEBHOOK_ADDR` | `:8443` | GitHub webhooks |
+| `log_level` | `FLOWBEE_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+
+## Leasing and liveness
+
+| key | env override | default | meaning |
+|-----|--------------|---------|---------|
+| `lease_ttl_s` | `FLOWBEE_LEASE_TTL_S` | `300` | lease lifetime; **must be ≥ 3 × `heartbeat_interval_s`** (DESIGN §6.3.3) |
+| `heartbeat_interval_s` | `FLOWBEE_HEARTBEAT_INTERVAL_S` | `30` | worker heartbeat cadence |
+| `long_poll_wait_s` | `FLOWBEE_LONG_POLL_WAIT_S` | `30` | worker long-poll hold |
+| `river_max_workers` | `FLOWBEE_RIVER_MAX_WORKERS` | `10` | internal job-runner concurrency |
+| `no_eligible_worker_s` | `FLOWBEE_NO_ELIGIBLE_WORKER_S` | `120` | how long a `ready` job may sit with no compliant worker before the alarm fires |
+
+`flowbee doctor` fails the `config` check if `lease_ttl_s < 3 * heartbeat_interval_s`.
+
+## Autonomous merge (§14)
+
+| key | env override | default | meaning |
+|-----|--------------|---------|---------|
+| `allow_self_merge` | `FLOWBEE_ALLOW_SELF_MERGE` | `true` | **`true`** = Flowbee merges an approved + content-clean + CI-green-at-head job itself, no human gate (the production posture). `false` = every approved job hands off to a human. |
+
+The safety net for autonomous merge is entirely deterministic: a
+content-integrity gate, CI green at the *integrated* head, and a reconciled,
+SHA-bound verdict — never a worker's say-so.
+
+## Content-integrity gate
+
+| key | env override | default | meaning |
+|-----|--------------|---------|---------|
+| `content_max_diff_bytes` | `FLOWBEE_CONTENT_MAX_DIFF_BYTES` | shipped default | a diff over this is forced to handoff |
+| `content_max_changed_files` | `FLOWBEE_CONTENT_MAX_CHANGED_FILES` | shipped default | a diff over this is forced to handoff |
+| `content_deny_extra` | `FLOWBEE_CONTENT_DENY_EXTRA` (CSV) | — | extra path-prefix denylist; **augments**, never replaces, the always-on protected set (CI config, lockfiles, secrets, Flowbee's own source) |
+
+## Worker authentication
+
+Empty `worker_auth_secret` = loopback-only dev (the listener must stay on
+`127.0.0.1`). Set it for any non-loopback (Tailscale/LAN) listener.
+
+| key | env override | default | meaning |
+|-----|--------------|---------|---------|
+| `worker_auth_secret` | `FLOWBEE_WORKER_AUTH_SECRET` | — | HMAC key signing per-worker bearer tokens (DESIGN §7.6) |
+| `enrolled_identities` | `FLOWBEE_ENROLLED_IDENTITIES` (CSV) | — | allowlist of worker identities permitted to authenticate |
+| `auth_loopback_bypass` | `FLOWBEE_AUTH_LOOPBACK_BYPASS` | `true` | same-box (127.0.0.1) workers may skip the token |
+
+## Multiple repos (F9)
+
+One control plane can manage a **set** of repos over a shared, repo-agnostic
+worker fleet and a global scheduler. Add a `repos:` list to `flowbee.yaml`:
+
+```yaml
+repos:
+  - id: core               # short stable handle (scopes jobs/issues/PRs)
+    owner: acme
+    repo: core
+    default_branch: main
+  - id: web
+    owner: acme
+    repo: web
+    default_branch: main
+    token_env: WEB_PAT     # optional per-repo PAT env var; defaults to FLOWBEE_GITHUB_TOKEN
+    # active: false        # register-but-park (loops + scheduling stop) without deleting history
+```
+
+When `repos:` is present it takes precedence over the single-repo
+`github_owner`/`github_repo` keys.
