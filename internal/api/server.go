@@ -731,8 +731,9 @@ func (s *Server) specSubmit(w http.ResponseWriter, r *http.Request) {
 func (s *Server) specCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ID       string `json:"id"`
-		Title    string `json:"title"`     // human label / chat ref for the work item
-		Lens     string `json:"lens"`      // author lens (default engineering_manager)
+		Title    string `json:"title"`    // human label / chat ref for the work item
+		Lens     string `json:"lens"`     // author lens (default product_speccer; distinct from the issue-reviewer lens)
+		Repo     string `json:"repo"`     // repos.id this work item belongs to (default "default")
 		Priority int    `json:"priority"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -745,10 +746,14 @@ func (s *Server) specCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	lens := body.Lens
 	if lens == "" {
-		lens = "engineering_manager"
+		lens = "product_speccer"
+	}
+	repo := body.Repo
+	if repo == "" {
+		repo = "default"
 	}
 	j, err := s.store.SeedSpecJob(r.Context(), store.SeedSpecParams{
-		ID: id, ChatRef: body.Title, AuthorLens: lens, Priority: body.Priority, Now: s.clock.Now(),
+		ID: id, ChatRef: body.Title, AuthorLens: lens, Priority: body.Priority, Repo: repo, Now: s.clock.Now(),
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
