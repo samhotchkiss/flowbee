@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -116,28 +115,22 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	verdictFile := filepath.Join(fbDir, "verdict.json")
 	specFile := filepath.Join(fbDir, "spec.md")
 
-	if cfg.AgentCmd != "" {
-		cmd := exec.CommandContext(ctx, "sh", "-c", cfg.AgentCmd)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"FLOWBEE_JOB_ID="+grant.JobID,
-			"FLOWBEE_ROLE="+grant.Role,
-			"FLOWBEE_BASE_SHA="+grant.BaseSHA,
-			"FLOWBEE_TASK_FILE="+taskFile,
-			"FLOWBEE_TASK="+cctx.Task,
-			"FLOWBEE_SPEC="+cctx.Spec,
-			"FLOWBEE_ACCEPTANCE="+cctx.AcceptanceCriteria,
-			"FLOWBEE_IDENTITY="+cctx.Identity,
-			"FLOWBEE_LENS="+cctx.Lens,
-			"FLOWBEE_DIFF_FILE="+diffFile,
-			"FLOWBEE_VERDICT_FILE="+verdictFile,
-			"FLOWBEE_SPEC_FILE="+specFile,
-		)
-		var errb strings.Builder
-		cmd.Stderr = &errb
-		if err := cmd.Run(); err != nil {
-			return out, fmt.Errorf("agent cmd: %v: %s", err, strings.TrimSpace(errb.String()))
-		}
+	agentEnv := append(os.Environ(),
+		"FLOWBEE_JOB_ID="+grant.JobID,
+		"FLOWBEE_ROLE="+grant.Role,
+		"FLOWBEE_BASE_SHA="+grant.BaseSHA,
+		"FLOWBEE_TASK_FILE="+taskFile,
+		"FLOWBEE_TASK="+cctx.Task,
+		"FLOWBEE_SPEC="+cctx.Spec,
+		"FLOWBEE_ACCEPTANCE="+cctx.AcceptanceCriteria,
+		"FLOWBEE_IDENTITY="+cctx.Identity,
+		"FLOWBEE_LENS="+cctx.Lens,
+		"FLOWBEE_DIFF_FILE="+diffFile,
+		"FLOWBEE_VERDICT_FILE="+verdictFile,
+		"FLOWBEE_SPEC_FILE="+specFile,
+	)
+	if err := runAgentHeartbeat(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, dir, cfg.AgentCmd, agentEnv); err != nil {
+		return out, err
 	}
 
 	idem := fmt.Sprintf("%s-e%d", grant.JobID, grant.LeaseEpoch)

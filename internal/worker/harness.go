@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/samhotchkiss/flowbee/client"
 	"github.com/samhotchkiss/flowbee/internal/content"
@@ -233,20 +234,14 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	}
 
 	// ── spawn the agent CLI in the worktree (a black box, §7.1) ──
-	if cfg.AgentCmd != "" {
-		cmd := exec.CommandContext(ctx, "sh", "-c", cfg.AgentCmd)
-		cmd.Dir = wsDir
-		cmd.Env = append(os.Environ(),
-			"FLOWBEE_JOB_ID="+grant.JobID,
-			"FLOWBEE_BASE_SHA="+grant.BaseSHA,
-			"FLOWBEE_ROLE="+grant.Role,
-		)
-		cmd.Env = append(cmd.Env, taskEnv...)
-		var errb strings.Builder
-		cmd.Stderr = &errb
-		if err := cmd.Run(); err != nil {
-			return out, fmt.Errorf("agent cmd: %v: %s", err, strings.TrimSpace(errb.String()))
-		}
+	agentEnv := append(os.Environ(),
+		"FLOWBEE_JOB_ID="+grant.JobID,
+		"FLOWBEE_BASE_SHA="+grant.BaseSHA,
+		"FLOWBEE_ROLE="+grant.Role,
+	)
+	agentEnv = append(agentEnv, taskEnv...)
+	if err := runAgentHeartbeat(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+		return out, err
 	}
 
 	// The .flowbee/ scaffolding is Flowbee's INPUT to the agent, not the agent's
@@ -387,20 +382,14 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		return out, fmt.Errorf("write task context: %w", err)
 	}
 
-	if cfg.AgentCmd != "" {
-		cmd := exec.CommandContext(ctx, "sh", "-c", cfg.AgentCmd)
-		cmd.Dir = wsDir
-		cmd.Env = append(os.Environ(),
-			"FLOWBEE_JOB_ID="+grant.JobID,
-			"FLOWBEE_BASE_SHA="+grant.BaseSHA,
-			"FLOWBEE_ROLE="+grant.Role,
-		)
-		cmd.Env = append(cmd.Env, taskEnv...)
-		var errb strings.Builder
-		cmd.Stderr = &errb
-		if err := cmd.Run(); err != nil {
-			return out, fmt.Errorf("agent cmd: %v: %s", err, strings.TrimSpace(errb.String()))
-		}
+	agentEnv := append(os.Environ(),
+		"FLOWBEE_JOB_ID="+grant.JobID,
+		"FLOWBEE_BASE_SHA="+grant.BaseSHA,
+		"FLOWBEE_ROLE="+grant.Role,
+	)
+	agentEnv = append(agentEnv, taskEnv...)
+	if err := runAgentHeartbeat(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+		return out, err
 	}
 
 	// strip the Flowbee scaffolding before computing the untrusted diff (§9.2).
@@ -593,6 +582,48 @@ func ensureMirror(ctx context.Context, mirrorPath, repoURL, branch string) error
 	// if base_sha is genuinely absent the AddWorktree below fails clearly + the worker
 	// retries. So a fetch error never fails the job.
 	_ = gitops.Open(mirrorPath).FetchBranch(branch)
+	return nil
+}
+
+// runAgentHeartbeat spawns the agent CLI in dir and, WHILE it runs, keeps the lease
+// alive with periodic heartbeats. A real build/review can take longer than the lease
+// TTL; without this its lease would expire mid-run and the result be fenced as a
+// stale epoch (wasting the work + re-arming the job). Heartbeats fire at ~1/3 of the
+// TTL (min 20s). errb captures stderr for a useful failure message.
+func runAgentHeartbeat(ctx context.Context, c *client.Client, jobID string, epoch, ttlS int, dir, agentCmd string, env []string) error {
+	if agentCmd == "" {
+		return nil
+	}
+	cmd := exec.CommandContext(ctx, "sh", "-c", agentCmd)
+	cmd.Dir = dir
+	cmd.Env = env
+	var errb strings.Builder
+	cmd.Stderr = &errb
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("agent start: %w", err)
+	}
+	interval := ttlS / 3
+	if interval < 20 {
+		interval = 20
+	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(time.Duration(interval) * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				_, _, _ = c.Heartbeat(ctx, jobID, epoch)
+			}
+		}
+	}()
+	werr := cmd.Wait()
+	close(done)
+	if werr != nil {
+		return fmt.Errorf("agent cmd: %v: %s", werr, strings.TrimSpace(errb.String()))
+	}
 	return nil
 }
 
