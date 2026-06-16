@@ -371,7 +371,7 @@ func (s *Server) review(w http.ResponseWriter, r *http.Request) {
 	// on a passing gate, advance the branch point (§5.4) so the job reaches its
 	// terminal-for-M3 arm (merge_handoff by default; merging under self_merge).
 	if resp.Minted {
-		if final, derr := s.store.DispatchMerge(r.Context(), s.policy, store.DispatchMergeParams{JobID: jobID, Now: s.clock.Now()}); derr == nil {
+		if final, derr := s.store.DispatchMerge(r.Context(), s.facts, s.policy, store.DispatchMergeParams{JobID: jobID, Now: s.clock.Now()}); derr == nil {
 			resp.JobState = string(final)
 			s.broker.Publish(LifeEvent{JobID: jobID, State: string(final), Event: "merge_dispatched", Epoch: epoch})
 		}
@@ -514,11 +514,19 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		PushedRef string `json:"pushed_ref"`
 		BaseSHA   string `json:"base_sha"`
+		// Diff is the eng_worker's returned unified diff — UNTRUSTED DATA the M9
+		// content-integrity gate (§9.2, I-11) judges at the code_review stage.
+		Diff string `json:"diff"`
+		// BlastRadius is the worker's DECLARED scope (paths + scope), a commitment
+		// Flowbee verifies against the actual diff (§9.2b).
+		BlastRadius json.RawMessage `json:"blast_radius"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	resp, err := s.store.Result(r.Context(), store.ResultParams{
 		JobID: jobID, Epoch: epoch, IdempotencyKey: idemKey, Now: s.clock.Now(),
-		PushedRef: body.PushedRef,
+		PushedRef:           body.PushedRef,
+		PatchDiff:           body.Diff,
+		DeclaredBlastRadius: string(body.BlastRadius),
 	})
 	if err != nil {
 		s.writeFenceError(w, err)

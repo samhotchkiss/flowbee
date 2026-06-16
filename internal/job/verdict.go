@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+
+	"github.com/samhotchkiss/flowbee/internal/content"
 )
 
 // VerdictValue is the gate decision a reviewer claims and the engine derives.
@@ -113,6 +115,38 @@ type GateInputs struct {
 	Bounces   int          // current bounce count for this job
 	MaxBounce int
 	Policy    Policy
+	// Content is the deterministic content-integrity Result (§9.2, I-11): the
+	// runtime computes it from the stored patch + declared blast-radius and threads
+	// it in. A nil Content means the gate was not run (no patch) — treated as the
+	// SAFE default: not content-clear, so self_merge is denied and handoff forced.
+	// A non-nil, non-Eligible Result forces handoff regardless of the request
+	// (§5.4 conditions 2–4). It NEVER blocks minting the approval itself: a clean
+	// CI/approved diff still mints — it just cannot self-merge.
+	Content *content.Result
+}
+
+// SelfMergeEligible is the SINGLE canonical §5.4 predicate, evaluated by the core
+// (never the worker). self_merge is permitted IFF ALL of:
+//  1. THE ONE DECISION removed the human merge gate (Policy.AllowSelfMerge);
+//  2. path_denylist_clear         — §9.2(a) / content condition 2;
+//  3. blast_radius_consistent     — §9.2(b) / content condition 3;
+//  4. static_checks_pass          — §9.2(c) / content condition 4;
+//  5. integrated_head == reviewed_head — the verdict still binds to the reconciled
+//     SHA pair (any move supersedes; I-5). The verdict's tamper-evident hash IS the
+//     binding, so we Verify it against the facts.
+//
+// Conditions 2–4 are exactly the content-integrity gate (I-11); a nil chk (no
+// content gate ran) is NOT eligible (absence of proof is denial). If any condition
+// fails the flow takes handoff regardless of the reviewer's requested disposition.
+func SelfMergeEligible(v Verdict, gh DomainBFacts, chk *content.Result, p Policy) bool {
+	if !p.AllowSelfMerge {
+		return false
+	}
+	if chk == nil || !chk.Eligible() {
+		return false
+	}
+	// condition 5: the minted verdict must still bind to the reconciled SHA pair.
+	return v.Verify(gh.HeadSHA, gh.BaseSHA)
 }
 
 // GateOutcome is the pure result of evaluating the code_review gate.
@@ -146,14 +180,28 @@ func EvaluateGate(in GateInputs) GateOutcome {
 			}
 			return GateOutcome{Trigger: TriggerBounce, Reason: "approval claim failed reconciliation (CI not green / PR drift)"}
 		}
-		// disposition under policy (§5.4): self_merge is permitted iff THE ONE
-		// DECISION removed the human gate; otherwise every approval takes handoff.
+		// The verdict ALWAYS mints from green reconciled facts (I-9). The DISPOSITION
+		// is then promoted to self_merge ONLY when the §5.4 predicate holds — policy
+		// on AND the content-integrity gate is clear (denylist-clear ∧
+		// blast-radius-consistent ∧ static-checks-green, §9.2 / I-11). A reviewer that
+		// REQUESTS self_merge over a .github/workflows patch, a blast-radius-exceeding
+		// patch, or a non-applying/secret-tripping patch is forced to handoff —
+		// regardless of the request. We mint the verdict provisionally with the
+		// requested SHA pair, then run SelfMergeEligible (which also re-verifies the
+		// SHA binding) to decide the arm.
 		disp := Disposition(DispositionHandoff)
-		if in.Policy.AllowSelfMerge && in.Disp == DispositionSelfMerge {
+		provisional := MintVerdict(VerdictApproved, DispositionSelfMerge, in.Facts.HeadSHA, in.Facts.BaseSHA)
+		reason := "approved from reconciled facts -> handoff"
+		if in.Disp == DispositionSelfMerge && SelfMergeEligible(provisional, in.Facts, in.Content, in.Policy) {
 			disp = DispositionSelfMerge
+			reason = "approved from reconciled facts -> self_merge eligible (denylist-clear, blast-radius-consistent, static-checks-green)"
+		} else if in.Disp == DispositionSelfMerge {
+			// the reviewer asked for self_merge but the content gate (or policy/SHA)
+			// denied it: record WHY in the reason for the human reviewer.
+			reason = "self_merge requested but " + denyReason(in.Content, in.Policy)
 		}
 		v := MintVerdict(VerdictApproved, disp, in.Facts.HeadSHA, in.Facts.BaseSHA)
-		return GateOutcome{Trigger: TriggerApproved, Verdict: &v, Reason: "approved from reconciled facts"}
+		return GateOutcome{Trigger: TriggerApproved, Verdict: &v, Reason: reason}
 
 	default:
 		// an unknown / empty claim is treated as a non-approval bounce (defensive).
@@ -273,6 +321,27 @@ func EvaluateSpecGate(in SpecGateInputs) SpecGateOutcome {
 		return SpecGateOutcome{Trigger: TriggerBounceExhausted, Reason: "max_bounces reached"}
 	}
 	return SpecGateOutcome{Trigger: TriggerBounce, Reason: "changes_requested (conjunction not met)"}
+}
+
+// denyReason explains, for the human reviewer's attention queue, WHY a requested
+// self_merge was forced to handoff. Pure: a description over the content Result.
+func denyReason(chk *content.Result, p Policy) string {
+	if !p.AllowSelfMerge {
+		return "policy human-merge gate is ON (Branch A)"
+	}
+	if chk == nil {
+		return "no content-integrity gate ran (untrusted diff not cleared)"
+	}
+	switch {
+	case !chk.DenylistClear:
+		return "denylisted path touched (forced human gate, §9.2a)"
+	case !chk.BlastRadiusConsistent:
+		return "declared blast-radius does not match the actual diff (tamper signal, §9.2b)"
+	case !chk.StaticChecksPass:
+		return "deterministic static checks failed (§9.2c)"
+	default:
+		return "SHA moved since review (binding superseded)"
+	}
 }
 
 // gatePredicate is the deterministic reconciled-fact check the gate requires

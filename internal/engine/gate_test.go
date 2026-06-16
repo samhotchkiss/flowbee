@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/content"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
@@ -81,8 +82,21 @@ func TestDecideMergeDispatchBranch(t *testing.T) {
 	sm.Policy = job.Policy{AllowSelfMerge: true}
 	v := job.MintVerdict(job.VerdictApproved, job.DispositionSelfMerge, "h", "b")
 	sm.Job.Verdict = &v
+	// M9 (§5.4 conditions 2–5): self_merge also requires a clean content-integrity
+	// Result AND the verdict still bound to the reconciled SHA pair.
+	sm.GitHub = job.DomainBFacts{HeadSHA: "h", BaseSHA: "b"}
+	sm.Content = &content.Result{DenylistClear: true, BlastRadiusConsistent: true, StaticChecksPass: true}
 	d = Decide(sm, MergeDispatch{})
 	if len(d.Transitions) != 1 || d.Transitions[0].To != job.StateMerging {
 		t.Fatalf("policy-on self_merge dispatch should be merging: %+v", d.Transitions)
+	}
+
+	// the SAME verdict but a FAILING content Result (denylist hit) falls back to
+	// handoff even with policy on (M9, I-11).
+	tampered := sm
+	tampered.Content = &content.Result{DenylistClear: false, BlastRadiusConsistent: true, StaticChecksPass: true}
+	d = Decide(tampered, MergeDispatch{})
+	if len(d.Transitions) != 1 || d.Transitions[0].To != job.StateMergeHandoff {
+		t.Fatalf("self_merge over a denylisted diff must fall back to handoff: %+v", d.Transitions)
 	}
 }

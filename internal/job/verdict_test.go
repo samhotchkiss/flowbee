@@ -1,6 +1,16 @@
 package job
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/samhotchkiss/flowbee/internal/content"
+)
+
+// cleanContent is a content-integrity Result that passes all three §9.2 conditions
+// (the M9 prerequisite for self_merge eligibility).
+func cleanContent() *content.Result {
+	return &content.Result{DenylistClear: true, BlastRadiusConsistent: true, StaticChecksPass: true}
+}
 
 func greenFacts() DomainBFacts {
 	return DomainBFacts{PRExists: true, PRNumber: 7, HeadSHA: "head1", BaseSHA: "base1", CIGreen: true}
@@ -70,15 +80,93 @@ func TestGateMintsApprovalOnlyFromReconciledFacts(t *testing.T) {
 	}
 }
 
-// TestGateSelfMergeUnderPolicy: self_merge disposition is only honored when policy
-// allows it (Branch B); default (Branch A) forces handoff.
+// TestGateSelfMergeUnderPolicy: self_merge disposition is honored only when policy
+// allows it (Branch B) AND the M9 content-integrity gate is clear; default (Branch
+// A) or a failed content gate forces handoff.
 func TestGateSelfMergeUnderPolicy(t *testing.T) {
+	// policy ON + clean content -> self_merge honored.
 	out := EvaluateGate(GateInputs{
 		Claim: VerdictApproved, Disp: DispositionSelfMerge, Facts: greenFacts(), MaxBounce: 3,
-		Policy: Policy{AllowSelfMerge: true},
+		Policy: Policy{AllowSelfMerge: true}, Content: cleanContent(),
 	})
 	if out.Verdict == nil || out.Verdict.Disposition != DispositionSelfMerge {
-		t.Fatalf("policy-enabled self_merge should be honored: %+v", out)
+		t.Fatalf("policy-enabled self_merge over a clean diff should be honored: %+v", out)
+	}
+
+	// policy OFF (Branch A) -> handoff regardless of the clean content.
+	out = EvaluateGate(GateInputs{
+		Claim: VerdictApproved, Disp: DispositionSelfMerge, Facts: greenFacts(), MaxBounce: 3,
+		Policy: Policy{AllowSelfMerge: false}, Content: cleanContent(),
+	})
+	if out.Verdict == nil || out.Verdict.Disposition != DispositionHandoff {
+		t.Fatalf("Branch A must force handoff even over a clean diff: %+v", out)
+	}
+
+	// policy ON but NO content gate ran (nil) -> handoff (absence of proof is denial).
+	out = EvaluateGate(GateInputs{
+		Claim: VerdictApproved, Disp: DispositionSelfMerge, Facts: greenFacts(), MaxBounce: 3,
+		Policy: Policy{AllowSelfMerge: true}, Content: nil,
+	})
+	if out.Verdict == nil || out.Verdict.Disposition != DispositionHandoff {
+		t.Fatalf("a nil content Result must force handoff: %+v", out)
+	}
+}
+
+// TestGateContentFailureForcesHandoff is the M9 §5.4 conditions-2–4 truth: an
+// approved + self_merge request over a diff that hits the denylist, exceeds its
+// declared blast-radius, or fails static checks STILL mints the approval but is
+// forced to handoff (I-11). The verdict is never blocked — only its disposition.
+func TestGateContentFailureForcesHandoff(t *testing.T) {
+	cases := []struct {
+		name string
+		chk  *content.Result
+	}{
+		{"denylist_hit", &content.Result{DenylistClear: false, BlastRadiusConsistent: true, StaticChecksPass: true}},
+		{"blast_radius_exceeded", &content.Result{DenylistClear: true, BlastRadiusConsistent: false, StaticChecksPass: true}},
+		{"static_checks_failed", &content.Result{DenylistClear: true, BlastRadiusConsistent: true, StaticChecksPass: false}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := EvaluateGate(GateInputs{
+				Claim: VerdictApproved, Disp: DispositionSelfMerge, Facts: greenFacts(), MaxBounce: 3,
+				Policy: Policy{AllowSelfMerge: true}, Content: tc.chk,
+			})
+			if out.Trigger != TriggerApproved || out.Verdict == nil {
+				t.Fatalf("a green-CI approval must still mint the verdict (I-9): %+v", out)
+			}
+			if out.Verdict.Disposition != DispositionHandoff {
+				t.Fatalf("%s must force handoff despite the self_merge request: %+v", tc.name, out)
+			}
+		})
+	}
+}
+
+// TestSelfMergeEligiblePredicate exercises the SINGLE canonical §5.4 predicate
+// directly across all six conditions.
+func TestSelfMergeEligiblePredicate(t *testing.T) {
+	gh := greenFacts()
+	v := MintVerdict(VerdictApproved, DispositionSelfMerge, gh.HeadSHA, gh.BaseSHA)
+
+	if !SelfMergeEligible(v, gh, cleanContent(), Policy{AllowSelfMerge: true}) {
+		t.Fatal("all conditions met must be eligible")
+	}
+	// condition 1: policy off.
+	if SelfMergeEligible(v, gh, cleanContent(), Policy{AllowSelfMerge: false}) {
+		t.Fatal("policy off must deny")
+	}
+	// conditions 2–4: any content failure denies.
+	if SelfMergeEligible(v, gh, &content.Result{DenylistClear: false, BlastRadiusConsistent: true, StaticChecksPass: true}, Policy{AllowSelfMerge: true}) {
+		t.Fatal("denylist hit must deny")
+	}
+	// nil content denies.
+	if SelfMergeEligible(v, gh, nil, Policy{AllowSelfMerge: true}) {
+		t.Fatal("nil content must deny")
+	}
+	// condition 5: a SHA move since the mint supersedes the binding.
+	moved := gh
+	moved.HeadSHA = "head-moved"
+	if SelfMergeEligible(v, moved, cleanContent(), Policy{AllowSelfMerge: true}) {
+		t.Fatal("a moved head SHA must deny (binding superseded)")
 	}
 }
 

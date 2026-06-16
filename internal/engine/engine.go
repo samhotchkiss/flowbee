@@ -9,6 +9,7 @@ package engine
 import (
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/content"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/liveness"
@@ -24,6 +25,12 @@ type EngineState struct {
 	GitHub job.DomainBFacts // reconciled-IN facts (M3: from a stubbed FactSource)
 	Policy job.Policy       // THE ONE DECISION (§14): AllowSelfMerge
 	Spec   SpecState        // spec-flow inputs (M7): the CURRENT content hash + lenses
+	// Content is the deterministic content-integrity Result (§9.2, I-11), computed
+	// by the runtime from the stored patch + declared blast-radius and passed IN as
+	// a value (the engine never runs the checks itself — it stays a pure function of
+	// persisted facts). nil means the gate did not run: the SAFE default is "not
+	// self_merge-eligible" (handoff forced). The §5.4 conditions 2–4 read it.
+	Content *content.Result
 }
 
 // SpecState carries the spec-flow ground truth the gate reasons over (§11.5):
@@ -326,6 +333,7 @@ func Decide(s EngineState, e Event) Decision {
 			Bounces:   s.Job.Bounces,
 			MaxBounce: s.Job.MaxBounces,
 			Policy:    s.Policy,
+			Content:   s.Content, // §9.2 / I-11: forces handoff if the diff is not clear
 		})
 		switch out.Trigger {
 		case job.TriggerApproved:
@@ -409,8 +417,14 @@ func Decide(s EngineState, e Event) Decision {
 		if s.Job.State != job.StateMergeable {
 			return Decision{Reject: &RejectReason{Reason: "job not mergeable"}}
 		}
-		if s.Policy.AllowSelfMerge && s.Job.Verdict != nil &&
-			s.Job.Verdict.Disposition == job.DispositionSelfMerge {
+		// the branch arm is decided by the SINGLE canonical §5.4 predicate over the
+		// MINTED verdict + reconciled facts + the content-integrity Result + policy.
+		// self_merge is reachable only when the verdict carried the self_merge
+		// disposition (the gate already enforced content/policy at mint time) AND the
+		// predicate STILL holds (re-checks content + the SHA binding here — condition
+		// 5: a SHA move since the mint supersedes and falls back to handoff, I-5).
+		if s.Job.Verdict != nil && s.Job.Verdict.Disposition == job.DispositionSelfMerge &&
+			job.SelfMergeEligible(*s.Job.Verdict, s.GitHub, s.Content, s.Policy) {
 			return Decision{Transitions: []Transition{{
 				From: job.StateMergeable, To: job.StateMerging, Kind: ledger.KindMergeStarted,
 			}}}

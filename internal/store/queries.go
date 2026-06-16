@@ -343,6 +343,13 @@ type ResultParams struct {
 	// (§7.3). Flowbee records it on the job so it can validate+promote it (the full
 	// PR-open trigger is M7); an empty value (e.g. a review result) is ignored.
 	PushedRef string
+	// PatchDiff is the eng_worker's returned diff (§7.3) — UNTRUSTED DATA the M9
+	// content-integrity gate (§9.2, I-11) judges. Stored verbatim at build-result
+	// time; the code_review gate later runs the deterministic checks over it.
+	PatchDiff string
+	// DeclaredBlastRadius is the worker's DECLARED scope (paths + scope), a
+	// commitment Flowbee verifies against the actual diff (§9.2b). JSON-encoded.
+	DeclaredBlastRadius string
 }
 
 // ResultResponse is the cached/applied response for a result POST.
@@ -414,12 +421,14 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 				       builder_identity     = COALESCE(builder_identity, bound_identity),
 				       builder_model_family = COALESCE(builder_model_family, bound_model_family),
 				       head_ref = COALESCE(NULLIF(?, ''), head_ref),
+				       patch_diff = ?, declared_blast_radius = ?,
 				       lease_id = NULL, bound_identity = NULL,
 				       bound_model_family = NULL, lease_hb_due = NULL,
 				       eng_worker_job = COALESCE(eng_worker_job, id),
 				       updated_at = datetime('now')
 				 WHERE id = ?`,
-				string(final), marshalStrings([]string{"role:code_reviewer"}), p.PushedRef, p.JobID); err != nil {
+				string(final), marshalStrings([]string{"role:code_reviewer"}), p.PushedRef,
+				p.PatchDiff, p.DeclaredBlastRadius, p.JobID); err != nil {
 				return fmt.Errorf("apply result projection: %w", err)
 			}
 			// arm the review-stage no_eligible_worker alarm (I-6): if no compliant,

@@ -240,11 +240,23 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			return err
 		}
 
+		// M9 (§9.2, I-11): run the deterministic content-integrity gate over the
+		// stored (untrusted) patch + declared blast-radius and thread the Result into
+		// the pure engine. A denylist hit / blast-radius mismatch / failed static
+		// check forces handoff regardless of the reviewer's self_merge request.
+		chk, err := contentResultTx(ctx, tx, in.JobID)
+		if err != nil {
+			return err
+		}
+
 		dec := engine.Decide(engine.EngineState{
-			Job: j, Now: in.Now, Epoch: j.LeaseEpoch, GitHub: facts, Policy: p,
+			Job: j, Now: in.Now, Epoch: j.LeaseEpoch, GitHub: facts, Policy: p, Content: &chk,
 		}, engine.ReviewClaim{Epoch: in.Epoch, Value: in.Claim, Disposition: in.Disposition})
 		if dec.Reject != nil {
 			return lease.ErrStaleEpoch
+		}
+		if err := persistContentResultTx(ctx, tx, in.JobID, chk); err != nil {
+			return err
 		}
 
 		nextSeq := seq
@@ -362,17 +374,33 @@ type DispatchMergeParams struct {
 }
 
 // DispatchMerge moves a `mergeable` job to merge_handoff (default) or merging
-// (self_merge, only when policy enabled it AND the minted verdict carried it). The
-// engine decides the arm purely from the persisted verdict + policy. Returns the
-// resulting state.
-func (s *Store) DispatchMerge(ctx context.Context, p job.Policy, in DispatchMergeParams) (job.State, error) {
+// (self_merge, only when policy enabled it AND the minted verdict carried it AND
+// the §5.4 content/SHA predicate STILL holds). The engine decides the arm purely
+// from the persisted verdict + reconciled facts + the content Result + policy.
+// Returns the resulting state.
+func (s *Store) DispatchMerge(ctx context.Context, src FactSource, p job.Policy, in DispatchMergeParams) (job.State, error) {
+	// reconcile facts OUTSIDE the tx (read-only) for the §5.4 condition-5 SHA
+	// re-binding; a nil/erroring source leaves facts zero (self_merge then denied,
+	// the safe default — handoff).
+	var facts job.DomainBFacts
+	if src != nil {
+		if f, _, ferr := src.Facts(ctx, in.JobID); ferr == nil {
+			facts = f
+		}
+	}
 	var final job.State
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		j, seq, err := loadJobTx(ctx, tx, in.JobID)
 		if err != nil {
 			return err
 		}
-		dec := engine.Decide(engine.EngineState{Job: j, Now: in.Now, Epoch: j.LeaseEpoch, Policy: p}, engine.MergeDispatch{})
+		chk, err := contentResultTx(ctx, tx, in.JobID)
+		if err != nil {
+			return err
+		}
+		dec := engine.Decide(engine.EngineState{
+			Job: j, Now: in.Now, Epoch: j.LeaseEpoch, Policy: p, GitHub: facts, Content: &chk,
+		}, engine.MergeDispatch{})
 		if dec.Reject != nil {
 			return fmt.Errorf("dispatch merge: %s", dec.Reject.Reason)
 		}

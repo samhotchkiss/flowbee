@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/samhotchkiss/flowbee/client"
+	"github.com/samhotchkiss/flowbee/internal/content"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 )
 
@@ -132,6 +133,13 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 		_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
 		return out, fmt.Errorf("agent produced no changes")
 	}
+	// the unified diff against base is the UNTRUSTED work-product the M9
+	// content-integrity gate (§9.2, I-11) judges. We compute it BEFORE the commit so
+	// the staged tree is captured; an error here is non-fatal (the gate then runs
+	// over an empty diff — the safe default is not-eligible only if the worker also
+	// asked for self_merge).
+	diff, _ := wt.Diff()
+
 	sha, ref, err := wt.CommitAndPushEpoch(grant.JobID, grant.LeaseEpoch,
 		fmt.Sprintf("flowbee: %s build %s@e%d", cfg.Identity, grant.JobID, grant.LeaseEpoch))
 	if err != nil {
@@ -140,13 +148,18 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	out.PushedRef, out.PushedSHA = ref, sha
 
 	// ── submit the real patch result (fenced, idempotent), then release (§7.1) ──
+	// An HONEST worker declares exactly the paths its diff touches; Flowbee verifies
+	// the declaration against the actual diff (§9.2b) — they agree for an honest
+	// worker and diverge for a tampering one.
 	idem := fmt.Sprintf("%s-e%d", grant.JobID, grant.LeaseEpoch)
 	body := map[string]any{
 		"kind":       "patch",
 		"base_sha":   grant.BaseSHA,
 		"pushed_ref": ref,
+		"diff":       diff,
 		"blast_radius": map[string]any{
 			"scope": "worktree",
+			"paths": content.TouchedPaths(diff),
 		},
 		"status": "succeeded", // a HINT only — never the verdict (I-9)
 	}

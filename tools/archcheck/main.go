@@ -18,6 +18,9 @@ var corePackages = []string{
 	"github.com/samhotchkiss/flowbee/internal/ledger",
 	"github.com/samhotchkiss/flowbee/internal/lease",
 	"github.com/samhotchkiss/flowbee/internal/liveness",
+	// content (the I-11 gate) is consumed by the deterministic core via
+	// EngineState.Content, so it must itself stay clock/rand/ULID/GitHub-free.
+	"github.com/samhotchkiss/flowbee/internal/content",
 }
 
 // Forbidden import path prefixes. (time is intentionally allowed: the core uses
