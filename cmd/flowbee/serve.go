@@ -12,6 +12,7 @@ import (
 
 	"github.com/samhotchkiss/flowbee/internal/alarm"
 	"github.com/samhotchkiss/flowbee/internal/api"
+	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/config"
 	"github.com/samhotchkiss/flowbee/internal/github"
@@ -46,6 +47,18 @@ func runServe(_ []string) error {
 
 	st.NoEligibleWorkerDelay = cfg.NoEligibleWorker()
 
+	// worker-transport mutual auth (§7.6): when a signing secret is configured the
+	// private API requires a signed per-worker bearer token bound to an enrolled
+	// identity — the trust boundary a non-loopback (Tailscale/LAN) listener needs.
+	// Empty secret = loopback-only dev (no mutual auth). mTLS is the documented
+	// alternative (auth.MTLSConfig); it needs a CA + per-worker certs (real infra),
+	// so it is not the default in-env path.
+	var authn auth.Authenticator
+	if cfg.WorkerAuthSecret != "" {
+		authn = auth.NewBearer([]byte(cfg.WorkerAuthSecret), cfg.EnrolledIdentities, cfg.AuthLoopbackBypass)
+		logger.Info("worker mutual-auth enabled", "enrolled", len(cfg.EnrolledIdentities), "loopback_bypass", cfg.AuthLoopbackBypass)
+	}
+
 	srv := api.New(st, clock.Real{}, ulid.NewMinter(nil), api.Config{
 		LeaseTTL:           cfg.LeaseTTL(),
 		HeartbeatInterval:  cfg.HeartbeatInterval(),
@@ -55,7 +68,8 @@ func runServe(_ []string) error {
 		// same-box `worktree` provisioning: hand workers the shared bare mirror so
 		// they can add a per-lease worktree at base_sha and push to the epoch ref
 		// (§7.4). Empty disables local provisioning hints.
-		MirrorPath: os.Getenv("FLOWBEE_MIRROR_PATH"),
+		MirrorPath:    os.Getenv("FLOWBEE_MIRROR_PATH"),
+		Authenticator: authn,
 	}, version)
 	healthSrv := &http.Server{Addr: cfg.HealthAddr, Handler: srv.HealthHandler()}
 	privateSrv := &http.Server{Addr: cfg.PrivateAddr, Handler: srv.PrivateHandler()}

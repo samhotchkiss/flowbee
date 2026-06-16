@@ -34,6 +34,9 @@ type HarnessConfig struct {
 	OS   string
 	// Capabilities are CLAIMED at registration; the server attests them.
 	Capabilities []string
+	// BearerToken is the signed per-worker token (§7.6) for a non-loopback
+	// (cross-box) listener. Empty on loopback (the server's loopback bypass).
+	BearerToken string
 }
 
 // HarnessOutcome reports what one lease cycle did.
@@ -64,7 +67,7 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 		caps = []string{"role:eng_worker", "model_family:" + cfg.ModelFamily, "arch:" + arch, "os:" + osName}
 	}
 
-	c := client.New(cfg.BaseURL)
+	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	if _, err := c.Register(ctx, client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 	}); err != nil {

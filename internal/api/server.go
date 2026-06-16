@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/engine"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
@@ -46,6 +47,9 @@ type Server struct {
 	mirrorPath string
 	// staleHB is the roster's stale-heartbeat threshold (§12.6.2).
 	staleHB time.Duration
+	// authn is the worker-transport authenticator (§7.6). Nil = loopback-only dev
+	// (no mutual auth); set for a non-loopback listener (bearer token / mTLS).
+	authn auth.Authenticator
 }
 
 // Config carries the timing knobs the worker API needs.
@@ -71,6 +75,12 @@ type Config struct {
 	// StaleHBThreshold badges a worker stale on the roster after this idle gap
 	// (§12.6.2). Defaults to 3× the heartbeat interval.
 	StaleHBThreshold time.Duration
+	// Authenticator is the worker-transport trust boundary (§7.6): every private
+	// worker-API call is authenticated against the enrolled-identity allowlist
+	// before it can lease job context. Nil = loopback-only dev (no mutual auth);
+	// a non-loopback listener MUST set it (bearer token or mTLS). The bound,
+	// unforgeable identity it returns overrides any self-asserted query param.
+	Authenticator auth.Authenticator
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -108,6 +118,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		pollInterval: poll,
 		mirrorPath:   cfg.MirrorPath,
 		staleHB:      staleHB,
+		authn:        cfg.Authenticator,
 	}
 }
 
@@ -121,21 +132,44 @@ func (s *Server) HealthHandler() http.Handler {
 	return mux
 }
 
-// PrivateHandler serves the worker API + SSE + board (loopback / Tailscale only).
+// PrivateHandler serves the worker API + SSE + dashboard (loopback / Tailscale
+// only). When an Authenticator is configured (§7.6), the mutating worker-protocol
+// routes are wrapped in mutual-auth middleware: an unenrolled caller is rejected
+// 401 and never reaches a handler — it cannot lease job context. The read-only
+// dashboard/SSE views are served without auth (they expose no Domain-A write and
+// bind to loopback/Tailscale).
 func (s *Server) PrivateHandler() http.Handler {
+	// the authenticated worker-protocol surface (every mutating call + lease).
+	worker := http.NewServeMux()
+	worker.HandleFunc("POST /v1/workers/register", s.register)
+	worker.HandleFunc("GET /v1/lease", s.lease)
+	worker.HandleFunc("POST /v1/jobs/{job}/heartbeat", s.heartbeat)
+	worker.HandleFunc("POST /v1/jobs/{job}/result", s.result)
+	worker.HandleFunc("POST /v1/jobs/{job}/review", s.review)
+	worker.HandleFunc("POST /v1/jobs/{job}/spec", s.specSubmit)
+	worker.HandleFunc("POST /v1/jobs/{job}/spec-review", s.specReview)
+	worker.HandleFunc("POST /v1/jobs/{job}/release", s.release)
+	authed := auth.Middleware(s.authn, worker)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/workers/register", s.register)
-	mux.HandleFunc("GET /v1/lease", s.lease)
-	mux.HandleFunc("POST /v1/jobs/{job}/heartbeat", s.heartbeat)
-	mux.HandleFunc("POST /v1/jobs/{job}/result", s.result)
-	mux.HandleFunc("POST /v1/jobs/{job}/review", s.review)
-	mux.HandleFunc("POST /v1/jobs/{job}/spec", s.specSubmit)
-	mux.HandleFunc("POST /v1/jobs/{job}/spec-review", s.specReview)
-	mux.HandleFunc("POST /v1/jobs/{job}/release", s.release)
+	// worker-protocol routes go through the authenticated surface.
+	for _, p := range []string{
+		"POST /v1/workers/register", "GET /v1/lease",
+		"POST /v1/jobs/{job}/heartbeat", "POST /v1/jobs/{job}/result",
+		"POST /v1/jobs/{job}/review", "POST /v1/jobs/{job}/spec",
+		"POST /v1/jobs/{job}/spec-review", "POST /v1/jobs/{job}/release",
+	} {
+		mux.Handle(p, authed)
+	}
+	// read-only dashboard + live feed (board / roster / budget / audit / cost, SSE).
 	mux.HandleFunc("GET /v1/events", s.eventsHandler)
 	mux.HandleFunc("GET /v1/budget", s.budgetJSON)
 	mux.HandleFunc("GET /v1/roster", s.rosterJSON)
+	mux.HandleFunc("GET /v1/audit", s.auditJSON)
+	mux.HandleFunc("GET /v1/cost", s.costJSON)
+	mux.HandleFunc("GET /v1/needs-human", s.needsHumanJSON)
 	mux.HandleFunc("GET /roster", s.rosterPage)
+	mux.HandleFunc("GET /dashboard", s.dashboard)
 	mux.HandleFunc("GET /", s.board)
 	return mux
 }
@@ -149,6 +183,79 @@ func (s *Server) budgetJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, g)
+}
+
+// auditJSON serves the GitHub audit log (§3.3): every project-OUT action keyed
+// (job_id, action, head_sha). The dashboard's audit pane reads this.
+func (s *Server) auditJSON(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.store.AllAudit(r.Context())
+	if err != nil {
+		http.Error(w, "audit error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
+// costJSON serves the per-job cost meter (§6.7, I-15): tokens + micro-USD + over
+// budget, for the dashboard cost pane.
+func (s *Server) costJSON(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.store.AllJobCost(r.Context())
+	if err != nil {
+		http.Error(w, "cost error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
+// needsHumanJSON serves the unified needs_human chokepoint (§12.6.1): every job
+// that escalated, tagged with the trigger (attempts | bounces | cost | stall).
+func (s *Server) needsHumanJSON(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.store.NeedsHumanView(r.Context())
+	if err != nil {
+		http.Error(w, "needs_human error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
+// dashboard renders the finished operator UI (§12.6): board + roster + budget +
+// audit + cost in one live page, refreshed off the SSE feed.
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	board, err := s.store.BoardSnapshot(ctx)
+	if err != nil {
+		http.Error(w, "dashboard error", http.StatusInternalServerError)
+		return
+	}
+	roster, err := s.store.Roster(ctx, s.clock.Now(), s.staleHB)
+	if err != nil {
+		http.Error(w, "dashboard error", http.StatusInternalServerError)
+		return
+	}
+	budget, err := s.store.RateLimit(ctx)
+	if err != nil {
+		http.Error(w, "dashboard error", http.StatusInternalServerError)
+		return
+	}
+	cost, err := s.store.AllJobCost(ctx)
+	if err != nil {
+		http.Error(w, "dashboard error", http.StatusInternalServerError)
+		return
+	}
+	audit, err := s.store.AllAudit(ctx)
+	if err != nil {
+		http.Error(w, "dashboard error", http.StatusInternalServerError)
+		return
+	}
+	needsHuman, err := s.store.NeedsHumanView(ctx)
+	if err != nil {
+		http.Error(w, "dashboard error", http.StatusInternalServerError)
+		return
+	}
+	renderDashboard(w, dashboardData{
+		Board: board, Roster: roster, Budget: budget,
+		Cost: cost, Audit: audit, NeedsHuman: needsHuman,
+	})
 }
 
 // rosterJSON serves the worker roster as JSON (§12.6.2).
@@ -227,7 +334,13 @@ type LeaseGrant struct {
 // it (the claim also rejects, belt-and-suspenders), so the job stays `ready` and
 // its no_eligible_worker alarm can fire (I-6).
 func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
+	// The identity is the CREDENTIAL-BOUND one (§7.6: unforgeable), not the
+	// self-asserted query param, whenever the request was authenticated. This is
+	// the boundary that stops an enrolled box from leasing as someone else.
 	identity := r.URL.Query().Get("identity")
+	if bound, ok := auth.IdentityFrom(r); ok {
+		identity = bound
+	}
 	family := r.URL.Query().Get("model_family")
 	roleFilter := job.Role(r.URL.Query().Get("role"))
 

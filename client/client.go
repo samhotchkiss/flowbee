@@ -17,10 +17,27 @@ import (
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
+	// BearerToken is the signed per-worker token (DESIGN §7.6) presented on every
+	// call as Authorization: Bearer. Empty on a loopback dev client (the server's
+	// loopback bypass accepts it); REQUIRED for a non-loopback listener.
+	BearerToken string
 }
 
 func New(baseURL string) *Client {
 	return &Client{BaseURL: baseURL, HTTP: http.DefaultClient}
+}
+
+// NewWithToken builds a client that authenticates with a signed bearer token —
+// the cross-box (non-loopback) path (§7.6).
+func NewWithToken(baseURL, token string) *Client {
+	return &Client{BaseURL: baseURL, HTTP: http.DefaultClient, BearerToken: token}
+}
+
+// authHeader sets Authorization: Bearer when a token is configured.
+func (c *Client) authHeader(req *http.Request) {
+	if c.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.BearerToken)
+	}
 }
 
 // Registration mirrors the server-side enrollment payload. Arch/OS are the
@@ -90,6 +107,7 @@ func (c *Client) LeaseWithLens(ctx context.Context, identity, family, role, lens
 	if err != nil {
 		return LeaseGrant{}, false, err
 	}
+	c.authHeader(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return LeaseGrant{}, false, err
@@ -248,6 +266,7 @@ func (c *Client) postJSONStatus(ctx context.Context, path string, headers map[st
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.authHeader(req)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -256,6 +275,12 @@ func (c *Client) postJSONStatus(ctx context.Context, path string, headers map[st
 		return 0, err
 	}
 	defer resp.Body.Close()
+	// Auth failures are surfaced as errors: a worker that is not an enrolled
+	// identity (§7.6) must SEE the rejection, not silently treat it as a no-op.
+	// (Fencing 409s are NOT errors here — callers branch on the returned status.)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return resp.StatusCode, statusErr(resp)
+	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 && out != nil {
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
 			return resp.StatusCode, err

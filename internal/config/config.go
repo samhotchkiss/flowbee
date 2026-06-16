@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -25,6 +26,20 @@ type Config struct {
 	// NoEligibleWorkerS is how long a `ready` job may sit with no compliant
 	// worker before the no_eligible_worker alarm fires (I-6, §6.6).
 	NoEligibleWorkerS int `yaml:"no_eligible_worker_s"`
+
+	// WorkerAuthSecret is the HMAC key that signs per-worker bearer tokens
+	// (DESIGN §7.6). When set, the private worker API requires mutual auth: every
+	// call carries a signed token bound to an enrolled identity, and an unenrolled
+	// caller is rejected 401 before it can lease job context. Empty = loopback-only
+	// dev (no mutual auth — the listener must stay on 127.0.0.1). Set via
+	// FLOWBEE_WORKER_AUTH_SECRET for any non-loopback (Tailscale/LAN) listener.
+	WorkerAuthSecret string `yaml:"worker_auth_secret"`
+	// EnrolledIdentities is the allowlist of worker identities permitted to
+	// authenticate (§7.6). Set via FLOWBEE_ENROLLED_IDENTITIES (comma-separated).
+	EnrolledIdentities []string `yaml:"enrolled_identities"`
+	// AuthLoopbackBypass lets same-box (127.0.0.1) workers skip the token even when
+	// WorkerAuthSecret is set (§12.4 "bearer fallback on loopback"). Default true.
+	AuthLoopbackBypass bool `yaml:"auth_loopback_bypass"`
 }
 
 func Default() Config {
@@ -39,6 +54,7 @@ func Default() Config {
 		RiverMaxWorkers:    10,
 		LogLevel:           "info",
 		NoEligibleWorkerS:  120,
+		AuthLoopbackBypass: true,
 	}
 }
 
@@ -106,6 +122,25 @@ func applyEnv(c *Config) {
 	if v := envInt("FLOWBEE_NO_ELIGIBLE_WORKER_S"); v > 0 {
 		c.NoEligibleWorkerS = v
 	}
+	if v := os.Getenv("FLOWBEE_WORKER_AUTH_SECRET"); v != "" {
+		c.WorkerAuthSecret = v
+	}
+	if v := os.Getenv("FLOWBEE_ENROLLED_IDENTITIES"); v != "" {
+		c.EnrolledIdentities = splitCSV(v)
+	}
+	if v := os.Getenv("FLOWBEE_AUTH_LOOPBACK_BYPASS"); v != "" {
+		c.AuthLoopbackBypass = v == "1" || v == "true"
+	}
+}
+
+func splitCSV(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envInt(key string) int {

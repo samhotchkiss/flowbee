@@ -230,6 +230,37 @@ func (s *Store) FlowCostRollup(ctx context.Context, flowID string) (FlowCostRoll
 	return rollup, rows.Err()
 }
 
+// AllJobCost returns the per-job cost meter for every job (§6.7, I-15): the
+// dashboard cost pane reads this to show tokens + micro-USD + over-budget across
+// the whole board, complementing FlowCostRollup's per-feature view.
+func (s *Store) AllJobCost(ctx context.Context) ([]FlowCostRow, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, flow, stage, role, state,
+		       cost_tokens_in, cost_tokens_out, cost_micro_usd, cost_ceiling_micro_usd, over_budget
+		  FROM jobs ORDER BY cost_micro_usd DESC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FlowCostRow
+	for rows.Next() {
+		var r FlowCostRow
+		var ceiling sql.NullInt64
+		var over int
+		if err := rows.Scan(&r.JobID, &r.Flow, &r.Stage, &r.Role, &r.State,
+			&r.TokensIn, &r.TokensOut, &r.MicroUSD, &ceiling, &over); err != nil {
+			return nil, err
+		}
+		if ceiling.Valid {
+			c := ceiling.Int64
+			r.CeilingMicroUSD = &c
+		}
+		r.OverBudget = over != 0
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // NeedsHumanRow is one job in the unified needs_human chokepoint (§12.6.1): the
 // operator's primary attention queue, where all four escalation triggers deposit.
 type NeedsHumanRow struct {

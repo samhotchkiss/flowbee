@@ -53,9 +53,11 @@ func runWork(args []string) error {
 		return nil
 	}
 
+	token := os.Getenv("FLOWBEE_WORKER_TOKEN")
 	run := func() error {
 		out, err := worker.RunOnceHarness(ctx, worker.HarnessConfig{
-			BaseURL: url, Identity: *identity, ModelFamily: *family, Role: *role, AgentCmd: *agentCmd,
+			BaseURL: url, Identity: *identity, ModelFamily: *family, Role: *role,
+			AgentCmd: *agentCmd, BearerToken: token,
 		})
 		if err != nil {
 			return err
@@ -91,7 +93,7 @@ func runLease(args []string) error {
 		return err
 	}
 	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
-	c := client.New(url)
+	c := client.NewWithToken(url, os.Getenv("FLOWBEE_WORKER_TOKEN"))
 	grant, ok, err := c.Lease(context.Background(), *identity, *family, *role)
 	if err != nil {
 		return err
@@ -128,7 +130,7 @@ func runSubmit(args []string) error {
 		return fmt.Errorf("--job is required")
 	}
 	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
-	c := client.New(url)
+	c := client.NewWithToken(url, os.Getenv("FLOWBEE_WORKER_TOKEN"))
 	ctx := context.Background()
 
 	switch *action {
