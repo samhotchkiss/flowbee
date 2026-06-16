@@ -448,6 +448,22 @@ func (w *Worktree) Diff() (string, error) {
 	return out, nil
 }
 
+// DiffAgainst returns the unified diff of the worktree against an EXPLICIT ref —
+// used by the worker-push harness to compute the FULL change vs main even when the
+// worktree was cut from the issue-branch tip (a revise stacks on prior commits, but
+// the content gate + reviewer want the whole PR change vs the integration base). It
+// stages everything first so new files are included. Call BEFORE committing.
+func (w *Worktree) DiffAgainst(ref string) (string, error) {
+	if _, err := run(w.Dir, "git", "add", "-A"); err != nil {
+		return "", fmt.Errorf("stage: %w", err)
+	}
+	out, err := run(w.Dir, "git", "diff", "--cached", ref)
+	if err != nil {
+		return "", fmt.Errorf("diff: %w", err)
+	}
+	return out, nil
+}
+
 // CommitAndPushEpoch commits the worktree's changes and pushes them to the
 // epoch-namespaced ref on the mirror (DESIGN §3.5: the worker pushes HERE, never
 // to a branch). Returns the pushed commit SHA. No credentials are involved — the

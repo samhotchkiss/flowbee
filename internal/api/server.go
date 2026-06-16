@@ -1010,8 +1010,21 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 		// behalf (credential-less bundle path), it commits WITH this message so the
 		// issue-branch history carries the node author's account of the change.
 		CommitMessage string `json:"commit_message"`
+		// PushedBranch + HeadSHA are the WORKER-PUSH signal: a node that holds a key
+		// committed its own work and pushed it to flowbee/issue-N on GitHub itself
+		// (build-list: "each node commits"). The control plane then does NOT apply or
+		// re-push anything — it just opens the PR (it stays the sole GitHub-API caller +
+		// merger). HeadSHA is the commit the node pushed; the diff still rides along for
+		// the content gate + the reviewer.
+		PushedBranch string `json:"pushed_branch"`
+		HeadSHA      string `json:"head_sha"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	// worker-push: the node already published its commit to the issue branch on
+	// GitHub. Record the pushed SHA as the head marker; skip the control-plane apply
+	// + branch-push entirely (the worker did the git write with its own key).
+	workerPushed := body.PushedBranch != "" && body.HeadSHA != ""
 
 	// F3 — credential-less cross-box write path (§7.4 bundle/scoped-read, R4/§8).
 	// A worker that was provisioned read-only (a bundle) holds NO git write path and
@@ -1024,7 +1037,10 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 	// GitHub. The patch is untrusted data: a malformed/hostile diff fails to apply in
 	// the disposable worktree and the result is declined (it cannot corrupt the mirror).
 	pushedRef := body.PushedRef
-	if s.bundleProvisioning && pushedRef == "" && body.Diff != "" && s.mirrorPath != "" && body.BaseSHA != "" {
+	if workerPushed {
+		// the worker pushed the branch itself: head_ref marker = the pushed commit.
+		pushedRef = body.HeadSHA
+	} else if s.bundleProvisioning && pushedRef == "" && body.Diff != "" && s.mirrorPath != "" && body.BaseSHA != "" {
 		applyMsg := body.CommitMessage
 		if strings.TrimSpace(applyMsg) == "" {
 			applyMsg = "flowbee: applied bundle-worker patch " + jobID
@@ -1056,13 +1072,25 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 	// token, then enqueues the PR-open. The worker holds no credential; Flowbee does
 	// the GitHub write. Best-effort: a publish failure leaves the job review_pending
 	// for a retry and never fails the accepted result.
-	if resp.JobState == string(job.StateReviewPending) && s.pushRemoteURL != "" && s.mirrorPath != "" && pushedRef != "" {
-		if sha, ok := gitops.Open(s.mirrorPath).RefSHA(pushedRef); ok {
-			branch := store.IssueBranch(s.store.ResolveIssueNum(r.Context(), jobID), jobID)
-			if err := gitops.Open(s.mirrorPath).PushCommit(s.pushRemoteURL, sha, branch); err != nil {
-				s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "pr_branch_push_failed", Epoch: epoch})
-			} else if _, err := s.store.EnqueuePROpen(r.Context(), jobID, sha, "main"); err == nil {
+	if resp.JobState == string(job.StateReviewPending) {
+		switch {
+		case workerPushed:
+			// worker-push: the node already pushed flowbee/issue-N to GitHub. The control
+			// plane does NO git write — it just opens the PR (sole GitHub-API caller +
+			// merger). Idempotent enqueue keyed on the pushed head.
+			if _, err := s.store.EnqueuePROpen(r.Context(), jobID, body.HeadSHA, "main"); err == nil {
 				s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "pr_open_enqueued", Epoch: epoch})
+			}
+		case s.pushRemoteURL != "" && s.mirrorPath != "" && pushedRef != "":
+			// credential-less path: the worker pushed only a local epoch ref; the control
+			// plane publishes that commit to GitHub as the branch, then opens the PR.
+			if sha, ok := gitops.Open(s.mirrorPath).RefSHA(pushedRef); ok {
+				branch := store.IssueBranch(s.store.ResolveIssueNum(r.Context(), jobID), jobID)
+				if err := gitops.Open(s.mirrorPath).PushCommit(s.pushRemoteURL, sha, branch); err != nil {
+					s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "pr_branch_push_failed", Epoch: epoch})
+				} else if _, err := s.store.EnqueuePROpen(r.Context(), jobID, sha, "main"); err == nil {
+					s.broker.Publish(LifeEvent{JobID: jobID, State: resp.JobState, Event: "pr_open_enqueued", Epoch: epoch})
+				}
 			}
 		}
 	}

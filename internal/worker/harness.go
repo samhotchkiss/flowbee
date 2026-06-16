@@ -555,10 +555,26 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		}
 		defer os.RemoveAll(workRoot)
 	}
+	// worker-push start point: when the issue branch already has commits (a revise, or
+	// a build after an earlier node), START from its tip so this node's commit STACKS
+	// on the prior nodes' — the branch accumulates the node-by-node history. The first
+	// build (branch absent) starts from base. Falls back to base on any fetch trouble.
+	issueBranch := ""
+	if grant.Context != nil {
+		issueBranch = grant.Context.IssueBranch
+	}
+	startRef := grant.BaseSHA
+	if issueBranch != "" && cfg.RepoURL != "" {
+		if tip, exists, terr := mirror.RemoteBranchTip(cfg.RepoURL, issueBranch); terr == nil && exists && tip != "" {
+			if ferr := mirror.FetchRef(cfg.RepoURL, "refs/heads/"+issueBranch, "refs/flowbee/issue-tip/"+grant.JobID); ferr == nil {
+				startRef = tip
+			}
+		}
+	}
 	wsDir := gitops.WorktreeBase(workRoot, grant.JobID, grant.LeaseEpoch)
-	wt, err := mirror.AddWorktree(wsDir, grant.BaseSHA)
+	wt, err := mirror.AddWorktree(wsDir, startRef)
 	if err != nil {
-		return out, fmt.Errorf("provision worktree at %s: %w", grant.BaseSHA, err)
+		return out, fmt.Errorf("provision worktree at %s: %w", startRef, err)
 	}
 	defer wt.Destroy()
 
@@ -588,19 +604,38 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
 		return out, fmt.Errorf("agent produced no changes")
 	}
-	diff, err := wt.Diff()
+	// the FULL change vs the integration base (main), even when we stacked on the
+	// issue-branch tip — the content gate + reviewer judge the whole PR change.
+	diff, err := wt.DiffAgainst(grant.BaseSHA)
 	if err != nil {
 		return out, fmt.Errorf("diff: %w", err)
 	}
 
-	// return ONLY the diff (no pushed_ref): the control plane applies it, pushes the
-	// epoch ref, and opens the PR (R4 — only the control plane holds write creds).
 	idem := fmt.Sprintf("%s-e%d", grant.JobID, grant.LeaseEpoch)
 	body := map[string]any{
 		"kind": "patch", "base_sha": grant.BaseSHA, "diff": diff,
 		"commit_message": commitMsg,
 		"blast_radius":   map[string]any{"scope": "worktree", "paths": content.TouchedPaths(diff)},
 		"status":         "succeeded",
+	}
+	// ── worker-push: this node commits its own work and pushes the issue branch to
+	// GitHub with its key (build-list: "each node commits"). The control plane then
+	// only opens the PR (sole GitHub-API caller + merger). When no branch/remote is
+	// configured, fall back to returning ONLY the diff (the control plane applies it).
+	if issueBranch != "" && cfg.RepoURL != "" {
+		sha, cerr := wt.CommitAuthored(cfg.Identity, commitMsg, false)
+		if cerr != nil {
+			return out, fmt.Errorf("commit: %w", cerr)
+		}
+		if perr := wt.PushTo(cfg.RepoURL, issueBranch, false); perr != nil {
+			// the branch moved under us (e.g. a rebase-before-review force-update): drop
+			// the lease so the job re-arms and the next attempt restarts from the new tip.
+			_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
+			return out, fmt.Errorf("push %s: %w", issueBranch, perr)
+		}
+		body["pushed_branch"] = issueBranch
+		body["head_sha"] = sha
+		out.PushedSHA = sha
 	}
 	res, st, err := c.Result(ctx, grant.JobID, grant.LeaseEpoch, idem, body)
 	if err != nil {
