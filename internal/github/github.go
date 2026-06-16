@@ -504,6 +504,46 @@ func (c *RealClient) CreateCheck(ctx context.Context, sha, name, conclusion stri
 	}, nil)
 }
 
+// Preflight is a read-only deployment sanity check (used by `flowbee doctor`): can
+// the token WRITE this repo, does the repo have CI (Flowbee merges only on green CI),
+// and is the integration branch protected (autonomous merge then needs the token to
+// satisfy the protection, or it must be off). These are the three misconfigs that
+// otherwise silently stall a real deployment.
+type Preflight struct {
+	CanWrite        bool
+	HasCI           bool
+	BranchProtected bool
+}
+
+func (c *RealClient) Preflight(ctx context.Context, branch string) (Preflight, error) {
+	var pf Preflight
+	var repo struct {
+		Permissions struct {
+			Admin    bool `json:"admin"`
+			Maintain bool `json:"maintain"`
+			Push     bool `json:"push"`
+		} `json:"permissions"`
+	}
+	if err := c.rest(ctx, http.MethodGet, "", nil, &repo); err != nil {
+		return pf, err // can't even read the repo — token/owner/repo wrong
+	}
+	pf.CanWrite = repo.Permissions.Push || repo.Permissions.Maintain || repo.Permissions.Admin
+	var wf struct {
+		TotalCount int `json:"total_count"`
+	}
+	if err := c.rest(ctx, http.MethodGet, "/actions/workflows", nil, &wf); err == nil {
+		pf.HasCI = wf.TotalCount > 0
+	}
+	if branch == "" {
+		branch = "main"
+	}
+	// 404 on protection => not protected (the autonomous-merge-friendly default).
+	if err := c.rest(ctx, http.MethodGet, "/branches/"+branch+"/protection", nil, nil); err == nil {
+		pf.BranchProtected = true
+	}
+	return pf, nil
+}
+
 func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
 	// GitHub's native merge-queue is a GraphQL mutation that requires the repo to
 	// have a merge queue configured. When it isn't, integrate the PR directly via

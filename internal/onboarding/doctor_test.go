@@ -35,6 +35,66 @@ func (errProbe) BoardSweep(context.Context) (gh.BoardSnapshot, error) {
 	return gh.BoardSnapshot{}, errors.New("dial tcp: simulated network failure")
 }
 
+// preflightProbe is reachable AND exposes a configurable deployment preflight.
+type preflightProbe struct{ pf gh.Preflight }
+
+func (preflightProbe) BoardSweep(context.Context) (gh.BoardSnapshot, error) {
+	return gh.BoardSnapshot{}, nil
+}
+func (p preflightProbe) Preflight(context.Context, string) (gh.Preflight, error) { return p.pf, nil }
+
+func findCheck(rep DoctorReport, name string) Check {
+	for _, c := range rep.Checks {
+		if c.Name == name {
+			return c
+		}
+	}
+	return Check{}
+}
+
+func TestDoctorPreflight(t *testing.T) {
+	root := initGitRepo(t)
+	if _, err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	run := func(pf gh.Preflight) DoctorReport {
+		rep, err := Doctor(context.Background(), DoctorOptions{Root: root, Probe: preflightProbe{pf}})
+		if err != nil {
+			t.Fatalf("Doctor: %v", err)
+		}
+		return rep
+	}
+
+	rep := run(gh.Preflight{CanWrite: true, HasCI: true, BranchProtected: false})
+	if !rep.Green() {
+		t.Fatalf("expected green:\n%s", dump(rep))
+	}
+	for _, n := range []string{"github write access", "ci configured", "branch protection"} {
+		if c := findCheck(rep, n); c.Status != StatusPass {
+			t.Fatalf("%q should pass, got %+v", n, c)
+		}
+	}
+
+	rep = run(gh.Preflight{CanWrite: false, HasCI: true})
+	if rep.Green() {
+		t.Fatal("a token without write access must break green")
+	}
+	if c := findCheck(rep, "github write access"); c.Status != StatusFail {
+		t.Fatalf("write access should fail, got %+v", c)
+	}
+
+	rep = run(gh.Preflight{CanWrite: true, HasCI: false, BranchProtected: true})
+	if !rep.Green() {
+		t.Fatalf("warnings must not break green:\n%s", dump(rep))
+	}
+	if c := findCheck(rep, "ci configured"); c.Status != StatusWarn {
+		t.Fatalf("missing CI should warn, got %+v", c)
+	}
+	if c := findCheck(rep, "branch protection"); c.Status != StatusWarn {
+		t.Fatalf("protected branch should warn, got %+v", c)
+	}
+}
+
 func TestDoctor_GreenOnFreshInit(t *testing.T) {
 	root := initGitRepo(t)
 	if _, err := Init(root); err != nil {

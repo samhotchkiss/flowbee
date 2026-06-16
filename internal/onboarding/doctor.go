@@ -58,6 +58,14 @@ type GitHubProbe interface {
 	BoardSweep(ctx context.Context) (gh.BoardSnapshot, error)
 }
 
+// preflighter is the optional deployment-sanity capability (satisfied by the
+// RealClient). When the probe implements it, doctor also checks the three misconfigs
+// that otherwise silently stall a real run: token write-scope, CI presence, and
+// branch protection.
+type preflighter interface {
+	Preflight(ctx context.Context, branch string) (gh.Preflight, error)
+}
+
 // DoctorOptions configures one doctor run. Root is the repo to inspect. Probe is
 // the optional GitHub reachability prober (nil + SkipGitHub=false => doctor builds
 // a RealClient from FLOWBEE_GITHUB_TOKEN, or warns if no token). SkipGitHub forces
@@ -250,4 +258,31 @@ func checkGitHub(ctx context.Context, opts DoctorOptions, cfg config.Config, rep
 	}
 	rep.add("github", StatusPass, fmt.Sprintf("reachable; rate-limit remaining=%d, board has %d PRs / %d issues",
 		snap.RateLimit.Remaining, len(snap.PullRequests), len(snap.Issues)))
+
+	// deployment preflight (the make-or-break misconfigs): token write-scope, CI, and
+	// branch protection. Only when the probe is a real client (the fake skips these).
+	pf, ok := probe.(preflighter)
+	if !ok {
+		return
+	}
+	pre, perr := pf.Preflight(cctx, cfg.GithubDefaultBranch)
+	if perr != nil {
+		rep.add("github write access", StatusWarn, fmt.Sprintf("could not read repo permissions: %v", perr))
+		return
+	}
+	if pre.CanWrite {
+		rep.add("github write access", StatusPass, "token can write (push branches / open + merge PRs / close issues)")
+	} else {
+		rep.add("github write access", StatusFail, "token lacks WRITE — use a fine-grained PAT with Contents + Pull requests + Issues = write (read-only can't push or merge)")
+	}
+	if pre.HasCI {
+		rep.add("ci configured", StatusPass, "repo has GitHub Actions workflows (the merge gate can go green)")
+	} else {
+		rep.add("ci configured", StatusWarn, "no GitHub Actions workflow found — Flowbee merges ONLY on green CI, so nothing will merge until the repo reports a CI status check")
+	}
+	if pre.BranchProtected {
+		rep.add("branch protection", StatusWarn, "integration branch is protected — autonomous merge needs the token to satisfy the required checks, or turn protection off")
+	} else {
+		rep.add("branch protection", StatusPass, "integration branch unprotected — autonomous merge OK")
+	}
 }
