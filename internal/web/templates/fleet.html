@@ -1,5 +1,5 @@
 {{define "fleet.html"}}
-<h1>Fleet</h1>
+<h1><span class="logo">🐝</span>Fleet</h1>
 {{if not .Boxes}}<p class="muted">No workers registered.</p>{{end}}
 <div class="fleet-grid">
 {{range .Boxes}}
@@ -18,14 +18,14 @@
       </div>
       {{range .Accounts}}
       <div class="gauge" data-account="{{.AccountID}}">
-        <div class="acct"><span class="name">{{.AccountID}}</span><span>{{pct .UsagePct}}% / {{.CeilingPct}}%</span></div>
+        <div class="acct"><span class="name">▸ {{.AccountID}}</span><span>{{pct .UsagePct}}% / {{.CeilingPct}}%</span></div>
         <div class="bar">
           <span class="fill {{barClass .UsagePct .CeilingPct}}" style="width:{{pct .UsagePct}}%"></span>
           <span class="ceiling" style="left:{{pct .CeilingPct}}%"></span>
         </div>
         <div class="roll">
           rank {{.PreferenceRank}}
-          {{if .AtCeiling}}<span class="badge">at ceiling → rollover</span>{{end}}
+          {{if .AtCeiling}}<span class="badge rollover">at ceiling → rollover</span>{{end}}
           {{if .RateLimited}}<span class="badge">429 cool-down</span>{{end}}
         </div>
       </div>

@@ -1,5 +1,5 @@
 {{define "dashboard.html"}}
-<h1>Dashboard</h1>
+<h1><span class="logo">🐝</span>Dashboard</h1>
 <p class="muted">GitHub budget: <b>{{.Budget.Remaining}}</b> / {{.Budget.Limit}} remaining
 {{if not .Budget.LastSweep.IsZero}}· last sweep {{abs .Budget.LastSweep}}{{end}}</p>
 
