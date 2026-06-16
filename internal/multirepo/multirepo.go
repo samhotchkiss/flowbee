@@ -114,8 +114,11 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 		recClk := reconcileClock{clk}
 		projClk := projectClock{clk}
 		sender := project.NewForRepo(r.ID, r.DefaultBranch, st, writer, projClk, asProjectPub(pub))
+		rec := reconcile.NewForRepo(r.ID, st, client, recClk, asReconcilePub(pub))
 		// F11 (build-list §F): wire the per-repo history writer so the merged->done
-		// post-merge archive commit lands on the repo's integration branch.
+		// post-merge archive commit lands on the repo's integration branch. The same
+		// mirror also resolves base_sha for GitHub-issue intake (adopt a labeled issue
+		// as a build cut from current main).
 		if cfg.history != nil {
 			if hw := cfg.history(r); hw != nil {
 				branch := r.DefaultBranch
@@ -123,11 +126,12 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 					branch = "main"
 				}
 				sender = sender.WithHistory(hw, branch)
+				rec = rec.WithIntake(hw, branch)
 			}
 		}
 		m.loops[r.ID] = &repoLoop{
 			repo:   r,
-			rec:    reconcile.NewForRepo(r.ID, st, client, recClk, asReconcilePub(pub)),
+			rec:    rec,
 			sender: sender,
 		}
 		m.order = append(m.order, r.ID)

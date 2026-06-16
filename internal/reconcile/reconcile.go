@@ -40,6 +40,33 @@ type Reconciler struct {
 	// ONLY within this repo (PR numbers are repo-scoped), so one control plane runs
 	// one Reconciler per repo, each over its own github.Client.
 	repo string
+	// mirror resolves the integration-branch tip so a label-opted issue can be
+	// adopted as a build cut from current main (GitHub-issue intake). Nil disables
+	// issue intake for this repo (e.g. tests with no local mirror).
+	mirror RepoMirror
+	branch string
+}
+
+// RepoMirror resolves a ref to a commit SHA (satisfied by *gitops.Mirror) so the
+// reconciler can cut an adopted issue's build from the current integration tip.
+type RepoMirror interface {
+	HeadSHA(ref string) (string, error)
+}
+
+// IntakeLabel is the opt-in label a human adds to a GitHub issue to hand it to
+// Flowbee (distinct from the `flowbee` umbrella label Flowbee puts on issues it
+// MATERIALIZES, so a materialized issue is never re-adopted).
+const IntakeLabel = "flowbee:build"
+
+// WithIntake wires the integration-branch mirror + branch so Sweep adopts
+// label-opted issues as builds. Returns the reconciler for chaining.
+func (r *Reconciler) WithIntake(m RepoMirror, branch string) *Reconciler {
+	r.mirror = m
+	if branch == "" {
+		branch = "main"
+	}
+	r.branch = branch
+	return r
 }
 
 // New builds a Reconciler for the legacy single-repo scope (repo="").
@@ -80,7 +107,31 @@ func (r *Reconciler) Sweep(ctx context.Context) ([]store.ReconcileOutcome, error
 			outs = append(outs, out)
 		}
 	}
+	// GitHub-issue intake (build-list): adopt every label-opted, not-yet-tracked
+	// issue as a build cut from the current integration tip. Idempotent in the store
+	// (a job already tracking the issue is a no-op), so re-sweeps never duplicate.
+	if r.mirror != nil {
+		base, berr := r.mirror.HeadSHA("refs/heads/" + r.branch)
+		for _, iss := range snap.Issues {
+			if berr != nil || !hasLabel(iss.Labels, IntakeLabel) {
+				continue
+			}
+			id, aerr := r.store.AdoptIssueAsBuild(ctx, r.repo, iss.Number, iss.Title, iss.Body, base, now)
+			if aerr == nil && id != "" && r.pub != nil {
+				r.pub.PublishReconcile(id, "issue_adopted")
+			}
+		}
+	}
 	return outs, nil
+}
+
+func hasLabel(labels []string, want string) bool {
+	for _, l := range labels {
+		if l == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Refetch handles a webhook HINT (§8.1.3): a TARGETED single-PR refetch through

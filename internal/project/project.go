@@ -355,10 +355,17 @@ func prTitle(j job.Job, jobID string) string {
 // issue number lives on the spec job the build descends from (FlowID).
 func (s *Sender) prBody(ctx context.Context, j job.Job) string {
 	var b strings.Builder
-	if j.FlowID != "" {
-		if spec, err := s.store.GetJob(ctx, j.FlowID); err == nil && spec.IssueNum > 0 {
-			fmt.Fprintf(&b, "Closes #%d\n\n", spec.IssueNum)
+	// link the originating issue so the merge closes it: an adopted GitHub issue is
+	// stamped on the build job itself; a spec-flow build descends from the spec job
+	// that carries the materialized issue number (FlowID).
+	issueNum := j.IssueNum
+	if issueNum == 0 && j.FlowID != "" && j.FlowID != j.ID {
+		if spec, err := s.store.GetJob(ctx, j.FlowID); err == nil {
+			issueNum = spec.IssueNum
 		}
+	}
+	if issueNum > 0 {
+		fmt.Fprintf(&b, "Closes #%d\n\n", issueNum)
 	}
 	b.WriteString("Implements the signed-off spec.\n\n---\n")
 	b.WriteString("_Opened by Flowbee from the eng_worker patch (§7.3); Flowbee performed the git write, not the worker._")
