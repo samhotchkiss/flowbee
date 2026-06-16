@@ -40,16 +40,36 @@ type Sender struct {
 	clock Clock
 	pub   Publisher
 
+	// repo is the F9 repo-scope handle this sender drains for (a repos.id). Empty is
+	// the legacy single-repo scope (drains all rows). One control plane runs one
+	// Sender per repo, each over the repo's own github.Writer, so a sender only
+	// renders side-effects for its own repo's jobs (build-list F9).
+	repo string
+	// baseBranch is the repo's integration branch (the PR base when an OpenPR payload
+	// omits one). Empty defaults to "main".
+	baseBranch string
+
 	// parkedUntil is the Retry-After park horizon (§8.2.4): while now < it, the
 	// WHOLE outbox is parked. Single-sender, so a plain field is safe (Drain is
 	// not called concurrently with itself).
 	parkedUntil time.Time
 }
 
-// New builds a Sender over a github.Writer (real or fake).
+// New builds a Sender over a github.Writer for the legacy single-repo scope.
 func New(st *store.Store, w gh.Writer, clk Clock, pub Publisher) *Sender {
 	return &Sender{store: st, gh: w, clock: clk, pub: pub}
 }
+
+// NewForRepo builds a Sender bound to a specific F9 repo scope (a repos.id): it
+// drains ONLY that repo's outbox rows, over that repo's own github.Writer, and
+// opens PRs against baseBranch by default. One control plane holds one Sender per
+// managed repo.
+func NewForRepo(repo, baseBranch string, st *store.Store, w gh.Writer, clk Clock, pub Publisher) *Sender {
+	return &Sender{store: st, gh: w, clock: clk, pub: pub, repo: repo, baseBranch: baseBranch}
+}
+
+// Repo returns the repo-scope handle this sender is bound to ("" = legacy).
+func (s *Sender) Repo() string { return s.repo }
 
 // DrainOnce drains every currently-pending outbox row, oldest first, ≤1 in-flight
 // (§8.2.4). It stops early if a Retry-After parks the outbox or a send errors
@@ -62,7 +82,17 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 	}
 	sent := 0
 	for {
-		row, ok, err := s.store.NextPendingOutbox(ctx)
+		var (
+			row store.OutboxRow
+			ok  bool
+			err error
+		)
+		if s.repo != "" {
+			// F9: a repo-scoped sender drains ONLY its own repo's rows.
+			row, ok, err = s.store.NextPendingOutboxForRepo(ctx, s.repo)
+		} else {
+			row, ok, err = s.store.NextPendingOutbox(ctx)
+		}
 		if err != nil {
 			return sent, err
 		}
@@ -117,7 +147,7 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		number, err := s.gh.OpenPR(ctx, gh.OpenPRInput{
 			Title:   fmt.Sprintf("flowbee: %s", row.JobID),
 			Body:    "Opened by Flowbee from the eng_worker patch (§7.3).",
-			HeadRef: str(p, "head_ref"), BaseRef: orDefault(str(p, "base_ref"), "main"), Draft: true,
+			HeadRef: str(p, "head_ref"), BaseRef: orDefault(str(p, "base_ref"), orDefault(s.baseBranch, "main")), Draft: true,
 		})
 		if err != nil {
 			return "", err

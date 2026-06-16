@@ -48,6 +48,10 @@ type SeedParams struct {
 	TaskText           string
 	SpecText           string
 	AcceptanceCriteria string
+	// Repo is the F9 repo-scope handle (a repos.id). Empty is the legacy single-repo
+	// default. A seeded job is bound to exactly one repo so reconcile-IN/project-OUT
+	// can scope it; the scheduler still ranks across all repos.
+	Repo string
 }
 
 // SeedJob inserts a job and its job_created event in one transaction (append +
@@ -79,11 +83,11 @@ func (s *Store) SeedJob(ctx context.Context, p SeedParams) (job.Job, error) {
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 			                  cost_ceiling_micro_usd, flow_id,
-			                  task_text, spec_text, acceptance_criteria)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 3, 0, ?, ?, ?, ?, ?)`,
+			                  task_text, spec_text, acceptance_criteria, repo)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 3, 0, ?, ?, ?, ?, ?, ?)`,
 			p.ID, string(p.Kind), p.Flow, p.Stage, string(state), string(p.Role), p.BaseSHA, p.Priority,
 			blockedJSON, reqJSON, p.Now.Format(rfc3339), ceiling, flowID,
-			p.TaskText, p.SpecText, p.AcceptanceCriteria)
+			p.TaskText, p.SpecText, p.AcceptanceCriteria, p.Repo)
 		if err != nil {
 			return fmt.Errorf("insert job: %w", err)
 		}
@@ -869,7 +873,8 @@ const jobSelect = `
 	       over_budget, COALESCE(flow_id,''), COALESCE(escalation_reason,''),
 	       build_epoch, COALESCE(merge_provenance,''),
 	       COALESCE(task_text,''), COALESCE(spec_text,''), COALESCE(acceptance_criteria,''),
-	       COALESCE(epic_id,''), COALESCE(is_epic,0), COALESCE(epic_reviewed,0)
+	       COALESCE(epic_id,''), COALESCE(is_epic,0), COALESCE(epic_reviewed,0),
+	       COALESCE(repo,'')
 	  FROM jobs`
 
 type rowScanner interface {
@@ -893,7 +898,8 @@ func scanJob(row rowScanner) (job.Job, error) {
 		&overBudget, &j.FlowID, &j.EscalationReason,
 		&j.BuildEpoch, &j.MergeProvenance,
 		&j.TaskText, &j.SpecText, &j.AcceptanceCriteria,
-		&j.EpicID, &isEpic, &epicReviewed)
+		&j.EpicID, &isEpic, &epicReviewed,
+		&j.Repo)
 	if err != nil {
 		return j, err
 	}

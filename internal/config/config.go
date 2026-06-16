@@ -60,7 +60,33 @@ type Config struct {
 	// lockfiles, secrets, Flowbee's own source). Any diff touching a configured prefix
 	// is forced to the human gate. Set via FLOWBEE_CONTENT_DENY_EXTRA (comma-separated).
 	ContentDenyExtra []string `yaml:"content_deny_extra"`
+
+	// Repos is the F9 multi-repo registry: one control plane manages a SET of repos,
+	// each with its own GitHub coords + integration branch + its own reconcile-IN /
+	// project-OUT loop, over a SHARED, repo-agnostic worker fleet and a GLOBAL
+	// scheduler. Empty falls back to the single-repo FLOWBEE_GITHUB_OWNER/REPO env
+	// path (the legacy posture). Configured in flowbee.yaml only (a structured list).
+	Repos []RepoConfig `yaml:"repos"`
 }
+
+// RepoConfig is one managed repo's coordinates in the F9 registry (build-list F9).
+// ID is a short stable handle used to scope jobs; Owner/Repo are the GitHub coords;
+// DefaultBranch is the integration branch (PR base + I-8 protection target); Token
+// is an optional per-repo PAT env-var NAME (not the secret itself) — empty falls
+// back to FLOWBEE_GITHUB_TOKEN (one shared operator PAT across repos is the common
+// single-operator case).
+type RepoConfig struct {
+	ID            string `yaml:"id"`
+	Owner         string `yaml:"owner"`
+	Repo          string `yaml:"repo"`
+	DefaultBranch string `yaml:"default_branch"`
+	TokenEnv      string `yaml:"token_env"`
+	// Active defaults to true; set false to register-but-park a repo.
+	Active *bool `yaml:"active"`
+}
+
+// IsActive reports whether the repo is active (default true when unset).
+func (r RepoConfig) IsActive() bool { return r.Active == nil || *r.Active }
 
 // ContentPolicy projects the content-integrity knobs into the content package's
 // operator Policy (F2). The zero config yields the zero Policy = shipped defaults.

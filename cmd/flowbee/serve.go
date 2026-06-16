@@ -17,7 +17,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/config"
 	"github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/job"
-	"github.com/samhotchkiss/flowbee/internal/reconcile"
+	"github.com/samhotchkiss/flowbee/internal/multirepo"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/ulid"
 	"github.com/samhotchkiss/flowbee/internal/webhook"
@@ -118,36 +118,43 @@ func runServe(_ []string) error {
 		}
 	}()
 
-	// reconcile-IN (M6, §8.1): Flowbee is the SINGLE GitHub caller (R4). Wired only
-	// when GitHub App config is present (FLOWBEE_GITHUB_OWNER/REPO/TOKEN); there are
-	// no creds in dev/CI, so this stays dormant by default (e2e_github off). When
-	// configured: a boot sweep, then a low-frequency periodic sweep (the floor),
-	// and a PUBLIC webhook listener (HMAC, deduped, write-ahead -> targeted refetch).
-	if owner, repo := os.Getenv("FLOWBEE_GITHUB_OWNER"), os.Getenv("FLOWBEE_GITHUB_REPO"); owner != "" && repo != "" {
-		tok := os.Getenv("FLOWBEE_GITHUB_TOKEN")
-		ghClient := github.NewRealClient(owner, repo, func(context.Context) (string, error) { return tok, nil })
-		rec := reconcile.New(st, ghClient, clock.Real{}, srv.Broker())
-		// boot sweep + periodic floor sweep (every 2-5 min; default 3 min).
+	// reconcile-IN + project-OUT (M6/M7, §8.1/§8.2): Flowbee is the SINGLE GitHub
+	// caller (R4). F9 multi-repo: ONE control plane runs a per-repo reconcile-IN +
+	// project-OUT loop over the repos registry, sharing a GLOBAL scheduler + fleet.
+	// The registry is seeded from cfg.Repos (a structured list) or, for backward
+	// compatibility, the single-repo FLOWBEE_GITHUB_OWNER/REPO env path. There are no
+	// creds in dev/CI, so this stays dormant when nothing is configured.
+	if mgr := wireMultiRepo(ctx, logger, cfg, st, srv); mgr != nil {
+		// boot sweep + periodic floor sweep PER repo (every 2-5 min; default 3 min),
+		// plus a periodic project-OUT drain PER repo.
 		go func() {
-			if _, err := rec.Sweep(ctx); err != nil {
+			if _, err := mgr.SweepAll(ctx); err != nil {
 				logger.Error("boot reconcile sweep", "err", err)
 			}
 			t := time.NewTicker(3 * time.Minute)
 			defer t.Stop()
+			drain := time.NewTicker(5 * time.Second)
+			defer drain.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					if _, err := rec.Sweep(ctx); err != nil {
+					if _, err := mgr.SweepAll(ctx); err != nil {
 						logger.Error("reconcile sweep", "err", err)
+					}
+				case <-drain.C:
+					if _, err := mgr.DrainAll(ctx); err != nil {
+						logger.Error("project-out drain", "err", err)
 					}
 				}
 			}
 		}()
-		// the PUBLIC webhook listener (I-2): only started when a secret is set.
+		// the PUBLIC webhook listener (I-2): only started when a secret is set. Hints
+		// are routed to the right repo's reconciler via the X-Flowbee-Repo header
+		// (default: the sole/first managed repo when unset).
 		if secret := os.Getenv("FLOWBEE_WEBHOOK_SECRET"); secret != "" {
-			wh := webhook.New(secret, st, rec)
+			wh := webhook.New(secret, st, repoRefetcher{mgr: mgr, defaultRepo: firstRepo(mgr)})
 			webhookMux := http.NewServeMux()
 			webhookMux.Handle("POST /webhooks", wh)
 			webhookSrv := &http.Server{Addr: cfg.WebhookAddr, Handler: webhookMux}
@@ -158,7 +165,7 @@ func runServe(_ []string) error {
 				_ = webhookSrv.Shutdown(shutdownCtx)
 			}()
 		}
-		logger.Info("reconcile-IN wired", "owner", owner, "repo", repo)
+		logger.Info("multi-repo control plane wired", "repos", mgr.Repos())
 	}
 
 	logger.Info("flowbee serve started",
@@ -172,6 +179,79 @@ func runServe(_ []string) error {
 	_ = healthSrv.Shutdown(shutdownCtx)
 	_ = privateSrv.Shutdown(shutdownCtx)
 	return nil
+}
+
+// wireMultiRepo seeds the F9 repos registry from config (or the legacy single-repo
+// env) and builds the per-repo reconcile/project Manager. Returns nil when no repo
+// is configured (dev/CI with no creds), so the control plane runs without GitHub.
+func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, st *store.Store, srv *api.Server) *multirepo.Manager {
+	// (1) seed the registry. cfg.Repos (structured list) wins; else fall back to the
+	// single-repo FLOWBEE_GITHUB_OWNER/REPO env path (registered under id "default").
+	repos := cfg.Repos
+	tokenEnv := map[string]string{} // repo id -> token env-var name ("" = shared default)
+	if len(repos) == 0 {
+		owner, repo := os.Getenv("FLOWBEE_GITHUB_OWNER"), os.Getenv("FLOWBEE_GITHUB_REPO")
+		if owner == "" || repo == "" {
+			return nil // nothing configured: no GitHub loops
+		}
+		repos = []config.RepoConfig{{ID: "default", Owner: owner, Repo: repo, DefaultBranch: "main"}}
+	}
+	for _, rc := range repos {
+		id := rc.ID
+		if id == "" {
+			id = rc.Repo
+		}
+		if err := st.RegisterRepo(ctx, store.Repo{
+			ID: id, Owner: rc.Owner, Repo: rc.Repo,
+			DefaultBranch: rc.DefaultBranch, Active: rc.IsActive(),
+		}); err != nil {
+			logger.Error("register repo", "id", id, "err", err)
+			continue
+		}
+		tokenEnv[id] = rc.TokenEnv
+	}
+
+	// (2) per-repo GitHub factory: each repo gets its OWN RealClient bearing its
+	// per-repo PAT (or the shared FLOWBEE_GITHUB_TOKEN). Workers hold NO creds (F3).
+	sharedTok := os.Getenv("FLOWBEE_GITHUB_TOKEN")
+	factory := func(r store.Repo) (github.Client, github.Writer, error) {
+		tok := sharedTok
+		if env := tokenEnv[r.ID]; env != "" {
+			if v := os.Getenv(env); v != "" {
+				tok = v
+			}
+		}
+		client := github.NewRealClient(r.Owner, r.Repo, func(context.Context) (string, error) { return tok, nil })
+		return client, client, nil
+	}
+	mgr, err := multirepo.New(ctx, st, clock.Real{}, srv.Broker(), factory)
+	if err != nil {
+		logger.Error("build multi-repo manager", "err", err)
+		return nil
+	}
+	if len(mgr.Repos()) == 0 {
+		return nil
+	}
+	return mgr
+}
+
+// repoRefetcher adapts the multi-repo Manager to the webhook.Refetcher interface:
+// a hint is routed to the default repo's reconciler (a richer X-Flowbee-Repo router
+// is a later enhancement; the floor sweep reconciles every repo regardless).
+type repoRefetcher struct {
+	mgr         *multirepo.Manager
+	defaultRepo string
+}
+
+func (r repoRefetcher) RefetchHint(ctx context.Context, prNumber int) bool {
+	return r.mgr.RefetchHint(ctx, r.defaultRepo, prNumber)
+}
+
+func firstRepo(mgr *multirepo.Manager) string {
+	if rs := mgr.Repos(); len(rs) > 0 {
+		return rs[0]
+	}
+	return ""
 }
 
 func serveHTTP(logger *slog.Logger, name string, srv *http.Server) {

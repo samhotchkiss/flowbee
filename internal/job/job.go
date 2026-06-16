@@ -167,6 +167,13 @@ type Job struct {
 	State State
 	Role  Role
 
+	// Repo is the F9 repo-scope handle (the repos.id this job belongs to). Empty is
+	// the legacy single-repo default. It is a resolved Domain-A fact: the scheduler
+	// is repo-AGNOSTIC (it ranks the union of all repos' ready jobs), but reconcile-IN
+	// and project-OUT are repo-SCOPED (each repo has its own GitHub coords + loop), so
+	// a swept PR number is bound back to a job only within its own repo.
+	Repo string
+
 	// lineage (Domain A)
 	ChatRef   string
 	SpecRef   string

@@ -8,3 +8,19 @@ heartbeat_interval_s: 30
 long_poll_wait_s: 30
 river_max_workers: 10
 log_level: info
+
+# F9 multi-repo: one control plane manages a SET of repos over a SHARED, repo-agnostic
+# worker fleet and a GLOBAL scheduler (cross-repo prioritization by priority/aging).
+# Each repo gets its own reconcile-IN / project-OUT loop against its own GitHub coords.
+# Omit this block to use the single-repo FLOWBEE_GITHUB_OWNER/REPO env path instead.
+# repos:
+#   - id: core               # short stable handle (scopes jobs/issues/PRs)
+#     owner: acme            # GitHub owner/org
+#     repo: core             # GitHub repo name
+#     default_branch: main   # integration branch (PR base + branch-protection target)
+#   - id: web
+#     owner: acme
+#     repo: web
+#     default_branch: main
+#     token_env: WEB_PAT     # optional per-repo PAT env var; defaults to FLOWBEE_GITHUB_TOKEN
+#     # active: false        # register-but-park (loops + scheduling stop) without deleting history

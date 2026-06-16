@@ -1,0 +1,242 @@
+package multirepo_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/samhotchkiss/flowbee/internal/clock"
+	gh "github.com/samhotchkiss/flowbee/internal/github"
+	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/multirepo"
+	"github.com/samhotchkiss/flowbee/internal/store"
+	"github.com/samhotchkiss/flowbee/internal/testutil"
+)
+
+// seedReadyBuild seeds a ready build job scoped to a repo with a priority and an
+// eng_worker capability requirement (so a shared eng_worker pool can win it).
+func seedReadyBuild(t *testing.T, st *store.Store, id, repo string, priority int, now time.Time) {
+	t.Helper()
+	if _, err := st.SeedJob(context.Background(), store.SeedParams{
+		ID: id, Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+		BaseSHA: "base-" + id, Priority: priority, Repo: repo,
+		RequiredCapabilities: []string{"role:eng_worker"}, Now: now,
+	}); err != nil {
+		t.Fatalf("seed %s: %v", id, err)
+	}
+}
+
+// TestMultiRepoControlPlane is the F9 acceptance test (build-list F9 DONE-WHEN):
+// TWO repos managed by ONE control plane (fakeGitHub x2); a job from each routes to
+// the SHARED worker pool; reconcile/project run PER repo; the scheduler prioritizes
+// ACROSS repos.
+func TestMultiRepoControlPlane(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(10_000, 0)
+	clk := clock.NewFake(now)
+
+	// ── one control plane, a SET of repos ──
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "core", Owner: "acme", Repo: "core", DefaultBranch: "main", Active: true}); err != nil {
+		t.Fatalf("register core: %v", err)
+	}
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "web", Owner: "acme", Repo: "web", DefaultBranch: "trunk", Active: true}); err != nil {
+		t.Fatalf("register web: %v", err)
+	}
+
+	// per-repo fakeGitHub x2 (workers hold NO GitHub creds; Flowbee owns the writes).
+	fakes := map[string]*gh.Fake{
+		"core": gh.NewFake(),
+		"web":  gh.NewFake(),
+	}
+	factory := func(r store.Repo) (gh.Client, gh.Writer, error) {
+		f := fakes[r.ID]
+		return f, f, nil
+	}
+	mgr, err := multirepo.New(ctx, st, clk, nil, factory)
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	if got := mgr.Repos(); len(got) != 2 || got[0] != "core" || got[1] != "web" {
+		t.Fatalf("managed repos = %v, want [core web]", got)
+	}
+
+	// ── a job from EACH repo ──
+	// web's job is higher priority => cross-repo prioritization must offer it first,
+	// even though it belongs to a different repo than core's job.
+	seedReadyBuild(t, st, "jCore", "core", 1, now)
+	seedReadyBuild(t, st, "jWeb", "web", 9, now)
+
+	// ── the GLOBAL scheduler routes ANY repo's ready work to ANY capable worker ──
+	// one shared, repo-agnostic worker (advertises a capability, never a repo).
+	attested := []string{"role:eng_worker"}
+	order, err := mgr.GlobalReadyOrder(ctx, attested, now)
+	if err != nil {
+		t.Fatalf("global ready order: %v", err)
+	}
+	if len(order) != 2 {
+		t.Fatalf("global queue should hold BOTH repos' ready jobs, got %d", len(order))
+	}
+	// cross-repo prioritization: web (priority 9) outranks core (priority 1).
+	if order[0].JobID != "jWeb" || order[1].JobID != "jCore" {
+		t.Fatalf("cross-repo priority order = [%s %s], want [jWeb jCore]", order[0].JobID, order[1].JobID)
+	}
+
+	// the SAME shared worker pool claims both repos' jobs (repo-agnostic): one worker
+	// identity claims the top of the global queue, then the next.
+	for _, c := range order {
+		ls, cerr := st.ClaimReadyJob(ctx, store.ClaimParams{
+			JobID: c.JobID, LeaseID: "lease-" + c.JobID, Identity: "shared-box",
+			ModelFamily: "claude", Role: job.RoleEngWorker, Attested: attested,
+			TTL: 5 * time.Minute, Now: now,
+		})
+		if cerr != nil {
+			t.Fatalf("shared worker claim %s: %v", c.JobID, cerr)
+		}
+		if ls == nil {
+			t.Fatalf("claim %s returned nil lease", c.JobID)
+		}
+	}
+	// both jobs are now leased to the one shared box (proves repo-agnostic routing).
+	for _, id := range []string{"jCore", "jWeb"} {
+		j, _ := st.GetJob(ctx, id)
+		if j.BoundIdentity != "shared-box" {
+			t.Fatalf("%s bound to %q, want shared-box (one shared pool)", id, j.BoundIdentity)
+		}
+	}
+
+	// ── project-OUT runs PER repo (each sender drains only its repo, on its writer) ──
+	if _, err := st.EnqueuePROpen(ctx, "jCore", "sha-core", ""); err != nil {
+		t.Fatalf("enqueue core PR: %v", err)
+	}
+	if _, err := st.EnqueuePROpen(ctx, "jWeb", "sha-web", ""); err != nil {
+		t.Fatalf("enqueue web PR: %v", err)
+	}
+	sent, err := mgr.DrainAll(ctx)
+	if err != nil {
+		t.Fatalf("drain all: %v", err)
+	}
+	if sent["core"] != 1 || sent["web"] != 1 {
+		t.Fatalf("per-repo drain counts = %v, want core:1 web:1", sent)
+	}
+
+	// each repo's PR landed on its OWN fakeGitHub (NOT the other's): the per-repo
+	// project-OUT is genuinely scoped, not a shared writer.
+	coreOpens := countCalls(fakes["core"].Calls(), "OpenPR")
+	webOpens := countCalls(fakes["web"].Calls(), "OpenPR")
+	if coreOpens != 1 || webOpens != 1 {
+		t.Fatalf("OpenPR per repo = core:%d web:%d, want 1/1 (writes did not cross repos)", coreOpens, webOpens)
+	}
+	// the web PR was opened against web's integration branch "trunk" (per-repo base).
+	webPR := openedPR(t, fakes["web"])
+	if webPR.BaseRefOid != "trunk" {
+		t.Fatalf("web PR base = %q, want trunk (repo default branch)", webPR.BaseRefOid)
+	}
+	corePR := openedPR(t, fakes["core"])
+	if corePR.BaseRefOid != "main" {
+		t.Fatalf("core PR base = %q, want main", corePR.BaseRefOid)
+	}
+
+	// the PR number Flowbee stamped is repo-scoped onto each job.
+	jCore, _ := st.GetJob(ctx, "jCore")
+	jWeb, _ := st.GetJob(ctx, "jWeb")
+	if jCore.PRNumber == 0 || jWeb.PRNumber == 0 {
+		t.Fatalf("PR numbers not stamped: core=%d web=%d", jCore.PRNumber, jWeb.PRNumber)
+	}
+
+	// ── reconcile-IN runs PER repo, scoped so a PR-number COLLISION never cross-binds ──
+	// Force the COLLISION case: rebind both jobs to the SAME PR number across repos,
+	// then script that number on EACH fake with different facts. The per-repo sweep
+	// must bind each repo's #777 to its own repo's job.
+	rebindPR(t, st, "jCore", 777)
+	rebindPR(t, st, "jWeb", 777)
+	fakes["core"].SetPR(gh.PullRequest{
+		Number: 777, HeadRefOid: "core-head", BaseRefOid: "main", CIRollup: gh.CISuccess,
+		UpdatedAt: now,
+	})
+	fakes["web"].SetPR(gh.PullRequest{
+		Number: 777, HeadRefOid: "web-head", BaseRefOid: "trunk", CIRollup: gh.CISuccess,
+		UpdatedAt: now,
+	})
+	counts, err := mgr.SweepAll(ctx)
+	if err != nil {
+		t.Fatalf("sweep all: %v", err)
+	}
+	if counts["core"] != 1 || counts["web"] != 1 {
+		t.Fatalf("per-repo sweep applied = %v, want core:1 web:1", counts)
+	}
+
+	// the keystone: each repo's #777 reconciled its OWN job's Domain-B facts — core's
+	// job got core-head (NOT web-head), and vice versa. A cross-bind would have
+	// written the wrong head SHA onto the wrong repo's job.
+	coreFacts, ok, _ := store.DBFactSource{DB: st.DB}.Facts(ctx, "jCore")
+	if !ok || coreFacts.HeadSHA != "core-head" {
+		t.Fatalf("core job head = %q ok=%v, want core-head (no cross-repo bind)", coreFacts.HeadSHA, ok)
+	}
+	webFacts, ok, _ := store.DBFactSource{DB: st.DB}.Facts(ctx, "jWeb")
+	if !ok || webFacts.HeadSHA != "web-head" {
+		t.Fatalf("web job head = %q ok=%v, want web-head (no cross-repo bind)", webFacts.HeadSHA, ok)
+	}
+
+	// each repo's BoardSweep was its OWN call (per-repo reconcile loop).
+	if countCalls(fakes["core"].Calls(), "BoardSweep") != 1 {
+		t.Fatalf("core BoardSweep count != 1: %v", fakes["core"].Calls())
+	}
+	if countCalls(fakes["web"].Calls(), "BoardSweep") != 1 {
+		t.Fatalf("web BoardSweep count != 1: %v", fakes["web"].Calls())
+	}
+}
+
+// TestParkedRepoNotManaged: a parked (active=0) repo is omitted from the Manager —
+// its loops do not run.
+func TestParkedRepoNotManaged(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	clk := clock.NewFake(time.Unix(1, 0))
+
+	_ = st.RegisterRepo(ctx, store.Repo{ID: "live", Owner: "a", Repo: "live", Active: true})
+	_ = st.RegisterRepo(ctx, store.Repo{ID: "parked", Owner: "a", Repo: "parked", Active: false})
+
+	fake := gh.NewFake()
+	mgr, err := multirepo.New(ctx, st, clk, nil, func(store.Repo) (gh.Client, gh.Writer, error) {
+		return fake, fake, nil
+	})
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	if got := mgr.Repos(); len(got) != 1 || got[0] != "live" {
+		t.Fatalf("managed = %v, want [live] (parked repo excluded)", got)
+	}
+}
+
+func countCalls(calls []string, want string) int {
+	n := 0
+	for _, c := range calls {
+		if c == want {
+			n++
+		}
+	}
+	return n
+}
+
+// rebindPR overwrites a job's bound PR number directly (the test forces a
+// cross-repo PR-number collision the reconcile sweep must scope).
+func rebindPR(t *testing.T, st *store.Store, jobID string, pr int) {
+	t.Helper()
+	if _, err := st.DB.ExecContext(context.Background(),
+		`UPDATE jobs SET pr_number = ? WHERE id = ?`, pr, jobID); err != nil {
+		t.Fatalf("rebind pr %s: %v", jobID, err)
+	}
+}
+
+// openedPR returns the single PR opened on a fake (asserts exactly one stamped).
+func openedPR(t *testing.T, f *gh.Fake) gh.PullRequest {
+	t.Helper()
+	for n := 1001; n < 1100; n++ {
+		if pr, ok := f.PRState(n); ok {
+			return pr
+		}
+	}
+	t.Fatalf("no opened PR found on fake")
+	return gh.PullRequest{}
+}

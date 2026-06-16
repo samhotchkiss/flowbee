@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 // TestAllowSelfMergeEnv proves FLOWBEE_ALLOW_SELF_MERGE flips the §14 decision (F2):
 // default off (Branch A); "true"/"1" turns Branch B on.
@@ -52,5 +55,43 @@ func TestContentPolicyEnv(t *testing.T) {
 	if len(pol.ExtraDenyPrefixes) != 2 ||
 		pol.ExtraDenyPrefixes[0] != "migrations/" || pol.ExtraDenyPrefixes[1] != "deploy/prod" {
 		t.Fatalf("content deny-extra not parsed (CSV, trimmed, empties dropped): %v", pol.ExtraDenyPrefixes)
+	}
+}
+
+// TestReposConfig proves the F9 multi-repo registry parses from YAML, including the
+// active default (true when unset) and explicit park.
+func TestReposConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/flowbee.yaml"
+	yaml := `database_url: x.db
+heartbeat_interval_s: 30
+lease_ttl_s: 300
+repos:
+  - id: core
+    owner: acme
+    repo: core
+    default_branch: main
+  - id: web
+    owner: acme
+    repo: web
+    token_env: WEB_PAT
+    active: false
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("FLOWBEE_CONFIG", path)
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(c.Repos) != 2 {
+		t.Fatalf("want 2 repos, got %d", len(c.Repos))
+	}
+	if c.Repos[0].ID != "core" || c.Repos[0].Owner != "acme" || !c.Repos[0].IsActive() {
+		t.Fatalf("core repo mismatch: %+v", c.Repos[0])
+	}
+	if c.Repos[1].TokenEnv != "WEB_PAT" || c.Repos[1].IsActive() {
+		t.Fatalf("web repo should carry token_env and be parked: %+v", c.Repos[1])
 	}
 }

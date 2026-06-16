@@ -80,6 +80,29 @@ func (s *Store) NextPendingOutbox(ctx context.Context) (OutboxRow, bool, error) 
 	return row, true, nil
 }
 
+// NextPendingOutboxForRepo claims the oldest pending outbox row whose job belongs
+// to the given F9 repo scope (build-list F9). One control plane runs one project-OUT
+// Sender per repo — each over the repo's own github.Writer — so the drains must be
+// repo-scoped: a sender only renders side-effects for its own repo's jobs, never
+// another repo's. An empty repo scopes to legacy single-repo (repo='') jobs, so the
+// pre-F9 NextPendingOutbox is the degenerate single-repo case of this one.
+func (s *Store) NextPendingOutboxForRepo(ctx context.Context, repo string) (OutboxRow, bool, error) {
+	var row OutboxRow
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT o.id, o.job_id, o.action, o.head_sha, o.payload, o.status
+		  FROM outbox o JOIN jobs j ON j.id = o.job_id
+		 WHERE o.status = 'pending' AND j.repo = ?
+		 ORDER BY o.id ASC LIMIT 1`, repo).
+		Scan(&row.ID, &row.JobID, &row.Action, &row.HeadSHA, &row.Payload, &row.Status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return OutboxRow{}, false, nil
+	}
+	if err != nil {
+		return OutboxRow{}, false, err
+	}
+	return row, true, nil
+}
+
 // MarkOutboxSent flips an outbox row to 'sent' and writes the audit-log row in
 // the SAME transaction (§3.3): every GitHub action appears ONCE in the audit log,
 // keyed identically to the outbox (job_id, action, head_sha). The audit UNIQUE

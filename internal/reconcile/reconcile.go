@@ -35,12 +35,27 @@ type Reconciler struct {
 	gh    gh.Client
 	clock Clock
 	pub   Publisher
+	// repo is the F9 repo-scope handle this reconciler is bound to (a repos.id).
+	// Empty is the legacy single-repo scope. Every swept PR is bound back to a job
+	// ONLY within this repo (PR numbers are repo-scoped), so one control plane runs
+	// one Reconciler per repo, each over its own github.Client.
+	repo string
 }
 
-// New builds a Reconciler.
+// New builds a Reconciler for the legacy single-repo scope (repo="").
 func New(st *store.Store, client gh.Client, clk Clock, pub Publisher) *Reconciler {
 	return &Reconciler{store: st, gh: client, clock: clk, pub: pub}
 }
+
+// NewForRepo builds a Reconciler bound to a specific F9 repo scope (a repos.id):
+// its sweep binds swept PRs back to jobs only within that repo. One control plane
+// holds one Reconciler per managed repo, each over the repo's own github.Client.
+func NewForRepo(repo string, st *store.Store, client gh.Client, clk Clock, pub Publisher) *Reconciler {
+	return &Reconciler{store: st, gh: client, clock: clk, pub: pub, repo: repo}
+}
+
+// Repo returns the repo-scope handle this reconciler is bound to ("" = legacy).
+func (r *Reconciler) Repo() string { return r.repo }
 
 // Sweep performs one batched BoardSweep (§8.1.1) and reconciles every PR whose
 // number is bound to a job. It records the rate-limit gauge (I-14) every sweep.
@@ -100,7 +115,7 @@ func (r *Reconciler) RefetchHint(ctx context.Context, prNumber int) bool {
 // ingest maps one PR's Domain-B facts to its bound job and applies them under the
 // I-3 guards. An un-bound PR (no job for that number) is a no-op (applied=false).
 func (r *Reconciler) ingest(ctx context.Context, pr gh.PullRequest, now time.Time) (store.ReconcileOutcome, bool, error) {
-	jobID, ok, err := r.store.JobIDForPR(ctx, pr.Number)
+	jobID, ok, err := r.store.JobIDForPRInRepo(ctx, r.repo, pr.Number)
 	if err != nil {
 		return store.ReconcileOutcome{}, false, err
 	}
