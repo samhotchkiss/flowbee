@@ -102,16 +102,23 @@ Create the file(s) on disk now. Make only the change described." --dangerously-s
 			"--mirror", *mirror, "--repo-url", repoURL,
 			"--identity", id, "--model-family", "claude", "--agent-cmd", *buildCmd)
 	}
-	// review + spec roles (git-less, run anywhere). Distinct model_family per role so a
-	// reviewer is never the builder's family (anti-affinity, enforced server-side).
+	// review + spec roles. Distinct model_family per role so a reviewer is never the
+	// builder's family (anti-affinity, enforced server-side). The code_reviewer now
+	// lands an EMPTY findings-commit on the issue branch, so it gets the local mirror +
+	// repo URL (it pushes with its key); spec roles stay git-less (they emit a verdict
+	// only — no commit).
 	for _, r := range []struct{ role, family string }{
 		{"code_reviewer", "opus"},
 		{"spec_author", "claude"},
 		{"spec_reviewer", "sonnet"},
 	} {
 		id := host + "-" + r.role
-		spawn(id, "work", "--role", r.role,
-			"--identity", id, "--model-family", r.family, "--agent-cmd", *agentCmd)
+		argv := []string{"work", "--role", r.role,
+			"--identity", id, "--model-family", r.family, "--agent-cmd", *agentCmd}
+		if r.role == "code_reviewer" {
+			argv = append(argv, "--mirror", *mirror, "--repo-url", repoURL)
+		}
+		spawn(id, argv...)
 	}
 
 	fmt.Printf("🐝 flowbee fleet up on %s → %s\n   %d build + 1 code-review + 1 author + 1 issue-review worker (all roles; this box is fungible capacity)\n",

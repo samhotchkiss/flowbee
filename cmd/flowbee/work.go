@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -71,6 +72,13 @@ func runWork(args []string) error {
 		if o, r := os.Getenv("FLOWBEE_GITHUB_OWNER"), os.Getenv("FLOWBEE_GITHUB_REPO"); o != "" && r != "" {
 			*repoURL = "https://github.com/" + o + "/" + r + ".git"
 		}
+	}
+	// the worker keeps its OWN local copy of the repo (Sam's model): default it to
+	// ~/dev/<repo> — matching how repos are laid out — overridable via --mirror /
+	// FLOWBEE_MIRROR_PATH. The worker fetches each job here and works in per-job
+	// worktrees off it, and (worker-push) commits + pushes the issue branch from it.
+	if *mirror == "" {
+		*mirror = defaultWorkerMirror(*repoURL)
 	}
 	slots := parseModelSlots(*modelSlots)
 	accts := parseAccounts(*accounts)
@@ -312,4 +320,28 @@ func runSubmit(args []string) error {
 		return fmt.Errorf("unknown action %q", *action)
 	}
 	return nil
+}
+
+// defaultWorkerMirror is the worker's local repo-copy path when --mirror is unset:
+// ~/dev/<repo> by default (matching how repos are laid out on the boxes), derived
+// from FLOWBEE_GITHUB_REPO or the repo URL's last path segment. Returns "" when the
+// repo can't be derived (the harness then falls back to a temp mirror). Overridable
+// via --mirror / FLOWBEE_MIRROR_PATH.
+func defaultWorkerMirror(repoURL string) string {
+	repo := os.Getenv("FLOWBEE_GITHUB_REPO")
+	if repo == "" && repoURL != "" {
+		base := repoURL
+		if i := strings.LastIndex(base, "/"); i >= 0 {
+			base = base[i+1:]
+		}
+		repo = strings.TrimSuffix(base, ".git")
+	}
+	if repo == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, "dev", repo)
 }
