@@ -86,6 +86,12 @@ const (
 	KindRebased          EventKind = "rebased"           // clean rebase onto current main; re-validate at the new head (no agent)
 	KindConflictResolved EventKind = "conflict_resolved" // resolver returned the resolved diff -> review_pending (re-review + re-CI)
 	KindStackedRebased   EventKind = "stacked_rebased"   // a parent PR merged -> auto-rebase + re-arm this descendant (supersede)
+
+	// F10 CI-as-a-pluggable-fact (§F10). KindTestCIRecorded: a Flowbee `test` job
+	// ran the build's tests on a capability-matched worker and reported a result; the
+	// ci_green@sha fact it produced is honored by the merge gate exactly like
+	// reconciled GitHub-Actions CI. Audit-only on the build job (no projection move).
+	KindTestCIRecorded EventKind = "test_ci_recorded"
 )
 
 // Event is one appended ledger row. Payload holds kind-specific RESOLVED facts as
@@ -164,6 +170,13 @@ type Payload struct {
 	BuildEpoch      int    `json:",omitempty"`
 	DeadEpoch       int    `json:",omitempty"`
 	MergeProvenance string `json:",omitempty"`
+
+	// F10 pluggable-CI fact (test_ci_recorded). HeadSHA is the build head the
+	// ci_green fact binds to; CIGreen is the test job's result; TestJobID is the id
+	// of the `test` job that produced it (lineage). Audit-only — Fold ignores them.
+	HeadSHA   string `json:",omitempty"`
+	CIGreen   bool   `json:",omitempty"`
+	TestJobID string `json:",omitempty"`
 }
 
 // Fold replays events into the jobs projection. PURE: no clock, no RNG, no I/O.

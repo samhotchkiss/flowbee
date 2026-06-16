@@ -72,14 +72,28 @@ const (
 	// worktree, returning the resolved diff. Its output is untrusted code re-reviewed
 	// + re-CI'd like any build (resolution is just another job).
 	RoleConflictResolver Role = "conflict_resolver"
+	// RoleTester is the F10 `test` job slot: a worker that runs the build's test
+	// suite and reports a pass/fail. It is capability-matched on the test job's
+	// DIFF-DERIVED constraints (arch/os/tool); a green report produces a ci_green@sha
+	// fact the merge gate honors (the pluggable-CI fact).
+	RoleTester Role = "tester"
 )
 
-// Kind is one of exactly two job kinds (DESIGN §6.1).
+// Kind is a job kind (DESIGN §6.1). spec/build are the original two; F10 adds
+// `test`: a capability-matched CI job whose green result is a PLUGGABLE source of
+// the merge gate's ci_green@sha fact (an alternative to reconcile-from-Actions).
 type Kind string
 
 const (
 	KindSpec  Kind = "spec"
 	KindBuild Kind = "build"
+	// KindTest is the F10 `test` job: Flowbee runs the build's tests itself (rather
+	// than only reconciling GitHub-Actions CI). It is capability-matched on
+	// DIFF-DERIVED constraints (arch/os/tool — the arch-lottery fix) so an arm64
+	// build's tests route ONLY to an arm64-capable worker. A passing test job
+	// records a ci_green@sha fact the merge gate honors exactly like reconciled
+	// Actions CI (the §F10 pluggable-CI fact).
+	KindTest Kind = "test"
 )
 
 // ActiveLeaseStates is the set of states that hold an active lease (§6.2.1). It
