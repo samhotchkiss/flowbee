@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -190,11 +191,24 @@ func runServe(_ []string) error {
 	if mgr := wireMultiRepo(ctx, logger, cfg, st, srv); mgr != nil {
 		// boot sweep + periodic floor sweep PER repo (every 2-5 min; default 3 min),
 		// plus a periodic project-OUT drain PER repo.
+		// reconcile cadence drives how fast Flowbee REACTS to GitHub facts — chiefly
+		// CI going green (the reviewer can't mint until it's reconciled) and a PR
+		// merging. A slow sweep means a green build sits unreviewed until the next tick,
+		// so this is the dominant pipeline latency. Default 45s (public repos have ample
+		// rate limit — one GraphQL board read per repo per tick); tune via
+		// FLOWBEE_RECONCILE_INTERVAL_S. Webhooks make it event-driven when wired.
+		reconcileEvery := 45 * time.Second
+		if v := os.Getenv("FLOWBEE_RECONCILE_INTERVAL_S"); v != "" {
+			if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
+				reconcileEvery = time.Duration(n) * time.Second
+			}
+		}
+		logger.Info("reconcile cadence", "interval", reconcileEvery.String())
 		go func() {
 			if _, err := mgr.SweepAll(ctx); err != nil {
 				logger.Error("boot reconcile sweep", "err", err)
 			}
-			t := time.NewTicker(3 * time.Minute)
+			t := time.NewTicker(reconcileEvery)
 			defer t.Stop()
 			drain := time.NewTicker(5 * time.Second)
 			defer drain.Stop()
