@@ -204,5 +204,7 @@ func toReconciled(pr gh.PullRequest) store.ReconciledPR {
 		BaseSHA:     pr.BaseRefOid,
 		MergeCommit: pr.MergeCommit,
 		CIGreen:     pr.CIRollup == gh.CISuccess,
+		// a DEFINITIVE failure (not merely pending/none): the build is broken.
+		CIFailed: pr.CIRollup == gh.CIFailure || pr.CIRollup == gh.CIError,
 	}
 }

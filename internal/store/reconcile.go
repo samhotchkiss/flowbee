@@ -26,6 +26,11 @@ type ReconciledPR struct {
 	BaseSHA     string
 	MergeCommit string
 	CIGreen     bool
+	// CIFailed is true only on a DEFINITIVE CI failure at the head (FAILURE/ERROR,
+	// not PENDING): the build is broken. A review_pending job then bounces back to
+	// build (rebuild), escalating to needs_human at max_bounces. Transient (not
+	// stored) — recomputed from the rollup each sweep.
+	CIFailed bool
 }
 
 // ReconcileOutcome reports what an ingest did, for the runtime to publish / assert.
@@ -137,6 +142,15 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 				return err
 			}
 			out.Superseded = true
+		case pr.CIFailed && j.State == job.StateReviewPending:
+			// the build's CI is DEFINITIVELY red while it awaits review: the change is
+			// broken, so bounce it back to build (rebuild), escalating to needs_human
+			// at max_bounces. Gated to review_pending so a single failure bounces once
+			// (the rebuild moves the head; the next sweep sees fresh/pending CI).
+			if err := ciFailBounceTx(ctx, tx, &j, seq, now); err != nil {
+				return err
+			}
+			out.Applied = true
 		}
 		return nil
 	})
@@ -205,6 +219,52 @@ func reconcileTransitionTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int,
 		`UPDATE jobs SET state = ?, updated_at = datetime('now') WHERE id = ?`,
 		string(to), j.ID); err != nil {
 		return fmt.Errorf("apply reconcile transition: %w", err)
+	}
+	return setJobSeq(ctx, tx, j.ID, nextSeq)
+}
+
+// ciFailBounceTx re-arms a review_pending job whose CI is definitively red back to
+// build (a rebuild), or escalates to needs_human at max_bounces. It mirrors the
+// gate's own bounce events (KindReviewBounced / KindBounceExhausted) EXACTLY so the
+// jobs projection stays equal to a re-fold of the ledger (determinism).
+func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time) error {
+	nextSeq := seq + 1
+	if j.Bounces+1 > j.MaxBounces {
+		// the rebuild keeps failing CI: escalate to a human (KindBounceExhausted fold:
+		// state = ToState, bounces += delta, lease cleared).
+		ev := ledger.Event{
+			JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindBounceExhausted,
+			FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
+			Actor: "reconcile", CreatedAt: now, Payload: ledger.Payload{BouncesDelta: 1},
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs SET state='needs_human', bounces=bounces+1,
+			       lease_id=NULL, bound_identity=NULL, bound_model_family=NULL,
+			       updated_at=datetime('now') WHERE id=?`, j.ID); err != nil {
+			return fmt.Errorf("apply ci-fail escalate: %w", err)
+		}
+		return setJobSeq(ctx, tx, j.ID, nextSeq)
+	}
+	// bounce to ready as an eng_worker for a fresh build (KindReviewBounced fold:
+	// state = ToState, bounces += delta, role = eng_worker, enqueued_at = now,
+	// lease cleared).
+	ev := ledger.Event{
+		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindReviewBounced,
+		FromState: j.State, ToState: job.StateReady, LeaseEpoch: j.LeaseEpoch,
+		Actor: "reconcile", CreatedAt: now, Payload: ledger.Payload{BouncesDelta: 1},
+	}
+	if err := appendEvent(ctx, tx, ev); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state='ready', role='eng_worker', bounces=bounces+1,
+		       enqueued_at=?, lease_id=NULL, bound_identity=NULL, bound_model_family=NULL,
+		       updated_at=datetime('now') WHERE id=?`,
+		now.Format(rfc3339), j.ID); err != nil {
+		return fmt.Errorf("apply ci-fail bounce: %w", err)
 	}
 	return setJobSeq(ctx, tx, j.ID, nextSeq)
 }
