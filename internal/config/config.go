@@ -120,6 +120,8 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func (c Config) LeaseTTL() time.Duration          { return time.Duration(c.LeaseTTLS) * time.Second }
-func (c Config) HeartbeatInterval() time.Duration { return time.Duration(c.HeartbeatIntervalS) * time.Second }
-func (c Config) LongPollWait() time.Duration      { return time.Duration(c.LongPollWaitS) * time.Second }
+func (c Config) LeaseTTL() time.Duration { return time.Duration(c.LeaseTTLS) * time.Second }
+func (c Config) HeartbeatInterval() time.Duration {
+	return time.Duration(c.HeartbeatIntervalS) * time.Second
+}
+func (c Config) LongPollWait() time.Duration { return time.Duration(c.LongPollWaitS) * time.Second }

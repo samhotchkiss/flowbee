@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/api"
+	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/config"
 	"github.com/samhotchkiss/flowbee/internal/store"
+	"github.com/samhotchkiss/flowbee/internal/ulid"
 )
 
 // runServe boots the control plane: load config -> open store -> migrate ->
@@ -38,7 +40,13 @@ func runServe(_ []string) error {
 	}
 	logger.Info("migrations applied")
 
-	srv := api.New(st, version)
+	srv := api.New(st, clock.Real{}, ulid.NewMinter(nil), api.Config{
+		LeaseTTL:           cfg.LeaseTTL(),
+		HeartbeatInterval:  cfg.HeartbeatInterval(),
+		LongPollWait:       cfg.LongPollWait(),
+		LeaseTTLS:          cfg.LeaseTTLS,
+		HeartbeatIntervalS: cfg.HeartbeatIntervalS,
+	}, version)
 	healthSrv := &http.Server{Addr: cfg.HealthAddr, Handler: srv.HealthHandler()}
 	privateSrv := &http.Server{Addr: cfg.PrivateAddr, Handler: srv.PrivateHandler()}
 

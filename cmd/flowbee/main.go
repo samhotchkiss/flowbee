@@ -25,8 +25,14 @@ func main() {
 		err = runServe(args)
 	case "migrate":
 		err = runMigrate(args)
-	case "work", "lease", "submit", "seed":
-		fmt.Printf("flowbee %s: not implemented until M1\n", cmd)
+	case "seed":
+		err = runSeed(args)
+	case "work":
+		err = runWork(args)
+	case "lease":
+		err = runLease(args)
+	case "submit":
+		err = runSubmit(args)
 	case "version", "-v", "--version":
 		fmt.Printf("flowbee %s\n", version)
 	default:
