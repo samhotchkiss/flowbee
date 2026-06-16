@@ -141,6 +141,7 @@ func runServe(_ []string) error {
 		if branch == "" {
 			branch = "main"
 		}
+		pushURL := githubPushURL()
 		go func() {
 			t := time.NewTicker(45 * time.Second)
 			defer t.Stop()
@@ -151,7 +152,16 @@ func runServe(_ []string) error {
 				case <-t.C:
 					if err := gitops.Open(mp).FetchBranch(branch); err != nil {
 						logger.Warn("mirror refresh", "branch", branch, "err", err)
+						continue
 					}
+					// rebase-before-review (build-list): now that the mirror's integration
+					// branch tracks GitHub, replay any review_pending build that is behind the
+					// tip onto it BEFORE a reviewer leases it — so the reviewer judges what will
+					// actually merge, and a real conflict is diverted to a conflict_resolver
+					// instead of wasting a full review. A clean rebase re-arms review + CI at
+					// the integrated head; the rebased commit is force-pushed to the issue
+					// branch so the PR + CI track it.
+					rebaseStaleReviews(ctx, logger, st, mp, pushURL, branch)
 				}
 			}
 		}()
@@ -290,6 +300,45 @@ func githubPushURL() string {
 		return ""
 	}
 	return "https://x-access-token:" + tok + "@github.com/" + owner + "/" + repo + ".git"
+}
+
+// rebaseStaleReviews replays every review_pending build that is behind the current
+// integration tip onto it, BEFORE a reviewer leases it (build-list rebase-before-
+// review). It reuses the F8 machinery (store.RebaseOnto): a clean rebase re-arms
+// review + CI at the integrated head and the rebased commit is force-pushed to the
+// issue branch so the PR + CI track it; a real conflict diverts the job to a
+// conflict_resolver. Best-effort: a single job's failure never blocks the others.
+func rebaseStaleReviews(ctx context.Context, logger *slog.Logger, st *store.Store, mirrorPath, pushURL, branch string) {
+	mainTip, err := gitops.Open(mirrorPath).HeadSHA("refs/heads/" + branch)
+	if err != nil {
+		return
+	}
+	stale, err := st.StaleReviewBuilds(ctx, mainTip)
+	if err != nil || len(stale) == 0 {
+		return
+	}
+	mirror := gitops.Open(mirrorPath)
+	for _, jobID := range stale {
+		res, rerr := st.RebaseOnto(ctx, mirror, store.RebaseOntoParams{
+			JobID: jobID, NewBaseSHA: mainTip, Now: time.Now(),
+		})
+		if rerr != nil {
+			logger.Warn("rebase-before-review", "job", jobID, "err", rerr)
+			continue
+		}
+		switch {
+		case res.Clean && res.NewSHA != "" && pushURL != "":
+			// force-push the rebased head to the issue branch so the PR + CI track it.
+			brName := store.IssueBranch(st.ResolveIssueNum(ctx, jobID), jobID)
+			if perr := mirror.PushCommit(pushURL, res.NewSHA, brName); perr != nil {
+				logger.Warn("rebase-before-review push", "job", jobID, "branch", brName, "err", perr)
+			} else {
+				logger.Info("rebased review onto tip", "job", jobID, "branch", brName, "head", res.NewSHA[:min(7, len(res.NewSHA))])
+			}
+		case res.ResolverNeeded:
+			logger.Info("review diverted to conflict_resolver before review", "job", jobID)
+		}
+	}
 }
 
 func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, st *store.Store, srv *api.Server) *multirepo.Manager {

@@ -317,6 +317,38 @@ func (s *Store) RebaseOnto(ctx context.Context, mirror *gitops.Mirror, p RebaseO
 	return res, nil
 }
 
+// StaleReviewBuilds returns the ids of review_pending build jobs whose base_sha is
+// behind the current integration tip (mainTip) and that carry a stored patch to
+// replay. These are the jobs to rebase-before-review (build-list: "rebase before the
+// reviewer starts so it doesn't review something that won't merge"): the control
+// plane replays each onto mainTip via RebaseOnto — a clean rebase re-arms review +
+// CI at the integrated head; a real conflict diverts to a conflict_resolver BEFORE
+// any review effort is spent. A job already on mainTip is skipped (no-op).
+func (s *Store) StaleReviewBuilds(ctx context.Context, mainTip string) ([]string, error) {
+	if strings.TrimSpace(mainTip) == "" {
+		return nil, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id FROM jobs
+		 WHERE state = 'review_pending' AND kind = 'build'
+		   AND base_sha != '' AND base_sha != ?
+		   AND patch_diff IS NOT NULL AND patch_diff != ''
+		 ORDER BY updated_at ASC`, mainTip)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ── (3) resolve_conflict result: re-review + re-CI ──────────────────────────────
 
 // ResolveConflictParams is a conflict_resolver's returned resolution (the resolved
