@@ -37,6 +37,9 @@ type Fake struct {
 	// retryAfter, when >0, makes the NEXT write return *ErrRetryAfter (§8.2.4),
 	// then resets — so a test can prove the sender parks the outbox and retries.
 	retryAfter time.Duration
+	// nextErr, when set, makes the NEXT write return it (then resets) — so a test can
+	// inject a permanent *ErrGitHub and prove the sender dead-letters the poison row.
+	nextErr error
 }
 
 // NewFake builds an empty Fake with a healthy starting rate-limit budget.
@@ -163,8 +166,21 @@ func (f *Fake) Issues() map[int]CreateIssueInput {
 	return out
 }
 
-// retryGate returns *ErrRetryAfter once, if armed. Caller holds f.mu.
+// FailNextWriteWith makes the next write return err (then resets) — for injecting a
+// permanent *ErrGitHub to prove the sender dead-letters the poison row.
+func (f *Fake) FailNextWriteWith(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextErr = err
+}
+
+// retryGate returns an armed injected error once, if any. Caller holds f.mu.
 func (f *Fake) retryGate() error {
+	if f.nextErr != nil {
+		e := f.nextErr
+		f.nextErr = nil
+		return e
+	}
 	if f.retryAfter > 0 {
 		d := f.retryAfter
 		f.retryAfter = 0

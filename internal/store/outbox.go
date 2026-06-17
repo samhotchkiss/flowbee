@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
 
 // OutboxRow is one desired project-OUT side-effect (§8.2). It is enqueued
@@ -13,12 +16,13 @@ import (
 // a single serialized sender. The (JobID, Action, HeadSHA) triple is the
 // idempotency key: enqueuing the same triple twice is a no-op (ON CONFLICT).
 type OutboxRow struct {
-	ID      int64
-	JobID   string
-	Action  string
-	HeadSHA string
-	Payload string // action-specific JSON args
-	Status  string
+	ID       int64
+	JobID    string
+	Action   string
+	HeadSHA  string
+	Payload  string // action-specific JSON args
+	Status   string
+	Attempts int // failed-send count so far (the dead-letter backstop reads this)
 }
 
 // outbox action constants (§8.2.1).
@@ -68,9 +72,9 @@ func (s *Store) EnqueueOutbox(ctx context.Context, row OutboxRow) error {
 func (s *Store) NextPendingOutbox(ctx context.Context) (OutboxRow, bool, error) {
 	var row OutboxRow
 	err := s.DB.QueryRowContext(ctx, `
-		SELECT id, job_id, action, head_sha, payload, status
+		SELECT id, job_id, action, head_sha, payload, status, attempts
 		  FROM outbox WHERE status = 'pending' ORDER BY id ASC LIMIT 1`).
-		Scan(&row.ID, &row.JobID, &row.Action, &row.HeadSHA, &row.Payload, &row.Status)
+		Scan(&row.ID, &row.JobID, &row.Action, &row.HeadSHA, &row.Payload, &row.Status, &row.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OutboxRow{}, false, nil
 	}
@@ -89,11 +93,11 @@ func (s *Store) NextPendingOutbox(ctx context.Context) (OutboxRow, bool, error) 
 func (s *Store) NextPendingOutboxForRepo(ctx context.Context, repo string) (OutboxRow, bool, error) {
 	var row OutboxRow
 	err := s.DB.QueryRowContext(ctx, `
-		SELECT o.id, o.job_id, o.action, o.head_sha, o.payload, o.status
+		SELECT o.id, o.job_id, o.action, o.head_sha, o.payload, o.status, o.attempts
 		  FROM outbox o JOIN jobs j ON j.id = o.job_id
 		 WHERE o.status = 'pending' AND j.repo = ?
 		 ORDER BY o.id ASC LIMIT 1`, repo).
-		Scan(&row.ID, &row.JobID, &row.Action, &row.HeadSHA, &row.Payload, &row.Status)
+		Scan(&row.ID, &row.JobID, &row.Action, &row.HeadSHA, &row.Payload, &row.Status, &row.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OutboxRow{}, false, nil
 	}
@@ -145,6 +149,50 @@ func (s *Store) MarkOutboxSuppressed(ctx context.Context, id int64) error {
 func (s *Store) BumpOutboxAttempts(ctx context.Context, id int64) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE outbox SET attempts=attempts+1 WHERE id = ?`, id)
 	return err
+}
+
+// DeadLetterOutbox abandons a poison outbox row — a PERMANENT GitHub failure (a 4xx:
+// deleted branch/PR, 422, 404) or one that exhausted its retry budget — so the rest of
+// the repo's GitHub writes keep flowing instead of wedging behind it (the outbox is
+// serialized oldest-first; a stuck head row blocks everything). When `escalate` (a
+// CRITICAL action: open-PR / merge / create-issue), the owning job is surfaced to
+// needs_human with `reason` so a human fixes the GitHub state and requeues; a cosmetic
+// action (comment / label / check) is simply dropped. The row is abandoned WITHOUT an
+// audit entry — the action never took effect on GitHub.
+func (s *Store) DeadLetterOutbox(ctx context.Context, rowID int64, jobID, reason string, escalate bool, now time.Time) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE outbox SET status='abandoned', sent_at=datetime('now'), attempts=attempts+1 WHERE id = ?`, rowID); err != nil {
+			return err
+		}
+		if !escalate {
+			return nil
+		}
+		j, seq, err := loadJobTx(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		// already terminal / human-owned: drop the row, don't rewind state.
+		if j.State == job.StateDone || j.State == job.StateNeedsHuman || j.State == job.StateCancelled {
+			return nil
+		}
+		nextSeq := seq + 1
+		ev := ledger.Event{
+			JobID: jobID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
+			FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
+			Actor: "project-out", CreatedAt: now,
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE jobs SET state='needs_human', escalation_reason=?, lease_id=NULL,
+			     bound_identity=NULL, lease_hb_due=NULL, updated_at=datetime('now') WHERE id=?`,
+			reason, jobID); err != nil {
+			return err
+		}
+		return setJobSeq(ctx, tx, jobID, nextSeq)
+	})
 }
 
 // AbandonOutboxForJobSHA voids every pending outbox row for a job whose head_sha

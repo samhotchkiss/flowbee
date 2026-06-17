@@ -179,6 +179,29 @@ func (e *ErrRetryAfter) Error() string {
 // to a conflict_resolver instead of re-queuing the merge.
 var ErrMergeConflict = errors.New("pull request has merge conflicts (not mergeable)")
 
+// ErrGitHub is a non-2xx REST response carrying its status code, so the sender can
+// distinguish a PERMANENT failure (a 4xx — a deleted branch/PR, a 422 validation, a
+// 404 not-found: retrying NEVER succeeds) from a TRANSIENT one (a 5xx / network blip:
+// GitHub will recover). Without this the outbox cannot tell a poison row from a brief
+// outage and would either wedge forever (head-of-line) or dead-letter good work.
+type ErrGitHub struct {
+	StatusCode     int
+	Method, Path   string
+	Body           string
+}
+
+func (e *ErrGitHub) Error() string {
+	return fmt.Sprintf("rest %s %s: %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+// Permanent reports whether retrying is futile: a 4xx client error (the request is
+// malformed or the target is gone), EXCEPT 408 Request Timeout and 429 Too Many
+// Requests, which are retried (429 is normally surfaced as ErrRetryAfter upstream).
+func (e *ErrGitHub) Permanent() bool {
+	return e.StatusCode >= 400 && e.StatusCode < 500 &&
+		e.StatusCode != http.StatusRequestTimeout && e.StatusCode != http.StatusTooManyRequests
+}
+
 // isMergeConflict reports whether a failed merge is an unmergeable-conflict 405 (vs a
 // transient error). GitHub's messages are stable: "Pull Request has merge conflicts"
 // and "Pull Request is not mergeable".
@@ -489,7 +512,7 @@ func (c *RealClient) rest(ctx context.Context, method, path string, body any, ou
 		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("rest %s %s: %d: %s", method, path, resp.StatusCode, string(raw))
+		return &ErrGitHub{StatusCode: resp.StatusCode, Method: method, Path: path, Body: string(raw)}
 	}
 	if out != nil && len(raw) > 0 {
 		return json.Unmarshal(raw, out)

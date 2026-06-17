@@ -30,6 +30,26 @@ import (
 // Clock is the injected clock (DESIGN: Flowbee is the sole clock).
 type Clock interface{ Now() time.Time }
 
+// maxOutboxAttempts is the dead-letter backstop: a row that has failed to send this
+// many times is treated as poison even if its error looked transient (a misclassified
+// permanent error, or a multi-hour GitHub outage). Generous, because the head-of-line
+// serialization means only the STUCK row accumulates attempts — a brief outage recovers
+// long before this. A genuinely permanent 4xx is dead-lettered immediately, not here.
+const maxOutboxAttempts = 100
+
+// criticalAction reports whether a permanently-failed outbox action should escalate
+// its job to a human (it blocks the pipeline: no PR -> no review/merge; no merge -> no
+// completion; no issue -> no spec materialization). A cosmetic action (a comment, a
+// label, a check, a draft-back) is simply dropped — the pipeline proceeds without it.
+func criticalAction(action string) bool {
+	switch action {
+	case store.ActionOpenPR, store.ActionEnqueueMerge, store.ActionCreateIssue:
+		return true
+	default:
+		return false
+	}
+}
+
 // Publisher surfaces a project-OUT action live on the SSE feed (optional).
 type Publisher interface {
 	PublishReconcile(jobID, event string)
@@ -182,6 +202,25 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 				}
 				// could not route (no local mirror to resolve main, or route failed) — fall
 				// through to the transient path so a human eventually sees the stuck merge.
+			}
+			// a PERMANENT GitHub failure (a 4xx: deleted branch/PR, 422, 404) never
+			// succeeds on retry; a row that has also exhausted a generous retry budget is a
+			// poison row (a transient error misclassified, or a multi-hour outage). Either
+			// would wedge the SERIALIZED oldest-first outbox forever behind it — blocking
+			// every other GitHub write for the repo. Dead-letter it (surfacing the job to a
+			// human for a CRITICAL action) and CONTINUE draining the rest, instead of
+			// stopping the whole drain on one bad row.
+			var ghErr *gh.ErrGitHub
+			permanent := errors.As(err, &ghErr) && ghErr.Permanent()
+			if permanent || row.Attempts+1 >= maxOutboxAttempts {
+				if derr := s.store.DeadLetterOutbox(ctx, row.ID, row.JobID,
+					string(job.EscalationProjectOut), criticalAction(row.Action), s.clock.Now()); derr != nil {
+					return sent, derr
+				}
+				if s.pub != nil {
+					s.pub.PublishReconcile(row.JobID, "project_out:dead_letter")
+				}
+				continue
 			}
 			// a transient error: bump attempts, leave pending, stop this drain.
 			_ = s.store.BumpOutboxAttempts(ctx, row.ID)

@@ -132,6 +132,12 @@ const (
 	EscalationBounces  EscalationReason = "bounces"
 	EscalationCost     EscalationReason = "cost"
 	EscalationStall    EscalationReason = "stall"
+	// EscalationProjectOut is the stuck-GitHub-write trigger: an outbox row (open PR /
+	// merge / comment / label) failed PERMANENTLY (a 4xx — deleted branch/PR, 422, 404)
+	// or exhausted its retry budget. The row is dead-lettered so the rest of the repo's
+	// GitHub writes keep flowing (no head-of-line wedge), and the job is surfaced so a
+	// human fixes the underlying GitHub state and requeues.
+	EscalationProjectOut EscalationReason = "project_out"
 	// EscalationCIStalled is the stuck-CI trigger: a review_pending job whose PR has
 	// been open with CI NOT green for the entire (generous) stall window — CI is wedged
 	// (the runner is down, no workflow was triggered, or the run is perpetually pending),

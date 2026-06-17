@@ -7,6 +7,7 @@ import (
 
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	gh "github.com/samhotchkiss/flowbee/internal/github"
+	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
@@ -157,5 +158,48 @@ func TestRetryAfterParksWholeOutbox(t *testing.T) {
 	clk.Advance(31 * time.Second)
 	if n, _ := sender.DrainOnce(ctx); n != 1 {
 		t.Fatalf("after the park expires the row must drain, got %d", n)
+	}
+}
+
+// TestPoisonOutboxRowDeadLetteredNoHeadOfLineWedge: a row whose GitHub write fails
+// PERMANENTLY (a 4xx — e.g. the branch was deleted) must not wedge the serialized,
+// oldest-first outbox behind it. The sender dead-letters the poison row (surfacing its
+// job to a human, since open-PR is critical) and CONTINUES draining — the good row
+// behind it still goes out.
+func TestPoisonOutboxRowDeadLetteredNoHeadOfLineWedge(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+	seedReviewPending(t, st, "poison")
+	seedReviewPending(t, st, "good")
+
+	// poison's PR-open is enqueued FIRST -> it is the head of the serialized queue.
+	if _, err := st.EnqueuePROpen(ctx, "poison", "sha-poison", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnqueuePROpen(ctx, "good", "sha-good", "main"); err != nil {
+		t.Fatal(err)
+	}
+	// the poison row's OpenPR fails permanently (branch gone -> 422).
+	fake.FailNextWriteWith(&gh.ErrGitHub{StatusCode: 422, Method: "POST", Path: "/pulls", Body: "Reference does not exist"})
+
+	n, err := sender.DrainOnce(ctx)
+	if err != nil {
+		t.Fatalf("a poison row must NOT abort the whole drain: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("drain sent=%d, want 1 (the good row proceeds past the dead-lettered poison)", n)
+	}
+	// the poison job is surfaced to a human with the project_out reason.
+	pj, _ := st.GetJob(ctx, "poison")
+	if pj.State != job.StateNeedsHuman || pj.EscalationReason != string(job.EscalationProjectOut) {
+		t.Fatalf("poison job state=%s reason=%q, want needs_human/project_out", pj.State, pj.EscalationReason)
+	}
+	// the good job's PR-open actually went out (no head-of-line block).
+	if audit, _ := st.AuditLog(ctx, "good"); len(audit) != 1 || audit[0].Action != store.ActionOpenPR {
+		t.Fatalf("good row must have drained past the poison: audit=%+v", audit)
+	}
+	// the poison row left NO audit entry (the action never took effect on GitHub).
+	if audit, _ := st.AuditLog(ctx, "poison"); len(audit) != 0 {
+		t.Fatalf("dead-lettered poison must not write an audit entry: %+v", audit)
 	}
 }
