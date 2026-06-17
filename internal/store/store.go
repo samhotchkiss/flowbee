@@ -8,6 +8,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/content"
@@ -60,6 +62,30 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.DB.PingContext(ctx) }
+
+// DBSizeBytes returns the on-disk size of the SQLite database (main file + WAL + SHM),
+// so the operator can SEE the ledger grow: job_events is append-only (the source of
+// truth — projection == Fold(events)), so the DB grows with throughput over months.
+// SQLite handles multi-GB fine and it is litestream-backed, but a metric makes the
+// growth observable + alertable rather than a silent surprise (the one unbounded table
+// — pruning it safely is a future opt-in feature, not a default). O(1) stat, never a
+// table scan. 0 when the path can't be resolved (e.g., an in-memory test DB).
+func (s *Store) DBSizeBytes() int64 {
+	path := strings.TrimPrefix(s.dsn, "file:")
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	if path == "" || path == ":memory:" || strings.Contains(s.dsn, ":memory:") || strings.Contains(s.dsn, "mode=memory") {
+		return 0
+	}
+	var total int64
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if fi, err := os.Stat(path + suffix); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
+}
 
 // Close folds the WAL into the main db file, then closes, so a file-level copy of just
 // flowbee.db is self-contained, the next start replays no WAL, and a graceful SIGTERM

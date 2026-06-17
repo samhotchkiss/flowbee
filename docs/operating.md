@@ -188,9 +188,11 @@ building → review_pending → code_review → mergeable → merging → done**
   `flowbee_github_last_success_age_seconds` (seconds since the last successful GitHub reconcile
   sweep — grows without bound when the control plane can't reach GitHub: an **expired/revoked
   token**, exhausted rate limit, or connectivity loss; `/healthz` carries the error in
-  `github_last_error`). The pages that matter: a wedged `needs_human` job,
-  `flowbee_fleet_workers{status="live"} == 0` with waiting jobs, `over_budget` climbing, or
-  `flowbee_github_last_success_age_seconds` past a few minutes (all progress has silently stalled).
+  `github_last_error`), and `flowbee_db_size_bytes` (the SQLite file size — the ledger
+  `job_events` is append-only, so this grows with throughput; see Durability below). The pages
+  that matter: a wedged `needs_human` job, `flowbee_fleet_workers{status="live"} == 0` with
+  waiting jobs, `over_budget` climbing, or `flowbee_github_last_success_age_seconds` past a few
+  minutes (all progress has silently stalled).
   Example minimal `prometheus.yml` scrape config:
 
   ```yaml
@@ -242,6 +244,15 @@ No object store handy? A periodic `sqlite3 flowbee.db ".backup '/backups/flowbee
 is a coarse floor, but litestream's continuous WAL replication is the production answer
 (point-in-time recovery, seconds of data loss vs. a day). The ledger is append-only, so a
 restore is always internally consistent — replay folds the jobs table back exactly.
+
+**On growth:** `job_events` is the append-only ledger (the source of truth), so the DB grows
+with throughput — watch `flowbee_db_size_bytes`. SQLite handles multi-GB comfortably and it is
+litestream-replicated, so this is a slow scaling line (≈hundreds of MB/year at a steady cadence),
+not a near-term limit. The `jobs` table (one row per job, the final projection + verdict +
+counters), the GitHub `audit_log`, and the git history are the durable record of *what happened*;
+the per-job event timeline is the fine-grained detail. A retention policy that archives + prunes
+old **terminal** jobs' events is a deliberate, opt-in future feature — terminal jobs are never
+re-folded, but pruning the source of truth is not something to default-on.
 
 ---
 

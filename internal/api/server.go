@@ -493,6 +493,13 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "# TYPE flowbee_github_last_success_age_seconds gauge\n")
 	fmt.Fprintf(&b, "flowbee_github_last_success_age_seconds %d\n", s.clock.Now().Unix()-s.ghLastSuccess.Load())
 
+	// DB on-disk size: the ledger (job_events) is append-only, so this grows with
+	// throughput over months. Litestream-backed + SQLite handles multi-GB, but surface
+	// it so an operator can watch the one unbounded table rather than be surprised.
+	fmt.Fprintf(&b, "# HELP flowbee_db_size_bytes On-disk size of the SQLite database (main + WAL + SHM).\n")
+	fmt.Fprintf(&b, "# TYPE flowbee_db_size_bytes gauge\n")
+	fmt.Fprintf(&b, "flowbee_db_size_bytes %d\n", s.store.DBSizeBytes())
+
 	// Jobs by repo+state: the core liveness signal. A state with no jobs emits no
 	// series (Prometheus treats absent == 0), which is the correct semantics for
 	// alerting on `flowbee_jobs{state="needs_human"} > 0`.
