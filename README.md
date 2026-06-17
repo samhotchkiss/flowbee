@@ -103,7 +103,7 @@ content-integrity gate **merges to `main` autonomously** — no human gate.
 
 Go deeper: **[DESIGN.md](./DESIGN.md)** — the full architecture · **[BUILD.md](./BUILD.md)** — the milestone plan.
 
-Run it: **[docs/operating.md](./docs/operating.md)** — stand up a control plane + fleet and feed it work · **[docs/troubleshooting.md](./docs/troubleshooting.md)** — confirm and fix common failure modes · **[docs/pipeline.md](./docs/pipeline.md)** — the stages a change moves through · **[docs/config.md](./docs/config.md)** · **[docs/identities.md](./docs/identities.md)** · **[docs/deploy/multi-repo.md](./docs/deploy/multi-repo.md)**.
+Run it: **[docs/operating.md](./docs/operating.md)** — stand up a control plane + fleet and feed it work · **[docs/troubleshooting.md](./docs/troubleshooting.md)** — confirm and fix common failure modes · **[docs/pipeline.md](./docs/pipeline.md)** — the stages a change moves through · **[docs/config.md](./docs/config.md)** · **[docs/identities.md](./docs/identities.md)** · **[docs/deploy/multi-repo.md](./docs/deploy/multi-repo.md)** · **[Glossary](docs/glossary.md)** — definitions of Flowbee terms.
 
 ## Status
 
