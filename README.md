@@ -101,7 +101,7 @@ content-integrity gate **merges to `main` autonomously** — no human gate.
 - **Trust nothing, verify everything.** Verdicts derive from reconciled facts, never a worker's say-so. Liveness detection tells *slow* from *stuck*. A content-integrity gate keeps a prompt-injected diff out of `main`.
 - **Compounding memory.** Every issue and outcome is archived in-repo, so the fleet stops re-deriving dead ends and re-submitting patches that already failed review.
 
-Go deeper: **[DESIGN.md](./DESIGN.md)** — the full architecture · **[BUILD.md](./BUILD.md)** — the milestone plan.
+Go deeper: **[docs/architecture-overview.md](./docs/architecture-overview.md)** — high-level map of the system (start here) · **[DESIGN.md](./DESIGN.md)** — the full architecture · **[BUILD.md](./BUILD.md)** — the milestone plan.
 
 Run it: **[docs/operating.md](./docs/operating.md)** — stand up a control plane + fleet and feed it work · **[docs/troubleshooting.md](./docs/troubleshooting.md)** — confirm and fix common failure modes · **[docs/pipeline.md](./docs/pipeline.md)** — the stages a change moves through · **[docs/config.md](./docs/config.md)** · **[docs/identities.md](./docs/identities.md)** · **[docs/deploy/multi-repo.md](./docs/deploy/multi-repo.md)**.
 
