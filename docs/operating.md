@@ -80,7 +80,7 @@ repos:
 ## 3. The fleet (`flowbee fleet`)
 
 One command on each worker box brings up every role — build workers, a code reviewer, a
-spec author, and a spec reviewer:
+conflict resolver, a spec author, and a spec reviewer:
 
 ```sh
 FLOWBEE_REPO_URL=git@github.com:samhotchkiss/flowbee.git \
@@ -92,7 +92,9 @@ What it does:
 - Smoke-tests the agent CLI first (fail loud, not mid-job).
 - Spawns `--builders` N parallel **eng_worker** build workers (each gets its own worktree
   off a shared per-repo bare mirror under `~/.flowbee/mirrors`).
-- Spawns one **code_reviewer**, one **spec_author**, one **spec_reviewer**.
+- Spawns one **code_reviewer**, one **conflict_resolver** (rebases + resolves a PR that
+  conflicts after a sibling merged, so conflicts resolve autonomously instead of
+  escalating), one **spec_author**, one **spec_reviewer**.
 - Workers commit + push with the box's own key; the control plane never gets their creds.
 
 Flags: `--builders N`, `--mirror DIR`, `--agent-cmd` (review/author roles),
