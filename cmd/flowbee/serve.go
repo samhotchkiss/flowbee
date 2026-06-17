@@ -211,12 +211,25 @@ func runServe(args []string) error {
 
 	// the single durable-timer polling goroutine (project override #2): drives the
 	// no_eligible_worker alarm + the M8 liveness deadlines (Rung-3), epoch-guarded.
+	// hbReap: presume a worker dead after ~4 missed heartbeats. The worker beats every
+	// clamp(TTL/3, 20s, 60s); 4× that is comfortably above both the inter-beat gap and
+	// the pre-first-beat worktree-setup window (covered by the grant-time floor), so a
+	// live worker is never reaped — but a CRASHED one is, in minutes instead of the full
+	// ~20-min absolute cap. The cap remains the backstop for tiny TTLs where 4× > cap.
+	hbInterval := cfg.LeaseTTL() / 3
+	if hbInterval > 60*time.Second {
+		hbInterval = 60 * time.Second
+	}
+	if hbInterval < 20*time.Second {
+		hbInterval = 20 * time.Second
+	}
 	livenessCfg := store.LivenessConfig{
 		PhaseBudget:                   cfg.LeaseTTL() / 2, // soft deadline ~ half the TTL window
 		AbsoluteCap:                   cfg.LeaseTTL(),     // the un-gameable Rung-3 floor
 		Rung2Window:                   cfg.LeaseTTL() / 2,
 		GovernorCeiling:               3, // Rung-4 anti-thrash (distinct from max_attempts)
 		CircuitBreakerAbstainFraction: 0.8,
+		HeartbeatReapAfter:            4 * hbInterval, // crash recovery in minutes, not ~20m
 	}
 	poller := alarm.New(st, clock.Real{}, time.Second, srv.Broker()).
 		WithLiveness(livenessCfg, store.DBFactSource{DB: st.DB}, srv.Broker())

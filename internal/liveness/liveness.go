@@ -67,6 +67,15 @@ const (
 type Rung3State struct {
 	SoftCrossed bool // per-phase soft deadline crossed (role/constraint-derived)
 	AbsoluteCap bool // absolute lease cap hit — the un-gameable floor, full kill
+	// HeartbeatStale is clock-truth that the worker has stopped checking in: it has not
+	// heartbeated for longer than the reap window (several heartbeat intervals). A
+	// CLEANLY-crashed worker (kill -9, OOM, power loss) reports no "unhealthy" hint — its
+	// last health is "ok" and it simply goes silent — so the soft-deadline ladder, which
+	// needs a corroborating rung, never fires and only the absolute cap (lease_ttl, ~20m)
+	// reaps it. That makes crash recovery 20 min instead of a few. HeartbeatStale is
+	// un-gameable (a worker cannot fake heartbeats it never sent) and presumes death, so
+	// like the absolute cap it is a UNILATERAL kill — revoke + redispatch at once.
+	HeartbeatStale bool
 }
 
 // RungSet is the folded snapshot of every rung's current observation for a job,
@@ -148,10 +157,15 @@ func rung1Suspect(c Rung1Class, h AgentHealth) bool {
 // The fleet-wide circuit breaker, when tripped, suppresses every clock-plus-Rung2
 // combination (widening deadlines instead) — only the absolute cap survives it.
 func EvaluateKill(rs RungSet) KillDecision {
-	// 1. The absolute lease cap is the lone unilateral kill (§10.3). Un-gameable,
-	//    breaker-proof: it is pure clock-truth, never "blind".
+	// 1. The unilateral, un-gameable, breaker-proof kills (§10.3) — pure clock-truth,
+	//    never "blind": the absolute lease cap, and a worker that has gone SILENT past the
+	//    reap window (a clean crash — it reports no unhealthy hint, so the soft-deadline
+	//    ladder never corroborates; without this it waits the full lease_ttl to recover).
 	if rs.Rung3.AbsoluteCap {
 		return KillDecision{Kill: true, Unilateral: true, Reason: "absolute lease cap (Rung-3)"}
+	}
+	if rs.Rung3.HeartbeatStale {
+		return KillDecision{Kill: true, Unilateral: true, Reason: "heartbeat stale (worker presumed dead)"}
 	}
 
 	// The circuit breaker (§10.2): on a wholesale reconcile outage Rung-2 abstains

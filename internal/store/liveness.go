@@ -37,6 +37,15 @@ type LivenessConfig struct {
 	// wholesale reconcile outage) — Flowbee then widens deadlines rather than letting
 	// Rung-3 kill into a blind spot (§10.2). Zero disables the breaker.
 	CircuitBreakerAbstainFraction float64
+	// HeartbeatReapAfter is how long a leased job may go WITHOUT a heartbeat before the
+	// worker is presumed dead and the lease reaped (a unilateral, clock-truth kill —
+	// Rung3.HeartbeatStale). A cleanly-crashed worker reports no unhealthy hint, so
+	// without this it waits the full AbsoluteCap (~20m) to recover. Must be safely above
+	// the worker heartbeat interval + worktree-setup time (the worker heartbeats every
+	// ~60s during the agent run, and setup precedes the first beat). Zero disables it
+	// (only the absolute cap reaps a silent worker). A few minutes is the sweet spot:
+	// fast crash recovery without false-reaping a live-but-quiet setup phase.
+	HeartbeatReapAfter time.Duration
 }
 
 // timer kinds for the M8 liveness checks (the River-replacing durable timers,
@@ -136,11 +145,11 @@ func (s *Store) EvaluateLiveness(ctx context.Context, jobID string, now time.Tim
 		}
 		// read the liveness sub-state on the lease.
 		var health, rung1, rung2 string
-		var phaseAt, capAt sql.NullString
+		var phaseAt, capAt, hbAt sql.NullString
 		if err := tx.QueryRowContext(ctx, `
-			SELECT agent_health, rung1_class, rung2_last_verdict, phase_deadline_at, lease_deadline
+			SELECT agent_health, rung1_class, rung2_last_verdict, phase_deadline_at, lease_deadline, last_heartbeat_at
 			  FROM jobs WHERE id = ?`, jobID).
-			Scan(&health, &rung1, &rung2, &phaseAt, &capAt); err != nil {
+			Scan(&health, &rung1, &rung2, &phaseAt, &capAt, &hbAt); err != nil {
 			return fmt.Errorf("read liveness substate: %w", err)
 		}
 
@@ -154,6 +163,28 @@ func (s *Store) EvaluateLiveness(ctx context.Context, jobID string, now time.Tim
 		if capAt.Valid {
 			if t, perr := time.Parse(rfc3339, capAt.String); perr == nil && !now.Before(t) {
 				rs.Rung3.AbsoluteCap = true
+			}
+		}
+		// Heartbeat-staleness reap: a worker that hasn't checked in for longer than the
+		// reap window is presumed DEAD (a clean crash reports no unhealthy hint). Measure
+		// from the worker's last ACTIVITY = max(grant time, last heartbeat): the grant time
+		// (lease_deadline - AbsoluteCap) covers the pre-first-beat setup phase and a freshly
+		// re-claimed lease whose last_heartbeat_at is stale from the PRIOR worker — so a new
+		// worker is never reaped before it has had the window to start beating.
+		if cfg.HeartbeatReapAfter > 0 {
+			lastSeen := time.Time{}
+			if capAt.Valid && cfg.AbsoluteCap > 0 {
+				if t, perr := time.Parse(rfc3339, capAt.String); perr == nil {
+					lastSeen = t.Add(-cfg.AbsoluteCap) // grant time = deadline - cap
+				}
+			}
+			if hbAt.Valid {
+				if t, perr := time.Parse(rfc3339, hbAt.String); perr == nil && t.After(lastSeen) {
+					lastSeen = t
+				}
+			}
+			if !lastSeen.IsZero() && now.Sub(lastSeen) > cfg.HeartbeatReapAfter {
+				rs.Rung3.HeartbeatStale = true
 			}
 		}
 		if phaseAt.Valid {
