@@ -15,13 +15,17 @@ import (
 // returns "". The resulting build flows to a PR that Closes the issue on merge.
 func (s *Store) AdoptIssueAsBuild(ctx context.Context, repo string, issueNumber int, title, body, baseSHA string, now time.Time) (string, error) {
 	var existing int
+	// A CANCELLED job is abandoned work — it must NOT count as "tracked", or an issue
+	// whose prior build was cancelled can never be re-adopted after a re-label (a real
+	// dead end). A done (merged) or in-flight job still blocks: don't rebuild merged
+	// work, don't duplicate live work.
 	if err := s.DB.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM jobs WHERE issue_number = ? AND COALESCE(repo,'') = ?`,
+		`SELECT COUNT(*) FROM jobs WHERE issue_number = ? AND COALESCE(repo,'') = ? AND state != 'cancelled'`,
 		issueNumber, repo).Scan(&existing); err != nil {
 		return "", err
 	}
 	if existing > 0 {
-		return "", nil // already adopted
+		return "", nil // already adopted (live or merged)
 	}
 	id := ulid.New()
 	task := strings.TrimSpace(title)
