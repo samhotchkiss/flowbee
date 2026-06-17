@@ -216,3 +216,12 @@ Flowbee uses a single SQLite file (`flowbee.db`) in WAL mode — there is no dat
 to run or manage.
 
 ---
+
+### Can Flowbee decompose a goal into multiple issues?
+
+Yes. POST `/v1/epics` with a `goal` string and an `issues` list. Flowbee first runs a
+barrier issue-review step that validates the decomposition before any work begins; once
+that passes, each issue fans out independently through the normal
+spec → build → review → merge flow.
+
+---
