@@ -207,3 +207,12 @@ The same handoff happens for ordinary safety reasons: a verdict whose SHA no lon
 no-eligible-worker dead-end all land in `needs_human` or `merge_handoff`. Fix the cause
 and `flowbee requeue <job-id>` to re-arm it with a fresh budget. A human in the loop here
 is the system working as designed, not failing.
+
+---
+
+### What database does Flowbee use?
+
+Flowbee uses a single SQLite file (`flowbee.db`) in WAL mode — there is no database server
+to run or manage.
+
+---
