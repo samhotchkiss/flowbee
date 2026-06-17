@@ -260,6 +260,45 @@ func TestSupersedeOnSHAMove(t *testing.T) {
 	}
 }
 
+// TestMergeHandoffNotSuperseded pins the loop fix: a job handed to a human
+// (merge_handoff — e.g. a change to Flowbee's own source the flowbee_source denylist
+// blocks from self-merge) must SETTLE, not get re-armed. The reviewer's empty
+// findings-commit moves the branch head after the verdict bound to the reviewed head,
+// so a supersedable merge_handoff looped handoff→supersede→rebuild→re-review forever
+// (the live #41 stall). A head move must leave merge_handoff untouched.
+func TestMergeHandoffNotSuperseded(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	seedBuildPR(t, st, "jh", 41)
+
+	t1 := time.Unix(7000, 0)
+	if _, err := st.ApplyReconciledPR(ctx, "jh", store.ReconciledPR{
+		Number: 41, UpdatedAt: t1, HeadSHA: "h1", BaseSHA: "b1", CIGreen: true,
+	}, t1); err != nil {
+		t.Fatalf("baseline: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `
+		UPDATE jobs SET state='merge_handoff', head_sha='h1', lease_epoch=4 WHERE id='jh'`); err != nil {
+		t.Fatalf("set merge_handoff: %v", err)
+	}
+
+	// the reviewer's empty findings-commit moved the head to h2: must NOT supersede.
+	t2 := t1.Add(time.Minute)
+	out, err := st.ApplyReconciledPR(ctx, "jh", store.ReconciledPR{
+		Number: 41, UpdatedAt: t2, HeadSHA: "h2", BaseSHA: "b1", CIGreen: true,
+	}, t2)
+	if err != nil {
+		t.Fatalf("apply move: %v", err)
+	}
+	if out.Superseded {
+		t.Fatalf("merge_handoff was superseded on a head move — the human-merge loop bug")
+	}
+	j, _ := st.GetJob(ctx, "jh")
+	if j.State != job.StateMergeHandoff {
+		t.Fatalf("state=%s want merge_handoff (settled for the human)", j.State)
+	}
+}
+
 // TestUnboundPRNoOp: a swept PR not bound to any job is a no-op (no error).
 func TestUnboundPRNoOp(t *testing.T) {
 	st := testutil.NewStore(t)

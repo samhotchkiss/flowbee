@@ -165,9 +165,18 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 func supersedable(s job.State) bool {
 	switch s {
 	case job.StateLeased, job.StateBuilding, job.StateReviewPending,
-		job.StateCodeReview, job.StateMergeable, job.StateMerging, job.StateMergeHandoff:
+		job.StateCodeReview, job.StateMergeable:
 		return true
 	default:
+		// merge_handoff is DELIBERATELY excluded: it is the "a human merges" state
+		// (self-merge denied — e.g. a change to Flowbee's own source hits the
+		// flowbee_source denylist). The reviewer's empty findings-commit moves the
+		// branch head AFTER the verdict bound to the reviewed head, so leaving
+		// merge_handoff supersedable re-armed it on every sweep → an infinite
+		// handoff→supersede→rebuild→re-review loop the human could never merge into.
+		// A handed-off job must SETTLE; if a human pushes a real fix to the branch and
+		// wants re-review, they `flowbee requeue` it explicitly. merging is excluded
+		// too — a merge in flight must not be yanked back to build mid-dispatch.
 		return false
 	}
 }
