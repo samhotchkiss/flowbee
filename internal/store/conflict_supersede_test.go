@@ -51,13 +51,15 @@ func TestResolvedConflictHeadBaselinePreventsSupersede(t *testing.T) {
 	if j.State != job.StateReviewPending {
 		t.Fatalf("after resolve state=%s want review_pending", j.State)
 	}
-	// BOTH the resolved head and the rebased base are now the reconcile baseline.
-	if h, b := reconHeadBase(t, st, "rc"); h != resolvedSHA || b != newMain {
-		t.Fatalf("baseline head/base=%q/%q want %q/%q", h, b, resolvedSHA, newMain)
+	// the JOB records where Flowbee placed the branch (resolved head + rebased base);
+	// reconcile's flowbeePlaced guard reads THESE (race-free, not domain_b_facts).
+	if j.HeadSHA != resolvedSHA || j.BaseSHA != newMain {
+		t.Fatalf("job head/base=%q/%q want resolved %q / rebased %q", j.HeadSHA, j.BaseSHA, resolvedSHA, newMain)
 	}
 
-	// the next reconcile sweep sees the PR at the resolved head + rebased base — NO
-	// spurious move, so the job STAYS in review (the bug superseded it back to ready).
+	// the next reconcile sweep sees the PR at the resolved head + rebased base — the
+	// flowbeePlaced guard recognises it as Flowbee's own advance, so the job STAYS in
+	// review (the bug superseded it back to ready).
 	if _, err := st.ApplyReconciledPR(ctx, "rc", store.ReconciledPR{
 		Number: 7, HeadSHA: resolvedSHA, BaseSHA: newMain,
 	}, now.Add(2*time.Second)); err != nil {
@@ -110,6 +112,55 @@ func TestUnrecordedResolvedHeadWouldSupersede(t *testing.T) {
 	}
 }
 
+// TestFlowbeePlacedSuppressesRebuildSupersede pins the general guard (the residual
+// #113 churn): a review_pending job whose head_sha is the commit Flowbee just pushed
+// (a rebuild or rebase-before-review) must NOT be superseded when reconcile observes
+// that head — even if the reconcile baseline (domain_b_facts) still lags at the old
+// head. An EXTERNAL head (not the job's) still supersedes.
+func TestFlowbeePlacedSuppressesRebuildSupersede(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	now := time.Unix(1000, 0)
+
+	const newHead, oldHead, mainBase, externalHead = "rebuilthead00", "oldbuildhead0", "mainbase0000", "attackerhead0"
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "b", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// review_pending at the head Flowbee just pushed; baseline (domain_b_facts) lags.
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET state='review_pending', head_sha=?, base_sha=? WHERE id='b'`, newHead, mainBase); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertDomainBFacts(ctx, "b", job.DomainBFacts{
+		PRExists: true, PRNumber: 9, HeadSHA: oldHead, BaseSHA: mainBase,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// reconcile observes the PR at the job's own pushed head -> flowbeePlaced -> no supersede.
+	if _, err := st.ApplyReconciledPR(ctx, "b", store.ReconciledPR{
+		Number: 9, HeadSHA: newHead, BaseSHA: mainBase,
+	}, now.Add(time.Second)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if j, _ := st.GetJob(ctx, "b"); j.State != job.StateReviewPending {
+		t.Fatalf("Flowbee-placed head must not supersede, state=%s", j.State)
+	}
+
+	// an EXTERNAL head (not what Flowbee pushed) is a real move -> supersede.
+	if _, err := st.ApplyReconciledPR(ctx, "b", store.ReconciledPR{
+		Number: 9, HeadSHA: externalHead, BaseSHA: mainBase,
+	}, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("reconcile2: %v", err)
+	}
+	if j, _ := st.GetJob(ctx, "b"); j.State != job.StateReady {
+		t.Fatalf("external head move must supersede to ready, state=%s", j.State)
+	}
+}
+
 func reconHead(t *testing.T, st *store.Store, id string) string {
 	t.Helper()
 	var head string
@@ -120,12 +171,3 @@ func reconHead(t *testing.T, st *store.Store, id string) string {
 	return head
 }
 
-func reconHeadBase(t *testing.T, st *store.Store, id string) (string, string) {
-	t.Helper()
-	var head, base string
-	if err := st.DB.QueryRowContext(context.Background(),
-		`SELECT COALESCE(head_sha,''), COALESCE(base_sha,'') FROM domain_b_facts WHERE job_id=?`, id).Scan(&head, &base); err != nil {
-		t.Fatalf("read recon head/base: %v", err)
-	}
-	return head, base
-}

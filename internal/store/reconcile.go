@@ -105,7 +105,20 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		// an early sweep can report a head but an empty base oid (or vice versa), and
 		// later filling it in must NOT read as a base move (which would spuriously
 		// supersede a perfectly good verdict and re-arm the build).
-		shaMoved := !pr.Merged &&
+		//
+		// flowbeePlaced: the PR sits EXACTLY where Flowbee last placed the branch —
+		// j.head_sha / j.base_sha are the atomic record of the build result, a
+		// rebase-before-review, or a conflict resolution. That advance is Flowbee's OWN
+		// (it performed the git write), NOT an external move, so it must NOT supersede:
+		// otherwise our own rebase/resolve push reads as a SHA move and kicks the review
+		// back to build, churning (the live resolve→supersede→rebuild loop). This is
+		// race-free where a domain_b_facts write is not — the JOB row is set atomically
+		// with the state transition, independent of when the git push lands on GitHub.
+		// An EXTERNAL push (pr.head != j.head_sha) or main advancing PAST where we rebased
+		// (pr.base != j.base_sha) still differs from the job record -> a real move.
+		flowbeePlaced := j.HeadSHA != "" && pr.HeadSHA == j.HeadSHA &&
+			(j.BaseSHA == "" || pr.BaseSHA == "" || pr.BaseSHA == j.BaseSHA)
+		shaMoved := !pr.Merged && !flowbeePlaced &&
 			(prevHead != "" && prevHead != pr.HeadSHA ||
 				prevBase != "" && pr.BaseSHA != "" && prevBase != pr.BaseSHA)
 

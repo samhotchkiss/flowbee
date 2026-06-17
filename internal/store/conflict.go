@@ -275,16 +275,12 @@ func (s *Store) RebaseOnto(ctx context.Context, mirror *gitops.Mirror, p RebaseO
 				marshalStrings([]string{"role:code_reviewer"}), p.NewBaseSHA, newSHA, p.JobID); err != nil {
 				return fmt.Errorf("apply clean rebase: %w", err)
 			}
-			// record the rebased head + base as the reconcile baseline: rebaseStaleReviews
-			// force-pushes newSHA to the issue branch, so without this the next reconcile
-			// sweep reads our own rebase as an unexpected head/base move and supersedes the
-			// review straight back to build — the same spurious-supersede class as the
-			// conflict-resolution path. Flowbee performed the git write, so it owns the fact.
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE domain_b_facts SET head_sha = ?, base_sha = ?, updated_at = datetime('now')
-				 WHERE job_id = ?`, newSHA, p.NewBaseSHA, p.JobID); err != nil {
-				return fmt.Errorf("record rebased head/base baseline: %w", err)
-			}
+			// NOTE: do NOT write domain_b_facts here. rebaseStaleReviews force-pushes newSHA
+			// to GitHub AFTER this tx commits, so recording it now would put the baseline
+			// AHEAD of GitHub and a reconcile sweep in that window would read a (reverse)
+			// move and supersede. The job's head_sha/base_sha above are the atomic record of
+			// where Flowbee placed the branch; reconcile's `flowbeePlaced` guard reads THOSE
+			// to recognise the rebase as Flowbee's own, not an external move (race-free).
 			res.Clean = true
 			res.NewSHA = newSHA
 			return setJobSeq(ctx, tx, p.JobID, nextSeq)
@@ -468,6 +464,7 @@ func (s *Store) ResolveConflictResult(ctx context.Context, p ResolveConflictPara
 			       builder_identity     = COALESCE(builder_identity, bound_identity),
 			       builder_model_family = COALESCE(builder_model_family, bound_model_family),
 			       head_ref = COALESCE(NULLIF(?, ''), head_ref),
+			       head_sha = COALESCE(NULLIF(?, ''), head_sha),
 			       patch_diff = ?, declared_blast_radius = ?,
 			       verdict = NULL,
 			       eng_worker_job = COALESCE(eng_worker_job, id),
@@ -475,27 +472,16 @@ func (s *Store) ResolveConflictResult(ctx context.Context, p ResolveConflictPara
 			       bound_model_family = NULL, lease_hb_due = NULL,
 			       updated_at = datetime('now')
 			 WHERE id = ?`,
-			marshalStrings([]string{"role:code_reviewer"}), p.PushedRef,
+			marshalStrings([]string{"role:code_reviewer"}), p.PushedRef, p.PushedSHA,
 			p.ResolvedDiff, p.DeclaredBlastRadius, p.JobID); err != nil {
 			return fmt.Errorf("apply resolve_conflict result: %w", err)
 		}
-		// record the resolved head AND base as the reconcile baseline (the SHAs Flowbee
-		// just pushed — Flowbee performed the git write, so it OWNS these facts, like a
-		// merge commit). Without this the next reconcile sweep reads the resolver's
-		// (legitimate) head/base advance as an unexpected SHA move and supersedes
-		// review_pending -> build, churning (resolve -> supersede -> rebuild). BOTH move:
-		// the resolver force-pushes a new head AND rebases the branch onto current main,
-		// so the PR's baseRefOid (the main tip) differs from the pre-conflict base — record
-		// j.BaseSHA (the base the resolver rebased onto, set by RouteMergeConflict/rebase)
-		// so neither term of `shaMoved` fires. If main advances AGAIN before reconcile a
-		// supersede correctly recurs (rebuild on the newer base) — bounded, not a loop.
-		if p.PushedSHA != "" {
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE domain_b_facts SET head_sha = ?, base_sha = ?, updated_at = datetime('now')
-				 WHERE job_id = ?`, p.PushedSHA, j.BaseSHA, p.JobID); err != nil {
-				return fmt.Errorf("record resolved head/base baseline: %w", err)
-			}
-		}
+		// j.head_sha (set above to the resolved commit) + j.base_sha (already the rebased
+		// base from RouteMergeConflict) record where Flowbee placed the branch. The
+		// resolver force-pushed BEFORE submitting, so GitHub already has this head — and
+		// reconcile's `flowbeePlaced` guard reads these to recognise the resolution as
+		// Flowbee's own head/base advance, not an external move (uniform with the rebase
+		// path, and race-free: the JOB row is the atomic record, not domain_b_facts).
 		// close the resolver lease audit row.
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE leases SET ended_at = datetime('now'), end_reason = 'completed'

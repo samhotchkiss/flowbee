@@ -1302,6 +1302,7 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.store.Result(r.Context(), store.ResultParams{
 		JobID: jobID, Epoch: epoch, IdempotencyKey: idemKey, Now: s.clock.Now(),
 		PushedRef:           pushedRef,
+		PushedSHA:           body.HeadSHA,
 		PatchDiff:           body.Diff,
 		DeclaredBlastRadius: string(body.BlastRadius),
 	})
