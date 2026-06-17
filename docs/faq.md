@@ -6,6 +6,15 @@ Short answers to the questions new operators ask first. For the full runbook see
 
 ---
 
+### How do I check which build of Flowbee is running?
+
+Run `flowbee version`. It prints the embedded git SHA recorded at build time via
+`debug.ReadBuildInfo`, so you can pin the exact commit without consulting the host
+environment. The control plane also logs the build SHA on its startup line, so the
+same information is available in whatever log aggregator you point at the process.
+
+---
+
 ### What does "reconcile-first" mean, and why does GitHub stay the source of truth?
 
 **Reconcile-first** means Flowbee never trusts its own memory over the world. On every
