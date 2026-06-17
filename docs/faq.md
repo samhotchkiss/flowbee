@@ -6,6 +6,13 @@ Short answers to the questions new operators ask first. For the full runbook see
 
 ---
 
+### Does Flowbee need a database server?
+
+No — all state lives in a single SQLite file (`flowbee.db`) in WAL mode; there is no
+Postgres/MySQL to run. It is litestream-friendly for continuous backup to object storage.
+
+---
+
 ### What happens when two Flowbee PRs conflict?
 
 When one PR merges and a sibling no longer applies cleanly, Flowbee routes the sibling to
