@@ -200,7 +200,6 @@ func (s *Server) PrivateHandler() http.Handler {
 	worker.HandleFunc("POST /v1/jobs/{job}/spec", s.specSubmit)
 	worker.HandleFunc("POST /v1/jobs/{job}/spec-review", s.specReview)
 	worker.HandleFunc("POST /v1/jobs/{job}/release", s.release)
-	worker.HandleFunc("POST /v1/jobs/{job}/requeue", s.requeue)
 	worker.HandleFunc("GET /v1/jobs/{job}/bundle", s.bundle)
 	authed := auth.Middleware(s.authn, worker)
 
@@ -231,6 +230,9 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{job}/design", s.resolveDesign)
 	mux.HandleFunc("POST /v1/jobs/{job}/promote", s.promoteBacklog)
 	mux.HandleFunc("POST /v1/jobs/{job}/adopt", s.adoptOptIn)
+	// operator retry: re-arm a job stranded in needs_human (escalated from a now-fixed
+	// transient failure) back to ready. Same operator surface as promote/adopt.
+	mux.HandleFunc("POST /v1/jobs/{job}/requeue", s.requeue)
 	// the planner front-door (ingest): seed a spec-authoring job from a submitted
 	// work item so the spec flow (author -> issue-review -> materialize) can run.
 	mux.HandleFunc("POST /v1/specs", s.specCreate)
