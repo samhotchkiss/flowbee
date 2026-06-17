@@ -97,6 +97,7 @@ What it does:
   escalating), one **spec_author**, one **spec_reviewer**.
 - Workers commit + push with the box's own key; the control plane never gets their creds.
 - Reports per-job token + cost usage so the control plane can meter spend.
+- Meters every agent run so cost stays visible per job.
 
 Flags: `--builders N`, `--mirror DIR`, `--agent-cmd` (review/author roles),
 `--build-agent-cmd` (build role — writes files), `--no-smoke`, `--systemd` (print a
