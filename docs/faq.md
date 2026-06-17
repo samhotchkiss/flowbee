@@ -6,6 +6,13 @@ Short answers to the questions new operators ask first. For the full runbook see
 
 ---
 
+### Can one Flowbee control plane manage multiple repos?
+
+Yes — list each repo under `repos:` in `flowbee.yaml`; one control plane runs a per-repo
+reconcile/project loop over a shared, repo-agnostic worker fleet with a global scheduler.
+
+---
+
 ### What is the difference between `flowbee fleet` and `flowbee up`?
 
 `flowbee up` is the single-box all-in-one that starts the control plane plus one worker per
