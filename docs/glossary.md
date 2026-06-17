@@ -70,6 +70,16 @@ whatever agent it wraps, and reports the result; it renews the lease while still
 working and the lease expires if it goes silent. Each lease is fenced by an
 **epoch** so that exactly one worker holds a given job at a time.
 
+### merge queue
+
+The ordered line of approved PRs waiting to land on `main`. Flowbee runs a
+merge queue with a batch size of one: it integrates exactly one PR at a time,
+retrying a transient not-mergeable state before routing to the
+**conflict_resolver**. Keeping the batch size at one maximises isolation — each
+integration is a single, attributable change — and the retry avoids opening a
+conflict-resolution issue for a race condition that resolves on its own within
+seconds.
+
 ### reconcile-in / project-out
 
 The paired directions of state flow at the Flowbee ↔ GitHub boundary, with the
