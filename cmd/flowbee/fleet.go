@@ -23,6 +23,34 @@ import (
 //
 //	flowbee fleet --url http://<control-plane>:7070
 //
+// fleetBuilderFamily is the model_family the N build workers register under. Any role
+// that judges or resolves a build carries a server-side anti-affinity against it, so
+// such a role must NOT share this family or it could never claim.
+const fleetBuilderFamily = "claude"
+
+// fleetRole is one non-builder worker a fleet box runs (exactly one each).
+type fleetRole struct {
+	role        string
+	family      string // anti-affinity tag (see fleetBuilderFamily)
+	writesFiles bool   // runs the file-writing BUILD harness (--remote + build agent) vs the verdict-only review agent
+	needsMirror bool   // pushes to the issue branch, so it needs --mirror + --repo-url
+}
+
+// nonBuilderFleetRoles is the role roster a fleet box runs beyond its N build workers.
+// conflict_resolver is REQUIRED: the server routes a real merge conflict to a
+// resolving_conflict job that only a conflict_resolver can claim, so omitting it makes
+// every conflict escalate to needs_human instead of resolving autonomously. It writes
+// files (resolves markers) so it runs the build harness, under a NON-builder family
+// (§I-10: a build's own model may not resolve its own conflict).
+func nonBuilderFleetRoles() []fleetRole {
+	return []fleetRole{
+		{role: "conflict_resolver", family: "sonnet", writesFiles: true, needsMirror: true},
+		{role: "code_reviewer", family: "opus", writesFiles: false, needsMirror: true},
+		{role: "spec_author", family: "claude", writesFiles: false, needsMirror: false},
+		{role: "spec_reviewer", family: "sonnet", writesFiles: false, needsMirror: false},
+	}
+}
+
 // Build workers run in --remote mode (own local mirror + a worktree per job, so N
 // builders on one box run in parallel); review/author workers are git-less. Distinct
 // model_family tags keep a reviewer off the builder's family (anti-affinity). Auth,
@@ -139,26 +167,29 @@ Create the file(s) on disk now. Make only the change described." --output-format
 			"--mirror", *mirror, "--repo-url", repoURL,
 			"--identity", id, "--model-family", "claude", "--agent-cmd", *buildCmd)
 	}
-	// review + spec roles. Distinct model_family per role so a reviewer is never the
-	// builder's family (anti-affinity, enforced server-side). The code_reviewer now
-	// lands an EMPTY findings-commit on the issue branch, so it gets the local mirror +
-	// repo URL (it pushes with its key); spec roles stay git-less (they emit a verdict
-	// only — no commit).
-	for _, r := range []struct{ role, family string }{
-		{"code_reviewer", "opus"},
-		{"spec_author", "claude"},
-		{"spec_reviewer", "sonnet"},
-	} {
+	// The non-builder roles (one each). Distinct model_family per role so a reviewer/
+	// resolver is never the builder's family (anti-affinity, enforced server-side). A
+	// conflict_resolver is REQUIRED — without it every real merge conflict finds no
+	// eligible worker and escalates to needs_human instead of resolving autonomously.
+	// Roles that author files on a branch (conflict_resolver resolves markers) run the
+	// file-writing BUILD harness (--remote + build agent); ones that push an empty
+	// findings-commit (code_reviewer) or only emit a verdict (spec roles) use the review
+	// agent. needsMirror roles push to the issue branch, so they get --mirror + repo-url.
+	for _, r := range nonBuilderFleetRoles() {
 		id := host + "-" + r.role
-		argv := []string{"work", "--role", r.role,
-			"--identity", id, "--model-family", r.family, "--agent-cmd", *agentCmd}
-		if r.role == "code_reviewer" {
+		argv := []string{"work", "--role", r.role, "--identity", id, "--model-family", r.family}
+		if r.writesFiles {
+			argv = append(argv, "--remote", "--agent-cmd", *buildCmd)
+		} else {
+			argv = append(argv, "--agent-cmd", *agentCmd)
+		}
+		if r.needsMirror {
 			argv = append(argv, "--mirror", *mirror, "--repo-url", repoURL)
 		}
 		supervise(id, argv...)
 	}
 
-	fmt.Printf("🐝 flowbee fleet up on %s → %s  [%s]\n   %d build + 1 code-review + 1 author + 1 issue-review worker (all roles; this box is fungible capacity)\n",
+	fmt.Printf("🐝 flowbee fleet up on %s → %s  [%s]\n   %d build + 1 code-review + 1 conflict-resolver + 1 author + 1 issue-review worker (all roles; this box is fungible capacity)\n",
 		host, *url, buildVersion(), *builders)
 
 	sig := make(chan os.Signal, 1)

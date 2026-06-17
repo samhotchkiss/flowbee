@@ -24,6 +24,37 @@ func captureStdout(t *testing.T, f func()) string {
 	return string(out)
 }
 
+// TestFleetRunsConflictResolverOffBuilderFamily: the fleet MUST run a conflict_resolver
+// (else every real merge conflict escalates to needs_human instead of resolving
+// autonomously), and any build-judging/resolving role MUST carry a non-builder
+// model_family or the server-side anti-affinity makes it permanently unclaimable —
+// silently wedging the pipeline.
+func TestFleetRunsConflictResolverOffBuilderFamily(t *testing.T) {
+	byRole := map[string]fleetRole{}
+	for _, r := range nonBuilderFleetRoles() {
+		byRole[r.role] = r
+	}
+	// both judge/resolve a build and are required for an autonomous pipeline.
+	for _, must := range []string{"conflict_resolver", "code_reviewer"} {
+		if _, ok := byRole[must]; !ok {
+			t.Fatalf("fleet must run a %s worker (its work otherwise escalates to needs_human)", must)
+		}
+		if byRole[must].family == fleetBuilderFamily {
+			t.Errorf("%s family %q == builder family %q — anti-affinity makes it unclaimable",
+				byRole[must].family, must, fleetBuilderFamily)
+		}
+	}
+	// the resolver authors files (resolves conflict markers) and pushes the resolution,
+	// so it must run the file-writing build harness with the mirror.
+	cr := byRole["conflict_resolver"]
+	if !cr.writesFiles {
+		t.Error("conflict_resolver must run the file-writing build harness (it resolves markers)")
+	}
+	if !cr.needsMirror {
+		t.Error("conflict_resolver pushes the resolution, so it needs --mirror + --repo-url")
+	}
+}
+
 // TestFleetSystemdTemplatesRequiredRepoURL: the --systemd env template MUST include
 // FLOWBEE_REPO_URL — `flowbee fleet` hard-fails at startup without it, so omitting it
 // (the prior bug) printed a unit that died on enable. With nothing in the env, a clear
