@@ -19,8 +19,8 @@ func TestRenderTaskMarkdownConflictBrief(t *testing.T) {
 	md := renderTaskMarkdown("job-1", c)
 	for _, want := range []string{
 		"CONFLICT RESOLUTION",
-		"re-apply your ORIGINAL INTENT",
-		"reconciling the two",
+		"<<<<<<<",            // the brief explains the marker format
+		"KEEPING BOTH sides", // resolve mechanically, keep both
 		"diff --git a/docs/x.md", // the original patch is shown to the agent
 	} {
 		if !strings.Contains(md, want) {

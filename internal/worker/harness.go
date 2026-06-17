@@ -108,15 +108,18 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 			"and failing/smoke tests. Run the linter and tests if they are available, and FIX what is broken so CI passes this time.\n")
 	}
 	if c.Conflict {
-		b.WriteString("\n## ⚠️ This is a CONFLICT RESOLUTION — re-apply your change on the CURRENT code\n\n" +
-			"This working directory is at the LATEST main. Since your change was originally written, a sibling change " +
-			"merged into the SAME area, so your change no longer applies cleanly (that is the conflict). Your ORIGINAL " +
-			"intended change is shown below as a patch. Do NOT just re-run the task verbatim — its target text may no " +
-			"longer exist. Instead: read the CURRENT files, understand the sibling change already present, then re-apply " +
-			"your ORIGINAL INTENT on top of it, reconciling the two so BOTH changes are honored. Edit the files in this " +
-			"directory to produce the merged result.\n")
+		b.WriteString("\n## ⚠️ This is a CONFLICT RESOLUTION — resolve the merge conflict markers\n\n" +
+			"This working directory is at the LATEST main, and YOUR original change has ALREADY been applied on top " +
+			"with a 3-way merge. Where your change overlapped a sibling change that merged into the same area, git left " +
+			"conflict markers in the files:\n\n" +
+			"```\n<<<<<<< ours\n(the sibling's version, now on main)\n=======\n(your change)\n>>>>>>> theirs\n```\n\n" +
+			"Your job: find every `<<<<<<<` / `=======` / `>>>>>>>` marker and resolve it by KEEPING BOTH sides' " +
+			"intent — combine them into one coherent result, then DELETE the marker lines. Run `grep -rn '<<<<<<<' .` " +
+			"to find them all; none may remain. If there are NO markers, your change applied cleanly and is already " +
+			"present — verify it is correct and make no further edits. Do NOT discard the sibling's change, and do NOT " +
+			"revert your own.\n")
 		if strings.TrimSpace(c.Diff) != "" {
-			b.WriteString("\n### Your original intended change (patch)\n\n```diff\n")
+			b.WriteString("\n### Your original intended change, for reference (already applied above)\n\n```diff\n")
 			b.WriteString(strings.TrimSpace(c.Diff))
 			b.WriteString("\n```\n")
 		}
@@ -642,7 +645,11 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		issueBranch = grant.Context.IssueBranch
 	}
 	startRef := grant.BaseSHA
-	if issueBranch != "" && repoURL != "" {
+	isConflict := grant.Context != nil && grant.Context.Conflict
+	// A conflict_resolver starts from CURRENT MAIN (BaseSHA, with the sibling's merged
+	// change), NOT the issue-branch tip — it re-applies this job's change on top of main
+	// below. Every other role stacks on the issue branch so node commits accumulate.
+	if issueBranch != "" && repoURL != "" && !isConflict {
 		if tip, exists, terr := mirror.RemoteBranchTip(repoURL, issueBranch); terr == nil && exists && tip != "" {
 			if ferr := mirror.FetchRef(repoURL, "refs/heads/"+issueBranch, "refs/flowbee/issue-tip/"+grant.JobID); ferr == nil {
 				startRef = tip
@@ -655,6 +662,19 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		return out, fmt.Errorf("provision worktree at %s: %w", startRef, err)
 	}
 	defer wt.Destroy()
+
+	// Git-native conflict resolution: the worktree is at current main (with the sibling's
+	// change); apply THIS job's ORIGINAL change with a 3-way merge so overlapping edits
+	// surface as real <<<<<<< conflict markers the agent resolves MECHANICALLY (keep both
+	// sides' intent) — far more reliable than asking it to re-derive its change from a
+	// description (which it judges redundant). A clean apply (no overlap) just lands the
+	// change; the non-zero exit on conflict is EXPECTED (markers are left in the files).
+	if isConflict && strings.TrimSpace(grant.Context.Diff) != "" {
+		patchFile := filepath.Join(workRoot, "conflict-"+grant.JobID+".patch")
+		if werr := os.WriteFile(patchFile, []byte(grant.Context.Diff), 0o644); werr == nil {
+			_, _ = wt.Run("apply", "--3way", "--whitespace=nowarn", patchFile)
+		}
+	}
 
 	taskEnv, err := writeTaskContext(wsDir, grant)
 	if err != nil {
