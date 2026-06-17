@@ -46,6 +46,7 @@ single-repo keys are ignored.
 | `long_poll_wait_s` | `FLOWBEE_LONG_POLL_WAIT_S` | `30` | worker long-poll hold |
 | `river_max_workers` | `FLOWBEE_RIVER_MAX_WORKERS` | `10` | internal job-runner concurrency |
 | `no_eligible_worker_s` | `FLOWBEE_NO_ELIGIBLE_WORKER_S` | `120` | how long a `ready` job may sit with no compliant worker before the alarm fires |
+| `reconcile_interval_s` | `FLOWBEE_RECONCILE_INTERVAL_S` | `45` | how often the reconciler probes GitHub for jobs that may have been missed by webhooks |
 
 `flowbee doctor` fails the `config` check if `lease_ttl_s < 3 * heartbeat_interval_s`.
 
