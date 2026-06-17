@@ -257,6 +257,11 @@ func runServe(args []string) error {
 							continue
 						}
 						rebaseStaleReviews(ctx, logger, st, r.ID, mp, url, branch)
+						// routine maintenance: the control mirror accumulates objects from
+						// every fetch over months; `git gc --auto` is a no-op below git's
+						// loose-object threshold and self-batches the occasional real repack,
+						// so keeping the mirror lean costs ~nothing on the steady-state path.
+						_ = gitops.Open(mp).GCAuto()
 					}
 				}
 			}

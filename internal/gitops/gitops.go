@@ -124,6 +124,12 @@ func (m *Mirror) AddWorktree(dir, baseSHA string) (*Worktree, error) {
 	// Pruning here makes every new build self-heal prior leaks; it is best-effort
 	// (a prune failure must not block a legitimate add).
 	_ = m.PruneWorktrees()
+	// Keep the mirror from growing unbounded over a long-running fleet: every build
+	// fetches + commits objects, so loose objects + dangling history (abandoned builds,
+	// deleted issue branches) pile up. `git gc --auto` is a no-op below git's threshold
+	// and self-batches the occasional real repack, so this is a cheap routine maintenance
+	// hook at the per-build prune point — best-effort, never blocks a legitimate add.
+	_ = m.GCAuto()
 	if _, err := run("", "git", "--git-dir", m.Path, "worktree", "add", "--detach", dir, baseSHA); err != nil {
 		return nil, fmt.Errorf("worktree add at %s: %w", baseSHA, err)
 	}
@@ -136,6 +142,19 @@ func (m *Mirror) AddWorktree(dir, baseSHA string) (*Worktree, error) {
 // a live worktree, so it is safe and idempotent to call before every add.
 func (m *Mirror) PruneWorktrees() error {
 	_, err := run("", "git", "--git-dir", m.Path, "worktree", "prune")
+	return err
+}
+
+// GCAuto runs `git gc --auto` on the bare mirror: a near-instant no-op below git's
+// loose-object threshold, a full repack + prune of unreachable objects above it. A
+// mirror accumulates objects from every fetch and force-push (and dangling objects from
+// abandoned builds and deleted issue branches), so without periodic gc its object store
+// grows unboundedly over months — disk pressure + slower git ops. --auto self-batches
+// the cost, so calling it routinely (after a job, on a serve tick) is cheap and safe;
+// it also no-ops while another gc holds the lock. Errors are non-fatal (best-effort
+// maintenance), so callers may ignore the return.
+func (m *Mirror) GCAuto() error {
+	_, err := run("", "git", "--git-dir", m.Path, "gc", "--auto", "--quiet")
 	return err
 }
 

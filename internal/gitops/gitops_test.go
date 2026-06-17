@@ -227,3 +227,27 @@ func mustWrite(t *testing.T, path, content string) {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
+
+// TestGCAutoIsSafeAndAddWorktreeStillWorks: GCAuto runs on a real bare mirror without
+// error, and a worktree add right after it (the per-build hot path that now calls
+// GCAuto) still succeeds — so the maintenance hook never breaks a legitimate build.
+func TestGCAutoIsSafeAndAddWorktreeStillWorks(t *testing.T) {
+	m, base := newFixture(t)
+	if err := m.GCAuto(); err != nil {
+		t.Fatalf("GCAuto on a fresh mirror: %v", err)
+	}
+	// AddWorktree now calls GCAuto internally; prove it still provisions a worktree.
+	wsDir := filepath.Join(t.TempDir(), "ws")
+	wt, err := m.AddWorktree(wsDir, base)
+	if err != nil {
+		t.Fatalf("AddWorktree after GCAuto: %v", err)
+	}
+	defer wt.Destroy()
+	if _, err := os.Stat(filepath.Join(wsDir, "README.md")); err != nil {
+		t.Fatalf("worktree not checked out: %v", err)
+	}
+	// idempotent: a second GC is fine too.
+	if err := m.GCAuto(); err != nil {
+		t.Fatalf("second GCAuto: %v", err)
+	}
+}
