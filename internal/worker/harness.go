@@ -358,7 +358,11 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 		return out, fmt.Errorf("inspect worktree: %w", err)
 	}
 	if !changed {
-		// nothing produced: abandon the lease (does not burn an attempt as failure).
+		// nothing produced: abandon the lease as a FAILED attempt. c.Release (not
+		// ReleaseNoPenalty) burns an attempt, so an agent that consistently produces no
+		// output escalates to needs_human once max_attempts is reached instead of
+		// churning forever — switching this to ReleaseNoPenalty would reintroduce that
+		// infinite no-output loop (see store.Release's exhaustion escalation).
 		_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
 		return out, fmt.Errorf("agent produced no changes")
 	}

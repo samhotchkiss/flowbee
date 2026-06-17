@@ -601,6 +601,33 @@ func (s *Store) Release(ctx context.Context, p ReleaseParams) error {
 			p.JobID, j.LeaseEpoch); err != nil {
 			return fmt.Errorf("close lease: %w", err)
 		}
+		// A penalty release that exhausts the attempts budget escalates to needs_human
+		// rather than re-arming a `ready` build that would just be re-claimed and fail
+		// the same way. Without this, an agent that consistently produces no output (or
+		// fails fast) churns FOREVER: the claim path has no attempts guard,
+		// EvaluateLiveness only sees active leases (it misses the sub-second lease
+		// windows of a fast no-output cycle), and the claim→release churn keeps
+		// updated_at fresh so the forward-progress watchdog never reads the stall.
+		// Escalate with a distinct KindStateChanged (the watchdog's pattern), keeping the
+		// lease_released event's "abandoned, attempt burned" meaning clean. max_attempts
+		// == 0 means "no cap" — such a job stays re-armable by design.
+		if attemptsDelta == 1 && j.MaxAttempts > 0 && j.Attempts+1 >= j.MaxAttempts {
+			escSeq := nextSeq + 1
+			esc := ledger.Event{
+				JobID: p.JobID, JobSeq: escSeq, Kind: ledger.KindStateChanged,
+				FromState: toState, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
+				Actor: "attempts-exhausted", CreatedAt: p.Now,
+			}
+			if err := appendEvent(ctx, tx, esc); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE jobs SET state = 'needs_human', escalation_reason = ?, updated_at = datetime('now') WHERE id = ?`,
+				string(job.EscalationAttempts), p.JobID); err != nil {
+				return fmt.Errorf("escalate exhausted release: %w", err)
+			}
+			return setJobSeq(ctx, tx, p.JobID, escSeq)
+		}
 		return setJobSeq(ctx, tx, p.JobID, nextSeq)
 	})
 }
