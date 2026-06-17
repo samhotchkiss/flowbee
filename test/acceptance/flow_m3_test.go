@@ -64,6 +64,18 @@ func driveToCodeReview(t *testing.T, ctx context.Context, st *store.Store, url, 
 		t.Fatalf("after build result state=%s want review_pending", j.State)
 	}
 
+	// Production invariant: a review is only OFFERED once its PR's CI is reconciled
+	// green (ReviewPendingCandidates filters not-ready reviews so the fleet doesn't
+	// busy-wait on them). Stamp green Domain-B facts before the reviewer leases,
+	// exactly as reconcile-IN would. A test that exercises the verdict gate against
+	// RED/changed facts overwrites these AFTER the lease (the mint gate re-checks at
+	// submit) — leasing still requires green, just like live.
+	if err := st.UpsertDomainBFacts(ctx, jobID, job.DomainBFacts{
+		PRExists: true, PRNumber: 42, HeadSHA: "head-abc", BaseSHA: "base1", CIGreen: true,
+	}); err != nil {
+		t.Fatalf("seed green CI facts: %v", err)
+	}
+
 	// a DISTINCT reviewer (different identity AND model_family) leases the gate.
 	reviewer := client.New(url)
 	if _, err := reviewer.Register(ctx, client.Registration{

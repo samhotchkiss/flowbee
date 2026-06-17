@@ -74,7 +74,10 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	// A code_reviewer only judges a PR once CI is reconciled GREEN: an approval
 	// before then cannot mint and would bounce the build into a rebuild thrash. If
 	// CI is not ready, release the lease (re-arms review_pending, NOT the build) and
-	// signal the loop to back off — no agent is spawned, nothing is wasted.
+	// signal the loop to back off — no agent is spawned, nothing is wasted. This is
+	// now a DEFENSIVE BACKSTOP: the server no longer offers a CI-not-ready review as
+	// a lease candidate (ReviewPendingCandidates filters it), so a reviewer should
+	// never be granted one. Kept in case a grant races a CI status flip to not-green.
 	if grant.Role == "code_reviewer" && grant.Context != nil && !grant.Context.CIReady {
 		_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
 		out.Skipped = true

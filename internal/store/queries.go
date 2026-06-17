@@ -660,9 +660,18 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 		}
 		c.RequiredCapabilities = unmarshalStrings(reqJSON)
 		// CIReady mirrors the grant's ci_ready (server): a review is offerable only when
-		// its reconciled CI is green. A not-ready review sorts after ready ones so it
-		// never starves a reviewable one.
+		// its reconciled CI is green. A not-ready review is NOT a candidate at all — it
+		// waits quietly in review_pending until CI reconciles green (then it appears
+		// here) or red (reconcile bounces it). Offering it would make every reviewer
+		// poll claim-then-instantly-release it for the whole CI window — a fleet-wide
+		// busy-wait that inflated lease_epoch and bloated the ledger by ~200 events per
+		// CI run (observed: 98 churn cycles over a 40-min CI wait). The forward-progress
+		// watchdog treats a PR-open/CI-pending review as healthy (it no longer relies on
+		// that churn to keep updated_at fresh — see ReconcileStuck).
 		c.CIReady = prExists == 1 && ciGreen == 1 && merged == 0
+		if !c.CIReady {
+			continue
+		}
 		out = append(out, c)
 	}
 	return out, rows.Err()

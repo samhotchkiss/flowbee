@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -101,6 +102,18 @@ func (s *Store) ReconcileStuck(ctx context.Context, now time.Time, staleHB, stal
 			if live == 0 || cur.LeaseID != "" {
 				return nil
 			}
+			// A review_pending job with its PR open but CI not yet green is NOT a
+			// no-eligible-worker dead-end — it is waiting on Domain B (an external CI run
+			// or the next reconcile). It is intentionally not offered to reviewers until
+			// CI reconciles green (see ReviewPendingCandidates), so its updated_at no
+			// longer advances on every poll; escalating it on a stale updated_at would
+			// falsely page a human for a review that is simply waiting on a slow CI run.
+			// CI-red is bounced out of review_pending by reconcile, never escalated here.
+			if cur.State == job.StateReviewPending {
+				if waiting, werr := reviewWaitingOnCITx(ctx, tx, id); werr == nil && waiting {
+					return nil
+				}
+			}
 			// updated_at is a projection-only column (not folded onto job.Job); it is
 			// touched on every lease op, so a legitimately-polled review/build looks
 			// fresh and only a job with NO lease activity for the window trips this.
@@ -135,6 +148,26 @@ func (s *Store) ReconcileStuck(ctx context.Context, now time.Time, staleHB, stal
 		}
 	}
 	return rep, nil
+}
+
+// reviewWaitingOnCITx reports whether a review_pending job is healthily blocked on
+// Domain B: its PR exists, CI is not yet green, and it is not merged. Such a job is
+// withheld from reviewers by ReviewPendingCandidates until CI reconciles, so the
+// watchdog must not mistake its quiet (non-advancing updated_at) for a stall. A
+// review with NO PR yet (pr_exists=0) is NOT covered — that can be a genuine
+// PR-creation wedge, so it stays escalatable.
+func reviewWaitingOnCITx(ctx context.Context, tx *sql.Tx, id string) (bool, error) {
+	var prExists, ciGreen, merged int
+	err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(pr_exists,0), COALESCE(ci_green,0), COALESCE(merged,0)
+		  FROM domain_b_facts WHERE job_id=?`, id).Scan(&prExists, &ciGreen, &merged)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil // no facts row yet -> no PR -> not a CI wait
+	}
+	if err != nil {
+		return false, err
+	}
+	return prExists == 1 && ciGreen == 0 && merged == 0, nil
 }
 
 func (s *Store) leasableJobIDs(ctx context.Context) ([]string, error) {

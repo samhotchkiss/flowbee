@@ -361,6 +361,13 @@ func TestF4_BuildReviewStillBouncesToBuildAgent(t *testing.T) {
 		t.Fatalf("builder result: %v", err)
 	}
 
+	// a review is only offered once CI is reconciled green (ReviewPendingCandidates).
+	if err := e.st.UpsertDomainBFacts(ctx, buildJob, job.DomainBFacts{
+		PRExists: true, PRNumber: 7, HeadSHA: "head-0", BaseSHA: "base-0", CIGreen: true,
+	}); err != nil {
+		t.Fatalf("seed green CI facts: %v", err)
+	}
+
 	reviewer := registerCaps(t, ctx, url, "rev", "opus", []string{"role:code_reviewer", "model_family:opus"})
 	rg, ok, err := reviewer.Lease(ctx, "rev", "opus", string(job.RoleCodeReviewer))
 	if err != nil || !ok || rg.JobID != buildJob {
