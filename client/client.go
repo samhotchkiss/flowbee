@@ -151,6 +151,12 @@ type LeaseContext struct {
 	// reviewer's empty findings-commit) on top, and pushes it back — so the branch
 	// history is the node-by-node story. Empty when the job has no bound issue yet.
 	IssueBranch string `json:"issue_branch,omitempty"`
+	// Rebuild is true when this build job has been bounced before (a prior attempt
+	// FAILED CI or a reviewer requested changes). The harness brief then tells the
+	// agent the prior change is already in the worktree and to FIX the build/lint/test
+	// failures (run the linter/tests) rather than re-submit the same thing — otherwise
+	// a CI-failing change just loops to needs_human with no feedback.
+	Rebuild bool `json:"rebuild,omitempty"`
 	// RepoURL is the git clone/push URL for THIS job's repo (F9 multi-repo). A
 	// fungible worker leases jobs across repos, so the control plane tells it which
 	// repo each job belongs to — the worker-push harness clones/fetches/pushes here

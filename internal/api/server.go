@@ -537,6 +537,9 @@ type LeaseContext struct {
 	// a fungible worker which repo each job belongs to so worker-push targets the right
 	// remote. Empty in single-repo deployments.
 	RepoURL string `json:"repo_url,omitempty"`
+	// Rebuild signals a re-attempt after a bounce (prior CI failure / changes
+	// requested) so the build brief tells the agent to FIX what broke, not re-submit.
+	Rebuild bool `json:"rebuild,omitempty"`
 }
 
 // lease long-polls: rank `ready` candidates (scheduler: priority + aging +
@@ -663,6 +666,11 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 				// ancestor's materialized issue. Empty until an issue is bound.
 				if reviewing || role == job.RoleEngWorker || resolvingConflict {
 					grant.Context.IssueBranch = store.IssueBranch(s.store.ResolveIssueNum(r.Context(), cand.JobID), cand.JobID)
+					// a build that has bounced is a re-attempt after a CI failure / changes
+					// requested — tell the agent to fix what broke, not re-submit.
+					if role == job.RoleEngWorker && j.Bounces > 0 {
+						grant.Context.Rebuild = true
+					}
 					// F9: tell the (fungible) worker which repo this job belongs to so
 					// worker-push targets the right remote. Resolve the job's repo scope to
 					// its clone/push URL from the registry; the worker auths with its own

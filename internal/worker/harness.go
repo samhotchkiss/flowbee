@@ -100,6 +100,13 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 			b.WriteString("\n```\n")
 		}
 	}
+	if c.Rebuild {
+		b.WriteString("\n## ⚠️ This is a RE-ATTEMPT — a previous build was rejected\n\n" +
+			"A prior attempt at this task FAILED (CI was red — build/lint/tests — or a reviewer requested changes). " +
+			"The prior change is ALREADY in this working directory. Do NOT just re-submit it. " +
+			"Carefully review the existing change for the failure: build errors, linter violations (e.g. golangci-lint), " +
+			"and failing/smoke tests. Run the linter and tests if they are available, and FIX what is broken so CI passes this time.\n")
+	}
 	b.WriteString("\n## How to complete this\n\nMake the change by creating or editing files in THIS working directory. " +
 		"Write the actual files to disk now — do not just describe or print them. Touch only what the task requires.\n")
 	b.WriteString("\nWhen done, write `.flowbee/commit.md` with a clear, DETAILED commit message for your change: " +
