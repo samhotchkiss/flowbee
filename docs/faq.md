@@ -6,6 +6,22 @@ Short answers to the questions new operators ask first. For the full runbook see
 
 ---
 
+### What GitHub token permissions does Flowbee need?
+
+Flowbee requires a **fine-grained personal access token (PAT)** with the following
+repository-scoped write permissions for each repo it manages:
+
+- **Contents** — to push branches and read code
+- **Pull requests** — to open, update, and merge PRs
+- **Issues** — to create and close issues that represent jobs
+
+Set the token in the `FLOWBEE_GITHUB_TOKEN` environment variable. The **control plane is
+the sole GitHub API caller** — workers commit and push via git over SSH using the box's own
+key, never touching the GitHub REST API directly. Scope the token to only the repos listed
+under `repos:` in `flowbee.yaml`; no org-level or admin permissions are required.
+
+---
+
 ### Does Flowbee need a database server?
 
 No — all state lives in a single SQLite file (`flowbee.db`) in WAL mode; there is no
