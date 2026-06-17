@@ -236,3 +236,13 @@ that passes, each issue fans out independently through the normal
 spec → build → review → merge flow.
 
 ---
+
+### What happens if a worker crashes mid-build?
+
+The control plane detects the dead worker by watching its heartbeat: after a few missed
+heartbeats (or once the absolute lease cap expires), it reaps the lease, re-arms the job,
+and makes it available for the next worker to claim. No work is lost — the job resumes from
+scratch on the new worker — and nothing wedges, because the lease fence prevents the crashed
+worker from committing anything even if it somehow recovers late.
+
+---
