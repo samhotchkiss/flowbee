@@ -1261,6 +1261,30 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 		pushedRef = ref
 	}
 
+	// A conflict_resolver submits its RESOLUTION through this same endpoint, but a
+	// resolving_conflict job is NOT a build state — store.Result would fence it (409).
+	// Route it to the conflict handler, which re-gates the resolved diff and re-arms
+	// review_pending; the resolver force-pushed the issue branch, so reconcile picks up
+	// the updated PR head + re-runs CI, then the gate re-reviews + re-merges.
+	if cj, jerr := s.store.GetJob(r.Context(), jobID); jerr == nil && cj.State == job.StateResolvingConflict {
+		rr, rerr := s.store.ResolveConflictResult(r.Context(), store.ResolveConflictParams{
+			JobID: jobID, Epoch: epoch, ResolvedDiff: body.Diff,
+			DeclaredBlastRadius: string(body.BlastRadius), PushedRef: pushedRef, Now: s.clock.Now(),
+		})
+		if rerr != nil {
+			s.writeFenceError(w, rerr)
+			return
+		}
+		s.broker.Publish(LifeEvent{JobID: jobID, State: rr.JobState, Event: "conflict_resolved", Epoch: epoch})
+		if workerPushed {
+			// the resolution was force-pushed to the issue branch; re-enqueue PR-open so the
+			// PR tracks the new head (idempotent — a no-op if the PR already exists).
+			_, _ = s.store.EnqueuePROpen(r.Context(), jobID, body.HeadSHA, "main")
+		}
+		writeJSON(w, http.StatusOK, rr)
+		return
+	}
+
 	resp, err := s.store.Result(r.Context(), store.ResultParams{
 		JobID: jobID, Epoch: epoch, IdempotencyKey: idemKey, Now: s.clock.Now(),
 		PushedRef:           pushedRef,
