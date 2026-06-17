@@ -151,6 +151,27 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 				_ = s.store.BumpOutboxAttempts(ctx, row.ID)
 				return sent, nil
 			}
+			// a merge that conflicts (a sibling merged into the same area after the
+			// verdict minted) NEVER succeeds on retry. Route the job to a conflict_resolver
+			// at the current main tip and CONSUME the merge row, instead of re-queuing the
+			// merge forever (which also pollutes the drain for the whole repo).
+			if errors.Is(err, gh.ErrMergeConflict) {
+				mainTip, terr := s.history.HeadSHA("refs/heads/" + orDefault(s.baseBranch, "main"))
+				if terr == nil && mainTip != "" {
+					if rerr := s.store.RouteMergeConflict(ctx, row.JobID, mainTip, s.clock.Now()); rerr == nil {
+						if err := s.store.MarkOutboxSent(ctx, row.ID, "merge conflict -> resolving_conflict"); err != nil {
+							return sent, err
+						}
+						if s.pub != nil {
+							s.pub.PublishReconcile(row.JobID, "project_out:merge_conflict")
+						}
+						sent++
+						continue
+					}
+				}
+				// could not route (no local mirror to resolve main, or route failed) — fall
+				// through to the transient path so a human eventually sees the stuck merge.
+			}
 			// a transient error: bump attempts, leave pending, stop this drain.
 			_ = s.store.BumpOutboxAttempts(ctx, row.ID)
 			return sent, err

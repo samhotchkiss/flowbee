@@ -317,6 +317,52 @@ func (s *Store) RebaseOnto(ctx context.Context, mirror *gitops.Mirror, p RebaseO
 	return res, nil
 }
 
+// RouteMergeConflict diverts a job whose MERGE failed with a conflict into the
+// conflict_resolver path. A sibling can merge into the same area AFTER this change's
+// verdict was minted (both were reviewed before either merged), so the rebase-before-
+// review split never saw it and the merge itself hits GitHub's 405 "not mergeable".
+// Without this the project-out sender retries that merge forever. Like the rebase split
+// it emits KindConflictDetected and re-arms to resolving_conflict at newBaseSHA (current
+// main), invalidating the now-stale verdict; the resolver re-applies the change on
+// current main and the resolution is re-reviewed + re-merged. Idempotent: a job no
+// longer in merging/mergeable (already merged or re-armed) is left untouched.
+func (s *Store) RouteMergeConflict(ctx context.Context, jobID, newBaseSHA string, now time.Time) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		j, seq, err := loadJobTx(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		if j.State != job.StateMerging && j.State != job.StateMergeable {
+			return nil
+		}
+		nextSeq := seq + 1
+		ev := ledger.Event{
+			JobID: jobID, JobSeq: nextSeq, Kind: ledger.KindConflictDetected,
+			FromState: j.State, ToState: job.StateResolvingConflict, LeaseEpoch: j.LeaseEpoch + 1,
+			Actor: "project-out", CreatedAt: now,
+			Payload: ledger.Payload{BaseSHA: newBaseSHA},
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs
+			   SET state = 'resolving_conflict', role = 'conflict_resolver', stage = 'resolve_conflict',
+			       required_capabilities = ?,
+			       conflict_base_sha = ?, base_sha = ?, verdict = NULL,
+			       lease_epoch = lease_epoch + 1,
+			       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
+			       lease_hb_due = NULL, lease_deadline = NULL,
+			       enqueued_at = ?, updated_at = datetime('now')
+			 WHERE id = ?`,
+			marshalStrings([]string{"role:conflict_resolver"}), newBaseSHA, newBaseSHA,
+			now.Format(rfc3339), jobID); err != nil {
+			return fmt.Errorf("route merge conflict: %w", err)
+		}
+		return setJobSeq(ctx, tx, jobID, nextSeq)
+	})
+}
+
 // StaleReviewBuilds returns the ids of review_pending build jobs whose base_sha is
 // behind the current integration tip (mainTip) and that carry a stored patch to
 // replay. These are the jobs to rebase-before-review (build-list: "rebase before the

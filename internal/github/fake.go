@@ -28,7 +28,8 @@ type Fake struct {
 	comments   map[int][]string // issue/PR number -> comment bodies in order (reviewer findings, §F)
 	labels     map[int][]string
 	checks     []string // "name@sha=conclusion"
-	enqueued   []int    // PR numbers enqueued to the merge queue
+	enqueued    []int        // PR numbers enqueued to the merge queue
+	conflictPRs map[int]bool // PRs whose merge returns ErrMergeConflict (set via SetMergeConflict)
 	drafted    []int    // PR numbers converted back to draft (compensation, §6.5.4)
 	cancelled  []string // SHAs whose CI was cancelled (compensation, §6.5.4)
 	protection map[string]Protection
@@ -256,8 +257,22 @@ func (f *Fake) EnqueueMergeQueue(ctx context.Context, number int) error {
 	if err := f.retryGate(); err != nil {
 		return err
 	}
+	if f.conflictPRs[number] {
+		return fmt.Errorf("merge %d: %w", number, ErrMergeConflict)
+	}
 	f.enqueued = append(f.enqueued, number)
 	return nil
+}
+
+// SetMergeConflict makes EnqueueMergeQueue return ErrMergeConflict for a PR — the
+// GitHub-405 "not mergeable" a racing sibling merge produces.
+func (f *Fake) SetMergeConflict(number int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.conflictPRs == nil {
+		f.conflictPRs = map[int]bool{}
+	}
+	f.conflictPRs[number] = true
 }
 
 func (f *Fake) ConvertToDraft(ctx context.Context, number int) error {

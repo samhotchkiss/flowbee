@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -169,6 +170,22 @@ type ErrRetryAfter struct{ RetryAfter time.Duration }
 
 func (e *ErrRetryAfter) Error() string {
 	return fmt.Sprintf("retry after %s", e.RetryAfter)
+}
+
+// ErrMergeConflict signals a PR that GitHub refuses to merge because it conflicts
+// with its base (a 405 "merge conflicts" / "not mergeable") — a sibling merged into
+// the same area after this change's verdict was minted. Distinct from a transient
+// error: retrying the merge NEVER succeeds (it just loops). The sender routes the job
+// to a conflict_resolver instead of re-queuing the merge.
+var ErrMergeConflict = errors.New("pull request has merge conflicts (not mergeable)")
+
+// isMergeConflict reports whether a failed merge is an unmergeable-conflict 405 (vs a
+// transient error). GitHub's messages are stable: "Pull Request has merge conflicts"
+// and "Pull Request is not mergeable".
+func isMergeConflict(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "405") &&
+		(strings.Contains(s, "merge conflict") || strings.Contains(s, "not mergeable"))
 }
 
 // RealClient is the genuine GitHub caller. It is CGO-free (stdlib net/http only)
@@ -601,9 +618,15 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
 	// and a merge commit keeps that whole trail REACHABLE from main (so you can see
 	// how the change was built), while `git log --first-parent main` stays clean. A
 	// squash would discard the history the per-issue-branch model exists to preserve.
-	return c.rest(ctx, http.MethodPut, fmt.Sprintf("/pulls/%d/merge", number), map[string]any{
+	err := c.rest(ctx, http.MethodPut, fmt.Sprintf("/pulls/%d/merge", number), map[string]any{
 		"merge_method": "merge",
 	}, nil)
+	if err != nil && isMergeConflict(err) {
+		// surface a conflict as the typed error so the sender routes to a resolver
+		// instead of re-queuing a merge that can never succeed.
+		return fmt.Errorf("%w: %v", ErrMergeConflict, err)
+	}
+	return err
 }
 
 // prNodeQuery resolves a PR's GraphQL node ID (+ current draft state) from its
