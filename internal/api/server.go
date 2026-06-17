@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/auth"
@@ -38,6 +39,15 @@ type Server struct {
 	registry *worker.Registry
 	broker   *Broker
 	version  string
+
+	// GitHub reconcile health (the operator's "is the control plane still talking to
+	// GitHub?" signal). A sustained BoardSweep failure — almost always an EXPIRED
+	// token, but also a revoked PAT / rate-limit exhaustion / connectivity loss — would
+	// otherwise just log every 45s and silently stop all progress. ghLastSuccess (unix
+	// sec, seeded at startup) feeds flowbee_github_last_success_age_seconds so a scraper
+	// can page when it grows; ghLastErr carries the latest error for /healthz.
+	ghLastSuccess atomic.Int64
+	ghLastErr     atomic.Pointer[string]
 
 	facts  store.FactSource
 	policy job.Policy
@@ -150,7 +160,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 	// (ReviewResult / DispatchMerge) runs the configured ceilings + extra denylist.
 	st.ContentPolicy = cfg.ContentPolicy
 	ui := web.New(st, clk, web.Config{StaleHB: staleHB})
-	return &Server{
+	srv := &Server{
 		store:              st,
 		clock:              clk,
 		minter:             minter,
@@ -170,6 +180,25 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		authn:              cfg.Authenticator,
 		ui:                 ui,
 	}
+	// seed GitHub health to "just succeeded" so the age metric starts ~0, not at the
+	// unix epoch, before the first sweep runs.
+	srv.ghLastSuccess.Store(clk.Now().Unix())
+	return srv
+}
+
+// RecordGitHubSweep records the outcome of a reconcile BoardSweep so the operator can
+// see a sustained GitHub failure (an expired/revoked token, exhausted rate limit, or
+// connectivity loss) instead of it silently logging every 45s. On success it advances
+// the last-success watermark; on failure it leaves the watermark (so the age grows)
+// and stores the error for /healthz. The runtime calls this after every sweep.
+func (s *Server) RecordGitHubSweep(err error) {
+	if err == nil {
+		s.ghLastSuccess.Store(s.clock.Now().Unix())
+		s.ghLastErr.Store(nil)
+		return
+	}
+	e := err.Error()
+	s.ghLastErr.Store(&e)
 }
 
 // Broker exposes the SSE broker so the runtime can publish lifecycle events.
@@ -435,7 +464,12 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	if !dbOK {
 		status, code = "unavailable", http.StatusServiceUnavailable
 	}
-	writeJSON(w, code, map[string]any{"status": status, "db": dbOK, "version": s.version})
+	resp := map[string]any{"status": status, "db": dbOK, "version": s.version,
+		"github_last_success_age_seconds": s.clock.Now().Unix() - s.ghLastSuccess.Load()}
+	if e := s.ghLastErr.Load(); e != nil {
+		resp["github_last_error"] = *e
+	}
+	writeJSON(w, code, resp)
 }
 
 // metrics serves Prometheus text-format gauges on the unauthenticated health
@@ -450,6 +484,14 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "# HELP flowbee_build_info Build version (always 1).\n")
 	fmt.Fprintf(&b, "# TYPE flowbee_build_info gauge\n")
 	fmt.Fprintf(&b, "flowbee_build_info{version=%q} 1\n", s.version)
+
+	// GitHub reconcile health: seconds since the last successful BoardSweep. Grows
+	// without bound when the control plane can't reach GitHub (expired/revoked token,
+	// rate-limit exhaustion, connectivity loss) — the signal that ALL progress has
+	// silently stalled. Alert on flowbee_github_last_success_age_seconds > a few min.
+	fmt.Fprintf(&b, "# HELP flowbee_github_last_success_age_seconds Seconds since the last successful GitHub reconcile sweep.\n")
+	fmt.Fprintf(&b, "# TYPE flowbee_github_last_success_age_seconds gauge\n")
+	fmt.Fprintf(&b, "flowbee_github_last_success_age_seconds %d\n", s.clock.Now().Unix()-s.ghLastSuccess.Load())
 
 	// Jobs by repo+state: the core liveness signal. A state with no jobs emits no
 	// series (Prometheus treats absent == 0), which is the correct semantics for

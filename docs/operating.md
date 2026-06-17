@@ -184,9 +184,13 @@ building → review_pending → code_review → mergeable → merging → done**
   `/healthz`) emits Prometheus text format — point a scrape at it. Series: `flowbee_jobs{repo,state}`
   (job counts; a missing state means zero — alert on `flowbee_jobs{state="needs_human"} > 0`),
   `flowbee_fleet_workers{status="live"|"stale"}`, `flowbee_fleet_waiting_jobs`,
-  `flowbee_cost_micro_usd_total` (cumulative metered spend), and `flowbee_jobs_over_budget`.
-  The pages that matter: a wedged `needs_human` job, `flowbee_fleet_workers{status="live"} == 0`
-  with waiting jobs, or `over_budget` climbing.
+  `flowbee_cost_micro_usd_total` (cumulative metered spend), `flowbee_jobs_over_budget`, and
+  `flowbee_github_last_success_age_seconds` (seconds since the last successful GitHub reconcile
+  sweep — grows without bound when the control plane can't reach GitHub: an **expired/revoked
+  token**, exhausted rate limit, or connectivity loss; `/healthz` carries the error in
+  `github_last_error`). The pages that matter: a wedged `needs_human` job,
+  `flowbee_fleet_workers{status="live"} == 0` with waiting jobs, `over_budget` climbing, or
+  `flowbee_github_last_success_age_seconds` past a few minutes (all progress has silently stalled).
   Example minimal `prometheus.yml` scrape config:
 
   ```yaml

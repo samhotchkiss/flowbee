@@ -381,7 +381,9 @@ func runServe(args []string) error {
 		}
 		logger.Info("reconcile cadence", "interval", reconcileEvery.String())
 		go func() {
-			if _, err := mgr.SweepAll(ctx); err != nil {
+			_, err := mgr.SweepAll(ctx)
+			srv.RecordGitHubSweep(err) // surface a sustained GitHub failure (expired token, …)
+			if err != nil {
 				logger.Error("boot reconcile sweep", "err", err)
 			}
 			t := time.NewTicker(reconcileEvery)
@@ -393,7 +395,9 @@ func runServe(args []string) error {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					if _, err := mgr.SweepAll(ctx); err != nil {
+					_, err := mgr.SweepAll(ctx)
+					srv.RecordGitHubSweep(err)
+					if err != nil {
 						logger.Error("reconcile sweep", "err", err)
 					}
 				case <-drain.C:
