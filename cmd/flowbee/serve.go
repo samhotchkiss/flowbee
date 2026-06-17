@@ -495,7 +495,13 @@ func githubPushURL() string {
 // issue branch so the PR + CI track it; a real conflict diverts the job to a
 // conflict_resolver. Best-effort: a single job's failure never blocks the others.
 func rebaseStaleReviews(ctx context.Context, logger *slog.Logger, st *store.Store, repoID, mirrorPath, pushURL, branch string) {
-	mainTip, err := gitops.Open(mirrorPath).HeadSHA("refs/heads/" + branch)
+	mirror := gitops.Open(mirrorPath)
+	// the local mirror lags after a sibling's API merge, so fetch main FIRST — else the
+	// rebase target (and any conflict_resolver base derived from it) is a STALE pre-merge
+	// commit, the rebase misses the real conflict or replays onto the wrong base, and the
+	// resolution re-conflicts (the same stale-base bug fixed in project-out's merge path).
+	_ = mirror.FetchBranch(branch)
+	mainTip, err := mirror.HeadSHA("refs/heads/" + branch)
 	if err != nil {
 		return
 	}
@@ -503,7 +509,6 @@ func rebaseStaleReviews(ctx context.Context, logger *slog.Logger, st *store.Stor
 	if err != nil || len(stale) == 0 {
 		return
 	}
-	mirror := gitops.Open(mirrorPath)
 	for _, jobID := range stale {
 		res, rerr := st.RebaseOnto(ctx, mirror, store.RebaseOntoParams{
 			JobID: jobID, NewBaseSHA: mainTip, Now: time.Now(),
