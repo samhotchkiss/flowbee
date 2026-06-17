@@ -150,8 +150,10 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		// fallback: a generic `claude -p` agent prints the spec to stdout instead of
 		// writing $FLOWBEE_SPEC_FILE. Use what it emitted rather than discarding the
 		// whole run and re-claiming forever (the first-live-run spec_author wedge).
+		// agentResultText unwraps claude's JSON `.result` when the agent ran with
+		// --output-format json (for cost capture), else returns the raw stdout.
 		if strings.TrimSpace(spec) == "" {
-			spec = strings.TrimSpace(agentOut)
+			spec = strings.TrimSpace(agentResultText(agentOut))
 		}
 		if strings.TrimSpace(spec) == "" {
 			_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)

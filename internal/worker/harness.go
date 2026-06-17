@@ -787,9 +787,8 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, ep
 	cmd.Env = env
 	var errb, outb strings.Builder
 	cmd.Stderr = &errb
-	if capture {
-		cmd.Stdout = &outb
-	}
+	cmd.Stdout = &outb // always capture: needed to parse the agent's reported cost/usage
+	_ = capture        // (capture is now always on; the param is kept for call-site clarity)
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("agent start: %w", err)
 	}
@@ -818,10 +817,58 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, ep
 	}()
 	werr := cmd.Wait()
 	close(done)
-	if werr != nil {
-		return outb.String(), fmt.Errorf("agent cmd: %v: %s", werr, strings.TrimSpace(errb.String()))
+	out := outb.String()
+	// report the agent's metered cost (claude --output-format json prints total_cost_usd
+	// + usage) in a final heartbeat: the server folds the delta into the per-job meter,
+	// and a delta that crosses the ceiling escalates the job to needs_human (I-15). A
+	// text-output agent parses to nothing -> no report (backward compatible).
+	if ti, to, micro, ok := parseAgentUsage(out); ok && (ti != 0 || to != 0 || micro != 0) {
+		_, _, _ = c.HeartbeatWith(ctx, jobID, epoch, client.HeartbeatObs{
+			TokensInDelta: ti, TokensOutDelta: to, MicroUSDDelta: micro,
+		})
 	}
-	return outb.String(), nil
+	if werr != nil {
+		return out, fmt.Errorf("agent cmd: %v: %s", werr, strings.TrimSpace(errb.String()))
+	}
+	return out, nil
+}
+
+// parseAgentUsage extracts the agent's reported token/cost usage from its stdout when it
+// ran with `claude --output-format json` (a single result object carrying total_cost_usd
+// + usage). $ is taken directly from the agent (no price table); text output (no JSON)
+// returns ok=false so cost reporting is opt-in by output format.
+func parseAgentUsage(stdout string) (tokensIn, tokensOut, microUSD int64, ok bool) {
+	s := strings.TrimSpace(stdout)
+	if !strings.HasPrefix(s, "{") {
+		return 0, 0, 0, false
+	}
+	var r struct {
+		TotalCostUSD float64 `json:"total_cost_usd"`
+		Usage        struct {
+			InputTokens  int64 `json:"input_tokens"`
+			OutputTokens int64 `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal([]byte(s), &r) != nil {
+		return 0, 0, 0, false
+	}
+	return r.Usage.InputTokens, r.Usage.OutputTokens, int64(r.TotalCostUSD * 1_000_000), true
+}
+
+// agentResultText returns the agent's response text: the `.result` of a claude JSON
+// output, else the raw stdout — so the spec_author stdout fallback works whether the
+// agent ran in JSON (for cost capture) or plain text mode.
+func agentResultText(stdout string) string {
+	s := strings.TrimSpace(stdout)
+	if strings.HasPrefix(s, "{") {
+		var r struct {
+			Result string `json:"result"`
+		}
+		if json.Unmarshal([]byte(s), &r) == nil && r.Result != "" {
+			return r.Result
+		}
+	}
+	return stdout
 }
 
 func hostname() string {

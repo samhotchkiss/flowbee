@@ -32,10 +32,13 @@ func runFleet(args []string) error {
 	url := fs.String("url", envOr("FLOWBEE_URL", ""), "control-plane URL, e.g. http://100.67.2.108:7070")
 	mirror := fs.String("mirror", envOr("FLOWBEE_WORKER_MIRRORS_DIR", ""), "directory for the worker's per-repo BARE mirrors (default ~/.flowbee/mirrors; NOT a working checkout)")
 	builders := fs.Int("builders", 1, "parallel build workers on this box (each gets its own worktree off the shared mirror)")
-	defaultAgent := `claude -p "$(cat "$FLOWBEE_TASK_FILE")" --dangerously-skip-permissions`
+	// --output-format json makes claude print a single result object carrying
+	// total_cost_usd + usage, so the harness can meter per-job cost (I-15). The harness
+	// unwraps `.result` for any text it needs (e.g. the spec_author fallback).
+	defaultAgent := `claude -p "$(cat "$FLOWBEE_TASK_FILE")" --output-format json --dangerously-skip-permissions`
 	buildAgent := `claude -p "$(cat "$FLOWBEE_TASK_FILE")
 
-Create the file(s) on disk now. Make only the change described." --dangerously-skip-permissions`
+Create the file(s) on disk now. Make only the change described." --output-format json --dangerously-skip-permissions`
 	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", defaultAgent), "agent CLI for review/author roles")
 	buildCmd := fs.String("build-agent-cmd", envOr("FLOWBEE_BUILD_AGENT_CMD", buildAgent), "agent CLI for the build role (writes files)")
 	noSmoke := fs.Bool("no-smoke", false, "skip the agent smoke test at startup")
