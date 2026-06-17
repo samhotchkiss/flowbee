@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -85,25 +86,53 @@ Create the file(s) on disk now. Make only the change described." --dangerously-s
 	// identity, so it's minted per worker, not shared.
 	secret := os.Getenv("FLOWBEE_WORKER_AUTH_SECRET")
 
+	// Supervise each worker: if it exits while the fleet is up (a crash, an OOM, an
+	// agent that wedged and got killed), respawn it with capped backoff. Without this a
+	// dead worker stays dead until the whole fleet is restarted — silent capacity loss.
+	ctx, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+	var mu sync.Mutex
 	var kids []*exec.Cmd
-	spawn := func(identity string, argv ...string) {
-		c := exec.Command(self, argv...)
-		c.Env = env
-		if secret != "" {
-			c.Env = append(c.Env, "FLOWBEE_WORKER_TOKEN="+auth.NewBearer([]byte(secret), nil, false).Mint(identity))
-		}
-		c.Stdout, c.Stderr = prefixWriter{identity, os.Stdout}, prefixWriter{identity, os.Stderr}
-		if err := c.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "fleet: start %s: %v\n", identity, err)
-			return
-		}
-		kids = append(kids, c)
+	supervise := func(identity string, argv ...string) {
+		go func() {
+			backoff := time.Second
+			for ctx.Err() == nil {
+				c := exec.Command(self, argv...)
+				c.Env = env
+				if secret != "" {
+					c.Env = append(c.Env, "FLOWBEE_WORKER_TOKEN="+auth.NewBearer([]byte(secret), nil, false).Mint(identity))
+				}
+				c.Stdout, c.Stderr = prefixWriter{identity, os.Stdout}, prefixWriter{identity, os.Stderr}
+				if err := c.Start(); err != nil {
+					fmt.Fprintf(os.Stderr, "fleet: start %s: %v\n", identity, err)
+				} else {
+					mu.Lock()
+					kids = append(kids, c)
+					mu.Unlock()
+					ran := time.Now()
+					_ = c.Wait()
+					if ctx.Err() != nil {
+						return // fleet shutting down — the exit was our kill, not a crash
+					}
+					fmt.Fprintf(os.Stderr, "fleet: worker %s exited; respawning in %s\n", identity, backoff)
+					if time.Since(ran) > 60*time.Second {
+						backoff = time.Second // it ran healthy for a while — reset the backoff
+					}
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				backoff = nextRespawnBackoff(backoff)
+			}
+		}()
 	}
 
 	// build workers (--remote): N parallel, each a worktree off the shared local mirror.
 	for i := 0; i < *builders; i++ {
 		id := fmt.Sprintf("%s-builder-%d", host, i)
-		spawn(id, "work", "--role", "eng_worker", "--remote",
+		supervise(id, "work", "--role", "eng_worker", "--remote",
 			"--mirror", *mirror, "--repo-url", repoURL,
 			"--identity", id, "--model-family", "claude", "--agent-cmd", *buildCmd)
 	}
@@ -123,7 +152,7 @@ Create the file(s) on disk now. Make only the change described." --dangerously-s
 		if r.role == "code_reviewer" {
 			argv = append(argv, "--mirror", *mirror, "--repo-url", repoURL)
 		}
-		spawn(id, argv...)
+		supervise(id, argv...)
 	}
 
 	fmt.Printf("🐝 flowbee fleet up on %s → %s  [%s]\n   %d build + 1 code-review + 1 author + 1 issue-review worker (all roles; this box is fungible capacity)\n",
@@ -133,8 +162,23 @@ Create the file(s) on disk now. Make only the change described." --dangerously-s
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	fmt.Println("\nflowbee fleet: shutting down workers...")
-	killAll(kids)
+	shutdown() // stop the supervisors respawning before we kill the children
+	mu.Lock()
+	snapshot := append([]*exec.Cmd(nil), kids...)
+	mu.Unlock()
+	killAll(snapshot)
 	return nil
+}
+
+// nextRespawnBackoff doubles the respawn delay up to a 30s cap, so a worker that
+// crash-loops backs off instead of hot-spinning, while a healthy worker (which resets
+// the backoff after a good run) respawns promptly.
+func nextRespawnBackoff(d time.Duration) time.Duration {
+	d *= 2
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
 }
 
 // printFleetSystemd emits a ready-to-install systemd unit + env file so the fleet runs
