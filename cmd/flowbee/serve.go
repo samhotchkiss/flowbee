@@ -192,6 +192,30 @@ func runServe(_ []string) error {
 		}
 	}()
 
+	// fleet-health watchdog: a `ready` job with NO live worker sits silently (the
+	// scheduler has nothing to assign, no alarm fires for a build stage). Warn loudly
+	// + repeatedly so a down/disconnected fleet is impossible to miss — the operator
+	// sees it in the log even without looking at the dashboard.
+	staleHB := 3 * cfg.HeartbeatInterval()
+	if staleHB <= 0 {
+		staleHB = 90 * time.Second
+	}
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if h, err := st.FleetHealth(ctx, time.Now(), staleHB); err == nil && h.Stranded() {
+					logger.Warn("⚠️  jobs WAITING but NO live worker — is the fleet up? start `flowbee fleet` on a box",
+						"waiting_jobs", h.WaitingJobs, "stale_workers", h.StaleWorkers, "live_workers", h.LiveWorkers)
+				}
+			}
+		}
+	}()
+
 	// reconcile-IN + project-OUT (M6/M7, §8.1/§8.2): Flowbee is the SINGLE GitHub
 	// caller (R4). F9 multi-repo: ONE control plane runs a per-repo reconcile-IN +
 	// project-OUT loop over the repos registry, sharing a GLOBAL scheduler + fleet.

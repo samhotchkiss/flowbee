@@ -218,6 +218,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/events", s.eventsHandler)
 	mux.HandleFunc("GET /v1/budget", s.budgetJSON)
 	mux.HandleFunc("GET /v1/roster", s.rosterJSON)
+	mux.HandleFunc("GET /v1/fleet-health", s.fleetHealthJSON)
 	mux.HandleFunc("GET /v1/audit", s.auditJSON)
 	mux.HandleFunc("GET /v1/cost", s.costJSON)
 	mux.HandleFunc("GET /v1/needs-human", s.needsHumanJSON)
@@ -397,6 +398,20 @@ func (s *Server) rosterJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, roster)
+}
+
+// fleetHealthJSON answers "is anyone home?": live vs stale workers + jobs waiting for
+// one. `stranded: true` (work to do, zero live workers) is the down-fleet signature.
+func (s *Server) fleetHealthJSON(w http.ResponseWriter, r *http.Request) {
+	h, err := s.store.FleetHealth(r.Context(), s.clock.Now(), s.staleHB)
+	if err != nil {
+		http.Error(w, "fleet health error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"live_workers": h.LiveWorkers, "stale_workers": h.StaleWorkers,
+		"waiting_jobs": h.WaitingJobs, "stranded": h.Stranded(),
+	})
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
