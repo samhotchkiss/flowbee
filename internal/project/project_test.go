@@ -203,3 +203,33 @@ func TestPoisonOutboxRowDeadLetteredNoHeadOfLineWedge(t *testing.T) {
 		t.Fatalf("dead-lettered poison must not write an audit entry: %+v", audit)
 	}
 }
+
+// TestMergedJobDeletesItsIssueBranch: when reconcile sees a build's PR merged, it
+// enqueues a post-merge cleanup that deletes the flowbee/issue-N branch — so the repo
+// doesn't accumulate stale flowbee/issue-* branches. Safe: the merge commit keeps the
+// branch's commits reachable from main.
+func TestMergedJobDeletesItsIssueBranch(t *testing.T) {
+	st, fake, sender, clk := newSender(t)
+	sender.WithHistory(&fakeHistory{tip: "main-tip"}, "main")
+	ctx := context.Background()
+
+	if _, err := st.DB.ExecContext(ctx, `
+		INSERT INTO jobs (id, kind, flow, stage, state, role, issue_number, blocked_by,
+		                  required_capabilities, enqueued_at, lease_epoch, attempts,
+		                  max_attempts, bounces, max_bounces, job_seq)
+		VALUES ('m','build','build','review','merging','code_reviewer',77,'[]','[]',
+		        datetime('now'),0,0,5,0,9,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyReconciledPR(ctx, "m", store.ReconciledPR{
+		Number: 77, Merged: true, MergeCommit: "mc", HeadSHA: "h", BaseSHA: "b",
+	}, clk.Now()); err != nil {
+		t.Fatalf("reconcile merged: %v", err)
+	}
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got := fake.DeletedBranches(); len(got) != 1 || got[0] != "flowbee/issue-77" {
+		t.Fatalf("DeletedBranches=%v, want [flowbee/issue-77]", got)
+	}
+}

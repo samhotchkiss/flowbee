@@ -5,11 +5,28 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
+
+// resolveIssueNumTx mirrors ResolveIssueNum inside a tx: an adopted-issue build carries
+// its issue number directly; a spec-flow build descends from the spec job (FlowID) that
+// holds the materialized issue number. 0 when no issue is bound.
+func resolveIssueNumTx(ctx context.Context, tx *sql.Tx, j job.Job) int {
+	if j.IssueNum > 0 {
+		return j.IssueNum
+	}
+	if j.FlowID != "" && j.FlowID != j.ID {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(issue_number,0) FROM jobs WHERE id=?`, j.FlowID).Scan(&n); err == nil {
+			return n
+		}
+	}
+	return 0
+}
 
 // ReconciledPR is the Domain-B fact-set for one PR, as reconcile-IN observed it
 // from a sweep or a targeted refetch (§8.1). It carries ONLY GitHub-owned facts
@@ -151,6 +168,19 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 			// rebase-before-review; this closes the gap for not-yet-built ready jobs.
 			if pr.MergeCommit != "" {
 				if err := refreshReadyBaseTx(ctx, tx, j.Repo, jobID, pr.MergeCommit, now); err != nil {
+					return err
+				}
+			}
+			// post-merge branch cleanup: delete the merged job's flowbee/issue-N branch so
+			// the repo doesn't accumulate stale flowbee/issue-* branches forever (it grows
+			// one per merge). Only flowbee-owned branches; the merge commit keeps the
+			// branch's commits reachable from main, so deleting the ref is safe. SHA-less
+			// outbox row (one delete per job, deduped by (job, action, '')).
+			if br := IssueBranch(resolveIssueNumTx(ctx, tx, j), jobID); strings.HasPrefix(br, "flowbee/") {
+				if err := enqueueOutboxTx(ctx, tx, OutboxRow{
+					JobID: jobID, Action: ActionDeleteBranch,
+					Payload: outboxPayload(map[string]any{"branch": br}),
+				}); err != nil {
 					return err
 				}
 			}

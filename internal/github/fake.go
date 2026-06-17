@@ -30,7 +30,8 @@ type Fake struct {
 	checks     []string // "name@sha=conclusion"
 	enqueued    []int        // PR numbers enqueued to the merge queue
 	conflictPRs map[int]bool // PRs whose merge returns ErrMergeConflict (set via SetMergeConflict)
-	drafted    []int    // PR numbers converted back to draft (compensation, §6.5.4)
+	drafted         []int    // PR numbers converted back to draft (compensation, §6.5.4)
+	deletedBranches []string // branches deleted post-merge (cleanup)
 	cancelled  []string // SHAs whose CI was cancelled (compensation, §6.5.4)
 	protection map[string]Protection
 
@@ -312,6 +313,24 @@ func (f *Fake) CancelCI(ctx context.Context, sha string) error {
 	f.calls = append(f.calls, fmt.Sprintf("CancelCI(%s)", sha))
 	f.cancelled = append(f.cancelled, sha)
 	return nil
+}
+
+func (f *Fake) DeleteBranch(ctx context.Context, branch string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("DeleteBranch(%s)", branch))
+	if err := f.retryGate(); err != nil {
+		return err
+	}
+	f.deletedBranches = append(f.deletedBranches, branch)
+	return nil
+}
+
+// DeletedBranches returns the branches deleted (post-merge cleanup assertions).
+func (f *Fake) DeletedBranches() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deletedBranches...)
 }
 
 // Drafted returns the PR numbers converted back to draft (compensation assertions).

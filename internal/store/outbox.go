@@ -36,6 +36,9 @@ const (
 	// M11 compensation (§6.5.4, I-12): draft-back a PR opened for a now-dead epoch's
 	// attempt — never leave a revoked zombie's PR ready-for-review.
 	ActionDraftPR = "pulls.draft"
+	// ActionDeleteBranch deletes a merged job's flowbee/issue-N branch (post-merge
+	// cleanup) so the repo doesn't accumulate stale flowbee/issue-* branches forever.
+	ActionDeleteBranch = "git.deleteBranch"
 )
 
 // EnqueueOutbox writes one outbox row in the caller's transaction (the

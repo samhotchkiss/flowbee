@@ -110,8 +110,8 @@ func TestF11HistoryArchiveOnMerge(t *testing.T) {
 
 	// ── drain the sender: Flowbee (sole writer) lands the dedicated post-merge commit.
 	n, err := sender.DrainOnce(ctx)
-	if err != nil || n != 1 {
-		t.Fatalf("drain history: n=%d err=%v", n, err)
+	if err != nil || n != 2 {
+		t.Fatalf("drain history: n=%d err=%v (want 2: history write + post-merge branch delete)", n, err)
 	}
 
 	// ── PROVE the archive on disk: the card + the TOC are committed on main.

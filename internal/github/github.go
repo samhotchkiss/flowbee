@@ -142,6 +142,11 @@ type Writer interface {
 	// compensation step that stops a dead epoch's checks (§6.5.4, I-12). A best-effort
 	// cancel: CI not cancellable is not an error.
 	CancelCI(ctx context.Context, sha string) error
+	// DeleteBranch deletes refs/heads/<branch> — the post-merge cleanup of a
+	// flowbee/issue-N branch so the repo does not accumulate thousands of stale
+	// flowbee/issue-* branches. Safe after a MERGE commit: the branch's commits stay
+	// reachable from main, so only the ref is removed.
+	DeleteBranch(ctx context.Context, branch string) error
 	// BranchProtection reads the server-side protection on a branch (I-8, §9.6):
 	// the orchestrator-independent backstop Flowbee asserts on startup.
 	BranchProtection(ctx context.Context, branch string) (Protection, bool, error)
@@ -648,6 +653,21 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
 		// surface a conflict as the typed error so the sender routes to a resolver
 		// instead of re-queuing a merge that can never succeed.
 		return fmt.Errorf("%w: %v", ErrMergeConflict, err)
+	}
+	return err
+}
+
+// DeleteBranch deletes refs/heads/<branch>. A 404/422 (the ref is already gone, e.g.
+// GitHub auto-deleted it on merge, or a re-drain) is success — the goal state (no
+// branch) is reached either way, so the outbox row consumes cleanly rather than
+// dead-lettering. Branch names with slashes (flowbee/issue-N) are valid ref paths.
+func (c *RealClient) DeleteBranch(ctx context.Context, branch string) error {
+	err := c.rest(ctx, http.MethodDelete, "/git/refs/heads/"+branch, nil, nil)
+	if err != nil {
+		var ghErr *ErrGitHub
+		if errors.As(err, &ghErr) && (ghErr.StatusCode == http.StatusNotFound || ghErr.StatusCode == http.StatusUnprocessableEntity) {
+			return nil
+		}
 	}
 	return err
 }

@@ -363,6 +363,19 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		}
 		return fmt.Sprintf("draft_back pr=%d", number), nil
 
+	case store.ActionDeleteBranch:
+		// post-merge cleanup: delete the merged job's flowbee/issue-N branch so the repo
+		// does not accumulate stale flowbee/issue-* branches. Safe — the branch's commits
+		// stay reachable from the merge commit on main. A missing branch is success.
+		branch, _ := p["branch"].(string)
+		if branch == "" {
+			return "delete_branch:none", nil
+		}
+		if err := s.gh.DeleteBranch(ctx, branch); err != nil {
+			return "", err
+		}
+		return "deleted_branch " + branch, nil
+
 	case store.ActionWriteHistory:
 		// build-list §F: the dedicated post-merge issue-archive commit. Flowbee folds
 		// the job's ledger into a curated card + regenerates the TOC, then commits both
