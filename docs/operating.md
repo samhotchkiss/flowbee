@@ -98,6 +98,7 @@ What it does:
 - Workers commit + push with the box's own key; the control plane never gets their creds.
 - Reports per-job token + cost usage so the control plane can meter spend.
 - Resolves merge conflicts automatically via a dedicated conflict resolver.
+- Streams each worker's logs to journald for live tailing.
 
 Flags: `--builders N`, `--mirror DIR`, `--agent-cmd` (review/author roles),
 `--build-agent-cmd` (build role — writes files), `--no-smoke`, `--systemd` (print a
