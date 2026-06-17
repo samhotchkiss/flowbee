@@ -606,11 +606,65 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
 	}, nil)
 }
 
+// prNodeQuery resolves a PR's GraphQL node ID (+ current draft state) from its
+// number — convertPullRequestToDraft takes the node ID, not the number.
+const prNodeQuery = `
+query PRNode($owner:String!, $repo:String!, $number:Int!) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) { id isDraft }
+  }
+}`
+
+// convertToDraftMutation flips an open PR back to draft (the M11 zombie compensation).
+const convertToDraftMutation = `
+mutation Draft($id:ID!) {
+  convertPullRequestToDraft(input:{pullRequestId:$id}) {
+    pullRequest { isDraft }
+  }
+}`
+
 func (c *RealClient) ConvertToDraft(ctx context.Context, number int) error {
-	// converting an open PR back to draft is a GraphQL mutation in production; the
-	// REST shim here is a placeholder for the wired-but-unexercised real path.
-	return c.rest(ctx, http.MethodPatch, fmt.Sprintf("/pulls/%d", number),
-		map[string]any{"draft": true}, nil)
+	// GitHub's REST API treats a PR's `draft` flag as READ-ONLY — a PATCH cannot toggle
+	// it (it is silently ignored). Converting an open PR back to draft is only possible
+	// via the GraphQL convertPullRequestToDraft mutation, which takes the PR's node ID
+	// (not its number). Resolve the node ID, then mutate. This is the M11 zombie
+	// compensation (§6.5.4): a revoked epoch's PR must never sit ready-for-review, so a
+	// silent no-op here would leave a mergeable zombie behind.
+	var idQ struct {
+		Repository struct {
+			PullRequest *struct {
+				ID      string `json:"id"`
+				IsDraft bool   `json:"isDraft"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	}
+	if err := c.graphQL(ctx, prNodeQuery, map[string]any{
+		"owner": c.Owner, "repo": c.Repo, "number": number,
+	}, &idQ); err != nil {
+		return fmt.Errorf("resolve pr %d node id: %w", number, err)
+	}
+	if idQ.Repository.PullRequest == nil || idQ.Repository.PullRequest.ID == "" {
+		return fmt.Errorf("pr %d not found for draft-back", number)
+	}
+	if idQ.Repository.PullRequest.IsDraft {
+		return nil // already draft — idempotent (the sender may retry the action)
+	}
+	var mut struct {
+		ConvertPullRequestToDraft struct {
+			PullRequest struct {
+				IsDraft bool `json:"isDraft"`
+			} `json:"pullRequest"`
+		} `json:"convertPullRequestToDraft"`
+	}
+	if err := c.graphQL(ctx, convertToDraftMutation, map[string]any{
+		"id": idQ.Repository.PullRequest.ID,
+	}, &mut); err != nil {
+		return fmt.Errorf("convert pr %d to draft: %w", number, err)
+	}
+	if !mut.ConvertPullRequestToDraft.PullRequest.IsDraft {
+		return fmt.Errorf("pr %d still not draft after convertPullRequestToDraft", number)
+	}
+	return nil
 }
 
 func (c *RealClient) CancelCI(ctx context.Context, sha string) error {
