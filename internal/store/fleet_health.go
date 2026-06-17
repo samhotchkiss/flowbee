@@ -2,8 +2,26 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"time"
 )
+
+// WorkerIDForIdentity returns the worker_id already registered under this identity,
+// or "" if none. The workers table is UNIQUE(identity) but the registration upsert is
+// keyed ON CONFLICT(worker_id); a re-registering worker that sends an empty worker_id
+// (so the server mints a fresh one) would therefore collide on the identity constraint
+// and fail — freezing its stored capabilities at the first registration. Resolving the
+// existing worker_id first makes the upsert UPDATE the right row, so a worker that
+// changed its model_family/role actually refreshes.
+func (s *Store) WorkerIDForIdentity(ctx context.Context, identity string) (string, error) {
+	var wid string
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT worker_id FROM workers WHERE identity = ?`, identity).Scan(&wid)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return wid, err
+}
 
 // RecordWorkerSeen bumps a worker's last_seen — proof of liveness from any worker
 // call, notably the lease long-poll. An idle worker polling for work IS alive even

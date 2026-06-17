@@ -494,7 +494,17 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if reg.WorkerID == "" {
-		reg.WorkerID = s.minter.New()
+		// Reuse the worker_id already registered under this identity so a RE-registration
+		// (a worker that restarted, possibly with a changed model_family/role) UPDATES its
+		// existing row instead of minting a fresh worker_id that collides with the
+		// UNIQUE(identity) constraint and fails — which would freeze the worker's stored
+		// capabilities at its first registration (the stale-roster bug). Mint only for a
+		// genuinely new identity.
+		if existing, err := s.store.WorkerIDForIdentity(r.Context(), reg.Identity); err == nil && existing != "" {
+			reg.WorkerID = existing
+		} else {
+			reg.WorkerID = s.minter.New()
+		}
 	}
 	resp, err := s.registry.Register(r.Context(), reg, s.clock.Now())
 	if err != nil {
