@@ -46,7 +46,6 @@ Key environment:
 | `FLOWBEE_GIT_REMOTE` | `ssh` ships `git@github.com:…` remotes to SSH-only worker boxes |
 | `FLOWBEE_RECONCILE_INTERVAL_S` | reconcile cadence (default 45s) |
 | `FLOWBEE_WORKER_AUTH_SECRET` | shared secret the fleet authenticates with |
-| `FLOWBEE_SPEND_CAP_MICRO_USD` | aggregate spend circuit breaker (micro-USD; 0 = off). At the cap, new builds/specs pause; in-flight work drains. A backstop for unattended autonomous runs — distinct from the per-job ceiling |
 | `FLOWBEE_INSECURE` | dev only: disable mTLS/auth on the private API |
 
 Run it as a managed service so it survives reboots and restarts cleanly (the control

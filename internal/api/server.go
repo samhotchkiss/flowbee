@@ -46,11 +46,6 @@ type Server struct {
 	longPollWait time.Duration
 	pollInterval time.Duration
 
-	// spendCapMicroUSD is the aggregate metered-spend circuit breaker: when cumulative
-	// spend across all jobs reaches it, the lease handler stops granting NEW work
-	// (builds + new specs). 0 disables it (the default).
-	spendCapMicroUSD int64
-
 	// mirrorPath is the shared bare-repo mirror path handed to same-box workers
 	// for `worktree` provisioning (§7.4). Empty when no local mirror is configured
 	// (the worker then has no repo to provision and must supply its own).
@@ -85,8 +80,6 @@ type Config struct {
 	LongPollWait       time.Duration
 	LeaseTTLS          int
 	HeartbeatIntervalS int
-	// SpendCapMicroUSD is the aggregate metered-spend circuit breaker (0 disables).
-	SpendCapMicroUSD int64
 	// Policy is THE ONE DECISION surface (§14): AllowSelfMerge default false =
 	// Branch A (every approval -> handoff -> human).
 	Policy job.Policy
@@ -169,7 +162,6 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		leaseTTL:           cfg.LeaseTTL,
 		longPollWait:       cfg.LongPollWait,
 		pollInterval:       poll,
-		spendCapMicroUSD:   cfg.SpendCapMicroUSD,
 		mirrorPath:         cfg.MirrorPath,
 		bundleProvisioning: cfg.BundleProvisioning,
 		pushRemoteURL:      cfg.PushRemoteURL,
@@ -502,18 +494,6 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&b, "# HELP flowbee_jobs_over_budget Jobs that breached their cost ceiling.\n")
 		fmt.Fprintf(&b, "# TYPE flowbee_jobs_over_budget gauge\n")
 		fmt.Fprintf(&b, "flowbee_jobs_over_budget %d\n", overBudget)
-		// the aggregate spend circuit breaker: the cap (0 = disabled) and whether it is
-		// currently tripped (new-work leases refused). Alert on spend_capped == 1.
-		capped := 0
-		if s.spendCapMicroUSD > 0 && totalMicro >= s.spendCapMicroUSD {
-			capped = 1
-		}
-		fmt.Fprintf(&b, "# HELP flowbee_spend_cap_micro_usd Aggregate spend circuit-breaker cap (0 = disabled).\n")
-		fmt.Fprintf(&b, "# TYPE flowbee_spend_cap_micro_usd gauge\n")
-		fmt.Fprintf(&b, "flowbee_spend_cap_micro_usd %d\n", s.spendCapMicroUSD)
-		fmt.Fprintf(&b, "# HELP flowbee_spend_capped 1 when cumulative spend has reached the cap and new work is paused.\n")
-		fmt.Fprintf(&b, "# TYPE flowbee_spend_capped gauge\n")
-		fmt.Fprintf(&b, "flowbee_spend_capped %d\n", capped)
 	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -693,28 +673,8 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	specReviewing := role == job.RoleSpecReviewer
 	resolvingConflict := role == job.RoleConflictResolver
 
-	// Aggregate spend circuit breaker (§autonomous-safety): once cumulative metered
-	// spend reaches the configured cap, stop handing out NEW work — eng_worker (builds)
-	// and spec_author (new specs). In-flight reviews, resolutions, and merges still
-	// drain to completion (they finish committed work, not start fresh spend). The fleet
-	// quietly idles on new work until the operator raises the cap or stops it. cap==0
-	// (the default) disables the breaker entirely. Evaluated once per lease call.
-	startsNewWork := specAuthoring || (!reviewing && !specReviewing && !resolvingConflict)
-	spendCapped := false
-	if s.spendCapMicroUSD > 0 && startsNewWork {
-		if total, terr := s.store.TotalSpendMicroUSD(r.Context()); terr == nil && total >= s.spendCapMicroUSD {
-			spendCapped = true
-		}
-	}
-
 	deadline := time.Now().Add(s.longPollWait)
 	for {
-		if spendCapped {
-			// over the aggregate cap: take no new work this poll (204), so the fleet pauses
-			// at intake. A long-poll that just returns is fine — the worker re-polls.
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
 		// each role claims from its own source state: code_review from review_pending,
 		// spec_author from spec_authoring, spec_review from spec_review, every other
 		// (eng_worker) from `ready`. The atomic claim is the correctness backstop in
