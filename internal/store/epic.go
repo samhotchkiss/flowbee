@@ -135,22 +135,75 @@ func (s *Store) EpicReviewed(ctx context.Context, epicID string) (bool, error) {
 func (s *Store) EpicFanOut(ctx context.Context, epicID string, now time.Time) ([]string, error) {
 	var released []string
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		r, err := epicFanOutTx(ctx, tx, epicID, now)
+		released = r
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return released, nil
+}
+
+// FanOutReviewedEpics is the production trigger the epic flow was missing: a drain that
+// finds every epic whose barrier has PASSED (epic_reviewed=1) but still has children
+// parked in backlog, and fans each one out. The §F4 design keeps fan-out a SEPARATE
+// step from the barrier (so review and release stay distinct) — but nothing ever called
+// it, so a reviewed epic's issues sat in backlog forever. A serve tick runs this; it is
+// idempotent (a fully-fanned epic matches nothing). Returns the total children released.
+func (s *Store) FanOutReviewedEpics(ctx context.Context, now time.Time) (int, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT DISTINCT e.id
+		  FROM jobs e
+		  JOIN jobs c ON c.epic_id = e.id AND c.is_epic = 0 AND c.state = 'backlog'
+		 WHERE e.is_epic = 1 AND COALESCE(e.epic_reviewed,0) = 1`)
+	if err != nil {
+		return 0, err
+	}
+	var epicIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		epicIDs = append(epicIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, id := range epicIDs {
+		released, err := s.EpicFanOut(ctx, id, now)
+		if err != nil {
+			return total, fmt.Errorf("fan out reviewed epic %s: %w", id, err)
+		}
+		total += len(released)
+	}
+	return total, nil
+}
+
+// epicFanOutTx is EpicFanOut's body, callable inside an existing tx.
+func epicFanOutTx(ctx context.Context, tx *sql.Tx, epicID string, now time.Time) ([]string, error) {
+	var released []string
+	{
 		var reviewed int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COALESCE(epic_reviewed,0) FROM jobs WHERE id = ? AND is_epic = 1`, epicID).
 			Scan(&reviewed); err != nil {
 			if err == sql.ErrNoRows {
-				return fmt.Errorf("fan out: epic %s not found", epicID)
+				return nil, fmt.Errorf("fan out: epic %s not found", epicID)
 			}
-			return err
+			return nil, err
 		}
 		if reviewed == 0 {
-			return fmt.Errorf("fan out: epic %s not yet reviewed (barrier holds)", epicID)
+			return nil, fmt.Errorf("fan out: epic %s not yet reviewed (barrier holds)", epicID)
 		}
 		rows, err := tx.QueryContext(ctx,
 			`SELECT id, job_seq FROM jobs WHERE epic_id = ? AND is_epic = 0 AND state = 'backlog' ORDER BY id ASC`, epicID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		type child struct {
 			id  string
@@ -161,13 +214,13 @@ func (s *Store) EpicFanOut(ctx context.Context, epicID string, now time.Time) ([
 			var c child
 			if err := rows.Scan(&c.id, &c.seq); err != nil {
 				rows.Close()
-				return err
+				return nil, err
 			}
 			children = append(children, c)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		for _, c := range children {
 			nextSeq := c.seq + 1
@@ -177,7 +230,7 @@ func (s *Store) EpicFanOut(ctx context.Context, epicID string, now time.Time) ([
 				Actor: "system", CreatedAt: now,
 			}
 			if err := appendEvent(ctx, tx, ev); err != nil {
-				return err
+				return nil, err
 			}
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE jobs
@@ -185,17 +238,13 @@ func (s *Store) EpicFanOut(ctx context.Context, epicID string, now time.Time) ([
 				       required_capabilities = ?, enqueued_at = ?, updated_at = datetime('now')
 				 WHERE id = ? AND state = 'backlog'`,
 				marshalStrings([]string{"role:spec_author"}), now.Format(rfc3339), c.id); err != nil {
-				return fmt.Errorf("fan out child %s: %w", c.id, err)
+				return nil, fmt.Errorf("fan out child %s: %w", c.id, err)
 			}
 			if err := setJobSeq(ctx, tx, c.id, nextSeq); err != nil {
-				return err
+				return nil, err
 			}
 			released = append(released, c.id)
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	return released, nil
 }

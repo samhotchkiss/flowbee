@@ -637,6 +637,11 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 					`UPDATE jobs SET epic_reviewed = 1, updated_at = datetime('now') WHERE id = ?`, in.JobID); err != nil {
 					return fmt.Errorf("mark epic reviewed: %w", err)
 				}
+				// the children fan out via the fan-out drain (a serve tick calling
+				// FanOutReviewedEpics) — kept a SEPARATE step from the barrier so the
+				// review and the release stay distinct (the §F4 barrier-before-fan-out
+				// invariant). The bug this closes: that drain never existed, so an epic's
+				// issues sat in backlog forever after review.
 			} else {
 				// materialize_issues: enqueue the issues.create rendering (§8.2.1). The
 				// outbox key uses the content hash in place of a head_sha (spec is SHA-less).

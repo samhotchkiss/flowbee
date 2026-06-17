@@ -247,6 +247,27 @@ func runServe(_ []string) error {
 		}
 	}()
 
+	// epic fan-out drain (§F4): once an epic's barrier review passes, its child issues
+	// are released from backlog into their own spec flows. Review and fan-out are kept
+	// distinct steps (barrier-before-fan-out); this drain is the trigger that releases
+	// a reviewed epic's children — without it they sit in backlog forever.
+	go func() {
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if n, err := st.FanOutReviewedEpics(ctx, time.Now()); err != nil {
+					logger.Error("epic fan-out drain", "err", err)
+				} else if n > 0 {
+					logger.Info("📤 epic fan-out: released children to build", "issues", n)
+				}
+			}
+		}
+	}()
+
 	// reconcile-IN + project-OUT (M6/M7, §8.1/§8.2): Flowbee is the SINGLE GitHub
 	// caller (R4). F9 multi-repo: ONE control plane runs a per-repo reconcile-IN +
 	// project-OUT loop over the repos registry, sharing a GLOBAL scheduler + fleet.
