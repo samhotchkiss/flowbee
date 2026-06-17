@@ -146,7 +146,43 @@ building → review_pending → code_review → mergeable → merging → done**
 
 ---
 
-## 6. Recovering from trouble
+## 6. Durability & backup
+
+Flowbee's state lives in **two places**, and they recover differently:
+
+- **GitHub** is ground truth for the facts it owns (PR exists, CI status, merged). These
+  re-derive on the next reconcile — nothing to back up.
+- **`flowbee.db`** holds the **ledger** — the Domain-A source of truth (the job graph,
+  every verdict, the full lineage). The jobs table is a fold of it. **This is the thing
+  to back up:** lose it and you lose orchestration state that GitHub can't reconstruct.
+
+The DB runs in WAL mode, which is **litestream-friendly** — but Flowbee does NOT run
+litestream for you. For any real deployment, run it as a sidecar so the DB streams
+continuously to object storage:
+
+```yaml
+# /etc/litestream.yml
+dbs:
+  - path: /home/sam/.flowbee/flowbee.db
+    replicas:
+      - url: s3://my-bucket/flowbee-db    # or gcs://, abs://, file:// for a local disk
+```
+
+```sh
+# run it alongside the control plane (its own systemd unit, or `litestream replicate`)
+sudo systemctl enable --now litestream
+# disaster recovery: restore before starting flowbee serve
+litestream restore -o /home/sam/.flowbee/flowbee.db s3://my-bucket/flowbee-db
+```
+
+No object store handy? A periodic `sqlite3 flowbee.db ".backup '/backups/flowbee-$(date +%F).db'"`
+is a coarse floor, but litestream's continuous WAL replication is the production answer
+(point-in-time recovery, seconds of data loss vs. a day). The ledger is append-only, so a
+restore is always internally consistent — replay folds the jobs table back exactly.
+
+---
+
+## 7. Recovering from trouble
 
 Flowbee is built so nothing wedges permanently — but here is the operator's toolkit:
 
@@ -165,7 +201,7 @@ can never make a job unclaimable), and escalates a genuinely no-eligible-worker 
 
 ---
 
-## 7. Self-merge, briefly
+## 8. Self-merge, briefly
 
 Once a reviewer's verdict binds to the reconciled head/base SHA and CI is green, the gate
 merges autonomously (with `FLOWBEE_ALLOW_SELF_MERGE=1`). **Do not push to a repo's `main`
