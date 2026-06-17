@@ -159,7 +159,7 @@ func (s *Store) Backlog(ctx context.Context) ([]BacklogItem, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []BacklogItem
+	out := []BacklogItem{}
 	for rows.Next() {
 		var it BacklogItem
 		var needs int

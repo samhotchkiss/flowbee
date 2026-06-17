@@ -365,7 +365,7 @@ func (s *Store) NeedsInput(ctx context.Context) ([]NeedsInputItem, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []NeedsInputItem
+	out := []NeedsInputItem{}
 	for rows.Next() {
 		var it NeedsInputItem
 		if err := rows.Scan(&it.JobID, &it.State, &it.Reason, &it.SpecContentHash, &it.ChatRef, &it.EpicID); err != nil {

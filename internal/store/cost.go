@@ -296,7 +296,7 @@ func (s *Store) MergeHandoffView(ctx context.Context) ([]MergeHandoffRow, error)
 		return nil, err
 	}
 	defer rows.Close()
-	var out []MergeHandoffRow
+	out := []MergeHandoffRow{}
 	for rows.Next() {
 		var r MergeHandoffRow
 		if err := rows.Scan(&r.JobID, &r.Repo, &r.IssueNumber, &r.PRNumber); err != nil {
@@ -321,7 +321,7 @@ func (s *Store) NeedsHumanView(ctx context.Context) ([]NeedsHumanRow, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []NeedsHumanRow
+	out := []NeedsHumanRow{}
 	for rows.Next() {
 		var r NeedsHumanRow
 		var reason string
