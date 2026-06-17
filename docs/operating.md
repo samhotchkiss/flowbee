@@ -21,6 +21,19 @@ the world from GitHub + the ledger — there is no hidden in-memory state to los
 
 ---
 
+## Preflight checks (`flowbee doctor`)
+
+Run `flowbee doctor` before starting `flowbee serve` to validate your configuration:
+
+- **Config parsing** — confirms `flowbee.yaml` is valid YAML and passes schema validation.
+- **Repo coordinates** — verifies the owner/repo reference resolves on GitHub.
+- **Flow file identities** — checks that every identity referenced in the flow file exists.
+- **Lens coverage** — ensures each identity has a lens configured.
+
+Pass `--offline` to skip the GitHub reachability check when running in an air-gapped or offline environment.
+
+---
+
 ## 2. The control plane (`flowbee serve`)
 
 The control plane runs the scheduler, the per-repo reconcile-IN / project-OUT loops, the
