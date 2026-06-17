@@ -59,3 +59,22 @@ func TestRenderReviewBriefSpecReviewer(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderReviewBriefSpecAuthor pins the imperative file-write instruction: the
+// first live spec_author runs re-claimed because a generic `claude -p` agent emitted
+// the spec to stdout instead of writing $FLOWBEE_SPEC_FILE. The brief must tell it to
+// WRITE the file (with a concrete shell example) and not just print — and explicitly
+// warn that a run writing nothing is discarded.
+func TestRenderReviewBriefSpecAuthor(t *testing.T) {
+	c := &client.LeaseContext{Identity: "product_speccer", Task: "Add a board command", AcceptanceCriteria: "prints a table"}
+	brief := renderReviewBrief("job-3", "spec_author", c)
+	for _, want := range []string{"$FLOWBEE_SPEC_FILE", "Add a board command", "prints a table"} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("spec_author brief missing %q\n%s", want, brief)
+		}
+	}
+	// it must be imperative about writing the file, not printing.
+	if !strings.Contains(brief, "REQUIRED") || !strings.Contains(brief, "Do NOT just print") {
+		t.Fatalf("spec_author brief must force a file write, got:\n%s", brief)
+	}
+}

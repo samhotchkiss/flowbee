@@ -769,16 +769,29 @@ func ensureMirror(ctx context.Context, mirrorPath, repoURL, branch string) error
 // stale epoch (wasting the work + re-arming the job). Heartbeats fire at ~1/3 of the
 // TTL (min 20s). errb captures stderr for a useful failure message.
 func runAgentHeartbeat(ctx context.Context, c *client.Client, jobID string, epoch, ttlS int, dir, agentCmd string, env []string) error {
+	_, err := runAgentHeartbeatIO(ctx, c, jobID, epoch, ttlS, dir, agentCmd, env, false)
+	return err
+}
+
+// runAgentHeartbeatIO is runAgentHeartbeat with an optional stdout capture. The
+// review/author harness sets capture=true so it can fall back to the agent's stdout
+// when the agent emitted its result (e.g. a spec) to stdout instead of writing the
+// expected $FLOWBEE_SPEC_FILE / $FLOWBEE_VERDICT_FILE. Build roles leave it false
+// (their agents write files, and their stdout can be large — don't buffer it).
+func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, epoch, ttlS int, dir, agentCmd string, env []string, capture bool) (string, error) {
 	if agentCmd == "" {
-		return nil
+		return "", nil
 	}
 	cmd := exec.CommandContext(ctx, "sh", "-c", agentCmd)
 	cmd.Dir = dir
 	cmd.Env = env
-	var errb strings.Builder
+	var errb, outb strings.Builder
 	cmd.Stderr = &errb
+	if capture {
+		cmd.Stdout = &outb
+	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("agent start: %w", err)
+		return "", fmt.Errorf("agent start: %w", err)
 	}
 	// heartbeat well under the soft rungs (phase budget ~TTL/2, stale threshold
 	// ~3×heartbeat) so the lease never lapses mid-build — cap at 60s so a long TTL
@@ -806,9 +819,9 @@ func runAgentHeartbeat(ctx context.Context, c *client.Client, jobID string, epoc
 	werr := cmd.Wait()
 	close(done)
 	if werr != nil {
-		return fmt.Errorf("agent cmd: %v: %s", werr, strings.TrimSpace(errb.String()))
+		return outb.String(), fmt.Errorf("agent cmd: %v: %s", werr, strings.TrimSpace(errb.String()))
 	}
-	return nil
+	return outb.String(), nil
 }
 
 func hostname() string {

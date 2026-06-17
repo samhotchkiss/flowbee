@@ -130,7 +130,8 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		"FLOWBEE_VERDICT_FILE="+verdictFile,
 		"FLOWBEE_SPEC_FILE="+specFile,
 	)
-	if err := runAgentHeartbeat(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, dir, cfg.AgentCmd, agentEnv); err != nil {
+	agentOut, err := runAgentHeartbeatIO(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, dir, cfg.AgentCmd, agentEnv, true)
+	if err != nil {
 		return out, err
 	}
 
@@ -145,6 +146,12 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 			if b, e := os.ReadFile(specFile); e == nil {
 				spec = string(b)
 			}
+		}
+		// fallback: a generic `claude -p` agent prints the spec to stdout instead of
+		// writing $FLOWBEE_SPEC_FILE. Use what it emitted rather than discarding the
+		// whole run and re-claiming forever (the first-live-run spec_author wedge).
+		if strings.TrimSpace(spec) == "" {
+			spec = strings.TrimSpace(agentOut)
 		}
 		if strings.TrimSpace(spec) == "" {
 			_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
@@ -339,8 +346,10 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 		writeIf("Task", c.Task)
 		writeIf("Context", c.Spec)
 		writeIf("Acceptance criteria", c.AcceptanceCriteria)
-		b.WriteString("**Output:** write the full spec markdown to the file at $FLOWBEE_SPEC_FILE " +
-			"(or as the `spec_markdown` field of a JSON object at $FLOWBEE_VERDICT_FILE).\n")
+		b.WriteString("**Output (REQUIRED):** write the full spec markdown to the file at the path in " +
+			"the $FLOWBEE_SPEC_FILE environment variable. Use a shell command, e.g. " +
+			"`cat > \"$FLOWBEE_SPEC_FILE\" <<'EOF'` … `EOF`. Do NOT just print the spec as your reply — " +
+			"it is read from that file, and a run that writes nothing is discarded and retried.\n")
 	case "spec_reviewer":
 		b.WriteString("You are the issue-reviewer. Judge ONE thing: could an engineer BUILD this spec as-is? " +
 			"Default to `signed_off` — a spec is signable if it is clear enough to implement, even if imperfect. " +
