@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -49,5 +50,17 @@ func TestRequeueJob(t *testing.T) {
 	}
 	if j.Role != job.RoleEngWorker {
 		t.Fatalf("role=%s, want eng_worker (re-armed for a build)", j.Role)
+	}
+}
+
+// TestRequeueNotFound: requeueing a non-existent job id (e.g. a truncated id, an
+// operator typo) returns ErrJobNotFound so the API answers 404, not a misleading 500
+// (the §43 symptom — the documented recovery path looked broken on a bad id).
+func TestRequeueNotFound(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	_, err := st.RequeueJob(ctx, "01KV9R0HWS-truncated", time.Unix(1000, 0))
+	if !errors.Is(err, store.ErrJobNotFound) {
+		t.Fatalf("requeue of missing job: err=%v, want ErrJobNotFound", err)
 	}
 }

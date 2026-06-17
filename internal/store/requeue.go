@@ -3,12 +3,18 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
+
+// ErrJobNotFound is returned when an operation targets a job id that doesn't exist, so
+// the API can answer 404 (not a 500). A truncated/mistyped id is operator error, not a
+// server fault — surfacing it as 500 made the documented recovery path look broken.
+var ErrJobNotFound = errors.New("job not found")
 
 // RequeueJob re-arms an escalated / stranded job for a fresh attempt: it resets the
 // attempt + bounce budget, clears the lease + verdict, bumps the lease epoch (fencing
@@ -20,6 +26,9 @@ func (s *Store) RequeueJob(ctx context.Context, jobID string, now time.Time) (jo
 	var final job.State
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		j, seq, err := loadJobTx(ctx, tx, jobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrJobNotFound
+		}
 		if err != nil {
 			return err
 		}

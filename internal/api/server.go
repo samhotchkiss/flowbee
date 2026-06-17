@@ -1222,6 +1222,10 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 func (s *Server) requeue(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("job")
 	final, err := s.store.RequeueJob(r.Context(), jobID, s.clock.Now())
+	if errors.Is(err, store.ErrJobNotFound) {
+		http.Error(w, "requeue: no such job "+jobID+" (check the FULL job id, not a truncated one)", http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		http.Error(w, "requeue: "+err.Error(), http.StatusInternalServerError)
 		return
