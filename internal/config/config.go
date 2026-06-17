@@ -68,6 +68,12 @@ type Config struct {
 	// checks and is forced to handoff. 0 => the shipped content.DefaultLimits.
 	ContentMaxDiffBytes    int `yaml:"content_max_diff_bytes"`
 	ContentMaxChangedFiles int `yaml:"content_max_changed_files"`
+	// SpendCapMicroUSD is the AGGREGATE metered-spend circuit breaker (micro-USD,
+	// $1.00 = 1_000_000): when cumulative spend across all jobs reaches it, the control
+	// plane stops handing out NEW work (builds + new specs) so an unforeseen runaway
+	// can't keep burning money unattended. In-flight reviews/resolves/merges still
+	// drain. 0 disables it (the default — opt-in). Distinct from the per-job ceiling.
+	SpendCapMicroUSD int `yaml:"spend_cap_micro_usd"`
 	// ContentDenyExtra is an installation EXTRA path-prefix denylist (F2, §9.2a) that
 	// AUGMENTS — never replaces — the shipped, always-on protected set (CI config,
 	// lockfiles, secrets, Flowbee's own source). Any diff touching a configured prefix
@@ -194,6 +200,9 @@ func applyEnv(c *Config) {
 	}
 	if v := envInt("FLOWBEE_LEASE_TTL_S"); v > 0 {
 		c.LeaseTTLS = v
+	}
+	if v := envInt("FLOWBEE_SPEND_CAP_MICRO_USD"); v > 0 {
+		c.SpendCapMicroUSD = v
 	}
 	if v := envInt("FLOWBEE_HEARTBEAT_INTERVAL_S"); v > 0 {
 		c.HeartbeatIntervalS = v

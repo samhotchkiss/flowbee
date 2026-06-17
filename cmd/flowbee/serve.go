@@ -175,6 +175,7 @@ func runServe(args []string) error {
 		HeartbeatInterval:  cfg.HeartbeatInterval(),
 		LongPollWait:       cfg.LongPollWait(),
 		LeaseTTLS:          cfg.LeaseTTLS,
+		SpendCapMicroUSD:   int64(cfg.SpendCapMicroUSD),
 		HeartbeatIntervalS: cfg.HeartbeatIntervalS,
 		// same-box `worktree` provisioning: hand workers the shared bare mirror so
 		// they can add a per-lease worktree at base_sha and push to the epoch ref

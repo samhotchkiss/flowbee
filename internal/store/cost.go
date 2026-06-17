@@ -273,6 +273,20 @@ type NeedsHumanRow struct {
 	Reason string `json:"reason"`
 }
 
+// TotalSpendMicroUSD returns the cumulative metered agent spend across ALL jobs
+// (micro-USD). The aggregate spend circuit-breaker reads it: when it reaches the
+// configured cap the control plane stops handing out NEW work, so an unforeseen
+// runaway can't keep burning money while the operator is away. A SUM over jobs is
+// cheap at the single-control-plane scale; cache it if the table ever grows huge.
+func (s *Store) TotalSpendMicroUSD(ctx context.Context) (int64, error) {
+	var total sql.NullInt64
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(cost_micro_usd),0) FROM jobs`).Scan(&total); err != nil {
+		return 0, err
+	}
+	return total.Int64, nil
+}
+
 // MergeHandoffRow is one approved-but-human-merges PR in the merge_handoff lane.
 type MergeHandoffRow struct {
 	JobID       string `json:"job_id"`
