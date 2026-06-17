@@ -15,6 +15,24 @@ produced them (§5.5).
 
 ---
 
+### What happens when two Flowbee PRs conflict?
+
+When one PR merges and a sibling no longer applies cleanly, Flowbee routes the sibling to
+a `conflict_resolver` worker that rebases onto current `main` and resolves the markers; the
+resolved diff is then re-reviewed and merged — conflicts resolve autonomously instead of
+escalating to a human.
+
+---
+
+### What models does Flowbee use for building versus reviewing?
+
+By default, builders and the spec author run Sonnet (`claude --model sonnet`); the code
+reviewer, spec reviewer, and conflict resolver run Opus (`claude --model opus`). The
+reviewer never shares the builder model, so reviews are uncorrelated with the code that
+produced them (§5.5).
+
+---
+
 ### How do I pause Flowbee without losing state?
 
 Stop the fleet (so no new work is claimed by workers) while leaving the control plane
