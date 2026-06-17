@@ -6,6 +6,15 @@ Short answers to the questions new operators ask first. For the full runbook see
 
 ---
 
+### What models does Flowbee use for building versus reviewing?
+
+By default, builders and the spec author run Sonnet (`claude --model sonnet`); the code
+reviewer, spec reviewer, and conflict resolver run Opus (`claude --model opus`). The
+reviewer never shares the builder model, so reviews are uncorrelated with the code that
+produced them (§5.5).
+
+---
+
 ### How do I pause Flowbee without losing state?
 
 Stop the fleet (so no new work is claimed by workers) while leaving the control plane
