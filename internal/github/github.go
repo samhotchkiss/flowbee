@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -245,21 +246,31 @@ func NewRealClient(owner, repo string, token func(ctx context.Context) (string, 
 	}
 }
 
-// boardSweepQuery is the §8.1.1 batched read. Pagination cursors are threaded in
-// by the caller; this MVP fetches the first page (the sweep is the floor, and the
-// test repo is small) — full pagination is a mechanical extension.
+// boardSweepQuery is the §8.1.1 batched read, fully paginated by BoardSweep (below).
+// OPEN PRs and OPEN issues are paginated to exhaustion via $prCursor/$issueCursor — a
+// busy repo (e.g. 100+ open issues) must NOT silently fall off a single first page, or
+// reconcile would never see those items and intake would never adopt a stale-dated
+// flowbee:adopt issue. MERGED PRs are a SEPARATE first-page-only connection (newest
+// first) included on the first page only via $includeMerged: they are the recent-merge
+// backstop for the merged->done transition (the webhook + targeted refetch are the
+// primary signals), so paginating the entire merge history every sweep is neither
+// needed nor affordable.
 const boardSweepQuery = `
-query BoardSweep($owner:String!, $repo:String!, $prCursor:String, $issueCursor:String) {
+fragment prFields on PullRequest {
+  number updatedAt isDraft merged mergedAt
+  headRefOid baseRefOid
+  mergeCommit { oid }
+  commits(last:1) { nodes { commit { statusCheckRollup { state } } } }
+  labels(first:20) { nodes { name } }
+}
+query BoardSweep($owner:String!, $repo:String!, $prCursor:String, $issueCursor:String, $includeMerged:Boolean!) {
   repository(owner:$owner, name:$repo) {
-    pullRequests(first:50, after:$prCursor, states:[OPEN, MERGED], orderBy:{field:UPDATED_AT, direction:DESC}) {
+    pullRequests(first:50, after:$prCursor, states:[OPEN], orderBy:{field:UPDATED_AT, direction:DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes {
-        number updatedAt isDraft merged mergedAt
-        headRefOid baseRefOid
-        mergeCommit { oid }
-        commits(last:1) { nodes { commit { statusCheckRollup { state } } } }
-        labels(first:20) { nodes { name } }
-      }
+      nodes { ...prFields }
+    }
+    mergedPullRequests: pullRequests(first:50, states:[MERGED], orderBy:{field:UPDATED_AT, direction:DESC}) @include(if: $includeMerged) {
+      nodes { ...prFields }
     }
     issues(first:50, after:$issueCursor, states:[OPEN], orderBy:{field:UPDATED_AT, direction:DESC}) {
       pageInfo { hasNextPage endCursor }
@@ -306,39 +317,54 @@ func (c *RealClient) graphQL(ctx context.Context, query string, vars map[string]
 	return json.Unmarshal(env.Data, out)
 }
 
+// pageInfo is a GraphQL connection cursor (§8.1.1 pagination).
+type pageInfo struct {
+	HasNextPage bool   `json:"hasNextPage"`
+	EndCursor   string `json:"endCursor"`
+}
+
+// prNode is one pullRequests connection node (shared by the OPEN and MERGED selections
+// via the prFields fragment).
+type prNode struct {
+	Number      int       `json:"number"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+	IsDraft     bool      `json:"isDraft"`
+	Merged      bool      `json:"merged"`
+	MergedAt    time.Time `json:"mergedAt"`
+	HeadRefOid  string    `json:"headRefOid"`
+	BaseRefOid  string    `json:"baseRefOid"`
+	MergeCommit *struct {
+		Oid string `json:"oid"`
+	} `json:"mergeCommit"`
+	Commits struct {
+		Nodes []struct {
+			Commit struct {
+				StatusCheckRollup *struct {
+					State string `json:"state"`
+				} `json:"statusCheckRollup"`
+			} `json:"commit"`
+		} `json:"nodes"`
+	} `json:"commits"`
+	Labels struct {
+		Nodes []struct {
+			Name string `json:"name"`
+		} `json:"nodes"`
+	} `json:"labels"`
+}
+
 // sweepData mirrors the boardSweepQuery shape.
 type sweepData struct {
 	Repository struct {
 		PullRequests struct {
-			Nodes []struct {
-				Number      int       `json:"number"`
-				UpdatedAt   time.Time `json:"updatedAt"`
-				IsDraft     bool      `json:"isDraft"`
-				Merged      bool      `json:"merged"`
-				MergedAt    time.Time `json:"mergedAt"`
-				HeadRefOid  string    `json:"headRefOid"`
-				BaseRefOid  string    `json:"baseRefOid"`
-				MergeCommit *struct {
-					Oid string `json:"oid"`
-				} `json:"mergeCommit"`
-				Commits struct {
-					Nodes []struct {
-						Commit struct {
-							StatusCheckRollup *struct {
-								State string `json:"state"`
-							} `json:"statusCheckRollup"`
-						} `json:"commit"`
-					} `json:"nodes"`
-				} `json:"commits"`
-				Labels struct {
-					Nodes []struct {
-						Name string `json:"name"`
-					} `json:"nodes"`
-				} `json:"labels"`
-			} `json:"nodes"`
+			PageInfo pageInfo `json:"pageInfo"`
+			Nodes    []prNode `json:"nodes"`
 		} `json:"pullRequests"`
+		MergedPullRequests struct {
+			Nodes []prNode `json:"nodes"`
+		} `json:"mergedPullRequests"`
 		Issues struct {
-			Nodes []struct {
+			PageInfo pageInfo `json:"pageInfo"`
+			Nodes    []struct {
 				Number    int       `json:"number"`
 				UpdatedAt time.Time `json:"updatedAt"`
 				Title     string    `json:"title"`
@@ -358,47 +384,103 @@ type sweepData struct {
 	} `json:"rateLimit"`
 }
 
-func (d sweepData) toSnapshot() BoardSnapshot {
-	var snap BoardSnapshot
+// prFromNode maps a connection node to a Domain-B PullRequest fact.
+func prFromNode(n prNode) PullRequest {
+	pr := PullRequest{
+		Number: n.Number, UpdatedAt: n.UpdatedAt, IsDraft: n.IsDraft,
+		Merged: n.Merged, MergedAt: n.MergedAt,
+		HeadRefOid: n.HeadRefOid, BaseRefOid: n.BaseRefOid,
+	}
+	if n.MergeCommit != nil {
+		pr.MergeCommit = n.MergeCommit.Oid
+	}
+	if len(n.Commits.Nodes) > 0 && n.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
+		pr.CIRollup = CIState(n.Commits.Nodes[0].Commit.StatusCheckRollup.State)
+	}
+	for _, l := range n.Labels.Nodes {
+		pr.Labels = append(pr.Labels, l.Name)
+	}
+	return pr
+}
+
+// accumulate folds one query page into snap, deduping by number (a connection re-read
+// after its cursor is exhausted can return overlapping nodes). Merged PRs are taken only
+// from the first page (where $includeMerged was true and the alias is populated).
+func (d sweepData) accumulate(snap *BoardSnapshot, seenPR, seenIssue map[int]bool) {
+	add := func(n prNode) {
+		if seenPR[n.Number] {
+			return
+		}
+		seenPR[n.Number] = true
+		snap.PullRequests = append(snap.PullRequests, prFromNode(n))
+	}
 	for _, n := range d.Repository.PullRequests.Nodes {
-		pr := PullRequest{
-			Number: n.Number, UpdatedAt: n.UpdatedAt, IsDraft: n.IsDraft,
-			Merged: n.Merged, MergedAt: n.MergedAt,
-			HeadRefOid: n.HeadRefOid, BaseRefOid: n.BaseRefOid,
-		}
-		if n.MergeCommit != nil {
-			pr.MergeCommit = n.MergeCommit.Oid
-		}
-		if len(n.Commits.Nodes) > 0 && n.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
-			pr.CIRollup = CIState(n.Commits.Nodes[0].Commit.StatusCheckRollup.State)
-		}
-		for _, l := range n.Labels.Nodes {
-			pr.Labels = append(pr.Labels, l.Name)
-		}
-		snap.PullRequests = append(snap.PullRequests, pr)
+		add(n)
+	}
+	for _, n := range d.Repository.MergedPullRequests.Nodes {
+		add(n)
 	}
 	for _, n := range d.Repository.Issues.Nodes {
+		if seenIssue[n.Number] {
+			continue
+		}
+		seenIssue[n.Number] = true
 		iss := Issue{Number: n.Number, UpdatedAt: n.UpdatedAt, Title: n.Title, Body: n.Body}
 		for _, l := range n.Labels.Nodes {
 			iss.Labels = append(iss.Labels, l.Name)
 		}
 		snap.Issues = append(snap.Issues, iss)
 	}
-	snap.RateLimit = RateLimit{
-		Limit: d.RateLimit.Limit, Remaining: d.RateLimit.Remaining, ResetAt: d.RateLimit.ResetAt,
-	}
-	return snap
 }
 
-// BoardSweep performs the batched read (§8.1.1).
+// sweepMaxPages bounds the pagination loop (50 items/page => up to 50k open PRs+issues).
+// It is a runaway backstop set far beyond any real board; hitting it is logged, never
+// silent, so a genuinely huge board surfaces instead of truncating invisibly.
+const sweepMaxPages = 1000
+
+// BoardSweep performs the §8.1.1 batched read, paginating OPEN PRs and OPEN issues to
+// exhaustion. MERGED PRs are read once (first page, newest-first) as the recent-merge
+// backstop. A single first page is NOT enough: a repo with >50 open issues would
+// silently drop the tail, so reconcile would never see those PRs and intake would never
+// adopt a flowbee:adopt issue whose update time had aged out of the first page.
 func (c *RealClient) BoardSweep(ctx context.Context) (BoardSnapshot, error) {
-	var data sweepData
-	if err := c.graphQL(ctx, boardSweepQuery, map[string]any{
-		"owner": c.Owner, "repo": c.Repo, "prCursor": nil, "issueCursor": nil,
-	}, &data); err != nil {
-		return BoardSnapshot{}, err
+	var snap BoardSnapshot
+	seenPR, seenIssue := map[int]bool{}, map[int]bool{}
+	var prCursor, issueCursor *string
+	prMore, issueMore := true, true
+
+	page := 0
+	for ; (prMore || issueMore) && page < sweepMaxPages; page++ {
+		var data sweepData
+		if err := c.graphQL(ctx, boardSweepQuery, map[string]any{
+			"owner": c.Owner, "repo": c.Repo,
+			"prCursor": prCursor, "issueCursor": issueCursor,
+			"includeMerged": page == 0, // recent merges only need fetching once
+		}, &data); err != nil {
+			return BoardSnapshot{}, err
+		}
+		data.accumulate(&snap, seenPR, seenIssue)
+		if page == 0 {
+			snap.RateLimit = RateLimit{
+				Limit: data.RateLimit.Limit, Remaining: data.RateLimit.Remaining, ResetAt: data.RateLimit.ResetAt,
+			}
+		}
+		// Advance each cursor to its page end regardless of hasNextPage so an exhausted
+		// connection returns empty (not a re-read of page 1) while the other keeps paging.
+		prMore = data.Repository.PullRequests.PageInfo.HasNextPage
+		issueMore = data.Repository.Issues.PageInfo.HasNextPage
+		if cur := data.Repository.PullRequests.PageInfo.EndCursor; cur != "" {
+			prCursor = &cur
+		}
+		if cur := data.Repository.Issues.PageInfo.EndCursor; cur != "" {
+			issueCursor = &cur
+		}
 	}
-	return data.toSnapshot(), nil
+	if prMore || issueMore {
+		log.Printf("github: BoardSweep hit page cap (%d pages) with more remaining (prMore=%v issueMore=%v) for %s/%s — board larger than the runaway backstop",
+			sweepMaxPages, prMore, issueMore, c.Owner, c.Repo)
+	}
+	return snap, nil
 }
 
 // PullRequest fetches one PR's Domain-B facts (the targeted refetch, §8.1.3). It
