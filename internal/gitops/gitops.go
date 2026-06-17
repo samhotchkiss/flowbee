@@ -118,10 +118,25 @@ func (m *Mirror) FetchBranch(branch string) error {
 // (DESIGN §7.4: `git worktree add <ws> <base_sha>`). The worktree is one-shot
 // per lease (§7.5) — the caller destroys it after the result.
 func (m *Mirror) AddWorktree(dir, baseSHA string) (*Worktree, error) {
+	// Reap worktrees leaked by a crashed worker before adding. Worktree.Destroy is
+	// defer-only, so a worker killed mid-build leaves a stale .git/worktrees/ entry
+	// that survives reboots and accumulates without bound on a long-running fleet.
+	// Pruning here makes every new build self-heal prior leaks; it is best-effort
+	// (a prune failure must not block a legitimate add).
+	_ = m.PruneWorktrees()
 	if _, err := run("", "git", "--git-dir", m.Path, "worktree", "add", "--detach", dir, baseSHA); err != nil {
 		return nil, fmt.Errorf("worktree add at %s: %w", baseSHA, err)
 	}
 	return &Worktree{Dir: dir, mirror: m, baseSHA: baseSHA}, nil
+}
+
+// PruneWorktrees reaps worktree metadata whose working directory is already gone —
+// the residue of a worker that crashed before Worktree.Destroy could run. `git
+// worktree prune` only removes entries with a missing working tree; it never touches
+// a live worktree, so it is safe and idempotent to call before every add.
+func (m *Mirror) PruneWorktrees() error {
+	_, err := run("", "git", "--git-dir", m.Path, "worktree", "prune")
+	return err
 }
 
 // PromoteEpochRef fast-forwards the real branch from a worker's epoch ref AFTER
