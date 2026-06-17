@@ -137,6 +137,13 @@ building → review_pending → code_review → mergeable → merging → done**
 - **Liveness:** `GET /v1/fleet-health` → `{live_workers, stale_workers, waiting_jobs,
   stranded}`. `stranded: true` (work waiting, no live worker) is the loud "is the fleet
   up?" signal.
+- **Metrics:** `GET /metrics` on the health listener (`:7001`, same unauthenticated port as
+  `/healthz`) emits Prometheus text format — point a scrape at it. Series: `flowbee_jobs{repo,state}`
+  (job counts; a missing state means zero — alert on `flowbee_jobs{state="needs_human"} > 0`),
+  `flowbee_fleet_workers{status="live"|"stale"}`, `flowbee_fleet_waiting_jobs`,
+  `flowbee_cost_micro_usd_total` (cumulative metered spend), and `flowbee_jobs_over_budget`.
+  The pages that matter: a wedged `needs_human` job, `flowbee_fleet_workers{status="live"} == 0`
+  with waiting jobs, or `over_budget` climbing.
 - **The board:** the control plane logs each state transition, so `journalctl`/stdout is
   the live board. Each transition is also queryable from the single-file SQLite DB.
 - **The git trail** is the durable record: each issue lives on `flowbee/issue-N`; every
