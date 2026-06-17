@@ -231,6 +231,7 @@ type RealClient struct {
 	// outbound writes (the §8.2.4 concurrency cap) live in project-OUT, not here.
 	HTTP     *http.Client
 	Endpoint string // GraphQL endpoint; defaults to https://api.github.com/graphql
+	RESTBase string // REST base; defaults to https://api.github.com (overridable in tests)
 }
 
 // NewRealClient builds a RealClient with sane defaults.
@@ -480,7 +481,11 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 // package performs no concurrency control of its own (§8.2.4 lives in the sender).
 
 func (c *RealClient) restURL(path string) string {
-	return fmt.Sprintf("https://api.github.com/repos/%s/%s%s", c.Owner, c.Repo, path)
+	base := c.RESTBase
+	if base == "" {
+		base = "https://api.github.com"
+	}
+	return fmt.Sprintf("%s/repos/%s/%s%s", base, c.Owner, c.Repo, path)
 }
 
 // rest POSTs/PUTs a JSON body to a REST endpoint with the installation token and
@@ -650,7 +655,16 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
 		"merge_method": "merge",
 	}, nil)
 	if err != nil && isMergeConflict(err) {
-		// surface a conflict as the typed error so the sender routes to a resolver
+		// A 405 "not mergeable" is ambiguous: a REAL conflict, GitHub still recomputing
+		// mergeability after a sibling merge (transient), OR the PR is ALREADY MERGED — a
+		// CP crash/restart between this GitHub call succeeding and the outbox row being
+		// marked sent re-sends the merge, and GitHub 405s the merged PR. Distinguish by
+		// the PR's actual state: if it is merged, the merge HAPPENED — return success so
+		// the row consumes cleanly, instead of routing an already-merged PR to a resolver.
+		if pr, ok, perr := c.PullRequest(ctx, number); perr == nil && ok && pr.Merged {
+			return nil
+		}
+		// surface a real conflict as the typed error so the sender routes to a resolver
 		// instead of re-queuing a merge that can never succeed.
 		return fmt.Errorf("%w: %v", ErrMergeConflict, err)
 	}
