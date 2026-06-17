@@ -6,6 +6,17 @@ Short answers to the questions new operators ask first. For the full runbook see
 
 ---
 
+### How do I pause Flowbee without losing state?
+
+Stop the fleet (so no new work is claimed by workers) while leaving the control plane
+running, or stop both the fleet and the control plane entirely — either way, nothing is
+lost. All persistent state lives in the ledger (`flowbee.db`) and in GitHub. On restart,
+the next reconcile re-derives the full world from those two sources, exactly as if the
+process had never stopped. There is no in-memory state to drain or checkpoint before
+shutting down.
+
+---
+
 ### Can one Flowbee control plane manage multiple repos?
 
 Yes — list each repo under `repos:` in `flowbee.yaml`; one control plane runs a per-repo
