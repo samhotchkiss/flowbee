@@ -179,6 +179,7 @@ func (s *Server) Broker() *Broker { return s.broker }
 func (s *Server) HealthHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("GET /metrics", s.metrics)
 	return mux
 }
 
@@ -422,6 +423,68 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 		status, code = "unavailable", http.StatusServiceUnavailable
 	}
 	writeJSON(w, code, map[string]any{"status": status, "db": dbOK, "version": s.version})
+}
+
+// metrics serves Prometheus text-format gauges on the unauthenticated health
+// listener (alongside /healthz) so a scraper on the private network can alert on
+// the operational signals that actually page someone: jobs wedged in needs_human,
+// a dead fleet, work piling up unclaimed, cost ceilings breached. Everything here
+// is a cheap aggregate read; it never touches Domain-A write paths.
+func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "# HELP flowbee_build_info Build version (always 1).\n")
+	fmt.Fprintf(&b, "# TYPE flowbee_build_info gauge\n")
+	fmt.Fprintf(&b, "flowbee_build_info{version=%q} 1\n", s.version)
+
+	// Jobs by repo+state: the core liveness signal. A state with no jobs emits no
+	// series (Prometheus treats absent == 0), which is the correct semantics for
+	// alerting on `flowbee_jobs{state="needs_human"} > 0`.
+	if jobs, err := s.store.BoardSnapshot(ctx); err == nil {
+		counts := map[[2]string]int{}
+		for _, j := range jobs {
+			counts[[2]string{j.Repo, j.State}]++
+		}
+		fmt.Fprintf(&b, "# HELP flowbee_jobs Jobs by repo and state.\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_jobs gauge\n")
+		for k, n := range counts {
+			fmt.Fprintf(&b, "flowbee_jobs{repo=%q,state=%q} %d\n", k[0], k[1], n)
+		}
+	}
+
+	// Fleet liveness + backlog: a fleet of zero live workers with waiting jobs is
+	// the "nothing is getting done" page.
+	if fh, err := s.store.FleetHealth(ctx, s.clock.Now(), s.staleHB); err == nil {
+		fmt.Fprintf(&b, "# HELP flowbee_fleet_workers Registered workers by liveness.\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_fleet_workers gauge\n")
+		fmt.Fprintf(&b, "flowbee_fleet_workers{status=\"live\"} %d\n", fh.LiveWorkers)
+		fmt.Fprintf(&b, "flowbee_fleet_workers{status=\"stale\"} %d\n", fh.StaleWorkers)
+		fmt.Fprintf(&b, "# HELP flowbee_fleet_waiting_jobs Ready jobs with no worker yet.\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_fleet_waiting_jobs gauge\n")
+		fmt.Fprintf(&b, "flowbee_fleet_waiting_jobs %d\n", fh.WaitingJobs)
+	}
+
+	// Cost: cumulative metered spend + how many jobs tripped their ceiling.
+	if costs, err := s.store.AllJobCost(ctx); err == nil {
+		var totalMicro int64
+		var overBudget int
+		for _, c := range costs {
+			totalMicro += c.MicroUSD
+			if c.OverBudget {
+				overBudget++
+			}
+		}
+		fmt.Fprintf(&b, "# HELP flowbee_cost_micro_usd_total Cumulative metered agent spend (micro-USD).\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_cost_micro_usd_total counter\n")
+		fmt.Fprintf(&b, "flowbee_cost_micro_usd_total %d\n", totalMicro)
+		fmt.Fprintf(&b, "# HELP flowbee_jobs_over_budget Jobs that breached their cost ceiling.\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_jobs_over_budget gauge\n")
+		fmt.Fprintf(&b, "flowbee_jobs_over_budget %d\n", overBudget)
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	_, _ = w.Write([]byte(b.String()))
 }
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
