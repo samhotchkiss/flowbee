@@ -746,7 +746,13 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		if cerr != nil {
 			return out, fmt.Errorf("commit: %w", cerr)
 		}
-		if perr := wt.PushTo(repoURL, issueBranch, false); perr != nil {
+		// A conflict_resolver FORCE-pushes: its worktree started at current main and
+		// re-applied this job's change (resolving the markers), so the resolved commit is
+		// based on main, NOT a descendant of the issue branch's pre-conflict commits — a
+		// plain push is non-fast-forward and rejected. The resolution deliberately rebases
+		// the issue branch onto main, so replacing it is correct. Every other role
+		// fast-forwards (stacks on the branch tip).
+		if perr := wt.PushTo(repoURL, issueBranch, isConflict); perr != nil {
 			// the branch moved under us (e.g. a rebase-before-review force-update): the
 			// build SUCCEEDED, we just lost the fast-forward race. Re-arm WITHOUT burning
 			// an attempt (re-validation churn must not exhaust the failure budget and
