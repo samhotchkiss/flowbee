@@ -6,6 +6,14 @@ Short answers to the questions new operators ask first. For the full runbook see
 
 ---
 
+### What is the difference between `flowbee fleet` and `flowbee up`?
+
+`flowbee up` is the single-box all-in-one that starts the control plane plus one worker per
+role for local use; `flowbee fleet` brings up just the worker roles on a box and connects to
+a separate `flowbee serve` control plane (the multi-box topology).
+
+---
+
 ### How do I check which build of Flowbee is running?
 
 Run `flowbee version`. It prints the embedded git SHA recorded at build time via
