@@ -38,11 +38,16 @@ Create the file(s) on disk now. Make only the change described." --dangerously-s
 	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", defaultAgent), "agent CLI for review/author roles")
 	buildCmd := fs.String("build-agent-cmd", envOr("FLOWBEE_BUILD_AGENT_CMD", buildAgent), "agent CLI for the build role (writes files)")
 	noSmoke := fs.Bool("no-smoke", false, "skip the agent smoke test at startup")
+	systemd := fs.Bool("systemd", false, "print a systemd unit + env file to run the fleet as a managed service (then exit), instead of starting it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *url == "" {
 		return fmt.Errorf("flowbee fleet: --url (or FLOWBEE_URL) is required — the control-plane address")
+	}
+	if *systemd {
+		printFleetSystemd(*url, *builders, *agentCmd, *buildCmd)
+		return nil
 	}
 	repoURL := os.Getenv("FLOWBEE_REPO_URL")
 	if repoURL == "" {
@@ -130,6 +135,66 @@ Create the file(s) on disk now. Make only the change described." --dangerously-s
 	fmt.Println("\nflowbee fleet: shutting down workers...")
 	killAll(kids)
 	return nil
+}
+
+// printFleetSystemd emits a ready-to-install systemd unit + env file so the fleet runs
+// as a managed service: clean `systemctl restart` (no stale processes), reboot
+// survival, logs via journalctl. Solves the operability pain the first live run hit —
+// nohup/pkill fragility, stale binaries, fleets not surviving restarts.
+func printFleetSystemd(url string, builders int, agentCmd, buildCmd string) {
+	self, err := os.Executable()
+	if err != nil {
+		self = os.Args[0]
+	}
+	user := envOr("USER", "sam")
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		home = "/home/" + user
+	}
+	envPath := home + "/.flowbee/fleet.env"
+	// systemd env files are single-line KEY=VALUE; collapse any newlines in the agent
+	// commands (the build prompt is multi-line) to a space.
+	oneLine := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+	fmt.Printf("# 1. Write %s  (chmod 600 — may hold FLOWBEE_WORKER_AUTH_SECRET):\n", envPath)
+	fmt.Printf("FLOWBEE_URL=%s\n", url)
+	if v := os.Getenv("FLOWBEE_GITHUB_OWNER"); v != "" {
+		fmt.Printf("FLOWBEE_GITHUB_OWNER=%s\n", v)
+	}
+	if v := os.Getenv("FLOWBEE_GITHUB_REPO"); v != "" {
+		fmt.Printf("FLOWBEE_GITHUB_REPO=%s\n", v)
+	}
+	if v := os.Getenv("FLOWBEE_GIT_REMOTE"); v != "" {
+		fmt.Printf("FLOWBEE_GIT_REMOTE=%s\n", v)
+	}
+	if v := os.Getenv("FLOWBEE_WORKER_AUTH_SECRET"); v != "" {
+		fmt.Printf("FLOWBEE_WORKER_AUTH_SECRET=%s\n", v)
+	}
+	fmt.Printf("FLOWBEE_AGENT_CMD=%s\n", oneLine(agentCmd))
+	fmt.Printf("FLOWBEE_BUILD_AGENT_CMD=%s\n\n", oneLine(buildCmd))
+
+	fmt.Printf("# 2. Write /etc/systemd/system/flowbee-fleet.service:\n")
+	fmt.Printf(`[Unit]
+Description=Flowbee fleet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%s
+EnvironmentFile=%s
+ExecStart=%s fleet --builders %d
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+`, user, envPath, self, builders)
+
+	fmt.Printf("# 3. Enable + start (clean restart any time with `systemctl restart flowbee-fleet`):\n")
+	fmt.Printf("sudo systemctl daemon-reload && sudo systemctl enable --now flowbee-fleet\n")
+	fmt.Printf("journalctl -u flowbee-fleet -f   # tail logs; the startup line shows the build SHA\n")
 }
 
 // smokeAgent runs the build agent on a trivial "write ok.txt" task in a temp dir and
