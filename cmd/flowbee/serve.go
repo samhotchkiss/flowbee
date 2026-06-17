@@ -216,6 +216,37 @@ func runServe(_ []string) error {
 		}
 	}()
 
+	// forward-progress watchdog: the "never permanently stuck" guarantee. Each tick it
+	// (1) re-folds every leasable job's ledger and corrects any projection that drifted
+	// out of sync (the #2217 wedge: a `ready` build the table said needed a reviewer cap
+	// so no builder could claim it — determinism-restoring self-heal), and (2) escalates
+	// a job that re-folds clean but has sat unclaimed past stallAfter WHILE the fleet is
+	// live (a no-eligible-worker dead-end) to needs_human, so nothing wedges silently.
+	stallAfter := 4 * cfg.LeaseTTL() // generous: well past any real build/review cycle
+	if stallAfter < 30*time.Minute {
+		stallAfter = 30 * time.Minute
+	}
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				rep, err := st.ReconcileStuck(ctx, time.Now(), staleHB, stallAfter)
+				if err != nil {
+					logger.Error("forward-progress watchdog", "err", err)
+					continue
+				}
+				if rep.Resynced > 0 || rep.Escalated > 0 {
+					logger.Warn("🩹 forward-progress watchdog acted",
+						"resynced_projection", rep.Resynced, "escalated_to_human", rep.Escalated)
+				}
+			}
+		}
+	}()
+
 	// reconcile-IN + project-OUT (M6/M7, §8.1/§8.2): Flowbee is the SINGLE GitHub
 	// caller (R4). F9 multi-repo: ONE control plane runs a per-repo reconcile-IN +
 	// project-OUT loop over the repos registry, sharing a GLOBAL scheduler + fleet.
