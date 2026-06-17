@@ -103,6 +103,8 @@ content-integrity gate **merges to `main` autonomously** — no human gate.
 
 Go deeper: **[DESIGN.md](./DESIGN.md)** — the full architecture · **[BUILD.md](./BUILD.md)** — the milestone plan.
 
+Run it: **[docs/operating.md](./docs/operating.md)** — stand up a control plane + fleet and feed it work · **[docs/pipeline.md](./docs/pipeline.md)** — the stages a change moves through · **[docs/config.md](./docs/config.md)** · **[docs/identities.md](./docs/identities.md)** · **[docs/deploy/multi-repo.md](./docs/deploy/multi-repo.md)**.
+
 ## Status
 
 Working end-to-end. The control plane, fenced leasing, the flow engine, GitHub sync, liveness, the content-integrity gate, and the full pipeline are built — and **proven on this very repo**: a work item goes from intake → spec → issue-review → build → code-review → **autonomous merge**, with a real agent at every step and no human in the loop. Built, fittingly, by a fleet of agents.
