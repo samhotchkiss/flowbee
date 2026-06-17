@@ -61,11 +61,33 @@ func printServeSystemd() {
 	if os.Getenv("FLOWBEE_ALLOW_SELF_MERGE") != "" {
 		fmt.Printf("FLOWBEE_ALLOW_SELF_MERGE=1\n")
 	}
-	if os.Getenv("FLOWBEE_WORKER_AUTH_SECRET") != "" {
-		fmt.Printf("FLOWBEE_WORKER_AUTH_SECRET=<shared-worker-secret>\n")
-	}
 	if os.Getenv("FLOWBEE_WEBHOOK_SECRET") != "" {
 		fmt.Printf("FLOWBEE_WEBHOOK_SECRET=<webhook-secret>\n")
+	}
+	// Security stanza — REQUIRED for the unit to start: the worker API binds a
+	// non-loopback addr by default, so `flowbee serve` REFUSES TO START without either
+	// worker auth or an explicit insecure opt-in. Carry the operator's actual choice
+	// into the env so the installed unit boots; if neither is set, default to the
+	// trusted-private-network opt-in with a loud warning (the common single-operator
+	// deployment) rather than emitting a unit that dies on `systemctl enable`. systemd
+	// EnvironmentFile honors full-line `#` comments, so the guidance lives inline.
+	switch {
+	case os.Getenv("FLOWBEE_WORKER_AUTH_SECRET") != "":
+		fmt.Printf("FLOWBEE_WORKER_AUTH_SECRET=<shared-worker-secret>\n")
+		if v := os.Getenv("FLOWBEE_ENROLLED_IDENTITIES"); v != "" {
+			fmt.Printf("FLOWBEE_ENROLLED_IDENTITIES=%s\n", v)
+		} else {
+			fmt.Printf("# enroll each worker: run `flowbee token --identity <name>` and list them here:\n")
+			fmt.Printf("# FLOWBEE_ENROLLED_IDENTITIES=worker-a,worker-b\n")
+		}
+	case os.Getenv("FLOWBEE_INSECURE") != "":
+		fmt.Printf("# OPEN worker API — trusted private network (e.g. Tailscale) ONLY:\n")
+		fmt.Printf("FLOWBEE_INSECURE=1\n")
+	default:
+		fmt.Printf("# Pick ONE. Trusted private network (e.g. Tailscale)? keep FLOWBEE_INSECURE=1.\n")
+		fmt.Printf("# Otherwise DELETE it and set FLOWBEE_WORKER_AUTH_SECRET +\n")
+		fmt.Printf("# FLOWBEE_ENROLLED_IDENTITIES (run `flowbee token --identity <name>` per worker):\n")
+		fmt.Printf("FLOWBEE_INSECURE=1\n")
 	}
 	fmt.Printf("\n# 2. Write /etc/systemd/system/flowbee-serve.service:\n")
 	fmt.Printf(`[Unit]
