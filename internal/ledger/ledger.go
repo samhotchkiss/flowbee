@@ -218,7 +218,14 @@ func Fold(events []Event) (job.Job, error) {
 		case KindHeartbeat:
 			// liveness only; no projection field changes in M1.
 		case KindResultAccepted:
+			// building -> review_pending: the build result landed and the gate opens.
+			// The projection (store result-accept) flips the job to the REVIEWER
+			// capability so a code_reviewer — not an eng_worker — can claim the gate
+			// (the role stays eng_worker; the cap is what ClaimReviewJob matches on).
+			// The fold MUST mirror that or a re-fold yields the stale build cap and a
+			// projection-resync would strip the gate (the #2221/#2223 live regression).
 			j.State = e.ToState
+			j.RequiredCapabilities = []string{"role:code_reviewer"}
 			// the lease is released on result: clear live lease columns, keep epoch.
 			j.LeaseID = ""
 			j.BoundIdentity = ""
@@ -247,8 +254,11 @@ func Fold(events []Event) (job.Job, error) {
 			// the alarm is an observability event; no projection field changes
 			// (the job stays `ready`). Recorded for replay/audit completeness.
 		case KindReviewClaimed:
-			// review_pending -> code_review: a reviewer leased the gate stage.
+			// review_pending -> code_review: a reviewer leased the gate stage. The
+			// projection (ClaimReviewJob) binds the role to code_reviewer; the fold
+			// mirrors it so projection == Fold(events) across the claim/release cycle.
 			j.State = e.ToState
+			j.Role = job.RoleCodeReviewer
 			j.LeaseEpoch = e.LeaseEpoch
 			j.LeaseID = e.Payload.LeaseID
 			j.BoundIdentity = e.Payload.BoundIdentity

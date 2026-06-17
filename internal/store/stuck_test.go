@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
@@ -99,6 +100,60 @@ func TestWatchdogLeavesReviewCapsAlone(t *testing.T) {
 	j, _ := st.GetJob(ctx, "r")
 	if len(j.RequiredCapabilities) != 1 || j.RequiredCapabilities[0] != "role:code_reviewer" {
 		t.Fatalf("review caps=%v, want [role:code_reviewer] preserved (the watchdog must not strip the gate)", j.RequiredCapabilities)
+	}
+}
+
+// TestReviewGateFoldMatchesProjection is the determinism regression for the gap that
+// caused the live #2221/#2223 corruption: when a build result lands (→review_pending)
+// the projection flips required_capabilities to [role:code_reviewer], and a re-fold of
+// the ledger MUST reproduce exactly that — otherwise projection != Fold(events) and a
+// resync would strip the reviewer gate. Drives the REAL build-claim→result path and
+// asserts the projection equals the fold.
+func TestReviewGateFoldMatchesProjection(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "g", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+		BaseSHA: "base", RequiredCapabilities: []string{"role:eng_worker"}, Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bl, err := st.ClaimReadyJob(ctx, store.ClaimParams{
+		JobID: "g", LeaseID: "L1", Identity: "opus-w", ModelFamily: "opus",
+		Role: job.RoleEngWorker, Attested: []string{"role:eng_worker", "model_family:opus"},
+		TTL: time.Minute, Now: now.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := st.Result(ctx, store.ResultParams{
+		JobID: "g", Epoch: bl.Epoch, IdempotencyKey: "k1", Now: now.Add(2 * time.Second),
+		PushedRef: "refs/flowbee/g/e1", PatchDiff: "diff --git a/x b/x\n",
+	}); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+
+	proj, _ := st.GetJob(ctx, "g")
+	if proj.State != job.StateReviewPending {
+		t.Fatalf("projection state=%s want review_pending", proj.State)
+	}
+	// the projection flipped to the reviewer gate.
+	if len(proj.RequiredCapabilities) != 1 || proj.RequiredCapabilities[0] != "role:code_reviewer" {
+		t.Fatalf("projection caps=%v want [role:code_reviewer]", proj.RequiredCapabilities)
+	}
+	// the re-fold MUST agree (the determinism invariant the watchdog relies on).
+	events, _ := st.LoadEvents(ctx, "g")
+	folded, ferr := ledger.Fold(events)
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	if folded.State != proj.State {
+		t.Fatalf("fold state=%s != projection %s", folded.State, proj.State)
+	}
+	if len(folded.RequiredCapabilities) != 1 || folded.RequiredCapabilities[0] != "role:code_reviewer" {
+		t.Fatalf("fold caps=%v != projection [role:code_reviewer] — review-gate fold gap regressed", folded.RequiredCapabilities)
 	}
 }
 
