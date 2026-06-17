@@ -132,6 +132,15 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 			if err := enqueueHistoryWriteTx(ctx, tx, jobID); err != nil {
 				return err
 			}
+			// base_sha refresh after merge: advance every still-`ready` build in this repo
+			// to the new main (the merge commit) so it builds on CURRENT code, not the
+			// stale base it was adopted at. Jobs with a PR re-base via supersede /
+			// rebase-before-review; this closes the gap for not-yet-built ready jobs.
+			if pr.MergeCommit != "" {
+				if err := refreshReadyBaseTx(ctx, tx, j.Repo, jobID, pr.MergeCommit, now); err != nil {
+					return err
+				}
+			}
 			out.Done = true
 		case shaMoved && supersedable(j.State):
 			// I-5 / §6.2.4: a head/base move supersedes the SHA-bound verdict and
@@ -321,6 +330,59 @@ func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr Reconc
 		return fmt.Errorf("close superseded lease: %w", err)
 	}
 	return setJobSeq(ctx, tx, j.ID, nextSeq)
+}
+
+// refreshReadyBaseTx advances every still-`ready` build in repo (except the just-merged
+// job) to newBase — the new main HEAD after a sibling merge — so a job adopted at an
+// older base now builds on CURRENT code. Each refresh emits KindBaseRefreshed so the
+// projection equals a re-fold (base_sha is a folded field). Jobs already at newBase are
+// skipped (no churn / no spurious events). A ready job has no verdict or lease to
+// invalidate, so this is a pure base advance — not a supersession.
+func refreshReadyBaseTx(ctx context.Context, tx *sql.Tx, repo, mergedID, newBase string, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, job_seq, lease_epoch FROM jobs
+		 WHERE state = 'ready' AND kind = 'build' AND COALESCE(repo,'') = ?
+		   AND id != ? AND COALESCE(base_sha,'') != ?`,
+		repo, mergedID, newBase)
+	if err != nil {
+		return err
+	}
+	type row struct {
+		id         string
+		seq, epoch int
+	}
+	var rs []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.seq, &r.epoch); err != nil {
+			rows.Close()
+			return err
+		}
+		rs = append(rs, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range rs {
+		nextSeq := r.seq + 1
+		ev := ledger.Event{
+			JobID: r.id, JobSeq: nextSeq, Kind: ledger.KindBaseRefreshed,
+			LeaseEpoch: r.epoch, Actor: "reconcile", CreatedAt: now,
+			Payload: ledger.Payload{BaseSHA: newBase},
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE jobs SET base_sha = ?, updated_at = datetime('now') WHERE id = ?`, newBase, r.id); err != nil {
+			return fmt.Errorf("refresh ready base %s: %w", r.id, err)
+		}
+		if err := setJobSeq(ctx, tx, r.id, nextSeq); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // JobIDForPR resolves the job bound to a GitHub PR number. ok=false if no job is

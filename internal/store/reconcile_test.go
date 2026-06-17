@@ -320,3 +320,43 @@ func mustJSON(t *testing.T, v any) string {
 	}
 	return string(b)
 }
+
+// TestBaseRefreshOnMerge: when a PR merges, every still-`ready` build in the repo
+// advances its base_sha to the new main (the merge commit) so it builds on CURRENT
+// code — the literal "base_sha refresh after merge". A KindBaseRefreshed event keeps
+// projection == re-fold (base_sha is folded). The just-merged job is excluded.
+func TestBaseRefreshOnMerge(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(8000, 0)
+
+	// a ready build adopted at an OLD base (no PR).
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "ready1", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+		BaseSHA: "OLD", RequiredCapabilities: []string{"role:eng_worker"}, Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// a sibling that merges.
+	seedBuildPR(t, st, "merged1", 9)
+	if _, err := st.ApplyReconciledPR(ctx, "merged1", store.ReconciledPR{
+		Number: 9, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "NEWMAIN",
+	}, now); err != nil {
+		t.Fatalf("apply merge: %v", err)
+	}
+
+	j, _ := st.GetJob(ctx, "ready1")
+	if j.BaseSHA != "NEWMAIN" {
+		t.Fatalf("ready job base=%s, want NEWMAIN (refreshed on merge)", j.BaseSHA)
+	}
+	// determinism: Fold(events) reproduces the refreshed base.
+	evs, _ := st.LoadEvents(ctx, "ready1")
+	folded, _ := ledger.Fold(evs)
+	if folded.BaseSHA != "NEWMAIN" {
+		t.Fatalf("fold base=%s != projection NEWMAIN — KindBaseRefreshed not folded", folded.BaseSHA)
+	}
+	// the merged job itself is done, not "refreshed".
+	if m, _ := st.GetJob(ctx, "merged1"); m.State != job.StateDone {
+		t.Fatalf("merged job state=%s want done", m.State)
+	}
+}

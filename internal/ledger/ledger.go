@@ -39,6 +39,7 @@ const (
 	// M6 reconcile-IN event kinds (Domain-B-driven transitions; actor='reconcile').
 	KindFactsReconciled EventKind = "facts_reconciled" // a sweep/refetch wrote Domain-B facts (audit)
 	KindSuperseded      EventKind = "superseded"       // SHA move re-armed the job to ready (I-5, §6.2.4)
+	KindBaseRefreshed   EventKind = "base_refreshed"   // a ready job's base_sha advanced to the new main after a sibling merge
 	// M7 spec-flow + project-OUT event kinds.
 	KindSpecAuthored      EventKind = "spec_authored"       // Flowbee committed spec.md, opened spec_review (§11.6)
 	KindSpecClaim         EventKind = "spec_claim"          // the spec reviewer's CLAIM (untrusted, I-9)
@@ -243,6 +244,10 @@ func Fold(events []Event) (job.Job, error) {
 			j.BoundModelFamily = ""
 		case KindStateChanged:
 			j.State = e.ToState
+		case KindBaseRefreshed:
+			// a sibling PR merged; this still-`ready` job's base advances to the new main
+			// so it builds on current code (state/role unchanged — it was never leased).
+			j.BaseSHA = e.Payload.BaseSHA
 		case KindDepsCleared:
 			// blocked -> ready: aging clock starts now (the job becomes leasable).
 			j.State = e.ToState
