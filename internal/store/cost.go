@@ -273,6 +273,40 @@ type NeedsHumanRow struct {
 	Reason string `json:"reason"`
 }
 
+// MergeHandoffRow is one approved-but-human-merges PR in the merge_handoff lane.
+type MergeHandoffRow struct {
+	JobID       string `json:"job_id"`
+	Repo        string `json:"repo"`
+	IssueNumber int    `json:"issue_number"`
+	PRNumber    int    `json:"pr_number"`
+}
+
+// MergeHandoffView lists every job parked in merge_handoff: Flowbee built, reviewed,
+// and APPROVED the change, but policy (self-merge off, or a protected/source change)
+// reserves the merge for a human. With AllowSelfMerge off this is the operator's whole
+// merge queue, so it needs its own focused lane (the PR numbers to merge), not a scan
+// of the full board.
+func (s *Store) MergeHandoffView(ctx context.Context) ([]MergeHandoffRow, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT j.id, COALESCE(j.repo,''), j.issue_number, COALESCE(f.pr_number,0)
+		  FROM jobs j LEFT JOIN domain_b_facts f ON f.job_id = j.id
+		 WHERE j.state = 'merge_handoff'
+		 ORDER BY j.updated_at DESC, j.id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MergeHandoffRow
+	for rows.Next() {
+		var r MergeHandoffRow
+		if err := rows.Scan(&r.JobID, &r.Repo, &r.IssueNumber, &r.PRNumber); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // NeedsHumanView returns every job in needs_human, each tagged with the trigger
 // that escalated it (§12.6.1): the four independent conditions — max_attempts,
 // max_bounces, cost ceiling (I-15), and the two-rung stall kill (I-13) — all

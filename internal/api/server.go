@@ -223,6 +223,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/audit", s.auditJSON)
 	mux.HandleFunc("GET /v1/cost", s.costJSON)
 	mux.HandleFunc("GET /v1/needs-human", s.needsHumanJSON)
+	mux.HandleFunc("GET /v1/merge-handoff", s.mergeHandoffJSON)
 	mux.HandleFunc("GET /v1/needs-input", s.needsInputJSON)
 	mux.HandleFunc("GET /v1/backlog", s.backlogJSON)
 	mux.HandleFunc("GET /v1/fleet", s.fleetJSON)
@@ -300,6 +301,18 @@ func (s *Server) needsHumanJSON(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.store.NeedsHumanView(r.Context())
 	if err != nil {
 		http.Error(w, "needs_human error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
+// mergeHandoffJSON serves the merge_handoff lane: every change Flowbee approved but
+// reserves for a human to merge (self-merge off, or a protected change). With
+// AllowSelfMerge off this is the operator's entire merge queue — the PRs to merge.
+func (s *Server) mergeHandoffJSON(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.store.MergeHandoffView(r.Context())
+	if err != nil {
+		http.Error(w, "merge_handoff error", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)

@@ -162,6 +162,11 @@ building → review_pending → code_review → mergeable → merging → done**
 - **Liveness:** `GET /v1/fleet-health` → `{live_workers, stale_workers, waiting_jobs,
   stranded}`. `stranded: true` (work waiting, no live worker) is the loud "is the fleet
   up?" signal.
+- **Operator queues** (the human-in-the-loop lanes, each on the private API `:7070`):
+  `GET /v1/merge-handoff` lists approved PRs awaiting a human merge (with `allow_self_merge`
+  off, this is your whole merge queue); `GET /v1/needs-human` lists escalated jobs, each
+  tagged with the trigger (attempts/bounces/cost/stall); `GET /v1/needs-input` lists design
+  forks awaiting an answer. Act with `flowbee requeue <job>` (re-arm) or the matching POST.
 - **Metrics:** `GET /metrics` on the health listener (`:7001`, same unauthenticated port as
   `/healthz`) emits Prometheus text format — point a scrape at it. Series: `flowbee_jobs{repo,state}`
   (job counts; a missing state means zero — alert on `flowbee_jobs{state="needs_human"} > 0`),
