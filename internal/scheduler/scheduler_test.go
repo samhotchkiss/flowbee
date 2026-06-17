@@ -96,6 +96,20 @@ func TestOrderIsDeterministic(t *testing.T) {
 	}
 }
 
+// TestCIReadyReviewBeatsStarvingNotReady: a CI-ready review is offered before a
+// not-ready one EVEN IF the not-ready one is older (higher aged priority). A not-ready
+// review can't be done, so it must not starve a reviewable one (the live #56 stall:
+// a reviewer kept re-claiming an older CI-red review and never reached a CI-green one).
+func TestCIReadyReviewBeatsStarvingNotReady(t *testing.T) {
+	now := time.Unix(1000, 0)
+	notReady := Candidate{JobID: "old-red", EnqueuedAt: time.Unix(10, 0), CIReady: false} // older
+	ready := Candidate{JobID: "new-green", EnqueuedAt: time.Unix(900, 0), CIReady: true}  // newer
+	got := Order([]Candidate{notReady, ready}, nil, now)
+	if len(got) != 2 || got[0].JobID != "new-green" {
+		t.Fatalf("CI-ready review must be first (anti-starvation), got %v", ids(got))
+	}
+}
+
 func ids(cs []Candidate) []string {
 	out := make([]string, len(cs))
 	for i, c := range cs {

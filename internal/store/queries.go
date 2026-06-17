@@ -638,8 +638,11 @@ func (s *Store) ReadyCandidates(ctx context.Context) ([]scheduler.Candidate, err
 // review claim's WHERE state='review_pending' remains the correctness guarantee.
 func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candidate, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, priority, enqueued_at, required_capabilities
-		  FROM jobs WHERE state='review_pending'`)
+		SELECT j.id, j.priority, j.enqueued_at, j.required_capabilities,
+		       COALESCE(f.pr_exists,0), COALESCE(f.ci_green,0), COALESCE(f.merged,0)
+		  FROM jobs j
+		  LEFT JOIN domain_b_facts f ON f.job_id = j.id
+		 WHERE j.state='review_pending'`)
 	if err != nil {
 		return nil, err
 	}
@@ -648,13 +651,18 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 	for rows.Next() {
 		var c scheduler.Candidate
 		var enqueued, reqJSON string
-		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON); err != nil {
+		var prExists, ciGreen, merged int
+		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON, &prExists, &ciGreen, &merged); err != nil {
 			return nil, err
 		}
 		if ts, perr := time.Parse(rfc3339, enqueued); perr == nil {
 			c.EnqueuedAt = ts
 		}
 		c.RequiredCapabilities = unmarshalStrings(reqJSON)
+		// CIReady mirrors the grant's ci_ready (server): a review is offerable only when
+		// its reconciled CI is green. A not-ready review sorts after ready ones so it
+		// never starves a reviewable one.
+		c.CIReady = prExists == 1 && ciGreen == 1 && merged == 0
 		out = append(out, c)
 	}
 	return out, rows.Err()
