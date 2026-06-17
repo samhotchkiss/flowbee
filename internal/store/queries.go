@@ -574,7 +574,11 @@ func (s *Store) Release(ctx context.Context, p ReleaseParams) error {
 			toState = job.StateReady
 		}
 		attemptsDelta := 0
-		if toState == job.StateReady && !p.NoPenalty {
+		// A build abandon (-> ready) OR a failed conflict resolution (-> resolving_conflict)
+		// burns an attempt, so a worker that keeps failing escalates after max_attempts
+		// instead of churning the claim forever. Gate releases that merely let go of good
+		// work (code_review -> review_pending, spec_review -> spec_authoring) do not.
+		if !p.NoPenalty && (toState == job.StateReady || toState == job.StateResolvingConflict) {
 			attemptsDelta = 1
 		}
 		nextSeq := seq + 1

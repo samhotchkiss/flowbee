@@ -125,6 +125,16 @@ var transitions = map[transitionKey]State{
 	// bounce; a design fork escalates to needs_design and resumes to spec_review.
 	{StateSpecReview, TriggerSpecAmended}:     StateDone,
 	{StateSpecReview, TriggerSpecNeedsDesign}: StateNeedsDesign,
+
+	// F8 conflict resolution: a conflict_resolver claims resolving_conflict (the state
+	// stays resolving_conflict, lease bound). A release/expiry — the resolver gave up,
+	// timed out, or produced no resolution — re-arms BACK to resolving_conflict so
+	// another conflict_resolver can retry. WITHOUT this entry job.Next errors and the
+	// release falls back to `ready`, leaving a ready job that still carries
+	// role:conflict_resolver caps — unclaimable by eng_workers (cap mismatch) and unseen
+	// by conflict_resolvers (they only claim resolving_conflict): a hard wedge.
+	{StateResolvingConflict, TriggerReleased}:          StateResolvingConflict,
+	{StateResolvingConflict, TriggerLeaseExpiredRetry}: StateResolvingConflict,
 	{StateNeedsDesign, TriggerDesignResolved}: StateSpecReview,
 
 	// F7 board-lifecycle edges: a backlog item is promoted into a flow (never
