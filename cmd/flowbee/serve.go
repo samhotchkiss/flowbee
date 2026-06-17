@@ -32,7 +32,71 @@ import (
 
 // runServe boots the control plane: load config -> open store -> migrate ->
 // open health + private listeners -> block until signal -> graceful shutdown.
-func runServe(_ []string) error {
+// printServeSystemd emits a ready-to-install systemd unit + env file so the CONTROL
+// PLANE runs as a managed service — the same durability the fleet gets (clean
+// `systemctl restart`, reboot survival, Restart=always, journald logs). The control
+// plane is the most critical component; running it under bare nohup is the one
+// production gap left after the fleet got systemd. Secrets print as placeholders.
+func printServeSystemd() {
+	self, err := os.Executable()
+	if err != nil {
+		self = os.Args[0]
+	}
+	user := envOr("USER", "sam")
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		home = "/home/" + user
+	}
+	envPath := home + "/.flowbee/serve.env"
+	cfgPath := envOr("FLOWBEE_CONFIG", home+"/.flowbee/flowbee.yaml")
+
+	fmt.Printf("# 1. Write %s  (chmod 600 — holds the GitHub token):\n", envPath)
+	fmt.Printf("FLOWBEE_CONFIG=%s\n", cfgPath)
+	fmt.Printf("FLOWBEE_GITHUB_TOKEN=<your-github-token>\n")
+	if v := os.Getenv("FLOWBEE_MIRROR_PATH"); v != "" {
+		fmt.Printf("FLOWBEE_MIRROR_PATH=%s\n", v)
+	}
+	if v := os.Getenv("FLOWBEE_GIT_REMOTE"); v != "" {
+		fmt.Printf("FLOWBEE_GIT_REMOTE=%s\n", v)
+	}
+	if os.Getenv("FLOWBEE_ALLOW_SELF_MERGE") != "" {
+		fmt.Printf("FLOWBEE_ALLOW_SELF_MERGE=1\n")
+	}
+	if os.Getenv("FLOWBEE_WORKER_AUTH_SECRET") != "" {
+		fmt.Printf("FLOWBEE_WORKER_AUTH_SECRET=<shared-worker-secret>\n")
+	}
+	if os.Getenv("FLOWBEE_WEBHOOK_SECRET") != "" {
+		fmt.Printf("FLOWBEE_WEBHOOK_SECRET=<webhook-secret>\n")
+	}
+	fmt.Printf("\n# 2. Write /etc/systemd/system/flowbee-serve.service:\n")
+	fmt.Printf(`[Unit]
+Description=Flowbee control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%s
+EnvironmentFile=%s
+ExecStart=%s serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`, user, envPath, self)
+	fmt.Printf("\n# 3. Enable + start (clean restart any time with `systemctl restart flowbee-serve`):\n")
+	fmt.Printf("sudo systemctl daemon-reload && sudo systemctl enable --now flowbee-serve\n")
+	fmt.Printf("journalctl -u flowbee-serve -f   # tail logs; the startup line shows the build SHA\n")
+}
+
+func runServe(args []string) error {
+	for _, a := range args {
+		if a == "--systemd" {
+			printServeSystemd()
+			return nil
+		}
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err

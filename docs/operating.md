@@ -48,6 +48,16 @@ Key environment:
 | `FLOWBEE_WORKER_AUTH_SECRET` | shared secret the fleet authenticates with |
 | `FLOWBEE_INSECURE` | dev only: disable mTLS/auth on the private API |
 
+Run it as a managed service so it survives reboots and restarts cleanly (the control
+plane is the most critical component — don't leave it under bare `nohup`):
+
+```sh
+flowbee serve --systemd > /tmp/flowbee-serve.unit   # prints an env file + systemd unit
+# install the printed ~/.flowbee/serve.env (fill in FLOWBEE_GITHUB_TOKEN) + the unit, then:
+sudo systemctl daemon-reload && sudo systemctl enable --now flowbee-serve
+journalctl -u flowbee-serve -f   # the startup line shows the build SHA
+```
+
 `flowbee.yaml` lists the repos one board serves (see [`deploy/multi-repo.md`](deploy/multi-repo.md)):
 
 ```yaml
