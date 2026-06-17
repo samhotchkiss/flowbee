@@ -635,17 +635,15 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	if err != nil {
 		return out, fmt.Errorf("write task context: %w", err)
 	}
-	if cfg.AgentCmd != "" {
-		cmd := exec.CommandContext(ctx, "sh", "-c", cfg.AgentCmd)
-		cmd.Dir = wsDir
-		cmd.Env = append(os.Environ(),
-			"FLOWBEE_JOB_ID="+grant.JobID, "FLOWBEE_BASE_SHA="+grant.BaseSHA, "FLOWBEE_ROLE="+grant.Role)
-		cmd.Env = append(cmd.Env, taskEnv...)
-		var errb strings.Builder
-		cmd.Stderr = &errb
-		if err := cmd.Run(); err != nil {
-			return out, fmt.Errorf("agent cmd: %v: %s", err, strings.TrimSpace(errb.String()))
-		}
+	// run the agent WHILE heartbeating the lease (a real build takes minutes — longer
+	// than the lease TTL — so without this the lease is revoked mid-build and the
+	// pushed result is fenced 409, exactly the #2217 churn: the branch lands but the
+	// result is rejected). Mirrors the worktree + bundle harnesses.
+	agentEnv := append(os.Environ(),
+		"FLOWBEE_JOB_ID="+grant.JobID, "FLOWBEE_BASE_SHA="+grant.BaseSHA, "FLOWBEE_ROLE="+grant.Role)
+	agentEnv = append(agentEnv, taskEnv...)
+	if err := runAgentHeartbeat(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+		return out, err
 	}
 	commitMsg := nodeCommitMessage(wsDir, cfg.Identity, grant.Role, grant.JobID, grant.Context)
 	_ = os.RemoveAll(filepath.Join(wsDir, ".flowbee"))
