@@ -644,6 +644,15 @@ func (r repoRefetcher) RefetchHint(ctx context.Context, prNumber int) bool {
 	return r.mgr.RefetchHint(ctx, r.defaultRepo, prNumber)
 }
 
+// IntakeSweep runs a reconcile sweep across all repos so a freshly labeled/opened issue
+// is adopted immediately on the webhook, not on the next floor poll.
+func (r repoRefetcher) IntakeSweep(ctx context.Context) bool {
+	if _, err := r.mgr.SweepAll(ctx); err != nil {
+		return false
+	}
+	return true
+}
+
 func firstRepo(mgr *multirepo.Manager) string {
 	if rs := mgr.Repos(); len(rs) > 0 {
 		return rs[0]

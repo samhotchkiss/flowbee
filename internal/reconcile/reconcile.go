@@ -163,6 +163,15 @@ func (r *Reconciler) RefetchHint(ctx context.Context, prNumber int) bool {
 	return reconciled
 }
 
+// IntakeSweep runs a reconcile sweep so a freshly labeled/opened issue is adopted on
+// the webhook, not just on the floor poll (webhook.Refetcher). Returns whether it ran.
+func (r *Reconciler) IntakeSweep(ctx context.Context) bool {
+	if _, err := r.Sweep(ctx); err != nil {
+		return false
+	}
+	return true
+}
+
 // ingest maps one PR's Domain-B facts to its bound job and applies them under the
 // I-3 guards. An un-bound PR (no job for that number) is a no-op (applied=false).
 func (r *Reconciler) ingest(ctx context.Context, pr gh.PullRequest, now time.Time) (store.ReconcileOutcome, bool, error) {

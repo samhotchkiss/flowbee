@@ -39,8 +39,9 @@ func (m *memInbox) MarkDeliveryProcessed(_ context.Context, id string) error {
 
 // spyRefetcher records the PR numbers a verified webhook asked to refetch.
 type spyRefetcher struct {
-	mu    sync.Mutex
-	calls []int
+	mu     sync.Mutex
+	calls  []int
+	sweeps int
 }
 
 func (s *spyRefetcher) RefetchHint(_ context.Context, pr int) bool {
@@ -51,6 +52,15 @@ func (s *spyRefetcher) RefetchHint(_ context.Context, pr int) bool {
 }
 
 func (s *spyRefetcher) count() int { s.mu.Lock(); defer s.mu.Unlock(); return len(s.calls) }
+
+func (s *spyRefetcher) IntakeSweep(_ context.Context) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sweeps++
+	return true
+}
+
+func (s *spyRefetcher) sweepCount() int { s.mu.Lock(); defer s.mu.Unlock(); return s.sweeps }
 
 const secret = "topsecret"
 
@@ -93,6 +103,34 @@ func TestForgedSignatureRejected(t *testing.T) {
 	}
 	if len(inbox.seen) != 0 {
 		t.Fatalf("forged webhook reached the inbox; must be rejected before write-ahead")
+	}
+}
+
+// TestIssueLabeledTriggersIntakeSweep: a signed issues.labeled webhook triggers an
+// intake sweep (event-driven adoption), while an issues event whose action can't
+// introduce a new target (e.g. closed) does not — so the floor poll isn't the only way
+// a labeled issue gets picked up.
+func TestIssueLabeledTriggersIntakeSweep(t *testing.T) {
+	inbox, spy := newMemInbox(), &spyRefetcher{}
+	h := New(secret, inbox, spy)
+
+	labeled := `{"action":"labeled","issue":{"number":42},"label":{"name":"flowbee:build"}}`
+	rr := post(t, h, "d-lab", "issues", labeled, Sign([]byte(secret), []byte(labeled)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("labeled issue: code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if spy.sweepCount() != 1 {
+		t.Fatalf("issues.labeled must trigger 1 intake sweep, got %d", spy.sweepCount())
+	}
+	if spy.count() != 0 {
+		t.Fatalf("an issue event must not hit the PR refetch path, got %d", spy.count())
+	}
+
+	// a `closed` issues action introduces no intake target -> no sweep.
+	closed := `{"action":"closed","issue":{"number":42}}`
+	post(t, h, "d-cls", "issues", closed, Sign([]byte(secret), []byte(closed)))
+	if spy.sweepCount() != 1 {
+		t.Fatalf("issues.closed must NOT sweep; sweepCount=%d want 1", spy.sweepCount())
 	}
 }
 

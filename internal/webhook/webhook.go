@@ -27,6 +27,9 @@ import (
 // The bool reports whether the PR was bound to a job (and thus reconciled).
 type Refetcher interface {
 	RefetchHint(ctx context.Context, prNumber int) bool
+	// IntakeSweep runs a reconcile sweep so a freshly labeled/opened issue is adopted
+	// NOW (event-driven) instead of waiting for the floor poll. Returns whether it ran.
+	IntakeSweep(ctx context.Context) bool
 }
 
 // Inbox is the durable write-ahead inbox + dedupe (satisfied by *store.Store).
@@ -97,6 +100,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if prNumber > 0 && h.refetcher != nil {
 		reconciled = h.refetcher.RefetchHint(r.Context(), prNumber)
 	}
+	// an `issues` event whose action could introduce a new intake target (labeled with
+	// the opt-in label, or (re)opened) triggers a sweep so the issue is adopted NOW —
+	// event-driven intake, not just the floor poll. The sweep is idempotent: it adopts
+	// only labeled, not-yet-tracked issues, so a stray edit/close is a harmless no-op.
+	if event == "issues" && h.refetcher != nil {
+		switch parseIssueAction(body) {
+		case "labeled", "opened", "reopened":
+			reconciled = h.refetcher.IntakeSweep(r.Context()) || reconciled
+		}
+	}
 	if err := h.inbox.MarkDeliveryProcessed(r.Context(), delivery); err != nil {
 		http.Error(w, "inbox error", http.StatusInternalServerError)
 		return
@@ -132,6 +145,17 @@ func Sign(secret, body []byte) string {
 // parsePRNumber extracts the affected PR number from a webhook body. The §8.1.3
 // subscribed events all carry a PR number in one of these shapes; we treat them
 // uniformly as refetch hints. Unknown shapes return 0 (record-only).
+// parseIssueAction reads the `action` of an issues webhook (labeled / opened / …).
+func parseIssueAction(body []byte) string {
+	var p struct {
+		Action string `json:"action"`
+	}
+	if json.Unmarshal(body, &p) != nil {
+		return ""
+	}
+	return p.Action
+}
+
 func parsePRNumber(event string, body []byte) int {
 	var p struct {
 		Number      int `json:"number"`
