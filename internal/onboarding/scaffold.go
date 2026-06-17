@@ -50,7 +50,10 @@ database_url: flowbee.db     # SQLite file (WAL); no database server required
 private_addr: ":7070"        # worker API (loopback / Tailscale only)
 health_addr: ":7001"         # /healthz
 webhook_addr: ":8443"        # GitHub webhooks
-lease_ttl_s: 300             # must be >= 3 * heartbeat_interval_s (DESIGN §6.3.3)
+lease_ttl_s: 1200            # the un-gameable absolute cap on a lease — set it ABOVE your
+                             # slowest agent run (a real claude/codex build is 4-8 min),
+                             # or a long build is revoked mid-run and its result fenced.
+                             # Must also be >= 3 * heartbeat_interval_s (DESIGN §6.3.3).
 heartbeat_interval_s: 30
 long_poll_wait_s: 30
 river_max_workers: 10
