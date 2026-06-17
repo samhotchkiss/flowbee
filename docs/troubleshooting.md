@@ -13,3 +13,9 @@ behavior* — a safety gate doing its job, not a fault to force past.
 | Unsure which Flowbee binary/version is actually running. | `flowbee version` prints the build's git SHA. | Compare the printed SHA against the intended release; deploy/restart the correct binary if it differs. |
 | A worker process crashed. | `systemctl status flowbee-fleet` shows the unit and its restarts. | **None required** — the systemd-managed fleet auto-respawns the crashed worker. Verify recovery via the same `systemctl status flowbee-fleet`. |
 | `fleet-health` shows stale workers. | A worker lost its heartbeat and is no longer re-registering. | Restart the fleet on the affected box: `systemctl restart flowbee-fleet`. Workers re-register automatically on startup. |
+
+## An epic's child issues never start.
+
+**Cause:** The epic barrier review has not signed off yet, or the fan-out step has not run. Child issues are held until the epic's barrier review passes.
+
+**Fix:** Check the epic job state. Once the barrier review approves and the fan-out runs, the children start automatically — no manual intervention is needed.
