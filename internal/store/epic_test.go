@@ -51,9 +51,12 @@ func TestEpicBarrierGatesFanOut(t *testing.T) {
 		t.Fatal("epic must not be reviewed before the gate passes")
 	}
 
-	// pass the epic-level review (the barrier job is a spec_review at hash "").
+	// pass the epic-level review — bind to the barrier's decomposition content hash
+	// (the barrier now carries the rendered decomposition as its spec, so the sign-off
+	// binds to it like any other spec review).
+	bar, _ := st.GetJob(ctx, epic)
 	resp, err := st.SpecReviewResult(ctx, store.SpecReviewResultParams{
-		JobID: epic, Epoch: 0, Claim: job.VerdictSignedOff, BindsTo: "",
+		JobID: epic, Epoch: 0, Claim: job.VerdictSignedOff, BindsTo: bar.SpecContentHash,
 		MeetsStyle: true, MeetsRequirements: true, Now: now,
 	})
 	if err != nil {

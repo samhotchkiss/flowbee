@@ -198,6 +198,11 @@ func Fold(events []Event) (job.Job, error) {
 			j.TaskText = e.Payload.TaskText
 			j.SpecText = e.Payload.SpecText
 			j.AcceptanceCriteria = e.Payload.AcceptanceCriteria
+			// an epic barrier is created already carrying the decomposition as its spec
+			// (no authoring step) — fold the content hash/version it was minted with so
+			// the projection equals the re-fold (a normal job leaves these zero).
+			j.SpecContentHash = e.Payload.SpecContentHash
+			j.SpecVersion = e.Payload.SpecVersion
 			j.State = e.ToState
 			// EnqueuedAt: a job created already-`ready` is enqueued now (aging
 			// clock starts here); a `blocked` job starts aging when deps clear.

@@ -4,11 +4,31 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
+	"github.com/samhotchkiss/flowbee/internal/spec"
 )
+
+// renderDecomposition is the markdown the epic-review barrier presents: the goal plus
+// each child issue's task + acceptance, so the reviewer can judge scope, coverage,
+// dependency ordering, and standards over the WHOLE decomposition in one review.
+func renderDecomposition(goal string, issues []EpicIssue) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Epic decomposition\n\n**Goal:** %s\n\n", strings.TrimSpace(goal))
+	fmt.Fprintf(&b, "This epic decomposes the goal into %d issue(s). Review the decomposition as a whole: "+
+		"is the scope right, is the goal fully covered, are the issues correctly ordered and independent, "+
+		"do they meet standards?\n\n", len(issues))
+	for i, iss := range issues {
+		fmt.Fprintf(&b, "## Issue %d\n\n%s\n\n", i+1, strings.TrimSpace(iss.Task))
+		if strings.TrimSpace(iss.Acceptance) != "" {
+			fmt.Fprintf(&b, "**Acceptance:** %s\n\n", strings.TrimSpace(iss.Acceptance))
+		}
+	}
+	return b.String()
+}
 
 // SeedEpicParams seeds an epic decomposition (F4): ONE epic-barrier spec job (the
 // epic-level issue-review gate) plus N child issue jobs that sit in `backlog`
@@ -52,16 +72,25 @@ func (p SeedEpicParams) issues() []EpicIssue {
 // leased until the epic-level review releases it. This is the single barrier over
 // the whole decomposition.
 func (s *Store) SeedEpic(ctx context.Context, p SeedEpicParams) error {
+	// the decomposition IS the artifact the barrier review judges — render it as the
+	// barrier's spec so the reviewer actually SEES the issues (scope · coverage ·
+	// dep-graph · standards) and bind a content hash so the sign-off has something to
+	// bind to. Without this the barrier shipped an empty spec and the reviewer bounced
+	// it to spec_authoring — where an epic has no author, a dead end.
+	decomp := renderDecomposition(p.ChatRef, p.issues())
+	decompHash := spec.ContentHash([]byte(decomp))
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		// the epic barrier: a spec_review job carrying the decomposition. It is the
 		// one issue-review the epic gets (a barrier over all the issues).
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO jobs (id, kind, flow, stage, state, role, chat_ref, author_lens, priority, repo,
+			                  spec_text, spec_content_hash, spec_version,
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 			                  epic_id, is_epic)
-			VALUES (?, 'spec', 'spec', 'epic_review', 'spec_review', 'spec_reviewer', ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 3, 1, ?, 1)`,
+			VALUES (?, 'spec', 'spec', 'epic_review', 'spec_review', 'spec_reviewer', ?, ?, ?, ?, ?, ?, 1, '[]', ?, ?, 0, 0, 5, 0, 3, 1, ?, 1)`,
 			p.EpicID, p.ChatRef, p.AuthorLens, p.Priority, p.Repo,
+			decomp, decompHash,
 			marshalStrings([]string{"role:spec_reviewer"}), p.Now.Format(rfc3339), p.EpicID); err != nil {
 			return fmt.Errorf("insert epic barrier: %w", err)
 		}
@@ -71,6 +100,7 @@ func (s *Store) SeedEpic(ctx context.Context, p SeedEpicParams) error {
 			Payload: ledger.Payload{
 				Kind: job.KindSpec, Flow: "spec", Stage: "epic_review", Role: job.RoleSpecReviewer,
 				Priority: p.Priority, RequiredCapabilities: []string{"role:spec_reviewer"},
+				SpecText: decomp, SpecContentHash: decompHash, SpecVersion: 1,
 			},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
