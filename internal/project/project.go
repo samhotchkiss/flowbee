@@ -75,6 +75,11 @@ type HistoryWriter interface {
 	// HeadSHA resolves a ref (e.g. refs/heads/main) to its commit SHA, so the
 	// signed_off_issue -> build seeding can bind the build to the current main tip.
 	HeadSHA(ref string) (string, error)
+	// FetchBranch force-updates a local branch from origin (GitHub). The mirror lags
+	// after an API merge, so the merge-conflict router must fetch main BEFORE resolving
+	// the resolver's base — else the resolver builds against a stale main lacking the
+	// sibling's merge, the resolution re-conflicts, and the brief is nonsensical.
+	FetchBranch(branch string) error
 }
 
 // WithHistory wires the local-git history writer + the branch its dedicated
@@ -156,7 +161,13 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 			// at the current main tip and CONSUME the merge row, instead of re-queuing the
 			// merge forever (which also pollutes the drain for the whole repo).
 			if errors.Is(err, gh.ErrMergeConflict) {
-				mainTip, terr := s.history.HeadSHA("refs/heads/" + orDefault(s.baseBranch, "main"))
+				// the sibling merged via the GitHub API, so the local mirror's main lags —
+				// fetch it FIRST so the resolver's base is the real post-merge main (with the
+				// sibling's change present), or the resolution would build on a stale base and
+				// re-conflict.
+				mainBranch := orDefault(s.baseBranch, "main")
+				_ = s.history.FetchBranch(mainBranch)
+				mainTip, terr := s.history.HeadSHA("refs/heads/" + mainBranch)
 				if terr == nil && mainTip != "" {
 					if rerr := s.store.RouteMergeConflict(ctx, row.JobID, mainTip, s.clock.Now()); rerr == nil {
 						if err := s.store.MarkOutboxSent(ctx, row.ID, "merge conflict -> resolving_conflict"); err != nil {
