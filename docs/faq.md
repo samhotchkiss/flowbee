@@ -46,6 +46,17 @@ escalating to a human.
 
 ---
 
+### Does Flowbee retry a failed merge?
+
+Yes, for transient failures. When GitHub reports that a PR is "not mergeable," it sometimes
+means mergeability is still being recomputed after a sibling PR just merged — not that there
+is a real conflict. Flowbee retries the merge a few times before treating the result as a
+genuine conflict and routing the job to the `conflict_resolver`. This means concurrent
+non-conflicting PRs do not spuriously invoke the resolver just because GitHub's mergeability
+cache had not caught up yet.
+
+---
+
 ### What happens to the per-issue branch after a change merges?
 
 Flowbee deletes the `flowbee/issue-N` branch automatically after the merge — the merge
