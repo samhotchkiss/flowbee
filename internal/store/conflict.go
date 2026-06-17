@@ -275,6 +275,16 @@ func (s *Store) RebaseOnto(ctx context.Context, mirror *gitops.Mirror, p RebaseO
 				marshalStrings([]string{"role:code_reviewer"}), p.NewBaseSHA, newSHA, p.JobID); err != nil {
 				return fmt.Errorf("apply clean rebase: %w", err)
 			}
+			// record the rebased head + base as the reconcile baseline: rebaseStaleReviews
+			// force-pushes newSHA to the issue branch, so without this the next reconcile
+			// sweep reads our own rebase as an unexpected head/base move and supersedes the
+			// review straight back to build — the same spurious-supersede class as the
+			// conflict-resolution path. Flowbee performed the git write, so it owns the fact.
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE domain_b_facts SET head_sha = ?, base_sha = ?, updated_at = datetime('now')
+				 WHERE job_id = ?`, newSHA, p.NewBaseSHA, p.JobID); err != nil {
+				return fmt.Errorf("record rebased head/base baseline: %w", err)
+			}
 			res.Clean = true
 			res.NewSHA = newSHA
 			return setJobSeq(ctx, tx, p.JobID, nextSeq)
@@ -469,17 +479,21 @@ func (s *Store) ResolveConflictResult(ctx context.Context, p ResolveConflictPara
 			p.ResolvedDiff, p.DeclaredBlastRadius, p.JobID); err != nil {
 			return fmt.Errorf("apply resolve_conflict result: %w", err)
 		}
-		// record the resolved head as the reconcile baseline (the head Flowbee just
-		// pushed — Flowbee performed the git write, so it OWNS this fact, like a merge
-		// commit). Without this the next reconcile sweep sees the resolver's head advance
-		// as an unexpected SHA move and supersedes review_pending -> build, looping
-		// forever (resolve -> supersede -> rebuild -> re-conflict). Only the head moved;
-		// base is unchanged by a rebase-onto-current-main resolution.
+		// record the resolved head AND base as the reconcile baseline (the SHAs Flowbee
+		// just pushed — Flowbee performed the git write, so it OWNS these facts, like a
+		// merge commit). Without this the next reconcile sweep reads the resolver's
+		// (legitimate) head/base advance as an unexpected SHA move and supersedes
+		// review_pending -> build, churning (resolve -> supersede -> rebuild). BOTH move:
+		// the resolver force-pushes a new head AND rebases the branch onto current main,
+		// so the PR's baseRefOid (the main tip) differs from the pre-conflict base — record
+		// j.BaseSHA (the base the resolver rebased onto, set by RouteMergeConflict/rebase)
+		// so neither term of `shaMoved` fires. If main advances AGAIN before reconcile a
+		// supersede correctly recurs (rebuild on the newer base) — bounded, not a loop.
 		if p.PushedSHA != "" {
 			if _, err := tx.ExecContext(ctx, `
-				UPDATE domain_b_facts SET head_sha = ?, updated_at = datetime('now')
-				 WHERE job_id = ?`, p.PushedSHA, p.JobID); err != nil {
-				return fmt.Errorf("record resolved head baseline: %w", err)
+				UPDATE domain_b_facts SET head_sha = ?, base_sha = ?, updated_at = datetime('now')
+				 WHERE job_id = ?`, p.PushedSHA, j.BaseSHA, p.JobID); err != nil {
+				return fmt.Errorf("record resolved head/base baseline: %w", err)
 			}
 		}
 		// close the resolver lease audit row.

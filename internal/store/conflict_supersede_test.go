@@ -23,12 +23,18 @@ func TestResolvedConflictHeadBaselinePreventsSupersede(t *testing.T) {
 	st := testutil.NewStore(t)
 	now := time.Unix(1000, 0)
 
-	const buildSHA, resolvedSHA, mainSHA = "buildhead111", "resolvedhead2", "mainbase0000"
+	// the resolver rebases onto CURRENT main (newMain), which differs from the
+	// pre-conflict base (oldBase) — so BOTH head and base advance.
+	const oldBuildSHA, oldBase, resolvedSHA, newMain = "buildhead111", "oldbase00000", "resolvedhead2", "newmaintip000"
 
 	putResolvingConflict(t, st, "rc", 0, now)
-	// the PR already exists at the OLD build head (the head that conflicted at merge).
+	// the resolver rebased onto newMain — RouteMergeConflict already advanced the job base.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET base_sha=? WHERE id='rc'`, newMain); err != nil {
+		t.Fatal(err)
+	}
+	// the PR/reconcile baseline still holds the OLD pre-conflict head + base.
 	if err := st.UpsertDomainBFacts(ctx, "rc", job.DomainBFacts{
-		PRExists: true, PRNumber: 7, HeadSHA: buildSHA, BaseSHA: mainSHA,
+		PRExists: true, PRNumber: 7, HeadSHA: oldBuildSHA, BaseSHA: oldBase,
 	}); err != nil {
 		t.Fatalf("seed facts: %v", err)
 	}
@@ -45,15 +51,15 @@ func TestResolvedConflictHeadBaselinePreventsSupersede(t *testing.T) {
 	if j.State != job.StateReviewPending {
 		t.Fatalf("after resolve state=%s want review_pending", j.State)
 	}
-	// the resolved head is now the reconcile baseline.
-	if got := reconHead(t, st, "rc"); got != resolvedSHA {
-		t.Fatalf("domain_b_facts head=%q want the resolved head %q", got, resolvedSHA)
+	// BOTH the resolved head and the rebased base are now the reconcile baseline.
+	if h, b := reconHeadBase(t, st, "rc"); h != resolvedSHA || b != newMain {
+		t.Fatalf("baseline head/base=%q/%q want %q/%q", h, b, resolvedSHA, newMain)
 	}
 
-	// the next reconcile sweep sees the PR at the resolved head — NO spurious move,
-	// so the job STAYS in review (the bug would have superseded it back to ready).
+	// the next reconcile sweep sees the PR at the resolved head + rebased base — NO
+	// spurious move, so the job STAYS in review (the bug superseded it back to ready).
 	if _, err := st.ApplyReconciledPR(ctx, "rc", store.ReconciledPR{
-		Number: 7, HeadSHA: resolvedSHA, BaseSHA: mainSHA,
+		Number: 7, HeadSHA: resolvedSHA, BaseSHA: newMain,
 	}, now.Add(2*time.Second)); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -112,4 +118,14 @@ func reconHead(t *testing.T, st *store.Store, id string) string {
 		t.Fatalf("read recon head: %v", err)
 	}
 	return head
+}
+
+func reconHeadBase(t *testing.T, st *store.Store, id string) (string, string) {
+	t.Helper()
+	var head, base string
+	if err := st.DB.QueryRowContext(context.Background(),
+		`SELECT COALESCE(head_sha,''), COALESCE(base_sha,'') FROM domain_b_facts WHERE job_id=?`, id).Scan(&head, &base); err != nil {
+		t.Fatalf("read recon head/base: %v", err)
+	}
+	return head, base
 }
