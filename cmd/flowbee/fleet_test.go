@@ -24,6 +24,43 @@ func captureStdout(t *testing.T, f func()) string {
 	return string(out)
 }
 
+// TestRoleAgentCmdInjectsPerRoleModel: with no override, a role's agent command injects
+// `--model <family>`, so build (Sonnet) and review (Opus) run GENUINELY different models
+// (§5.5 uncorrelated review). An override wins and forgoes per-role models.
+func TestRoleAgentCmdInjectsPerRoleModel(t *testing.T) {
+	build := roleAgentCmd("sonnet", true, "", "")
+	if !strings.Contains(build, "--model sonnet") || !strings.Contains(build, "Create the file(s)") {
+		t.Errorf("build cmd missing --model sonnet or the file-writing prompt: %q", build)
+	}
+	review := roleAgentCmd("opus", false, "", "")
+	if !strings.Contains(review, "--model opus") {
+		t.Errorf("review cmd missing --model opus: %q", review)
+	}
+	if strings.Contains(review, "Create the file(s)") {
+		t.Errorf("review cmd must not use the file-writing build prompt: %q", review)
+	}
+	if build == review {
+		t.Error("build and review commands are identical — no model diversity (the §5.5 caveat)")
+	}
+	// the builder model and the code_reviewer model must actually differ.
+	var reviewerFamily string
+	for _, r := range nonBuilderFleetRoles() {
+		if r.role == "code_reviewer" {
+			reviewerFamily = r.family
+		}
+	}
+	if reviewerFamily == fleetBuilderFamily {
+		t.Errorf("code_reviewer model %q == builder model %q — correlated review", reviewerFamily, fleetBuilderFamily)
+	}
+	// overrides win and disable per-role model injection.
+	if got := roleAgentCmd("opus", false, "MY_REVIEW_CMD", ""); got != "MY_REVIEW_CMD" {
+		t.Errorf("agent override not honored: %q", got)
+	}
+	if got := roleAgentCmd("sonnet", true, "", "MY_BUILD_CMD"); got != "MY_BUILD_CMD" {
+		t.Errorf("build override not honored: %q", got)
+	}
+}
+
 // TestFleetRunsConflictResolverOffBuilderFamily: the fleet MUST run a conflict_resolver
 // (else every real merge conflict escalates to needs_human instead of resolving
 // autonomously), and any build-judging/resolving role MUST carry a non-builder

@@ -23,15 +23,40 @@ import (
 //
 //	flowbee fleet --url http://<control-plane>:7070
 //
-// fleetBuilderFamily is the model_family the N build workers register under. Any role
-// that judges or resolves a build carries a server-side anti-affinity against it, so
-// such a role must NOT share this family or it could never claim.
-const fleetBuilderFamily = "claude"
+// fleetBuilderFamily is the model_family — and the --model alias — the N build workers
+// register and run under. Any role that judges or resolves a build carries a
+// server-side anti-affinity against it, so such a role must NOT share this family or it
+// could never claim. It is a real claude model alias (Sonnet builds; Opus reviews).
+const fleetBuilderFamily = "sonnet"
+
+// Per-role default agent commands. The family doubles as the `--model` alias, so build
+// and review run genuinely different models (§5.5). %s is the model alias.
+const (
+	reviewAgentTmpl = `claude -p "$(cat "$FLOWBEE_TASK_FILE")" --model %s --output-format json --dangerously-skip-permissions`
+	buildAgentTmpl  = `claude -p "$(cat "$FLOWBEE_TASK_FILE") Create the file(s) on disk now. Make only the change described." --model %s --output-format json --dangerously-skip-permissions`
+)
+
+// roleAgentCmd returns the agent CLI for a role: the operator override if non-empty,
+// else the per-role default with `--model <family>` injected. writesFiles picks the
+// file-writing build template (eng_worker, conflict_resolver) over the verdict/spec
+// review template.
+func roleAgentCmd(family string, writesFiles bool, agentOverride, buildOverride string) string {
+	if writesFiles {
+		if buildOverride != "" {
+			return buildOverride
+		}
+		return fmt.Sprintf(buildAgentTmpl, family)
+	}
+	if agentOverride != "" {
+		return agentOverride
+	}
+	return fmt.Sprintf(reviewAgentTmpl, family)
+}
 
 // fleetRole is one non-builder worker a fleet box runs (exactly one each).
 type fleetRole struct {
 	role        string
-	family      string // anti-affinity tag (see fleetBuilderFamily)
+	family      string // model_family + --model alias; anti-affinity tag (see fleetBuilderFamily)
 	writesFiles bool   // runs the file-writing BUILD harness (--remote + build agent) vs the verdict-only review agent
 	needsMirror bool   // pushes to the issue branch, so it needs --mirror + --repo-url
 }
@@ -41,13 +66,14 @@ type fleetRole struct {
 // resolving_conflict job that only a conflict_resolver can claim, so omitting it makes
 // every conflict escalate to needs_human instead of resolving autonomously. It writes
 // files (resolves markers) so it runs the build harness, under a NON-builder family
-// (§I-10: a build's own model may not resolve its own conflict).
+// (§I-10: a build's own model may not resolve its own conflict). Each family is a real
+// claude --model alias, so Opus reviews/resolves what Sonnet built — genuine diversity.
 func nonBuilderFleetRoles() []fleetRole {
 	return []fleetRole{
-		{role: "conflict_resolver", family: "sonnet", writesFiles: true, needsMirror: true},
+		{role: "conflict_resolver", family: "opus", writesFiles: true, needsMirror: true},
 		{role: "code_reviewer", family: "opus", writesFiles: false, needsMirror: true},
-		{role: "spec_author", family: "claude", writesFiles: false, needsMirror: false},
-		{role: "spec_reviewer", family: "sonnet", writesFiles: false, needsMirror: false},
+		{role: "spec_author", family: "sonnet", writesFiles: false, needsMirror: false},
+		{role: "spec_reviewer", family: "opus", writesFiles: false, needsMirror: false},
 	}
 }
 
@@ -60,15 +86,17 @@ func runFleet(args []string) error {
 	url := fs.String("url", envOr("FLOWBEE_URL", ""), "control-plane URL, e.g. http://100.67.2.108:7070")
 	mirror := fs.String("mirror", envOr("FLOWBEE_WORKER_MIRRORS_DIR", ""), "directory for the worker's per-repo BARE mirrors (default ~/.flowbee/mirrors; NOT a working checkout)")
 	builders := fs.Int("builders", 1, "parallel build workers on this box (each gets its own worktree off the shared mirror)")
-	// --output-format json makes claude print a single result object carrying
-	// total_cost_usd + usage, so the harness can meter per-job cost (I-15). The harness
-	// unwraps `.result` for any text it needs (e.g. the spec_author fallback).
-	defaultAgent := `claude -p "$(cat "$FLOWBEE_TASK_FILE")" --output-format json --dangerously-skip-permissions`
-	buildAgent := `claude -p "$(cat "$FLOWBEE_TASK_FILE")
-
-Create the file(s) on disk now. Make only the change described." --output-format json --dangerously-skip-permissions`
-	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", defaultAgent), "agent CLI for review/author roles")
-	buildCmd := fs.String("build-agent-cmd", envOr("FLOWBEE_BUILD_AGENT_CMD", buildAgent), "agent CLI for the build role (writes files)")
+	// Per-role default agent commands inject `--model <family>` so the build and review
+	// roles run GENUINELY DIFFERENT models — real §5.5 uncorrelated review, not the same
+	// CLI-default model hiding behind distinct family labels (a reviewer that shares the
+	// builder's model shares its blind spots). The claude CLI accepts the 'opus'/'sonnet'
+	// aliases (claude --model opus|sonnet). Setting --agent-cmd / --build-agent-cmd (or
+	// the env) OVERRIDES with one command for all review-author / all build roles,
+	// forgoing per-role model diversity (the operator's explicit choice).
+	// --output-format json makes claude print total_cost_usd + usage so the harness can
+	// meter per-job cost (I-15); the harness unwraps `.result` for any text it needs.
+	agentCmd := fs.String("agent-cmd", os.Getenv("FLOWBEE_AGENT_CMD"), "override the review/author agent CLI (empty = per-role --model defaults)")
+	buildCmd := fs.String("build-agent-cmd", os.Getenv("FLOWBEE_BUILD_AGENT_CMD"), "override the build agent CLI (empty = per-role --model defaults)")
 	noSmoke := fs.Bool("no-smoke", false, "skip the agent smoke test at startup")
 	systemd := fs.Bool("systemd", false, "print a systemd unit + env file to run the fleet as a managed service (then exit), instead of starting it")
 	if err := fs.Parse(args); err != nil {
@@ -102,9 +130,10 @@ Create the file(s) on disk now. Make only the change described." --output-format
 	// verify the agent actually works BEFORE starting workers — a not-authed /
 	// rate-limited / mis-configured agent otherwise stalls every job as the vague
 	// "agent produced no changes". Fail loudly here instead.
+	builderCmd := roleAgentCmd(fleetBuilderFamily, true, *agentCmd, *buildCmd)
 	if !*noSmoke {
 		fmt.Printf("smoke-testing the build agent on %s ...\n", host)
-		if err := smokeAgent(*buildCmd); err != nil {
+		if err := smokeAgent(builderCmd); err != nil {
 			return fmt.Errorf("agent smoke test FAILED on %s: %w\n   fix the agent (e.g. `claude --version` / re-auth) then retry, or --no-smoke to skip", host, err)
 		}
 		fmt.Println("✓ agent works")
@@ -161,14 +190,17 @@ Create the file(s) on disk now. Make only the change described." --output-format
 	}
 
 	// build workers (--remote): N parallel, each a worktree off the shared local mirror.
+	// They run the builder model (fleetBuilderFamily) so reviews/resolutions can be a
+	// genuinely different model.
 	for i := 0; i < *builders; i++ {
 		id := fmt.Sprintf("%s-builder-%d", host, i)
 		supervise(id, "work", "--role", "eng_worker", "--remote",
 			"--mirror", *mirror, "--repo-url", repoURL,
-			"--identity", id, "--model-family", "claude", "--agent-cmd", *buildCmd)
+			"--identity", id, "--model-family", fleetBuilderFamily, "--agent-cmd", builderCmd)
 	}
 	// The non-builder roles (one each). Distinct model_family per role so a reviewer/
-	// resolver is never the builder's family (anti-affinity, enforced server-side). A
+	// resolver is never the builder's family (anti-affinity, enforced server-side) AND
+	// genuinely runs a different model (roleAgentCmd injects --model <family>). A
 	// conflict_resolver is REQUIRED — without it every real merge conflict finds no
 	// eligible worker and escalates to needs_human instead of resolving autonomously.
 	// Roles that author files on a branch (conflict_resolver resolves markers) run the
@@ -177,11 +209,10 @@ Create the file(s) on disk now. Make only the change described." --output-format
 	// agent. needsMirror roles push to the issue branch, so they get --mirror + repo-url.
 	for _, r := range nonBuilderFleetRoles() {
 		id := host + "-" + r.role
-		argv := []string{"work", "--role", r.role, "--identity", id, "--model-family", r.family}
+		argv := []string{"work", "--role", r.role, "--identity", id, "--model-family", r.family,
+			"--agent-cmd", roleAgentCmd(r.family, r.writesFiles, *agentCmd, *buildCmd)}
 		if r.writesFiles {
-			argv = append(argv, "--remote", "--agent-cmd", *buildCmd)
-		} else {
-			argv = append(argv, "--agent-cmd", *agentCmd)
+			argv = append(argv, "--remote")
 		}
 		if r.needsMirror {
 			argv = append(argv, "--mirror", *mirror, "--repo-url", repoURL)
@@ -255,8 +286,16 @@ func printFleetSystemd(url string, builders int, agentCmd, buildCmd string) {
 	// secret. Always emit the line as a PLACEHOLDER (never the live value — the unit
 	// text is often pasted, committed, or logged); delete it only for an insecure dev CP.
 	fmt.Printf("FLOWBEE_WORKER_AUTH_SECRET=<shared-worker-secret>\n")
-	fmt.Printf("FLOWBEE_AGENT_CMD=%s\n", oneLine(agentCmd))
-	fmt.Printf("FLOWBEE_BUILD_AGENT_CMD=%s\n\n", oneLine(buildCmd))
+	// Only pin the agent commands when the operator OVERRODE them. Left unset, the fleet
+	// applies per-role defaults with distinct --model (Sonnet builds, Opus reviews) for
+	// genuine §5.5 diversity — pinning a single command here would forgo that.
+	if oneLine(agentCmd) != "" {
+		fmt.Printf("FLOWBEE_AGENT_CMD=%s\n", oneLine(agentCmd))
+	}
+	if oneLine(buildCmd) != "" {
+		fmt.Printf("FLOWBEE_BUILD_AGENT_CMD=%s\n", oneLine(buildCmd))
+	}
+	fmt.Printf("\n")
 
 	fmt.Printf("# 2. Write /etc/systemd/system/flowbee-fleet.service:\n")
 	fmt.Printf(`[Unit]
