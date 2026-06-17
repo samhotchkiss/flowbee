@@ -107,6 +107,20 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 			"Carefully review the existing change for the failure: build errors, linter violations (e.g. golangci-lint), " +
 			"and failing/smoke tests. Run the linter and tests if they are available, and FIX what is broken so CI passes this time.\n")
 	}
+	if c.Conflict {
+		b.WriteString("\n## ⚠️ This is a CONFLICT RESOLUTION — re-apply your change on the CURRENT code\n\n" +
+			"This working directory is at the LATEST main. Since your change was originally written, a sibling change " +
+			"merged into the SAME area, so your change no longer applies cleanly (that is the conflict). Your ORIGINAL " +
+			"intended change is shown below as a patch. Do NOT just re-run the task verbatim — its target text may no " +
+			"longer exist. Instead: read the CURRENT files, understand the sibling change already present, then re-apply " +
+			"your ORIGINAL INTENT on top of it, reconciling the two so BOTH changes are honored. Edit the files in this " +
+			"directory to produce the merged result.\n")
+		if strings.TrimSpace(c.Diff) != "" {
+			b.WriteString("\n### Your original intended change (patch)\n\n```diff\n")
+			b.WriteString(strings.TrimSpace(c.Diff))
+			b.WriteString("\n```\n")
+		}
+	}
 	b.WriteString("\n## How to complete this\n\nMake the change by creating or editing files in THIS working directory. " +
 		"Write the actual files to disk now — do not just describe or print them. Touch only what the task requires.\n")
 	b.WriteString("\nWhen done, write `.flowbee/commit.md` with a clear, DETAILED commit message for your change: " +

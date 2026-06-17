@@ -614,6 +614,11 @@ type LeaseContext struct {
 	// Rebuild signals a re-attempt after a bounce (prior CI failure / changes
 	// requested) so the build brief tells the agent to FIX what broke, not re-submit.
 	Rebuild bool `json:"rebuild,omitempty"`
+	// Conflict signals a conflict_resolver lease: the worktree is at the CURRENT main
+	// (a sibling merged into the same area) and Diff carries this job's ORIGINAL intended
+	// change. The brief tells the agent to re-apply that intent on the current code,
+	// reconciling it with the sibling change — not to re-run the original task.
+	Conflict bool `json:"conflict,omitempty"`
 }
 
 // lease long-polls: rank `ready` candidates (scheduler: priority + aging +
@@ -760,6 +765,17 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 				// agent reads the diff (the review harness writes .flowbee/diff.patch),
 				// and ship CIReady so the harness skips until reconciled CI is green
 				// (an approval before then can't mint — it would bounce + rebuild-thrash).
+				// a conflict_resolver re-applies the job's ORIGINAL change on the CURRENT
+				// main (a sibling merged into the same area). Ship that original build patch
+				// as the Diff and flag Conflict so the resolver brief tells the agent to
+				// reconcile its intent with the current code — NOT to re-run the original
+				// task, whose target may no longer exist (which is the conflict).
+				if resolvingConflict {
+					if d, derr := s.store.JobPatchDiff(r.Context(), cand.JobID); derr == nil {
+						grant.Context.Diff = d
+					}
+					grant.Context.Conflict = true
+				}
 				if reviewing {
 					if d, derr := s.store.JobPatchDiff(r.Context(), cand.JobID); derr == nil {
 						grant.Context.Diff = d

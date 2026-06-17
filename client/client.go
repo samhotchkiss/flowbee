@@ -157,6 +157,14 @@ type LeaseContext struct {
 	// failures (run the linter/tests) rather than re-submit the same thing — otherwise
 	// a CI-failing change just loops to needs_human with no feedback.
 	Rebuild bool `json:"rebuild,omitempty"`
+	// Conflict is true for a conflict_resolver lease (resolving_conflict): the worktree
+	// is at the CURRENT main (a sibling merged a change to the same area since this work
+	// was built), and Diff carries this job's ORIGINAL intended change. The harness brief
+	// tells the agent to re-apply that intent on top of the current code, reconciling it
+	// with the sibling change — NOT to blindly re-run the original task (whose target may
+	// no longer exist, which is the conflict). Without this the resolver re-runs the build
+	// task and "produces no changes".
+	Conflict bool `json:"conflict,omitempty"`
 	// RepoURL is the git clone/push URL for THIS job's repo (F9 multi-repo). A
 	// fungible worker leases jobs across repos, so the control plane tells it which
 	// repo each job belongs to — the worker-push harness clones/fetches/pushes here
