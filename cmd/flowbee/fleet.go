@@ -121,8 +121,8 @@ Create the file(s) on disk now. Make only the change described." --dangerously-s
 		spawn(id, argv...)
 	}
 
-	fmt.Printf("🐝 flowbee fleet up on %s → %s\n   %d build + 1 code-review + 1 author + 1 issue-review worker (all roles; this box is fungible capacity)\n",
-		host, *url, *builders)
+	fmt.Printf("🐝 flowbee fleet up on %s → %s  [%s]\n   %d build + 1 code-review + 1 author + 1 issue-review worker (all roles; this box is fungible capacity)\n",
+		host, *url, buildVersion(), *builders)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

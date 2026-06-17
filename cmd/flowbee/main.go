@@ -7,10 +7,42 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=<sha>".
 var version = "dev"
+
+// buildVersion returns the running binary's identity. With ldflags it's the injected
+// version; otherwise it reads the git revision Go embeds via `go build` (so a plain
+// `go build` still tells you EXACTLY which commit is running — the answer to "is this
+// the rebuilt binary or a stale one?", which bit the first multi-repo run).
+func buildVersion() string {
+	if version != "dev" && version != "" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		var rev, mod string
+		for _, s := range bi.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				rev = s.Value
+			case "vcs.modified":
+				mod = s.Value
+			}
+		}
+		if rev != "" {
+			if len(rev) > 12 {
+				rev = rev[:12]
+			}
+			if mod == "true" {
+				rev += "+dirty"
+			}
+			return "dev-" + rev
+		}
+	}
+	return version
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -46,7 +78,7 @@ func main() {
 	case "requeue":
 		err = runRequeue(args)
 	case "version", "-v", "--version":
-		fmt.Printf("flowbee %s\n", version)
+		fmt.Printf("flowbee %s\n", buildVersion())
 	default:
 		usage()
 		os.Exit(2)

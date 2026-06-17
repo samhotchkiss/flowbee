@@ -114,7 +114,7 @@ func runServe(_ []string) error {
 		// (git@github.com:owner/repo.git) — for fleets whose boxes auth with SSH keys
 		// (no HTTPS credential helper / no token at rest). Default HTTPS.
 		WorkerGitSSH: strings.EqualFold(os.Getenv("FLOWBEE_GIT_REMOTE"), "ssh"),
-	}, version)
+	}, buildVersion())
 	if cfg.AllowSelfMerge {
 		logger.Info("autonomous merge enabled (Branch B): self_merge eligible jobs merge without a human gate")
 	}
@@ -280,7 +280,7 @@ func runServe(_ []string) error {
 	}
 
 	logger.Info("flowbee serve started",
-		"version", version, "health", cfg.HealthAddr, "private", cfg.PrivateAddr)
+		"version", buildVersion(), "health", cfg.HealthAddr, "private", cfg.PrivateAddr)
 
 	<-ctx.Done()
 	logger.Info("shutting down")
