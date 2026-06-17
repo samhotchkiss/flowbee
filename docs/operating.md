@@ -96,6 +96,7 @@ What it does:
   conflicts after a sibling merged, so conflicts resolve autonomously instead of
   escalating), one **spec_author**, one **spec_reviewer**.
 - Workers commit + push with the box's own key; the control plane never gets their creds.
+- Re-registers each worker so the roster always reflects its current model + role.
 
 Flags: `--builders N`, `--mirror DIR`, `--agent-cmd` (review/author roles),
 `--build-agent-cmd` (build role — writes files), `--no-smoke`, `--systemd` (print a
