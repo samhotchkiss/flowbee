@@ -2,6 +2,7 @@ package project
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -231,5 +232,43 @@ func TestMergedJobDeletesItsIssueBranch(t *testing.T) {
 	}
 	if got := fake.DeletedBranches(); len(got) != 1 || got[0] != "flowbee/issue-77" {
 		t.Fatalf("DeletedBranches=%v, want [flowbee/issue-77]", got)
+	}
+}
+
+// TestTransientNotMergeableRetriedNotResolved: a "not mergeable" 405 that CLEARS on a
+// retry — GitHub recomputing mergeability after a sibling merge, NOT a real conflict —
+// must be retried and merge, never spinning up the conflict_resolver. (The persistent
+// case is covered by TestMergeConflictRoutesToResolverAfterFetch.)
+func TestTransientNotMergeableRetriedNotResolved(t *testing.T) {
+	st, fake, sender, clk := newSender(t)
+	ctx := context.Background()
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "t", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: clk.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging' WHERE id='t'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
+		JobID: "t", Action: store.ActionEnqueueMerge, Payload: `{"pr_number":42}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// inject ONE transient "not mergeable" (no SetMergeConflict -> not a real conflict).
+	fake.FailNextWriteWith(fmt.Errorf("merge 42: %w", gh.ErrMergeConflict))
+
+	_, _ = sender.DrainOnce(ctx) // attempt 1: transient 405 -> retry, must NOT route
+	if j, _ := st.GetJob(ctx, "t"); j.State == job.StateResolvingConflict {
+		t.Fatal("a transient not-mergeable must NOT route to the resolver while retries remain")
+	}
+	_, _ = sender.DrainOnce(ctx) // attempt 2: mergeability settled -> merge succeeds
+
+	enq := fake.Enqueued()
+	if len(enq) != 1 || enq[0] != 42 {
+		t.Fatalf("the merge should succeed on retry once mergeability settles, enqueued=%v", enq)
+	}
+	if j, _ := st.GetJob(ctx, "t"); j.State == job.StateResolvingConflict {
+		t.Fatal("a transient not-mergeable must never route to the resolver")
 	}
 }

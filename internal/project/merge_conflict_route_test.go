@@ -51,8 +51,11 @@ func TestMergeConflictRoutesToResolverAfterFetch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := sender.DrainOnce(ctx); err != nil {
-		t.Fatalf("drain should consume the conflict, not error: %v", err)
+	// a "not mergeable" 405 is first RETRIED a few drains (it may be GitHub recomputing
+	// mergeability after a sibling merge, not a real conflict). A PERSISTENT conflict —
+	// the fake 405s every attempt — routes to the resolver once the retries are spent.
+	for i := 0; i < mergeMergeabilityRetries; i++ {
+		_, _ = sender.DrainOnce(ctx) // early attempts return the conflict err (transient retry)
 	}
 
 	// fetched main (so the resolver base is the real post-merge main, not the stale mirror)

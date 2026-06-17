@@ -37,6 +37,15 @@ type Clock interface{ Now() time.Time }
 // long before this. A genuinely permanent 4xx is dead-lettered immediately, not here.
 const maxOutboxAttempts = 100
 
+// mergeMergeabilityRetries is how many times a "not mergeable" 405 is retried before it
+// is treated as a REAL conflict. GitHub recomputes a PR's mergeability ASYNCHRONOUSLY
+// after its base moves (a sibling just merged), and a merge attempt in that ~1–5s window
+// returns "not mergeable" even when the PR has NO content conflict. Retrying (the drain
+// re-attempts every few seconds) lets the transient settle, so concurrent non-conflicting
+// merges (epics, high concurrency) don't spuriously invoke the conflict_resolver. A REAL
+// conflict stays not-mergeable past the retries and then routes correctly.
+const mergeMergeabilityRetries = 3
+
 // criticalAction reports whether a permanently-failed outbox action should escalate
 // its job to a human (it blocks the pipeline: no PR -> no review/merge; no merge -> no
 // completion; no issue -> no spec materialization). A cosmetic action (a comment, a
@@ -181,6 +190,14 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 			// at the current main tip and CONSUME the merge row, instead of re-queuing the
 			// merge forever (which also pollutes the drain for the whole repo).
 			if errors.Is(err, gh.ErrMergeConflict) {
+				// FIRST rule out a TRANSIENT "not mergeable": GitHub recomputes mergeability
+				// async after a sibling merge, so an early merge attempt 405s with no real
+				// conflict. Retry a few drains (it settles in seconds) before resolving — else
+				// every near-simultaneous concurrent merge spuriously spins up the resolver.
+				if row.Attempts+1 < mergeMergeabilityRetries {
+					_ = s.store.BumpOutboxAttempts(ctx, row.ID)
+					return sent, err // leave the merge pending; the next drain re-attempts
+				}
 				// the sibling merged via the GitHub API, so the local mirror's main lags —
 				// fetch it FIRST so the resolver's base is the real post-merge main (with the
 				// sibling's change present), or the resolution would build on a stale base and
