@@ -2,8 +2,29 @@ package config
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// TestDefaultDBPathIsStandardLocation: the default database path must resolve to the
+// standard ~/.flowbee/flowbee.db, NOT a cwd-relative "flowbee.db". The relative
+// default made `flowbee board`/`doctor` silently open an empty ./flowbee.db (cryptic
+// "no such table") instead of the live control-plane DB when run without FLOWBEE_CONFIG.
+func TestDefaultDBPathIsStandardLocation(t *testing.T) {
+	got := Default().DatabaseURL
+	if got == "flowbee.db" {
+		t.Fatal("DatabaseURL defaults to cwd-relative \"flowbee.db\" — CLI commands won't find the live DB")
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		want := filepath.Join(home, ".flowbee", "flowbee.db")
+		if got != want {
+			t.Fatalf("default DatabaseURL=%q, want %q", got, want)
+		}
+	} else if !strings.HasSuffix(got, "flowbee.db") {
+		t.Fatalf("default DatabaseURL=%q, want a flowbee.db path", got)
+	}
+}
 
 // TestAllowSelfMergeEnv proves FLOWBEE_ALLOW_SELF_MERGE flips the §14 decision (F2):
 // default off (Branch A); "true"/"1" turns Branch B on.

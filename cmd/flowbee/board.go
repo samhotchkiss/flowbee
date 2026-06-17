@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -32,6 +33,14 @@ func runBoard(args []string) error {
 
 	jobs, err := st.BoardSnapshot(ctx)
 	if err != nil {
+		// store.Open creates the file if absent, so a wrong/empty path surfaces here as
+		// "no such table: jobs". Turn that into actionable guidance instead of a raw SQL
+		// error: the operator is almost always pointed at the wrong DB or hasn't started
+		// the control plane.
+		if strings.Contains(err.Error(), "no such table") {
+			return fmt.Errorf("no initialized flowbee database at %q — start the control plane (`flowbee serve`) first, or point FLOWBEE_CONFIG / database_url at the live DB (standard location: ~/.flowbee/flowbee.db)",
+				cfg.DatabaseURL)
+		}
 		return err
 	}
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +14,18 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/content"
 	"gopkg.in/yaml.v3"
 )
+
+// defaultDBPath is the standard single-file DB location, ~/.flowbee/flowbee.db —
+// matching the ~/.flowbee/ convention used for mirrors and config. Using this as the
+// default (rather than a cwd-relative "flowbee.db") means a CLI command like `flowbee
+// board` finds the live control-plane DB on the host without FLOWBEE_CONFIG set,
+// instead of silently creating an empty ./flowbee.db and erroring "no such table".
+func defaultDBPath() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".flowbee", "flowbee.db")
+	}
+	return "flowbee.db"
+}
 
 type Config struct {
 	DatabaseURL        string `yaml:"database_url"`
@@ -111,7 +124,7 @@ func (c Config) ContentPolicy() content.Policy {
 
 func Default() Config {
 	return Config{
-		DatabaseURL:        "flowbee.db",
+		DatabaseURL:        defaultDBPath(),
 		PrivateAddr:        ":7070",
 		HealthAddr:         ":7001",
 		WebhookAddr:        ":8443",
