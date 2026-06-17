@@ -46,6 +46,14 @@ escalating to a human.
 
 ---
 
+### What happens to the per-issue branch after a change merges?
+
+Flowbee deletes the `flowbee/issue-N` branch automatically after the merge — the merge
+commit keeps the branch's commits reachable from main, so only the ref is removed, and the
+repo does not accumulate stale branches.
+
+---
+
 ### What models does Flowbee use for building versus reviewing?
 
 By default, builders and the spec author run Sonnet (`claude --model sonnet`); the code
