@@ -32,7 +32,14 @@ func (s *Store) RequeueJob(ctx context.Context, jobID string, now time.Time) (jo
 		if err != nil {
 			return err
 		}
-		target := job.StateReady
+		// Re-arm to the job's OWN entry stage: a spec job restarts at spec_authoring (it
+		// has no build to rebuild), a build job at `ready`. Routing a spec escalation to a
+		// build (the old unconditional behavior) would re-arm it as a buildable job with no
+		// spec, which just fails again.
+		target, role, stage, cap := job.StateReady, "eng_worker", "build", "role:eng_worker"
+		if j.Kind == job.KindSpec {
+			target, role, stage, cap = job.StateSpecAuthoring, string(job.RoleSpecAuthor), "spec", "role:spec_author"
+		}
 		ev := ledger.Event{
 			JobID: jobID, JobSeq: seq + 1, Kind: ledger.KindStateChanged,
 			FromState: j.State, ToState: target, LeaseEpoch: j.LeaseEpoch + 1,
@@ -41,18 +48,20 @@ func (s *Store) RequeueJob(ctx context.Context, jobID string, now time.Time) (jo
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err
 		}
+		// clear over_budget + escalation_reason too: a requeued job is active again, not
+		// escalated, so it must drop out of the over-budget metric / needs-human triage.
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs
-			   SET state = ?, role = 'eng_worker', stage = 'build',
+			   SET state = ?, role = ?, stage = ?,
 			       required_capabilities = ?,
 			       head_sha = '', verdict = NULL,
-			       attempts = 0, bounces = 0,
+			       attempts = 0, bounces = 0, over_budget = 0, escalation_reason = '',
 			       lease_epoch = lease_epoch + 1,
 			       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 			       lease_hb_due = NULL, lease_deadline = NULL,
 			       enqueued_at = ?, updated_at = datetime('now')
 			 WHERE id = ?`,
-			string(target), marshalStrings([]string{"role:eng_worker"}),
+			string(target), role, stage, marshalStrings([]string{cap}),
 			now.Format(rfc3339), jobID); err != nil {
 			return fmt.Errorf("requeue: %w", err)
 		}
