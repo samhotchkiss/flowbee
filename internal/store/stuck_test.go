@@ -71,6 +71,37 @@ func TestWatchdogResyncsWedgedCaps(t *testing.T) {
 	}
 }
 
+// TestWatchdogLeavesReviewCapsAlone is the guard against my own over-reach: the fold
+// does NOT reproduce a review_pending job's reviewer capability (KindResultAccepted /
+// KindReviewClaimed don't fold it), so resyncing review states to the fold would STRIP
+// the [role:code_reviewer] gate and let any worker claim the review. The watchdog must
+// resync `ready` ONLY and never touch a review_pending job's caps.
+func TestWatchdogLeavesReviewCapsAlone(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "r", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+		Now: now, // seeded WITHOUT caps, exactly like the live #2221/#2223
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// move it to review_pending with the reviewer gate the result-accept projection sets,
+	// while the ledger (only a job_created event) folds to empty caps — the live drift.
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET state='review_pending', required_capabilities='["role:code_reviewer"]' WHERE id='r'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReconcileStuck(ctx, now, 90*time.Second, 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	j, _ := st.GetJob(ctx, "r")
+	if len(j.RequiredCapabilities) != 1 || j.RequiredCapabilities[0] != "role:code_reviewer" {
+		t.Fatalf("review caps=%v, want [role:code_reviewer] preserved (the watchdog must not strip the gate)", j.RequiredCapabilities)
+	}
+}
+
 // TestWatchdogEscalatesStalledWithLiveFleet: a leasable job that re-folds clean but
 // has sat unclaimed past the stall window WHILE live workers exist (a no-eligible
 // dead-end) is moved to needs_human so a human always eventually sees it.

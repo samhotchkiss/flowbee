@@ -19,15 +19,23 @@ type StuckReport struct {
 // ReconcileStuck is the forward-progress guarantee: no job stays permanently stuck.
 //
 //	(1) RESYNC — the jobs table is a READ MODEL folded from the canonical ledger; a
-//	    bug in any projection write can leave it disagreeing with a re-fold (#2217: a
+//	    bug in a projection write can leave it disagreeing with a re-fold (#2217: a
 //	    CI-fail bounce wrote the ledger's KindReviewBounced — whose fold yields
 //	    role:eng_worker — but left the projection's required_capabilities as
-//	    role:code_reviewer, so no builder could claim the `ready` job). For every
-//	    leasable job this re-folds its ledger and, when the leaseability fields (state,
-//	    role, required_capabilities) disagree, rewrites the projection to MATCH THE
-//	    LEDGER. This is determinism-restoring (it makes projection == Fold(events), the
-//	    system invariant) and self-heals the entire wedge CLASS, even from a future
-//	    projection bug we haven't found yet.
+//	    role:code_reviewer, so no builder could claim the `ready` job). For a `ready`
+//	    job this re-folds its ledger and, when the leaseability fields (role,
+//	    required_capabilities) disagree, rewrites the projection to MATCH THE LEDGER. It
+//	    is determinism-restoring (it makes projection == Fold(events), the invariant)
+//	    and self-heals the wedge CLASS, even from a future projection bug.
+//
+//	    Scope: `ready` ONLY. `ready` is the capability-gated build-lease surface where
+//	    the wedge bites, AND the fold is faithful there (job_created / bounce /
+//	    supersede / deps_cleared all reproduce the build caps exactly). The review/spec/
+//	    conflict gates capability-match too, but the fold does NOT reproduce their caps/
+//	    role through the claim->release cycle (KindResultAccepted/KindReviewClaimed
+//	    don't fold the reviewer cap the projection writes), so resyncing them to the
+//	    fold would STRIP the gate. Those states can't wedge on a stale build cap and
+//	    have their own no_eligible_worker alarm; leave them to it.
 //	(2) ESCALATE — a job that re-folds clean but has still sat leasable and UNCLAIMED
 //	    far longer than stallAfter, while live workers exist (so it is not merely a
 //	    down fleet), is a no-eligible-worker dead-end. A real KindStateChanged event
@@ -74,8 +82,10 @@ func (s *Store) ReconcileStuck(ctx context.Context, now time.Time, staleHB, stal
 			if err != nil {
 				return err
 			}
-			// (1) resync the projection to the ledger when leaseability fields diverge.
-			if cur.State == folded.State &&
+			// (1) resync the projection to the ledger when leaseability fields diverge —
+			// `ready` only (see the doc comment: the fold is faithful for build caps but
+			// not for the review/spec/conflict gates' caps).
+			if cur.State == job.StateReady && cur.State == folded.State &&
 				(cur.Role != folded.Role || !sameStrings(cur.RequiredCapabilities, folded.RequiredCapabilities)) {
 				if _, err := tx.ExecContext(ctx, `
 					UPDATE jobs SET role=?, required_capabilities=?, updated_at=datetime('now')
