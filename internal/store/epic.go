@@ -16,12 +16,33 @@ import (
 // ONCE over the whole epic — scope · coverage · dep-graph · standards — before any
 // issue fans out.
 type SeedEpicParams struct {
-	EpicID     string   // the epic-barrier job's id (children point at it via epic_id)
-	ChatRef    string   // lineage root
-	AuthorLens string   // the lens that authored the decomposition (anti-affinity)
-	IssueIDs   []string // the child issue job ids (each created in backlog)
+	EpicID     string      // the epic-barrier job's id (children point at it via epic_id)
+	ChatRef    string      // lineage root
+	AuthorLens string      // the lens that authored the decomposition (anti-affinity)
+	Repo       string      // the repo the epic + its issues build/merge in (F9 scope)
+	Issues     []EpicIssue // the decomposed child issues WITH content (preferred)
+	IssueIDs   []string    // legacy: child ids only, no content (used iff Issues is empty)
 	Priority   int
 	Now        time.Time
+}
+
+// EpicIssue is one decomposed child issue carrying the content a spec_author needs to
+// draft its spec once the epic barrier passes and it fans out.
+type EpicIssue struct {
+	ID         string
+	Task       string // the imperative the issue must satisfy ($FLOWBEE_TASK)
+	Acceptance string // the DONE-WHEN for the issue
+}
+
+func (p SeedEpicParams) issues() []EpicIssue {
+	if len(p.Issues) > 0 {
+		return p.Issues
+	}
+	out := make([]EpicIssue, len(p.IssueIDs))
+	for i, id := range p.IssueIDs {
+		out[i] = EpicIssue{ID: id}
+	}
+	return out
 }
 
 // SeedEpic creates the epic barrier + its child issues. The epic barrier starts in
@@ -35,12 +56,12 @@ func (s *Store) SeedEpic(ctx context.Context, p SeedEpicParams) error {
 		// the epic barrier: a spec_review job carrying the decomposition. It is the
 		// one issue-review the epic gets (a barrier over all the issues).
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO jobs (id, kind, flow, stage, state, role, chat_ref, author_lens, priority,
+			INSERT INTO jobs (id, kind, flow, stage, state, role, chat_ref, author_lens, priority, repo,
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 			                  epic_id, is_epic)
-			VALUES (?, 'spec', 'spec', 'epic_review', 'spec_review', 'spec_reviewer', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 3, 1, ?, 1)`,
-			p.EpicID, p.ChatRef, p.AuthorLens, p.Priority,
+			VALUES (?, 'spec', 'spec', 'epic_review', 'spec_review', 'spec_reviewer', ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 3, 1, ?, 1)`,
+			p.EpicID, p.ChatRef, p.AuthorLens, p.Priority, p.Repo,
 			marshalStrings([]string{"role:spec_reviewer"}), p.Now.Format(rfc3339), p.EpicID); err != nil {
 			return fmt.Errorf("insert epic barrier: %w", err)
 		}
@@ -61,29 +82,31 @@ func (s *Store) SeedEpic(ctx context.Context, p SeedEpicParams) error {
 
 		// each child issue: created in `backlog` (tracked, NOT scheduled), pointing at
 		// the epic. It cannot be leased until EpicFanOut releases it.
-		for _, id := range p.IssueIDs {
+		for _, iss := range p.issues() {
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO jobs (id, kind, flow, stage, state, role, chat_ref, priority,
+				INSERT INTO jobs (id, kind, flow, stage, state, role, chat_ref, priority, repo,
+				                  task_text, acceptance_criteria,
 				                  blocked_by, required_capabilities, enqueued_at,
 				                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 				                  epic_id, is_epic)
-				VALUES (?, 'spec', 'spec', 'epic_issue', 'backlog', 'spec_author', ?, ?, '[]', ?, ?, 0, 0, 5, 0, 3, 1, ?, 0)`,
-				id, p.ChatRef, p.Priority,
+				VALUES (?, 'spec', 'spec', 'epic_issue', 'backlog', 'spec_author', ?, ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 3, 1, ?, 0)`,
+				iss.ID, p.ChatRef, p.Priority, p.Repo, iss.Task, iss.Acceptance,
 				marshalStrings([]string{"role:spec_author"}), p.Now.Format(rfc3339), p.EpicID); err != nil {
-				return fmt.Errorf("insert epic child %s: %w", id, err)
+				return fmt.Errorf("insert epic child %s: %w", iss.ID, err)
 			}
 			cev := ledger.Event{
-				JobID: id, JobSeq: 1, Kind: ledger.KindJobCreated,
+				JobID: iss.ID, JobSeq: 1, Kind: ledger.KindJobCreated,
 				ToState: job.StateBacklog, Actor: "system", CreatedAt: p.Now,
 				Payload: ledger.Payload{
 					Kind: job.KindSpec, Flow: "spec", Stage: "epic_issue", Role: job.RoleSpecAuthor,
 					Priority: p.Priority, RequiredCapabilities: []string{"role:spec_author"},
+					TaskText: iss.Task, AcceptanceCriteria: iss.Acceptance,
 				},
 			}
 			if err := appendEvent(ctx, tx, cev); err != nil {
 				return err
 			}
-			if err := setJobSeq(ctx, tx, id, 1); err != nil {
+			if err := setJobSeq(ctx, tx, iss.ID, 1); err != nil {
 				return err
 			}
 		}

@@ -58,3 +58,25 @@ func TestFanOutReviewedEpicsDrain(t *testing.T) {
 		t.Fatalf("second drain: n=%d err=%v, want 0/nil (idempotent)", n, err)
 	}
 }
+
+// TestSeedEpicCarriesIssueContent: a decomposed epic's children must carry the task +
+// acceptance content (and repo) a spec_author needs once fanned out — without it the
+// author would have nothing to draft. Pins the projection AND the folded ledger.
+func TestSeedEpicCarriesIssueContent(t *testing.T) {
+	st := newLiveStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	if err := st.SeedEpic(ctx, SeedEpicParams{
+		EpicID: "ec", ChatRef: "goal", AuthorLens: "product_speccer", Repo: "flowbee",
+		Issues: []EpicIssue{
+			{ID: "ec-1", Task: "add docs/faq.md", Acceptance: "FAQ exists"},
+			{ID: "ec-2", Task: "add docs/glossary.md", Acceptance: "glossary exists"},
+		}, Now: now,
+	}); err != nil {
+		t.Fatalf("seed epic: %v", err)
+	}
+	j, _ := st.GetJob(ctx, "ec-1")
+	if j.TaskText != "add docs/faq.md" || j.AcceptanceCriteria != "FAQ exists" || j.Repo != "flowbee" {
+		t.Fatalf("child content not stored: task=%q acc=%q repo=%q", j.TaskText, j.AcceptanceCriteria, j.Repo)
+	}
+}

@@ -151,17 +151,17 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 	st.ContentPolicy = cfg.ContentPolicy
 	ui := web.New(st, clk, web.Config{StaleHB: staleHB})
 	return &Server{
-		store:        st,
-		clock:        clk,
-		minter:       minter,
-		registry:     worker.NewRegistry(st, cfg.LeaseTTLS, cfg.HeartbeatIntervalS, allow),
-		broker:       NewBroker(),
-		version:      version,
-		facts:        facts,
-		policy:       cfg.Policy,
-		leaseTTL:     cfg.LeaseTTL,
-		longPollWait: cfg.LongPollWait,
-		pollInterval: poll,
+		store:              st,
+		clock:              clk,
+		minter:             minter,
+		registry:           worker.NewRegistry(st, cfg.LeaseTTLS, cfg.HeartbeatIntervalS, allow),
+		broker:             NewBroker(),
+		version:            version,
+		facts:              facts,
+		policy:             cfg.Policy,
+		leaseTTL:           cfg.LeaseTTL,
+		longPollWait:       cfg.LongPollWait,
+		pollInterval:       poll,
 		mirrorPath:         cfg.MirrorPath,
 		bundleProvisioning: cfg.BundleProvisioning,
 		pushRemoteURL:      cfg.PushRemoteURL,
@@ -237,6 +237,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	// the planner front-door (ingest): seed a spec-authoring job from a submitted
 	// work item so the spec flow (author -> issue-review -> materialize) can run.
 	mux.HandleFunc("POST /v1/specs", s.specCreate)
+	mux.HandleFunc("POST /v1/epics", s.epicCreate)
 	// the board's machine-readable snapshot (HTML clients hit the web UI's "/"; a
 	// JSON client uses this stable endpoint instead of content-negotiating "/").
 	mux.HandleFunc("GET /v1/board", s.boardJSON)
@@ -867,6 +868,57 @@ func (s *Server) specSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	s.broker.Publish(LifeEvent{JobID: jobID, State: string(job.StateSpecReview), Event: "spec_authored", Epoch: epoch})
 	writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "spec_content_hash": hash, "spec_version": version})
+}
+
+// epicCreate is the planner front-door for a DECOMPOSED goal (F4): it seeds the
+// epic-barrier job (the ONE issue-review over the whole decomposition) plus a child
+// issue per submitted work item. The barrier review (scope · coverage · dep-graph)
+// runs once; on pass the fan-out drain releases the children, each into its own spec
+// flow (author -> review -> materialize -> build -> review -> merge). Loopback admin.
+func (s *Server) epicCreate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Title    string `json:"title"` // the epic goal / chat ref
+		Lens     string `json:"lens"`  // the lens that authored the decomposition (anti-affinity)
+		Repo     string `json:"repo"`
+		Priority int    `json:"priority"`
+		Issues   []struct {
+			Task       string `json:"task"`
+			Acceptance string `json:"acceptance"`
+		} `json:"issues"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if len(body.Issues) == 0 {
+		http.Error(w, "epic needs at least one issue", http.StatusBadRequest)
+		return
+	}
+	lens := body.Lens
+	if lens == "" {
+		lens = "product_speccer"
+	}
+	repo := body.Repo
+	if repo == "" {
+		repo = "default"
+	}
+	epicID := ulid.New()
+	issues := make([]store.EpicIssue, len(body.Issues))
+	ids := make([]string, len(body.Issues))
+	for i, it := range body.Issues {
+		id := ulid.New()
+		ids[i] = id
+		issues[i] = store.EpicIssue{ID: id, Task: it.Task, Acceptance: it.Acceptance}
+	}
+	if err := s.store.SeedEpic(r.Context(), store.SeedEpicParams{
+		EpicID: epicID, ChatRef: body.Title, AuthorLens: lens, Repo: repo,
+		Issues: issues, Priority: body.Priority, Now: s.clock.Now(),
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	s.broker.Publish(LifeEvent{JobID: epicID, State: "spec_review", Event: "epic_ingested"})
+	writeJSON(w, http.StatusOK, map[string]any{"epic_id": epicID, "issue_ids": ids})
 }
 
 // specCreate is the planner front-door (ingest): it seeds a spec-authoring job
