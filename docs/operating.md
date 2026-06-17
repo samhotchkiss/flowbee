@@ -108,6 +108,24 @@ flowbee fleet --url http://<host>:7070 --builders 3 --systemd > flowbee-fleet.se
 # install the printed unit + env file, then: systemctl --user enable --now flowbee-fleet
 ```
 
+### Review-model independence
+
+Flowbee runs genuinely different models for builder and reviewer roles so that reviews are
+uncorrelated with the code that produced them. Build workers and spec-author workers default
+to Sonnet (`claude --model sonnet`), while the code reviewer, conflict resolver, and spec
+reviewer default to Opus (`claude --model opus`). Because the reviewer never shares the
+builder's model, it cannot share the same blind spots — a systematic mistake the builder
+would miss is more likely to be caught.
+
+Operators can override the model per role via the `--agent-cmd` flag (reviewer, conflict
+resolver, and spec-reviewer roles) and `--build-agent-cmd` flag (build and spec-author
+roles), or the equivalent environment variables `FLOWBEE_AGENT_CMD` and
+`FLOWBEE_BUILD_AGENT_CMD`. For example, to point all review roles at a custom wrapper:
+
+```sh
+flowbee fleet --url http://<host>:7070 --builders 3 --agent-cmd "claude --model opus-custom"
+```
+
 ---
 
 ## 4. Feeding it work
