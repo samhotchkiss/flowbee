@@ -231,6 +231,11 @@ func TestM3ChangesRequestedBouncesAndExhausts(t *testing.T) {
 
 	jobID := "job-bounce"
 	reviewer, rg := driveToCodeReview(t, ctx, st, ts.URL, jobID)
+	// pin max_bounces=3 (below the per-reviewer cap of 6) so this test exercises the
+	// TOTAL-bounce exhaustion path, independent of the shipped default (now higher).
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET max_bounces=3 WHERE id=?`, jobID); err != nil {
+		t.Fatalf("pin max_bounces: %v", err)
+	}
 
 	// bounce #1: changes_requested -> ready (re-armed build stage), bounces=1.
 	resp, _, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "cr-1", "changes_requested", "", "")

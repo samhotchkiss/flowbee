@@ -373,8 +373,14 @@ func (e *m10Env) driveStallToNeedsHuman(t *testing.T, ctx context.Context, jobID
 func (e *m10Env) driveBouncesToNeedsHuman(t *testing.T, ctx context.Context, jobID string) {
 	t.Helper()
 	reviewer, rg := driveToCodeReview(t, ctx, e.st, e.private.URL, jobID)
-	// max_bounces defaults to 3. Bounce three times: the 3rd reaches the ceiling ->
-	// needs_human. The gate bounces on changes_requested regardless of facts.
+	// pin max_bounces=3 (below the per-reviewer cap of 6) so the TOTAL-bounce backstop
+	// is the trigger here — this asserts the "bounces" escalation reason specifically,
+	// independent of the shipped default (now the higher backstop).
+	if _, err := e.st.DB.ExecContext(ctx, `UPDATE jobs SET max_bounces=3 WHERE id=?`, jobID); err != nil {
+		t.Fatalf("pin max_bounces: %v", err)
+	}
+	// Bounce three times: the 3rd reaches the ceiling -> needs_human. The gate bounces
+	// on changes_requested regardless of facts.
 	epoch := rg.LeaseEpoch
 	for i := 0; i < 3; i++ {
 		resp, code, err := reviewer.Review(ctx, jobID, epoch, "bounce-"+itoa(i), "changes_requested", "", "")

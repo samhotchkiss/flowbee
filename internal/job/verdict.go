@@ -122,9 +122,16 @@ type GateInputs struct {
 	Claim     VerdictValue // the reviewer's CLAIM (untrusted; never the verdict)
 	Disp      Disposition  // requested disposition (only meaningful on approved)
 	Facts     DomainBFacts // reconciled GitHub facts (the authority, I-9)
-	Bounces   int          // current bounce count for this job
+	Bounces   int          // current bounce count for this job (total, across ALL reviewers)
 	MaxBounce int
-	Policy    Policy
+	// ReviewerRejections is how many times THIS review node (the bound reviewer
+	// identity) has ALREADY requested changes on this same job, counted from the
+	// ledger. When ReviewerRejections+1 reaches MaxReviewerRejections the gate parks
+	// the job for a human — a single reviewer stuck in a loop with one task is the
+	// real runaway signal, and it fires BEFORE the cruder total-bounce backstop. 0 =
+	// this reviewer has no prior rejection on this job.
+	ReviewerRejections int
+	Policy             Policy
 	// Content is the deterministic content-integrity Result (§9.2, I-11): the
 	// runtime computes it from the stored patch + declared blast-radius and threads
 	// it in. A nil Content means the gate was not run (no patch) — treated as the
@@ -172,9 +179,24 @@ type GateOutcome struct {
 // fact-state with a non-approved claim does not approve; a red/missing fact-state
 // with an approved claim does not approve (the hostile-worker case). A
 // changes_requested claim bounces (or exhausts to needs_human at max_bounces).
+// MaxReviewerRejections is the per-review-node rejection cap: if the SAME review
+// node requests changes on the same task this many times, the task is parked for
+// human intervention rather than rebuilt again. A single reviewer in a loop with
+// one task is the runaway signal a total-bounce cap misses (it can iterate freely
+// with DIFFERENT reviewers). The total max_bounces is a higher, cruder backstop.
+// 6 = a genuine standoff, not normal back-and-forth.
+const MaxReviewerRejections = 6
+
 func EvaluateGate(in GateInputs) GateOutcome {
 	switch in.Claim {
 	case VerdictChangesRequested:
+		// the per-reviewer loop cap fires FIRST: a single review node that has rejected
+		// this same task MaxReviewerRejections times is a standoff, not iteration — park
+		// it for a human (the store stamps EscalationReviewerRejections so the trigger is
+		// legible even though total bounces is still under max_bounces).
+		if in.ReviewerRejections+1 >= MaxReviewerRejections {
+			return GateOutcome{Trigger: TriggerBounceExhausted, Reason: "max_reviewer_rejections reached"}
+		}
 		if in.Bounces+1 >= in.MaxBounce {
 			return GateOutcome{Trigger: TriggerBounceExhausted, Reason: "max_bounces reached"}
 		}
@@ -291,6 +313,11 @@ type SpecGateInputs struct {
 	AuthorLens        string // §5.5 spec term: reviewer lens must differ from author lens
 	Bounces           int
 	MaxBounce         int
+	// ReviewerRejections is how many times THIS spec reviewer (bound identity) has
+	// already requested changes on this spec — the per-review-node loop cap, same as
+	// the code gate. At MaxReviewerRejections the spec is parked for a human instead
+	// of bounced to the author again.
+	ReviewerRejections int
 
 	// F4 amend-in-place: when the reviewer AMENDS a sub-standard spec rather than
 	// bouncing it to the author, the runtime commits the amended bytes and passes the
@@ -367,6 +394,11 @@ func EvaluateSpecGate(in SpecGateInputs) SpecGateOutcome {
 	// otherwise changes_requested -> bounce (or exhaust at max_bounces, I-6). This is
 	// the LEGACY spec-flow bounce path (kept for the build flow); issue-review proper
 	// uses amend/needs_design above and never reaches it.
+	// the per-reviewer loop cap fires first: a single spec reviewer that has rejected
+	// this same spec MaxReviewerRejections times is a standoff — park it for a human.
+	if in.ReviewerRejections+1 >= MaxReviewerRejections {
+		return SpecGateOutcome{Trigger: TriggerBounceExhausted, Reason: "max_reviewer_rejections reached"}
+	}
 	if in.Bounces+1 >= in.MaxBounce {
 		return SpecGateOutcome{Trigger: TriggerBounceExhausted, Reason: "max_bounces reached"}
 	}

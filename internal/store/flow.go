@@ -280,9 +280,24 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			facts.CIGreen = facts.CIGreen && liveGreen
 		}
 
+		// per-review-node loop cap: count how many times THIS reviewer identity has
+		// ALREADY requested changes on this job (from the ledger), so the gate can park
+		// a task a single reviewer keeps rejecting — before the cruder total-bounce
+		// backstop. Deterministic given the ledger, like the reconciled facts.
+		var reviewerPrior int
+		if j.BoundIdentity != "" {
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM job_events
+				 WHERE job_id = ? AND kind = 'verdict_claim' AND actor = ?
+				   AND json_extract(payload, '$.VerdictClaim') = 'changes_requested'`,
+				in.JobID, j.BoundIdentity).Scan(&reviewerPrior); err != nil {
+				return fmt.Errorf("count reviewer rejections: %w", err)
+			}
+		}
+
 		dec := engine.Decide(engine.EngineState{
 			Job: j, Now: in.Now, Epoch: j.LeaseEpoch, GitHub: facts, Policy: p, Content: &chk,
-		}, engine.ReviewClaim{Epoch: in.Epoch, Value: in.Claim, Disposition: in.Disposition})
+		}, engine.ReviewClaim{Epoch: in.Epoch, Value: in.Claim, Disposition: in.Disposition, ReviewerPriorRejections: reviewerPrior})
 		if dec.Reject != nil {
 			return lease.ErrStaleEpoch
 		}
@@ -363,6 +378,17 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			 WHERE id = ?`,
 			string(final), verdictJSON, headSHA, bouncesDelta, in.JobID); err != nil {
 			return fmt.Errorf("apply review projection: %w", err)
+		}
+		// stamp the explicit per-reviewer escalation reason: when this cap fires the
+		// total bounces is still under max_bounces, so the inferred classifier would
+		// mislabel the park. Make the trigger legible to the operator queue.
+		if final == job.StateNeedsHuman && in.Claim == job.VerdictChangesRequested &&
+			reviewerPrior+1 >= job.MaxReviewerRejections {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE jobs SET escalation_reason = ? WHERE id = ?`,
+				string(job.EscalationReviewerRejections), in.JobID); err != nil {
+				return fmt.Errorf("stamp reviewer-rejection escalation: %w", err)
+			}
 		}
 		if err := setJobSeq(ctx, tx, in.JobID, nextSeq); err != nil {
 			return err

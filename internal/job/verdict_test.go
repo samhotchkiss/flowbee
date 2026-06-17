@@ -80,6 +80,71 @@ func TestGateMintsApprovalOnlyFromReconciledFacts(t *testing.T) {
 	}
 }
 
+// TestGatePerReviewerRejectionCap: a SINGLE review node that has already requested
+// changes MaxReviewerRejections-1 times parks the job for a human on its next
+// rejection — BEFORE the cruder total-bounce backstop, and even though total
+// bounces is still well under MaxBounce. Fewer prior rejections bounce normally.
+func TestGatePerReviewerRejectionCap(t *testing.T) {
+	// total backstop is high (9); only the per-reviewer cap is in play here.
+	const maxBounce = 9
+
+	// one short of the cap (5 prior) still bounces — normal iteration.
+	out := EvaluateGate(GateInputs{
+		Claim: VerdictChangesRequested, MaxBounce: maxBounce,
+		Bounces: MaxReviewerRejections - 2, ReviewerRejections: MaxReviewerRejections - 2,
+	})
+	if out.Trigger != TriggerBounce {
+		t.Fatalf("%d prior same-reviewer rejections should still bounce, got %v (%s)",
+			MaxReviewerRejections-2, out.Trigger, out.Reason)
+	}
+
+	// at the cap (this is the MaxReviewerRejections-th rejection by this node) ->
+	// exhaust to needs_human, even though total bounces (5) << max_bounces (9).
+	out = EvaluateGate(GateInputs{
+		Claim: VerdictChangesRequested, MaxBounce: maxBounce,
+		Bounces: MaxReviewerRejections - 1, ReviewerRejections: MaxReviewerRejections - 1,
+	})
+	if out.Trigger != TriggerBounceExhausted {
+		t.Fatalf("the %dth same-reviewer rejection must park for a human, got %v (%s)",
+			MaxReviewerRejections, out.Trigger, out.Reason)
+	}
+	if out.Reason != "max_reviewer_rejections reached" {
+		t.Fatalf("park reason should name the per-reviewer cap, got %q", out.Reason)
+	}
+
+	// distributed rejections (different reviewers => low per-reviewer count) do NOT
+	// trip the per-reviewer cap; they ride the total backstop instead. ReviewerRejections
+	// stays low (0) while total bounces climbs toward the backstop.
+	out = EvaluateGate(GateInputs{
+		Claim: VerdictChangesRequested, MaxBounce: maxBounce,
+		Bounces: MaxReviewerRejections, ReviewerRejections: 0,
+	})
+	if out.Trigger != TriggerBounce {
+		t.Fatalf("distinct reviewers (per-reviewer=0) under the total backstop should bounce, got %v", out.Trigger)
+	}
+}
+
+// TestSpecGatePerReviewerRejectionCap mirrors the code gate: a spec reviewer that
+// keeps rejecting the same spec is parked at the per-reviewer cap.
+func TestSpecGatePerReviewerRejectionCap(t *testing.T) {
+	base := SpecGateInputs{
+		Claim: VerdictChangesRequested, MeetsStyle: false, MeetsRequirements: false,
+		CurrentSpecHash: "h1", ClaimBindsTo: "h1", MaxBounce: 9,
+	}
+	// under the cap -> bounce to author.
+	in := base
+	in.ReviewerRejections = MaxReviewerRejections - 2
+	if out := EvaluateSpecGate(in); out.Trigger != TriggerBounce {
+		t.Fatalf("spec: under per-reviewer cap should bounce, got %v", out.Trigger)
+	}
+	// at the cap -> exhaust to needs_human.
+	in = base
+	in.ReviewerRejections = MaxReviewerRejections - 1
+	if out := EvaluateSpecGate(in); out.Trigger != TriggerBounceExhausted {
+		t.Fatalf("spec: at per-reviewer cap should park for a human, got %v", out.Trigger)
+	}
+}
+
 // TestGateSelfMergeUnderPolicy: self_merge disposition is honored only when policy
 // allows it (Branch B) AND the M9 content-integrity gate is clear; default (Branch
 // A) or a failed content gate forces handoff.

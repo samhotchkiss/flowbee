@@ -132,6 +132,12 @@ const (
 	EscalationBounces  EscalationReason = "bounces"
 	EscalationCost     EscalationReason = "cost"
 	EscalationStall    EscalationReason = "stall"
+	// EscalationReviewerRejections is the per-review-node loop trigger (§12.6.1): a
+	// SINGLE review node requested changes on the same task MaxReviewerRejections
+	// times. That is a genuine standoff with one reviewer — park it for a human
+	// rather than rebuild forever. Distinct from EscalationBounces, the cruder
+	// total-across-ALL-reviewers backstop, which fires later (max_bounces).
+	EscalationReviewerRejections EscalationReason = "reviewer_rejections"
 	// EscalationDesign is the F4 design-fork escalation: issue-review determined the
 	// spec needs human design input. It deposits into the needs_design surface (not
 	// the needs_human chokepoint) — a deliberate "the machine should not decide this".

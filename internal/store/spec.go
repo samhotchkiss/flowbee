@@ -41,7 +41,7 @@ func (s *Store) SeedSpecJob(ctx context.Context, p SeedSpecParams) (job.Job, err
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq, repo,
 			                  task_text, acceptance_criteria)
-			VALUES (?, 'spec', 'spec', 'author', 'spec_authoring', 'spec_author', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 3, 1, ?, ?, ?)`,
+			VALUES (?, 'spec', 'spec', 'author', 'spec_authoring', 'spec_author', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 9, 1, ?, ?, ?)`,
 			p.ID, p.ChatRef, p.AuthorLens, p.Priority,
 			marshalStrings([]string{"role:spec_author"}), p.Now.Format(rfc3339), p.Repo,
 			p.TaskText, p.AcceptanceCriteria)
@@ -533,6 +533,20 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 			`SELECT COALESCE(author_lens,''), COALESCE(reviewer_lens,''), COALESCE(is_epic,0) FROM jobs WHERE id = ?`, in.JobID).
 			Scan(&authorLens, &reviewerLens, &isEpic)
 
+		// per-review-node loop cap (mirrors ReviewResult): count this spec reviewer's
+		// prior changes_requested claims on this spec so the gate parks a spec a single
+		// reviewer keeps rejecting, before the total-bounce backstop.
+		var reviewerPrior int
+		if j.BoundIdentity != "" {
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM job_events
+				 WHERE job_id = ? AND kind = 'spec_claim' AND actor = ?
+				   AND json_extract(payload, '$.VerdictClaim') = 'changes_requested'`,
+				in.JobID, j.BoundIdentity).Scan(&reviewerPrior); err != nil {
+				return fmt.Errorf("count spec reviewer rejections: %w", err)
+			}
+		}
+
 		dec := engine.Decide(engine.EngineState{
 			Job: j, Now: in.Now, Epoch: j.LeaseEpoch,
 			Spec: engine.SpecState{
@@ -543,6 +557,7 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 			Epoch: in.Epoch, Claim: in.Claim, ClaimBindsTo: in.BindsTo,
 			MeetsStyle: in.MeetsStyle, MeetsRequirements: in.MeetsRequirements,
 			AmendedHash: in.AmendedHash, AmendedVersion: in.AmendedVersion,
+			ReviewerPriorRejections: reviewerPrior,
 		})
 		if dec.Reject != nil {
 			return lease.ErrStaleEpoch
@@ -688,14 +703,22 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 			}
 			resp.Superseded = superseded
 		default:
-			// 3c) bounce exhausted -> needs_human.
+			// 3c) bounce exhausted -> needs_human. Stamp the per-reviewer reason when
+			// that cap (not the total) is what parked it, so the operator queue shows the
+			// right trigger (total bounces is still under max_bounces in that case).
+			reason := ""
+			if final == job.StateNeedsHuman && in.Claim == job.VerdictChangesRequested &&
+				reviewerPrior+1 >= job.MaxReviewerRejections {
+				reason = string(job.EscalationReviewerRejections)
+			}
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE jobs
 				   SET state = ?, bounces = bounces + ?,
+				       escalation_reason = CASE WHEN ? <> '' THEN ? ELSE escalation_reason END,
 				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 				       lease_hb_due = NULL, updated_at = datetime('now')
 				 WHERE id = ?`,
-				string(final), bouncesDelta, in.JobID); err != nil {
+				string(final), bouncesDelta, reason, reason, in.JobID); err != nil {
 				return fmt.Errorf("apply spec exhaust projection: %w", err)
 			}
 		}

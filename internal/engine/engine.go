@@ -99,6 +99,11 @@ type ReviewClaim struct {
 	Epoch       int
 	Value       job.VerdictValue
 	Disposition job.Disposition
+	// ReviewerPriorRejections is how many times THIS review node already requested
+	// changes on this job (counted from the ledger by the runtime). It feeds the
+	// per-reviewer loop cap in the gate — deterministic given the ledger, like the
+	// reconciled facts.
+	ReviewerPriorRejections int
 }
 
 // MergeDispatch advances a `mergeable` job onto its branch-point arm (§5.4),
@@ -134,6 +139,9 @@ type SpecReviewClaim struct {
 	// to the AMENDED hash — issue-review amends in place, never bounces to the author.
 	AmendedHash    string
 	AmendedVersion int
+	// ReviewerPriorRejections is how many times THIS spec reviewer already requested
+	// changes on this spec (counted from the ledger) — feeds the per-reviewer cap.
+	ReviewerPriorRejections int
 }
 
 func (Heartbeat) isEngineEvent()       {}
@@ -386,13 +394,14 @@ func Decide(s EngineState, e Event) Decision {
 		// claim. The claim's value/disposition are inputs to the gate, never the
 		// authority — a hostile `approved` over red facts bounces, never approves.
 		out := job.EvaluateGate(job.GateInputs{
-			Claim:     ev.Value,
-			Disp:      ev.Disposition,
-			Facts:     s.GitHub,
-			Bounces:   s.Job.Bounces,
-			MaxBounce: s.Job.MaxBounces,
-			Policy:    s.Policy,
-			Content:   s.Content, // §9.2 / I-11: forces handoff if the diff is not clear
+			Claim:              ev.Value,
+			Disp:               ev.Disposition,
+			Facts:              s.GitHub,
+			Bounces:            s.Job.Bounces,
+			MaxBounce:          s.Job.MaxBounces,
+			ReviewerRejections: ev.ReviewerPriorRejections,
+			Policy:             s.Policy,
+			Content:            s.Content, // §9.2 / I-11: forces handoff if the diff is not clear
 		})
 		switch out.Trigger {
 		case job.TriggerApproved:
@@ -436,10 +445,11 @@ func Decide(s EngineState, e Event) Decision {
 			SpecVersion:       s.Spec.Version,
 			ReviewerLens:      s.Spec.ReviewerLens,
 			AuthorLens:        s.Spec.AuthorLens,
-			Bounces:           s.Job.Bounces,
-			MaxBounce:         s.Job.MaxBounces,
-			AmendedHash:       ev.AmendedHash,
-			AmendedVersion:    ev.AmendedVersion,
+			Bounces:            s.Job.Bounces,
+			MaxBounce:          s.Job.MaxBounces,
+			ReviewerRejections: ev.ReviewerPriorRejections,
+			AmendedHash:        ev.AmendedHash,
+			AmendedVersion:     ev.AmendedVersion,
 		})
 		switch out.Trigger {
 		case job.TriggerSpecSignedOff:

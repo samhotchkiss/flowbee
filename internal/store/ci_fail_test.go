@@ -23,6 +23,12 @@ func TestCIFailBouncesThenEscalates(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// pin max_bounces=3 for this test so it asserts the ESCALATION MECHANISM, not the
+	// shipped default (which is the higher total-bounce backstop now that the per-
+	// review-node rejection cap is the primary review-loop trigger).
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET max_bounces=3 WHERE id='j'`); err != nil {
+		t.Fatal(err)
+	}
 	toReview := func() {
 		// mimic the real build->review_pending transition: the cap flips to the
 		// reviewer role. The CI-fail bounce MUST reset it back to eng_worker, or the
