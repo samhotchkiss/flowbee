@@ -1,7 +1,7 @@
 # Operating Flowbee
 
 A start-to-finish runbook: stand up a control plane, bring up a worker fleet, feed it
-work, and watch a change go from idea to merged PR — with real agents driving the entire pipeline.
+work, and watch a change go from idea to merged PR — with real agents — each a distinct model — driving the entire pipeline.
 
 Flowbee is **reconcile-first**: GitHub is the source of truth, the control plane is the
 only component that calls the GitHub API and the only one that merges, and workers only
