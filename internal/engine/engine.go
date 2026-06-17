@@ -470,6 +470,16 @@ func Decide(s EngineState, e Event) Decision {
 				Kind: ledger.KindSpecSuperseded,
 			}}}
 		case job.TriggerBounce:
+			if s.Job.IsEpic {
+				// an epic BARRIER has no author to re-draft — the decomposition is the
+				// artifact, provided by the planner. A changes_requested on it means a
+				// HUMAN must revise the decomposition, so escalate to needs_human rather
+				// than bounce to spec_authoring (a dead end: an epic has no author stage).
+				return Decision{Transitions: []Transition{{
+					From: job.StateSpecReview, To: job.StateNeedsHuman,
+					Kind: ledger.KindBounceExhausted, BouncesDelta: 1,
+				}}}
+			}
 			return Decision{Transitions: []Transition{{
 				From: job.StateSpecReview, To: job.StateSpecAuthoring,
 				Kind: ledger.KindSpecBounced, BouncesDelta: 1,

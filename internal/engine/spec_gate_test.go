@@ -132,6 +132,30 @@ func TestSpecGateNeedsDesign_Engine(t *testing.T) {
 }
 
 // TestSpecGateStaleEpoch: a stale lease epoch is rejected (409), never evaluated.
+// TestSpecGateEpicBounceEscalates: a changes_requested on an EPIC BARRIER has no author
+// to bounce to (the decomposition is provided, not authored), so it must escalate to
+// needs_human — not dead-end in spec_authoring. A non-epic spec still bounces to author.
+func TestSpecGateEpicBounceEscalates(t *testing.T) {
+	epic := specReviewState(4, "blake3:H2", "product_speccer", "engineering_manager")
+	epic.Job.IsEpic = true
+	dec := Decide(epic, SpecReviewClaim{
+		Epoch: 4, Claim: job.VerdictChangesRequested, ClaimBindsTo: "blake3:H2",
+	})
+	if len(dec.Transitions) != 1 || dec.Transitions[0].To != job.StateNeedsHuman {
+		t.Fatalf("epic barrier changes_requested must escalate to needs_human, got %+v", dec.Transitions)
+	}
+
+	// a NON-epic spec still bounces back to the author for a re-draft.
+	plain := specReviewState(4, "blake3:H2", "product_speccer", "engineering_manager")
+	pdec := Decide(plain, SpecReviewClaim{
+		Epoch: 4, Claim: job.VerdictChangesRequested, ClaimBindsTo: "blake3:H2",
+	})
+	if len(pdec.Transitions) != 1 || pdec.Transitions[0].To != job.StateSpecAuthoring {
+		t.Fatalf("non-epic spec changes_requested must bounce to spec_authoring, got %+v", pdec.Transitions)
+	}
+}
+
+// TestSpecGateStaleEpoch: a stale lease epoch is rejected (409), never evaluated.
 func TestSpecGateStaleEpoch(t *testing.T) {
 	s := specReviewState(7, "blake3:H2", "product_speccer", "staff_engineer")
 	dec := Decide(s, SpecReviewClaim{Epoch: 6, Claim: job.VerdictSignedOff, ClaimBindsTo: "blake3:H2", MeetsStyle: true, MeetsRequirements: true})
