@@ -409,7 +409,15 @@ type ResolveConflictParams struct {
 	ResolvedDiff        string // the resolver's resolved patch (untrusted, re-gated)
 	DeclaredBlastRadius string
 	PushedRef           string
-	Now                 time.Time
+	// PushedSHA is the resolved commit the resolver force-pushed to the issue branch.
+	// It MUST be recorded as the reconcile head baseline, or the next reconcile sweep
+	// reads the resolver's (legitimate, Flowbee-authored) head advance as an unexpected
+	// SHA move and SUPERSEDES the review back to build — which rebuilds, re-pushes, and
+	// supersedes again: an organic-conflict resolve→supersede→rebuild loop (found live
+	// by two issues editing the same file). Recording it makes prevHead == the resolved
+	// head on the next sweep, so the resolution settles into review like any build.
+	PushedSHA string
+	Now       time.Time
 }
 
 // ResolveConflictResult accepts a conflict_resolver's resolution and routes the job
@@ -460,6 +468,19 @@ func (s *Store) ResolveConflictResult(ctx context.Context, p ResolveConflictPara
 			marshalStrings([]string{"role:code_reviewer"}), p.PushedRef,
 			p.ResolvedDiff, p.DeclaredBlastRadius, p.JobID); err != nil {
 			return fmt.Errorf("apply resolve_conflict result: %w", err)
+		}
+		// record the resolved head as the reconcile baseline (the head Flowbee just
+		// pushed — Flowbee performed the git write, so it OWNS this fact, like a merge
+		// commit). Without this the next reconcile sweep sees the resolver's head advance
+		// as an unexpected SHA move and supersedes review_pending -> build, looping
+		// forever (resolve -> supersede -> rebuild -> re-conflict). Only the head moved;
+		// base is unchanged by a rebase-onto-current-main resolution.
+		if p.PushedSHA != "" {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE domain_b_facts SET head_sha = ?, updated_at = datetime('now')
+				 WHERE job_id = ?`, p.PushedSHA, p.JobID); err != nil {
+				return fmt.Errorf("record resolved head baseline: %w", err)
+			}
 		}
 		// close the resolver lease audit row.
 		if _, err := tx.ExecContext(ctx, `

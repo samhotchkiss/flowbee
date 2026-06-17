@@ -1282,7 +1282,8 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 	if cj, jerr := s.store.GetJob(r.Context(), jobID); jerr == nil && cj.State == job.StateResolvingConflict {
 		rr, rerr := s.store.ResolveConflictResult(r.Context(), store.ResolveConflictParams{
 			JobID: jobID, Epoch: epoch, ResolvedDiff: body.Diff,
-			DeclaredBlastRadius: string(body.BlastRadius), PushedRef: pushedRef, Now: s.clock.Now(),
+			DeclaredBlastRadius: string(body.BlastRadius), PushedRef: pushedRef,
+			PushedSHA: body.HeadSHA, Now: s.clock.Now(),
 		})
 		if rerr != nil {
 			s.writeFenceError(w, rerr)
