@@ -112,15 +112,24 @@ func (s *Store) ClaimSpecAuthor(ctx context.Context, p ClaimSpecAuthorParams) (*
 		if !job.CapabilitiesSatisfy(p.Attested, unmarshalStrings(reqJSON)) {
 			return lease.ErrLostRace
 		}
+		// Live-lease guard: unlike the build/review claims (which transition state on
+		// claim, so a second claimer's WHERE no longer matches), the spec_author stage
+		// STAYS spec_authoring while worked — so without this guard a SECOND spec_author
+		// worker re-claims the in-flight job, bumps the epoch, and FENCES the first,
+		// whose submit then 409s (the live multi-worker churn: 11 claims for one spec).
+		// A job with an unexpired lease (heartbeats keep lease_deadline in the future) is
+		// not claimable; an expired one (dead worker) is — the recovery path is preserved.
 		row := tx.QueryRowContext(ctx, `
 			UPDATE jobs
 			   SET bound_identity = ?, bound_model_family = ?,
 			       lease_epoch = lease_epoch + 1, lease_id = ?,
 			       lease_deadline = ?, lease_hb_due = ?, updated_at = datetime('now')
 			 WHERE id = ? AND state = 'spec_authoring'
+			   AND (bound_identity IS NULL OR bound_identity = ''
+			        OR lease_deadline IS NULL OR lease_deadline = '' OR lease_deadline < ?)
 			RETURNING lease_epoch, job_seq`,
 			p.Identity, p.ModelFamily, p.LeaseID,
-			deadline.Format(rfc3339), deadline.Format(rfc3339), p.JobID)
+			deadline.Format(rfc3339), deadline.Format(rfc3339), p.JobID, p.Now.Format(rfc3339))
 		var newEpoch, prevSeq int
 		if err := row.Scan(&newEpoch, &prevSeq); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -408,6 +417,9 @@ func (s *Store) ClaimSpecReview(ctx context.Context, p ClaimSpecReviewParams) (*
 		if authorLens != "" && p.Lens == authorLens {
 			return lease.ErrLostRace
 		}
+		// Live-lease guard (same as ClaimSpecAuthor): spec_review STAYS spec_review while
+		// worked, so without this a second spec_reviewer steals the in-flight lease and
+		// fences the first → submit 409 churn. Unexpired lease => not claimable.
 		row := tx.QueryRowContext(ctx, `
 			UPDATE jobs
 			   SET role = 'spec_reviewer', stage = 'review',
@@ -415,9 +427,11 @@ func (s *Store) ClaimSpecReview(ctx context.Context, p ClaimSpecReviewParams) (*
 			       lease_epoch = lease_epoch + 1, lease_id = ?,
 			       lease_deadline = ?, lease_hb_due = ?, updated_at = datetime('now')
 			 WHERE id = ? AND state = 'spec_review'
+			   AND (bound_identity IS NULL OR bound_identity = ''
+			        OR lease_deadline IS NULL OR lease_deadline = '' OR lease_deadline < ?)
 			RETURNING lease_epoch, job_seq`,
 			p.Identity, p.ModelFamily, p.Lens, p.LeaseID,
-			deadline.Format(rfc3339), deadline.Format(rfc3339), p.JobID)
+			deadline.Format(rfc3339), deadline.Format(rfc3339), p.JobID, p.Now.Format(rfc3339))
 		var newEpoch, prevSeq int
 		if err := row.Scan(&newEpoch, &prevSeq); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
