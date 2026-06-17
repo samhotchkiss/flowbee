@@ -31,6 +31,7 @@ func (r *recordingHistory) CommitHistory(branch, _ string, files []gitops.Histor
 }
 
 func (r *recordingHistory) HeadSHA(string) (string, error) { return "deadbeef", nil }
+func (r *recordingHistory) FetchBranch(string) error        { return nil }
 
 // TestF11HistoryWiredPerRepo: the F11 issue-archive projection (build-list §F) is
 // wired per repo through multirepo.WithHistory. On a merged->done reconcile, draining
