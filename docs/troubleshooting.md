@@ -13,6 +13,7 @@ behavior* — a safety gate doing its job, not a fault to force past.
 | Unsure which Flowbee binary/version is actually running. | `flowbee version` prints the build's git SHA. | Compare the printed SHA against the intended release; deploy/restart the correct binary if it differs. |
 | A worker process crashed. | `systemctl status flowbee-fleet` shows the unit and its restarts. | **None required** — the systemd-managed fleet auto-respawns the crashed worker. Verify recovery via the same `systemctl status flowbee-fleet`. |
 | `fleet-health` shows stale workers. | A worker lost its heartbeat and is no longer re-registering. | Restart the fleet on the affected box: `systemctl restart flowbee-fleet`. Workers re-register automatically on startup. |
+| A PR sat in `merging` briefly, then merged on its own. | The merge log shows a transient "not mergeable" response followed by a successful retry. | **Expected behavior, not a bug.** GitHub was recomputing mergeability after a sibling merge; Flowbee retried and the merge completed — no action needed. |
 
 ## An epic's child issues never start.
 
