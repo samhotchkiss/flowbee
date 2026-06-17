@@ -144,6 +144,15 @@ building → review_pending → code_review → mergeable → merging → done**
   `flowbee_cost_micro_usd_total` (cumulative metered spend), and `flowbee_jobs_over_budget`.
   The pages that matter: a wedged `needs_human` job, `flowbee_fleet_workers{status="live"} == 0`
   with waiting jobs, or `over_budget` climbing.
+  Example minimal `prometheus.yml` scrape config:
+
+  ```yaml
+  scrape_configs:
+    - job_name: flowbee
+      scrape_interval: 30s
+      static_configs:
+        - targets: ['localhost:7001']
+  ```
 - **The board:** the control plane logs each state transition, so `journalctl`/stdout is
   the live board. Each transition is also queryable from the single-file SQLite DB.
 - **The git trail** is the durable record: each issue lives on `flowbee/issue-N`; every
