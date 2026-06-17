@@ -100,6 +100,7 @@ What it does:
 - Resolves merge conflicts automatically via a dedicated conflict resolver.
 - Streams each worker's logs to journald for live tailing.
 - Backs the job ledger up to object storage on a schedule.
+- Rotates each worker's auth token before it expires.
 
 Flags: `--builders N`, `--mirror DIR`, `--agent-cmd` (review/author roles),
 `--build-agent-cmd` (build role — writes files), `--no-smoke`, `--systemd` (print a
