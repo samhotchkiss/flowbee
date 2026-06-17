@@ -826,7 +826,14 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, ep
 	if agentCmd == "" {
 		return "", nil
 	}
-	cmd := exec.CommandContext(ctx, "sh", "-c", agentCmd)
+	// Bound the agent by the lease's absolute cap (+margin). The CP revokes a lease at
+	// lease_ttl_s EVEN while heartbeating (the un-gameable cap), so an agent that outruns
+	// it is a zombie working a job the CP already reassigned. A hung/slow agent must NEVER
+	// block the worker loop forever — cmd.Wait would never return, silently removing the
+	// worker from the fleet. Kill it when the deadline passes OR when the CP revokes.
+	runCtx, cancel := context.WithTimeout(ctx, time.Duration(ttlS+30)*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, "sh", "-c", agentCmd)
 	cmd.Dir = dir
 	cmd.Env = env
 	var errb, outb strings.Builder
@@ -855,7 +862,13 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, ep
 			case <-done:
 				return
 			case <-t.C:
-				_, _, _ = c.Heartbeat(ctx, jobID, epoch)
+				// act on the CP's verdict: a `cancel` directive (over-budget / two-rung kill)
+				// or a stale-epoch 409 means the lease is GONE — stop the now-orphaned agent
+				// at once and free the worker, instead of finishing reassigned work.
+				if hbDir, st, _ := c.Heartbeat(runCtx, jobID, epoch); hbDir == "cancel" || st == 409 {
+					cancel()
+					return
+				}
 			}
 		}
 	}()
@@ -872,6 +885,11 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, ep
 		})
 	}
 	if werr != nil {
+		// distinguish a deadline/revoke kill (the lease is gone — the caller releases and
+		// loops to fresh work) from a genuine agent failure, so the log isn't misleading.
+		if runCtx.Err() != nil {
+			return out, fmt.Errorf("agent aborted (lease revoked or exceeded lease_ttl): %w", runCtx.Err())
+		}
 		return out, fmt.Errorf("agent cmd: %v: %s", werr, strings.TrimSpace(errb.String()))
 	}
 	return out, nil
