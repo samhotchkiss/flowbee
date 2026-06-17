@@ -260,10 +260,11 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE jobs SET state='ready', role='eng_worker', bounces=bounces+1,
+		UPDATE jobs SET state='ready', role='eng_worker', required_capabilities=?,
+		       bounces=bounces+1,
 		       enqueued_at=?, lease_id=NULL, bound_identity=NULL, bound_model_family=NULL,
 		       updated_at=datetime('now') WHERE id=?`,
-		now.Format(rfc3339), j.ID); err != nil {
+		marshalStrings([]string{"role:eng_worker"}), now.Format(rfc3339), j.ID); err != nil {
 		return fmt.Errorf("apply ci-fail bounce: %w", err)
 	}
 	return setJobSeq(ctx, tx, j.ID, nextSeq)

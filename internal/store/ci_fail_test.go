@@ -24,7 +24,11 @@ func TestCIFailBouncesThenEscalates(t *testing.T) {
 		t.Fatal(err)
 	}
 	toReview := func() {
-		if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='review_pending' WHERE id='j'`); err != nil {
+		// mimic the real build->review_pending transition: the cap flips to the
+		// reviewer role. The CI-fail bounce MUST reset it back to eng_worker, or the
+		// re-armed `ready` build is unleaseable (no builder matches role:code_reviewer).
+		if _, err := st.DB.ExecContext(ctx,
+			`UPDATE jobs SET state='review_pending', required_capabilities='["role:code_reviewer"]' WHERE id='j'`); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -42,6 +46,11 @@ func TestCIFailBouncesThenEscalates(t *testing.T) {
 		}
 		if j.Role != job.RoleEngWorker {
 			t.Fatalf("bounce %d: role=%s, want eng_worker (re-armed for rebuild)", i, j.Role)
+		}
+		// the re-armed ready build MUST require the builder cap, not the reviewer cap —
+		// else no worker can claim it and it wedges (the live #2217 stall).
+		if len(j.RequiredCapabilities) != 1 || j.RequiredCapabilities[0] != "role:eng_worker" {
+			t.Fatalf("bounce %d: required_capabilities=%v, want [role:eng_worker] (else unleaseable)", i, j.RequiredCapabilities)
 		}
 	}
 	toReview()
