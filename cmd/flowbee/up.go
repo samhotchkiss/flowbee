@@ -25,8 +25,13 @@ import (
 // on each remote; `up` is the local all-in-one.
 func runUp(args []string) error {
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
-	defaultAgent := `claude -p "$(cat "$FLOWBEE_TASK_FILE")" --dangerously-skip-permissions`
-	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", defaultAgent), "agent CLI spawned per job (reads $FLOWBEE_TASK_FILE)")
+	// Per-role agent commands default to EMPTY so roleAgentCmd injects the per-role
+	// `--model` alias (genuine §5.5 diversity — Opus reviews what Sonnet built), the
+	// file-writing prompt for builders/resolvers, and `--output-format json` for cost
+	// metering — the SAME machinery `flowbee fleet` uses. A flag (or FLOWBEE_*_CMD env)
+	// override replaces it for every role.
+	agentCmd := fs.String("agent-cmd", os.Getenv("FLOWBEE_AGENT_CMD"), "override the review/author agent CLI (empty = per-role --model defaults)")
+	buildCmd := fs.String("build-agent-cmd", os.Getenv("FLOWBEE_BUILD_AGENT_CMD"), "override the build/resolver agent CLI (empty = per-role --model defaults)")
 	mirror := fs.String("mirror", envOr("FLOWBEE_MIRROR_PATH", filepath.Join(os.TempDir(), "flowbee-mirror.git")), "local bare mirror path")
 	selfMerge := fs.Bool("self-merge", envOr("FLOWBEE_ALLOW_SELF_MERGE", "") != "", "enable Branch B autonomous merge")
 	if err := fs.Parse(args); err != nil {
@@ -93,17 +98,13 @@ func runUp(args []string) error {
 		return fmt.Errorf("control plane did not come up at %s", base)
 	}
 
-	// 4. one worker per pipeline role. Distinct model_family tags keep code-review
-	// off the same family as the build (anti-affinity); the issue-reviewer lens is
-	// distinct from the author's, enforced server-side. All real-agent loops.
-	roles := []struct{ role, identity, family string }{
-		{"spec_author", "spec-author", "claude"},
-		{"spec_reviewer", "issue-reviewer", "sonnet"},
-		{"eng_worker", "builder", "claude"},
-		{"code_reviewer", "code-reviewer", "opus"},
-	}
-	for _, r := range roles {
-		spawn(r.role, "work", "--role", r.role, "--identity", r.identity, "--model-family", r.family, "--agent-cmd", *agentCmd)
+	// 4. one worker per pipeline role — each with its OWN model (Opus reviews/resolves
+	// what Sonnet built: genuine §5.5 uncorrelated review, not just distinct tags) and
+	// the cost-reporting JSON harness. Mirrors `flowbee fleet` so `up` is not a degraded
+	// shadow of it: conflict_resolver is included (a real merge conflict routes to a
+	// resolving_conflict job only it can claim — omit it and every conflict escalates).
+	for _, r := range upRoles(*agentCmd, *buildCmd) {
+		spawn(r.role, "work", "--role", r.role, "--identity", r.identity, "--model-family", r.family, "--agent-cmd", r.cmd)
 	}
 
 	fmt.Printf("\n🐝 Flowbee is up.\n   dashboard: %s/dashboard\n   board:     %s/board\n   intake:    label a GitHub issue `flowbee:build`, or POST %s/v1/specs\n   merge:     %s\n\n",
@@ -116,6 +117,29 @@ func runUp(args []string) error {
 	fmt.Println("\nflowbee up: shutting down fleet...")
 	killAll(kids)
 	return nil
+}
+
+// upRole is one supervised worker loop `flowbee up` spawns: a pipeline role, its
+// identity, its model_family (= the --model alias, also the anti-affinity tag), and
+// the fully-rendered agent command.
+type upRole struct{ role, identity, family, cmd string }
+
+// upRoles is the single-box role roster — one worker per pipeline stage, with the
+// SAME per-role model/prompt machinery as `flowbee fleet` (roleAgentCmd). Builders
+// and the conflict resolver get the file-writing build template; the author and the
+// two reviewers get the verdict/spec template. The reviewer/resolver family (opus)
+// differs from the builder/author family (sonnet) so anti-affinity (I-10) holds with
+// a REAL model difference, not just a label. agentOverride/buildOverride (the
+// --agent-cmd / --build-agent-cmd flags) replace the per-role defaults when set.
+func upRoles(agentOverride, buildOverride string) []upRole {
+	const reviewFamily = "opus" // the review/resolve model; differs from the builder family
+	return []upRole{
+		{"spec_author", "spec-author", fleetBuilderFamily, roleAgentCmd(fleetBuilderFamily, false, agentOverride, buildOverride)},
+		{"spec_reviewer", "issue-reviewer", reviewFamily, roleAgentCmd(reviewFamily, false, agentOverride, buildOverride)},
+		{"eng_worker", "builder", fleetBuilderFamily, roleAgentCmd(fleetBuilderFamily, true, agentOverride, buildOverride)},
+		{"code_reviewer", "code-reviewer", reviewFamily, roleAgentCmd(reviewFamily, false, agentOverride, buildOverride)},
+		{"conflict_resolver", "conflict-resolver", reviewFamily, roleAgentCmd(reviewFamily, true, agentOverride, buildOverride)},
+	}
 }
 
 func orDefault(v, def string) string {

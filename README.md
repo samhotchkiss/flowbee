@@ -67,7 +67,9 @@ export FLOWBEE_GITHUB_OWNER=you FLOWBEE_GITHUB_REPO=my-project
 export FLOWBEE_GITHUB_TOKEN=github_pat_...    # fine-grained: contents + PRs + issues (write)
 
 # bring up the WHOLE fleet in one command:
-# control plane + a real-agent worker for every role (author, review, build, code-review)
+# control plane + a real-agent worker for every role — spec author, issue reviewer,
+# builder, code reviewer, conflict resolver — each on its OWN model (Opus reviews
+# what Sonnet built: genuine uncorrelated review, §5.5)
 flowbee up --self-merge
 ```
 
