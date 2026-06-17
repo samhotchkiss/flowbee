@@ -556,6 +556,12 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	family := r.URL.Query().Get("model_family")
 	roleFilter := job.Role(r.URL.Query().Get("role"))
 
+	// polling for work is proof of liveness: bump last_seen so an idle worker (no
+	// active lease to heartbeat) isn't badged stale on the roster / by the watchdog.
+	if identity != "" {
+		_ = s.store.RecordWorkerSeen(r.Context(), identity, s.clock.Now())
+	}
+
 	attested, err := s.registry.AttestedFor(r.Context(), identity)
 	if err != nil {
 		http.Error(w, "lease error", http.StatusInternalServerError)

@@ -5,6 +5,16 @@ import (
 	"time"
 )
 
+// RecordWorkerSeen bumps a worker's last_seen — proof of liveness from any worker
+// call, notably the lease long-poll. An idle worker polling for work IS alive even
+// with no active lease to heartbeat; without this it shows stale on the roster and
+// falsely trips the fleet-health watchdog (an idle fleet read as a down fleet).
+func (s *Store) RecordWorkerSeen(ctx context.Context, identity string, now time.Time) error {
+	_, err := s.DB.ExecContext(ctx,
+		`UPDATE workers SET last_seen_at = ? WHERE identity = ?`, now.UTC().Format(rfc3339), identity)
+	return err
+}
+
 // FleetHealth is the operator-facing "is anyone home?" snapshot: how many workers are
 // live vs stale, and how many jobs are waiting for one. A positive WaitingJobs with
 // zero LiveWorkers is the silent-stall signature — a `ready` job that nobody can pick
