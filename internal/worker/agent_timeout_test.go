@@ -27,8 +27,10 @@ func TestHungAgentKilledOnContextEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		// a hung agent: sleeps far longer than the test would ever wait.
-		_, err := runAgentHeartbeatIO(ctx, c, "j", 1, 3600, t.TempDir(), "sleep 30", nil, true)
+		// a hung agent that FORKS a child holding the stdout pipe (`| cat`) — the real
+		// case: killing only the direct child leaves the orphan pinning cmd.Wait(). The
+		// fix kills the whole process group, so Wait returns when the GROUP dies.
+		_, err := runAgentHeartbeatIO(ctx, c, "j", 1, 3600, t.TempDir(), "sleep 30 | cat", nil, true)
 		done <- err
 	}()
 

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/client"
@@ -836,6 +837,22 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, ep
 	cmd := exec.CommandContext(runCtx, "sh", "-c", agentCmd)
 	cmd.Dir = dir
 	cmd.Env = env
+	// Run the agent in its OWN process group, and on cancel/timeout kill the WHOLE
+	// group — not just `sh`. A real agent forks children (the model CLI, git, …) that
+	// INHERIT the stdout/stderr pipe; killing only the direct child leaves those orphans
+	// holding the pipe open, so cmd.Wait() blocks until THEY exit (up to the full agent
+	// run) — re-wedging the worker the timeout was meant to free. Setpgid + a group-kill
+	// Cancel closes the pipe at once; WaitDelay force-closes it as a backstop. (This is
+	// also what made the unit test pass locally but hang in CI: a shell that exec-optimized
+	// `sh -c "cmd"` into one process vs one that forked a pipe-holding child.)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // -pid = the whole group
+		}
+		return nil
+	}
+	cmd.WaitDelay = 10 * time.Second
 	var errb, outb strings.Builder
 	cmd.Stderr = &errb
 	cmd.Stdout = &outb // always capture: needed to parse the agent's reported cost/usage
