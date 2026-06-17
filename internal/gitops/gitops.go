@@ -19,6 +19,50 @@ import (
 	"strings"
 )
 
+// gitCredHelper is an inline git credential helper that supplies a GitHub token from the
+// ENVIRONMENT (FLOWBEE_GITHUB_TOKEN, which the control-plane process already holds), so
+// the token never appears in argv. argv (/proc/pid/cmdline) is world-readable and shows
+// in `ps`; the env (/proc/pid/environ) is owner+root only. Git invokes it as `sh -c
+// '<helper> "$@"' <name> <op>`, so $1 is the operation.
+const gitCredHelper = `!f() { test "$1" = get && printf 'username=x-access-token\npassword=%s\n' "$FLOWBEE_GITHUB_TOKEN"; }; f`
+
+// gitCredFor splits a token-bearing https URL (https://x-access-token:TOKEN@host/path)
+// into a CLEAN url plus the `-c credential.helper=…` args that feed the token from the
+// environment. The token is DISCARDED from the url — it is the same FLOWBEE_GITHUB_TOKEN
+// the git process inherits, so the helper reads it from env. SSH and already-clean urls
+// pass through with no helper (SSH auths by key; the helper only fires on an http 401).
+func gitCredFor(remoteURL string) (clean string, credArgs []string) {
+	const marker = "https://x-access-token:"
+	if !strings.HasPrefix(remoteURL, marker) {
+		return remoteURL, nil
+	}
+	rest := remoteURL[len(marker):]
+	at := strings.IndexByte(rest, '@')
+	if at < 0 {
+		return remoteURL, nil
+	}
+	return "https://" + rest[at+1:], []string{"-c", "credential.helper=" + gitCredHelper}
+}
+
+// CloneBareMirror clones url into a bare mirror at path, keeping any GitHub token out of
+// BOTH argv and the persisted config. It clones with a clean url + the env-based
+// credential helper, then writes that helper into the mirror config so later
+// `git fetch origin` authenticates from FLOWBEE_GITHUB_TOKEN in the environment — the
+// token never lands on disk. A non-token (SSH/clean) url clones plainly.
+func CloneBareMirror(path, url string) error {
+	clean, cred := gitCredFor(url)
+	args := append(append([]string{}, cred...), "clone", "--bare", "--quiet", clean, path)
+	if _, err := run("", "git", args...); err != nil {
+		return fmt.Errorf("clone bare mirror: %w", err)
+	}
+	if len(cred) > 0 {
+		// https token clone: persist the env-reading helper so future fetches auth
+		// without a token in the config (the origin url is already clean).
+		_, _ = run("", "git", "--git-dir", path, "config", "credential.helper", gitCredHelper)
+	}
+	return nil
+}
+
 // EpochRef is the canonical epoch-namespaced ref a worker pushes its build to.
 // Flowbee promotes it onto a real branch only after validating the epoch (I-12);
 // a stale epoch's ref is orphaned, never promoted.
@@ -118,7 +162,9 @@ func (m *Mirror) DropRef(ref string) error {
 // publishes the build commit as a branch a PR can be opened against. Force-updates
 // the branch so a re-arm at a new epoch republishes cleanly.
 func (m *Mirror) PushCommit(remoteURL, sha, branch string) error {
-	if _, err := run("", "git", "--git-dir", m.Path, "push", "--force", remoteURL, sha+":refs/heads/"+branch); err != nil {
+	clean, cred := gitCredFor(remoteURL)
+	args := append(append([]string{}, cred...), "--git-dir", m.Path, "push", "--force", clean, sha+":refs/heads/"+branch)
+	if _, err := run("", "git", args...); err != nil {
 		return fmt.Errorf("push commit to %s: %w", branch, err)
 	}
 	return nil
@@ -131,7 +177,9 @@ func (m *Mirror) PushCommit(remoteURL, sha, branch string) error {
 // does not exist yet (the first build), the node starts from base. exists=false means
 // the branch is absent on the remote (a brand-new issue branch).
 func (m *Mirror) RemoteBranchTip(remoteURL, branch string) (sha string, exists bool, err error) {
-	out, lerr := run("", "git", "--git-dir", m.Path, "ls-remote", remoteURL, "refs/heads/"+branch)
+	clean, cred := gitCredFor(remoteURL)
+	args := append(append([]string{}, cred...), "--git-dir", m.Path, "ls-remote", clean, "refs/heads/"+branch)
+	out, lerr := run("", "git", args...)
 	if lerr != nil {
 		return "", false, fmt.Errorf("ls-remote %s: %w", branch, lerr)
 	}
@@ -152,7 +200,9 @@ func (m *Mirror) RemoteBranchTip(remoteURL, branch string) (sha string, exists b
 // tip the worker-push harness stacks on). Idempotent; force-updates the local ref.
 func (m *Mirror) FetchRef(remoteURL, remoteRef, localRef string) error {
 	spec := "+" + remoteRef + ":" + localRef
-	if _, err := run("", "git", "--git-dir", m.Path, "fetch", "--quiet", remoteURL, spec); err != nil {
+	clean, cred := gitCredFor(remoteURL)
+	args := append(append([]string{}, cred...), "--git-dir", m.Path, "fetch", "--quiet", clean, spec)
+	if _, err := run("", "git", args...); err != nil {
 		return fmt.Errorf("fetch %s: %w", remoteRef, err)
 	}
 	return nil
@@ -530,11 +580,13 @@ func (w *Worktree) CommitAuthored(identity, message string, allowEmpty bool) (sh
 // rebased/re-armed head. remoteURL bears the node's credential (only the control
 // plane caller ever uses the GitHub API — a push is plain git, not the API).
 func (w *Worktree) PushTo(remoteURL, branch string, force bool) error {
-	args := []string{"push"}
+	clean, cred := gitCredFor(remoteURL)
+	args := append([]string{}, cred...)
+	args = append(args, "push")
 	if force {
 		args = append(args, "--force")
 	}
-	args = append(args, remoteURL, "HEAD:refs/heads/"+branch)
+	args = append(args, clean, "HEAD:refs/heads/"+branch)
 	if _, err := run(w.Dir, "git", args...); err != nil {
 		return fmt.Errorf("push to %s: %w", branch, err)
 	}

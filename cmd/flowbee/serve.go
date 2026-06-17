@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -445,12 +444,13 @@ func ensureControlMirror(logger *slog.Logger) {
 		return
 	}
 	logger.Info("provisioning control-plane mirror from GitHub", "path", mp)
-	if out, err := exec.Command("git", "clone", "--bare", "--quiet", url, mp).CombinedOutput(); err != nil {
-		logger.Error("clone control-plane mirror", "err", err, "out", strings.TrimSpace(string(out)))
+	if err := gitops.CloneBareMirror(mp, url); err != nil {
+		logger.Error("clone control-plane mirror", "err", err)
 		return
 	}
-	// the mirror's origin URL embeds the token (needed for private-repo fetch/push);
-	// lock the mirror down so that credential isn't world/group-readable on the box.
+	// the token is NOT stored in the mirror config (CloneBareMirror persists an
+	// env-reading credential helper instead) and never appeared in argv; still lock the
+	// mirror down as defense-in-depth.
 	_ = os.Chmod(mp, 0o700)
 	_ = os.Chmod(filepath.Join(mp, "config"), 0o600)
 }
@@ -542,8 +542,8 @@ func ensureRepoMirror(logger *slog.Logger, mp, url string) {
 	if _, err := os.Stat(mp); err == nil {
 		return // already provisioned
 	}
-	if out, err := exec.Command("git", "clone", "--bare", "--quiet", url, mp).CombinedOutput(); err != nil {
-		logger.Error("clone repo mirror", "path", mp, "err", err, "out", strings.TrimSpace(string(out)))
+	if err := gitops.CloneBareMirror(mp, url); err != nil {
+		logger.Error("clone repo mirror", "path", mp, "err", err)
 		return
 	}
 	_ = os.Chmod(mp, 0o700)

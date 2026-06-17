@@ -214,8 +214,10 @@ func printFleetSystemd(url string, builders int, agentCmd, buildCmd string) {
 	if v := os.Getenv("FLOWBEE_GIT_REMOTE"); v != "" {
 		fmt.Printf("FLOWBEE_GIT_REMOTE=%s\n", v)
 	}
-	if v := os.Getenv("FLOWBEE_WORKER_AUTH_SECRET"); v != "" {
-		fmt.Printf("FLOWBEE_WORKER_AUTH_SECRET=%s\n", v)
+	if os.Getenv("FLOWBEE_WORKER_AUTH_SECRET") != "" {
+		// print a PLACEHOLDER, never the live secret — the unit text is often pasted,
+		// committed, or logged. The operator fills in the real value in the chmod-600 env.
+		fmt.Printf("FLOWBEE_WORKER_AUTH_SECRET=<shared-worker-secret>\n")
 	}
 	fmt.Printf("FLOWBEE_AGENT_CMD=%s\n", oneLine(agentCmd))
 	fmt.Printf("FLOWBEE_BUILD_AGENT_CMD=%s\n\n", oneLine(buildCmd))
