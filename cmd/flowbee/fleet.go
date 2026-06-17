@@ -131,12 +131,33 @@ func runFleet(args []string) error {
 	// rate-limited / mis-configured agent otherwise stalls every job as the vague
 	// "agent produced no changes". Fail loudly here instead.
 	builderCmd := roleAgentCmd(fleetBuilderFamily, true, *agentCmd, *buildCmd)
+	// the review roles default to a DIFFERENT model than the builder (§5.5), so resolve a
+	// representative review command (the code_reviewer's) to smoke-test separately.
+	reviewFamily := "opus"
+	for _, r := range nonBuilderFleetRoles() {
+		if r.role == "code_reviewer" {
+			reviewFamily = r.family
+		}
+	}
+	reviewerCmd := roleAgentCmd(reviewFamily, false, *agentCmd, *buildCmd)
 	if !*noSmoke {
 		fmt.Printf("smoke-testing the build agent on %s ...\n", host)
 		if err := smokeAgent(builderCmd); err != nil {
-			return fmt.Errorf("agent smoke test FAILED on %s: %w\n   fix the agent (e.g. `claude --version` / re-auth) then retry, or --no-smoke to skip", host, err)
+			return fmt.Errorf("build agent smoke test FAILED on %s: %w\n   fix the agent (e.g. `claude --version` / re-auth) then retry, or --no-smoke to skip", host, err)
 		}
-		fmt.Println("✓ agent works")
+		fmt.Println("✓ build agent works")
+		// Validate the REVIEW model too. It defaults to a different model than the builder,
+		// so an account that has the build model but not the review model would pass the
+		// build smoke, start the fleet, then fail EVERY review at runtime — a silent stall
+		// the build smoke alone can't catch. Skip only if the operator pinned both roles to
+		// the same command (then the build smoke already covered it).
+		if reviewerCmd != builderCmd {
+			fmt.Printf("smoke-testing the review agent on %s ...\n", host)
+			if err := smokeReviewAgent(reviewerCmd); err != nil {
+				return fmt.Errorf("review agent smoke test FAILED on %s: %w\n   the review model differs from the build model (§5.5); ensure it's available + authed, or override --agent-cmd, or --no-smoke to skip", host, err)
+			}
+			fmt.Println("✓ review agent works")
+		}
 	}
 
 	env := append(os.Environ(), "FLOWBEE_URL="+*url)
@@ -351,6 +372,40 @@ func smokeAgent(buildCmd string) error {
 		return fmt.Errorf("agent exited with error (is it installed + authed?): %v: %s", runErr, trunc(string(out), 300))
 	}
 	return fmt.Errorf("agent ran but wrote no file — likely not authed, rate-limited, or wrong --build-agent-cmd: %s", trunc(string(out), 300))
+}
+
+// smokeReviewAgent runs the REVIEW agent command on a trivial prompt and confirms it
+// exits cleanly with output — proving the review model (which defaults to a DIFFERENT
+// model than the builder, e.g. Opus) is installed, authed, and reachable. The review
+// agent emits a verdict, not files, so it can't be checked for ok.txt like the build
+// agent; a clean exit with non-empty output is the signal. Without this, an account
+// missing the review model passes the build smoke and fails every review at runtime.
+func smokeReviewAgent(reviewCmd string) error {
+	dir, err := os.MkdirTemp("", "flowbee-smoke-rv-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	taskFile := filepath.Join(dir, "task.md")
+	if err := os.WriteFile(taskFile, []byte("Reply with exactly the word: ok"), 0o644); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", reviewCmd)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"FLOWBEE_TASK_FILE="+taskFile,
+		"FLOWBEE_TASK=Reply with ok.",
+	)
+	out, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		return fmt.Errorf("review agent exited with error (is the review model available + authed?): %v: %s", runErr, trunc(string(out), 300))
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		return fmt.Errorf("review agent ran but produced no output — likely not authed or wrong --agent-cmd: %s", trunc(string(out), 300))
+	}
+	return nil
 }
 
 func trunc(s string, n int) string {
