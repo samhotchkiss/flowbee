@@ -29,6 +29,14 @@ Postgres/MySQL to run. It is litestream-friendly for continuous backup to object
 
 ---
 
+### Does Flowbee run as a managed service?
+
+Yes — both halves run under systemd with `Restart=always`: `flowbee serve --systemd` for
+the control plane and `flowbee fleet --systemd` for each worker box, so they survive
+reboots and restart cleanly.
+
+---
+
 ### What happens when two Flowbee PRs conflict?
 
 When one PR merges and a sibling no longer applies cleanly, Flowbee routes the sibling to
