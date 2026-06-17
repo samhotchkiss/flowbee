@@ -6,6 +6,15 @@ Short answers to the questions new operators ask first. For the full runbook see
 
 ---
 
+### What happens when two Flowbee PRs conflict?
+
+When one PR merges and a sibling no longer applies cleanly, Flowbee routes the sibling to
+a `conflict_resolver` worker that rebases onto current `main` and resolves the markers; the
+resolved diff is then re-reviewed and merged — conflicts resolve autonomously instead of
+escalating to a human.
+
+---
+
 ### What models does Flowbee use for building versus reviewing?
 
 By default, builders and the spec author run Sonnet (`claude --model sonnet`); the code
