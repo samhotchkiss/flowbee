@@ -132,6 +132,13 @@ const (
 	EscalationBounces  EscalationReason = "bounces"
 	EscalationCost     EscalationReason = "cost"
 	EscalationStall    EscalationReason = "stall"
+	// EscalationCIStalled is the stuck-CI trigger: a review_pending job whose PR has
+	// been open with CI NOT green for the entire (generous) stall window — CI is wedged
+	// (the runner is down, no workflow was triggered, or the run is perpetually pending),
+	// not merely slow. Distinct from a generic stall so the operator fixes CI (re-run /
+	// requeue) rather than hunting the job. A silent indefinite review is a worse failure
+	// than a clear page, so the watchdog surfaces it instead of waiting forever.
+	EscalationCIStalled EscalationReason = "ci_stalled"
 	// EscalationReviewerRejections is the per-review-node loop trigger (§12.6.1): a
 	// SINGLE review node requested changes on the same task MaxReviewerRejections
 	// times. That is a genuine standoff with one reviewer — park it for a human

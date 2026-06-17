@@ -73,24 +73,49 @@ func TestReviewCandidatesExcludeCINotReady(t *testing.T) {
 	}
 }
 
-// TestWatchdogDoesNotEscalateReviewWaitingOnCI: a review_pending job with its PR
-// open but CI not yet green is healthily blocked on Domain B, not a no-eligible
-// dead-end. Even stalled past the window with a live fleet, the watchdog must leave
-// it alone — escalating it on a stale updated_at would falsely page a human for a
-// review that is simply waiting on a slow CI run. A review with NO PR yet stays
-// escalatable (a genuine PR-creation wedge).
-func TestWatchdogDoesNotEscalateReviewWaitingOnCI(t *testing.T) {
+// TestWatchdogToleratesSlowCIWithinWindow: a review_pending job blocked on a CI run
+// that is still WITHIN the generous stall window is healthily waiting on Domain B —
+// the watchdog must leave it alone (no false page for a slow CI run).
+func TestWatchdogToleratesSlowCIWithinWindow(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
 	now := time.Unix(100000, 0)
 
-	seedReviewPending(t, st, "waiting", now, true, false) // PR open, CI pending
+	seedReviewPending(t, st, "slow", now, true, false) // PR open, CI pending
+	seedWorker(t, st, "feller-reviewer-1", now)
+	// updated_at 10 min ago — well within a 30 min window.
+	recent := now.Add(-10 * time.Minute).Format(time.RFC3339Nano)
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at=? WHERE id='slow'`, recent); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := st.ReconcileStuck(ctx, now, 90*time.Second, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Escalated != 0 {
+		t.Fatalf("Escalated=%d, want 0 (slow CI within the window must not page)", rep.Escalated)
+	}
+	if j, _ := st.GetJob(ctx, "slow"); j.State != job.StateReviewPending {
+		t.Fatalf("slow-CI review state=%s, want review_pending", j.State)
+	}
+}
+
+// TestWatchdogEscalatesWedgedCI: a review whose CI never goes green for the WHOLE
+// stall window is WEDGED (runner down / no workflow triggered), not merely slow — the
+// watchdog must surface it to a human with a DISTINCT ci_stalled reason rather than
+// let the review wait forever. A review with NO PR escalates as a generic wedge.
+func TestWatchdogEscalatesWedgedCI(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(100000, 0)
+
+	seedReviewPending(t, st, "wedged", now, true, false) // PR open, CI pending forever
 	seedReviewPending(t, st, "noprstuck", now, false, false)
 	seedWorker(t, st, "feller-reviewer-1", now)
 
-	// stall both: updated_at an hour in the past, no lease.
+	// stall both past the window: updated_at an hour in the past, no lease.
 	stale := now.Add(-1 * time.Hour).Format(time.RFC3339Nano)
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at=? WHERE id IN ('waiting','noprstuck')`, stale); err != nil {
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at=? WHERE id IN ('wedged','noprstuck')`, stale); err != nil {
 		t.Fatal(err)
 	}
 
@@ -98,13 +123,15 @@ func TestWatchdogDoesNotEscalateReviewWaitingOnCI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// only the no-PR review escalates; the CI-waiting one is left alone.
-	if rep.Escalated != 1 {
-		t.Fatalf("Escalated=%d, want 1 (no-PR review escalates, CI-waiting review does not)", rep.Escalated)
+	if rep.Escalated != 2 {
+		t.Fatalf("Escalated=%d, want 2 (wedged-CI review + no-PR review both surface)", rep.Escalated)
 	}
-	wj, _ := st.GetJob(ctx, "waiting")
-	if wj.State != job.StateReviewPending {
-		t.Fatalf("CI-waiting review state=%s, want review_pending (must not escalate)", wj.State)
+	wj, _ := st.GetJob(ctx, "wedged")
+	if wj.State != job.StateNeedsHuman {
+		t.Fatalf("wedged-CI review state=%s, want needs_human (no silent infinite wait)", wj.State)
+	}
+	if wj.EscalationReason != string(job.EscalationCIStalled) {
+		t.Fatalf("wedged-CI escalation_reason=%q, want %q", wj.EscalationReason, job.EscalationCIStalled)
 	}
 	nj, _ := st.GetJob(ctx, "noprstuck")
 	if nj.State != job.StateNeedsHuman {

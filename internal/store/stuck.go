@@ -102,16 +102,20 @@ func (s *Store) ReconcileStuck(ctx context.Context, now time.Time, staleHB, stal
 			if live == 0 || cur.LeaseID != "" {
 				return nil
 			}
-			// A review_pending job with its PR open but CI not yet green is NOT a
-			// no-eligible-worker dead-end — it is waiting on Domain B (an external CI run
-			// or the next reconcile). It is intentionally not offered to reviewers until
-			// CI reconciles green (see ReviewPendingCandidates), so its updated_at no
-			// longer advances on every poll; escalating it on a stale updated_at would
-			// falsely page a human for a review that is simply waiting on a slow CI run.
-			// CI-red is bounced out of review_pending by reconcile, never escalated here.
+			// A review_pending job with its PR open but CI not yet green is waiting on
+			// Domain B (an external CI run). It is intentionally NOT offered to reviewers
+			// until CI reconciles green (see ReviewPendingCandidates), so its updated_at no
+			// longer advances on every poll. Within the (generous, ~4×lease_ttl) stall
+			// window this is a healthy slow-CI wait — do NOT page. But it must not wait
+			// FOREVER: a CI that never goes green in the WHOLE window is wedged (runner
+			// down, no workflow triggered, perpetually pending), and a silent indefinite
+			// review is a worse failure than a clear page — so past the window it escalates
+			// with a DISTINCT ci_stalled reason (operator fixes CI / requeues, not hunts the
+			// job). CI-red is bounced out of review_pending by reconcile, never escalated here.
+			ciWedged := false
 			if cur.State == job.StateReviewPending {
 				if waiting, werr := reviewWaitingOnCITx(ctx, tx, id); werr == nil && waiting {
-					return nil
+					ciWedged = true
 				}
 			}
 			// updated_at is a projection-only column (not folded onto job.Job); it is
@@ -123,7 +127,11 @@ func (s *Store) ReconcileStuck(ctx context.Context, now time.Time, staleHB, stal
 			}
 			ts, perr := time.Parse(rfc3339, updated)
 			if perr != nil || now.Sub(ts) < stallAfter {
-				return nil
+				return nil // still within the generous window: a real build/review/CI cycle
+			}
+			reason := ""
+			if ciWedged {
+				reason = string(job.EscalationCIStalled)
 			}
 			ev := ledger.Event{
 				JobID: id, JobSeq: seq + 1, Kind: ledger.KindStateChanged,
@@ -134,7 +142,9 @@ func (s *Store) ReconcileStuck(ctx context.Context, now time.Time, staleHB, stal
 				return err
 			}
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE jobs SET state='needs_human', updated_at=datetime('now') WHERE id=?`, id); err != nil {
+				`UPDATE jobs SET state='needs_human',
+				     escalation_reason = CASE WHEN ? <> '' THEN ? ELSE escalation_reason END,
+				     updated_at=datetime('now') WHERE id=?`, reason, reason, id); err != nil {
 				return fmt.Errorf("escalate %s: %w", id, err)
 			}
 			if err := setJobSeq(ctx, tx, id, seq+1); err != nil {
