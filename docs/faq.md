@@ -85,6 +85,23 @@ keeps itself fed without hand-holding. If a box does go down entirely, restart
 
 ---
 
+### What happens if a reviewer keeps rejecting the same task?
+
+After **6 changes-requested rejections by the same review node**, Flowbee parks the job
+for human intervention with escalation reason `reviewer_rejections`. The job moves to
+`needs_human` so an operator can inspect the disagreement between builder and reviewer
+before more cycles are spent.
+
+This per-reviewer cap is distinct from — and fires before — the cruder `max_bounces`
+backstop, which counts total rejections across **all** reviewers combined. You can think of
+them as two separate circuit breakers: `reviewer_rejections` catches the case where one
+particular reviewer is consistently unhappy with the work; `max_bounces` catches the case
+where the job has accumulated too many total review trips regardless of which node did the
+rejecting. Both land the job in `needs_human`; use `flowbee requeue <job-id>` once the
+underlying issue is resolved to re-arm it with a fresh budget.
+
+---
+
 ### Why might a change to Flowbee's own source require a human to merge?
 
 Because a change to Flowbee can change the very rules that would approve it. A diff that
