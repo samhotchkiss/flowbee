@@ -70,6 +70,15 @@ whatever agent it wraps, and reports the result; it renews the lease while still
 working and the lease expires if it goes silent. Each lease is fenced by an
 **epoch** so that exactly one worker holds a given job at a time.
 
+### lease reaping
+
+When a worker stops heartbeating — due to a crash, OOM, or network loss — the
+control plane reaps its **lease** fast, after a few missed heartbeats, presuming
+the worker dead. Reaping revokes the lease, bumps the **epoch** to fence out the
+old worker if it resurfaces, and re-arms the job so another worker can claim it.
+Fast reaping (rather than waiting for the full TTL to expire) keeps queue latency
+low when a worker dies mid-job.
+
 ### merge queue
 
 The ordered line of approved PRs waiting to land on `main`. Flowbee runs a
