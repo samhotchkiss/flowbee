@@ -203,22 +203,27 @@ func printFleetSystemd(url string, builders int, agentCmd, buildCmd string) {
 	// commands (the build prompt is multi-line) to a space.
 	oneLine := func(s string) string { return strings.Join(strings.Fields(s), " ") }
 
-	fmt.Printf("# 1. Write %s  (chmod 600 — may hold FLOWBEE_WORKER_AUTH_SECRET):\n", envPath)
+	fmt.Printf("# 1. Write %s  (chmod 600 — holds FLOWBEE_WORKER_AUTH_SECRET):\n", envPath)
 	fmt.Printf("FLOWBEE_URL=%s\n", url)
-	if v := os.Getenv("FLOWBEE_GITHUB_OWNER"); v != "" {
-		fmt.Printf("FLOWBEE_GITHUB_OWNER=%s\n", v)
+	// FLOWBEE_REPO_URL is REQUIRED — `flowbee fleet` refuses to start without it (build
+	// workers clone/pull the repo through it). Echo the resolved value; if neither it
+	// nor OWNER+REPO is set in this shell, emit an obvious placeholder so the operator
+	// fills it in rather than installing a unit that dies at startup. systemd env files
+	// take the whole line after `=` as the value, so this stays comment-free.
+	repoURL := os.Getenv("FLOWBEE_REPO_URL")
+	if repoURL == "" {
+		if o, r := os.Getenv("FLOWBEE_GITHUB_OWNER"), os.Getenv("FLOWBEE_GITHUB_REPO"); o != "" && r != "" {
+			repoURL = "https://github.com/" + o + "/" + r + ".git"
+		}
 	}
-	if v := os.Getenv("FLOWBEE_GITHUB_REPO"); v != "" {
-		fmt.Printf("FLOWBEE_GITHUB_REPO=%s\n", v)
+	if repoURL == "" {
+		repoURL = "git@github.com:OWNER/REPO.git"
 	}
-	if v := os.Getenv("FLOWBEE_GIT_REMOTE"); v != "" {
-		fmt.Printf("FLOWBEE_GIT_REMOTE=%s\n", v)
-	}
-	if os.Getenv("FLOWBEE_WORKER_AUTH_SECRET") != "" {
-		// print a PLACEHOLDER, never the live secret — the unit text is often pasted,
-		// committed, or logged. The operator fills in the real value in the chmod-600 env.
-		fmt.Printf("FLOWBEE_WORKER_AUTH_SECRET=<shared-worker-secret>\n")
-	}
+	fmt.Printf("FLOWBEE_REPO_URL=%s\n", repoURL)
+	// A production control plane enforces worker auth, so the fleet needs the shared
+	// secret. Always emit the line as a PLACEHOLDER (never the live value — the unit
+	// text is often pasted, committed, or logged); delete it only for an insecure dev CP.
+	fmt.Printf("FLOWBEE_WORKER_AUTH_SECRET=<shared-worker-secret>\n")
 	fmt.Printf("FLOWBEE_AGENT_CMD=%s\n", oneLine(agentCmd))
 	fmt.Printf("FLOWBEE_BUILD_AGENT_CMD=%s\n\n", oneLine(buildCmd))
 
