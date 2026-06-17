@@ -73,6 +73,15 @@ a separate `flowbee serve` control plane (the multi-box topology).
 
 ---
 
+### Does Flowbee run as a managed service?
+
+Yes — both halves are designed to run under systemd with `Restart=always`. Use
+`flowbee serve --systemd` for the control plane and `flowbee fleet --systemd` on each
+worker box. With `Restart=always` both processes survive reboots and restart cleanly after
+unexpected exits, so the fleet stays up without operator hand-holding.
+
+---
+
 ### How do I check which build of Flowbee is running?
 
 Run `flowbee version`. It prints the embedded git SHA recorded at build time via
