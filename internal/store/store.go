@@ -60,4 +60,13 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 
 func (s *Store) Ping(ctx context.Context) error { return s.DB.PingContext(ctx) }
 
-func (s *Store) Close() error { return s.DB.Close() }
+// Close checkpoints the WAL into the main db file, then closes. The TRUNCATE
+// checkpoint (the control plane is the only connection at shutdown) folds every
+// committed write into flowbee.db and shrinks the WAL to zero, so: a file-level backup
+// of just flowbee.db is self-contained, the next start replays no WAL, and a graceful
+// SIGTERM leaves no lingering lock. Best-effort — a checkpoint failure must not block
+// shutdown (the WAL is still durable on disk for the next open to replay).
+func (s *Store) Close() error {
+	_, _ = s.DB.ExecContext(context.Background(), "PRAGMA wal_checkpoint(TRUNCATE)")
+	return s.DB.Close()
+}
