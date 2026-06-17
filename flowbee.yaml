@@ -3,7 +3,7 @@ database_url: flowbee.db     # SQLite file (WAL); no database server required
 private_addr: ":7070"        # worker API (loopback / Tailscale only); 7000 = macOS AirPlay
 health_addr: ":7001"         # /healthz
 webhook_addr: ":8443"        # GitHub webhooks (unused until M6)
-lease_ttl_s: 300             # must be >= 3 * heartbeat_interval_s (DESIGN §6.3.3)
+lease_ttl_s: 1200            # also the un-gameable lease cap; MUST exceed real agent build time
 heartbeat_interval_s: 30
 long_poll_wait_s: 30
 river_max_workers: 10

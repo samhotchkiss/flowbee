@@ -750,7 +750,13 @@ func runAgentHeartbeat(ctx context.Context, c *client.Client, jobID string, epoc
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("agent start: %w", err)
 	}
+	// heartbeat well under the soft rungs (phase budget ~TTL/2, stale threshold
+	// ~3×heartbeat) so the lease never lapses mid-build — cap at 60s so a long TTL
+	// doesn't stretch the interval past those thresholds (#40).
 	interval := ttlS / 3
+	if interval > 60 {
+		interval = 60
+	}
 	if interval < 20 {
 		interval = 20
 	}

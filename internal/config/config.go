@@ -115,7 +115,12 @@ func Default() Config {
 		PrivateAddr:        ":7070",
 		HealthAddr:         ":7001",
 		WebhookAddr:        ":8443",
-		LeaseTTLS:          300,
+		// LeaseTTLS is also the absolute lease cap (Rung-3, un-gameable): a worker can
+		// hold a lease at most this long, even while heartbeating. It MUST exceed a real
+		// agent build's wall time, or a multi-minute build is revoked mid-run and its
+		// pushed result fenced 409 (the #40 churn). 20 min covers real agent builds; a
+		// crashed worker is still caught sooner by the soft heartbeat rungs.
+		LeaseTTLS:          1200,
 		HeartbeatIntervalS: 30,
 		LongPollWaitS:      30,
 		RiverMaxWorkers:    10,
