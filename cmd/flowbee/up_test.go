@@ -91,3 +91,31 @@ func rolesList(rs []upRole) []string {
 	}
 	return out
 }
+
+// TestUpSmokeTestCatchesBrokenAgent: `flowbee up` smoke-tests the agent BEFORE starting
+// the fleet (it's the first-run path). A command that exits cleanly but writes nothing —
+// the classic un-authed / rate-limited agent — must FAIL the smoke so up errors loud
+// instead of starting a fleet that silently fails every job.
+func TestUpSmokeTestCatchesBrokenAgent(t *testing.T) {
+	if err := smokeAgent("true"); err == nil {
+		t.Fatal("smokeAgent must reject an agent that writes no file (the un-authed-agent symptom)")
+	}
+	if err := smokeAgent("echo ok > ok.txt"); err != nil {
+		t.Fatalf("a working agent (writes ok.txt) must pass the smoke test: %v", err)
+	}
+	// up smokes BOTH the build and review roles (the review model differs from the
+	// builder, §5.5) — confirm it has distinct commands to smoke for each.
+	roles := upRoles("", "")
+	var b, r string
+	for _, x := range roles {
+		switch x.role {
+		case "eng_worker":
+			b = x.cmd
+		case "code_reviewer":
+			r = x.cmd
+		}
+	}
+	if b == "" || r == "" || b == r {
+		t.Fatalf("up must smoke DISTINCT build/review agents, got build=%q review=%q", b, r)
+	}
+}

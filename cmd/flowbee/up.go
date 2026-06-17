@@ -32,6 +32,7 @@ func runUp(args []string) error {
 	// override replaces it for every role.
 	agentCmd := fs.String("agent-cmd", os.Getenv("FLOWBEE_AGENT_CMD"), "override the review/author agent CLI (empty = per-role --model defaults)")
 	buildCmd := fs.String("build-agent-cmd", os.Getenv("FLOWBEE_BUILD_AGENT_CMD"), "override the build/resolver agent CLI (empty = per-role --model defaults)")
+	noSmoke := fs.Bool("no-smoke", false, "skip the agent smoke test at startup")
 	mirror := fs.String("mirror", envOr("FLOWBEE_MIRROR_PATH", filepath.Join(os.TempDir(), "flowbee-mirror.git")), "local bare mirror path")
 	selfMerge := fs.Bool("self-merge", envOr("FLOWBEE_ALLOW_SELF_MERGE", "") != "", "enable Branch B autonomous merge")
 	if err := fs.Parse(args); err != nil {
@@ -47,6 +48,34 @@ func runUp(args []string) error {
 	}
 	if token == "" {
 		return fmt.Errorf("flowbee up: set FLOWBEE_GITHUB_TOKEN (a fine-grained PAT with contents+PR+issues write)")
+	}
+
+	// 0. smoke-test the agents BEFORE starting anything — a missing/unauthed agent CLI
+	// is the #1 first-run gotcha, and `up` is the path a first-time operator takes. Fail
+	// LOUD here instead of starting a fleet that silently fails every job. Smoke BOTH
+	// models: the reviewer (Opus) differs from the builder (Sonnet, §5.5), so an unauthed
+	// review model passes the build smoke but fails every review. Mirrors `flowbee fleet`.
+	if !*noSmoke {
+		roles := upRoles(*agentCmd, *buildCmd)
+		var bCmd, rCmd string
+		for _, r := range roles {
+			switch r.role {
+			case "eng_worker":
+				bCmd = r.cmd
+			case "code_reviewer":
+				rCmd = r.cmd
+			}
+		}
+		fmt.Println("flowbee up: smoke-testing the build agent ...")
+		if err := smokeAgent(bCmd); err != nil {
+			return fmt.Errorf("build agent smoke test FAILED: %w\n   fix the agent (e.g. `claude --version` / re-auth) then retry, or --no-smoke to skip", err)
+		}
+		if rCmd != bCmd {
+			fmt.Println("flowbee up: smoke-testing the review agent ...")
+			if err := smokeReviewAgent(rCmd); err != nil {
+				return fmt.Errorf("review agent smoke test FAILED: %w\n   the review model differs from the build model (§5.5); ensure it's available + authed, or --no-smoke to skip", err)
+			}
+		}
 	}
 
 	// 1. ensure the local mirror (Flowbee pushes build branches here, then to GitHub).
