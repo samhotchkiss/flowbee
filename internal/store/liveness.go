@@ -348,7 +348,8 @@ func (s *Store) ActiveLeaseJobs(ctx context.Context) ([]string, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT id FROM jobs
 		 WHERE state IN ('leased','building','code_review','merging',
-		                 'merge_handoff','spec_authoring','spec_review')`)
+		                 'merge_handoff','spec_authoring','spec_review',
+		                 'resolving_conflict')`)
 	if err != nil {
 		return nil, err
 	}

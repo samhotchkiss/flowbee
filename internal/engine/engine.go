@@ -193,14 +193,19 @@ type Decision struct {
 
 // redispatchTarget is the state a revoked/cancelled active-lease job returns to for
 // re-dispatch (§10.7): a code_review revoke returns to review_pending (the build
-// product still stands); spec stages return to spec_authoring; every build stage
-// (leased/building) returns to ready. Mirrors the release/expiry edges.
+// product still stands); spec stages return to spec_authoring; a conflict resolution
+// returns to resolving_conflict (re-claimable by another conflict_resolver — returning
+// it to `ready` with role:conflict_resolver caps would wedge it, unclaimable by any
+// role); every build stage (leased/building) returns to ready. Mirrors the release/
+// expiry edges.
 func redispatchTarget(from job.State) job.State {
 	switch from {
 	case job.StateCodeReview:
 		return job.StateReviewPending
 	case job.StateSpecAuthoring, job.StateSpecReview:
 		return job.StateSpecAuthoring
+	case job.StateResolvingConflict:
+		return job.StateResolvingConflict
 	default:
 		return job.StateReady
 	}
