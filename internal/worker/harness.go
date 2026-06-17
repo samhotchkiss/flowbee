@@ -652,6 +652,29 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		return out, fmt.Errorf("inspect worktree: %w", err)
 	}
 	if !changed {
+		// a re-build of an ALREADY-BUILT issue branch (e.g. after a requeue): the agent
+		// added nothing new, but the branch already carries a build — we started from its
+		// tip (startRef != base), and it's already pushed. Submit that EXISTING build for
+		// review instead of churning to needs_human. No new commit/push; point the result
+		// at the branch tip so the control plane opens the PR.
+		if issueBranch != "" && repoURL != "" && startRef != grant.BaseSHA {
+			diff, _ := wt.DiffAgainst(grant.BaseSHA)
+			idem := fmt.Sprintf("%s-e%d", grant.JobID, grant.LeaseEpoch)
+			body := map[string]any{
+				"kind": "patch", "base_sha": grant.BaseSHA, "diff": diff,
+				"commit_message": "existing build re-submitted for review (re-build produced no new changes)",
+				"blast_radius":   map[string]any{"scope": "worktree", "paths": content.TouchedPaths(diff)},
+				"status":         "succeeded",
+				"pushed_branch":  issueBranch,
+				"head_sha":       startRef,
+			}
+			if res, st, rerr := c.Result(ctx, grant.JobID, grant.LeaseEpoch, idem, body); rerr == nil && st == 200 {
+				out.JobState = res.JobState
+				out.PushedSHA = startRef
+				_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
+				return out, nil
+			}
+		}
 		_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
 		return out, fmt.Errorf("agent produced no changes")
 	}
