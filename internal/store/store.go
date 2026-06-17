@@ -15,7 +15,8 @@ import (
 )
 
 type Store struct {
-	DB *sql.DB
+	DB  *sql.DB
+	dsn string // the SQLite path, for a post-close WAL checkpoint (see Close)
 
 	// NoEligibleWorkerDelay is how long a job may sit `ready` with no compliant
 	// worker before the no_eligible_worker alarm fires (I-6). Zero disables
@@ -55,18 +56,26 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	return &Store{DB: db}, nil
+	return &Store{DB: db, dsn: dsn}, nil
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.DB.PingContext(ctx) }
 
-// Close checkpoints the WAL into the main db file, then closes. The TRUNCATE
-// checkpoint (the control plane is the only connection at shutdown) folds every
-// committed write into flowbee.db and shrinks the WAL to zero, so: a file-level backup
-// of just flowbee.db is self-contained, the next start replays no WAL, and a graceful
-// SIGTERM leaves no lingering lock. Best-effort — a checkpoint failure must not block
-// shutdown (the WAL is still durable on disk for the next open to replay).
+// Close folds the WAL into the main db file, then closes, so a file-level copy of just
+// flowbee.db is self-contained, the next start replays no WAL, and a graceful SIGTERM
+// leaves a clean on-disk state. It checkpoints on a FRESH connection AFTER the pool is
+// closed: while the control plane is up, a background goroutine can hold the single
+// pooled connection, so an in-pool TRUNCATE times out and the WAL stays full. Once the
+// pool is closed nothing holds the WAL, and the fresh connection's TRUNCATE checkpoint
+// folds every committed frame into flowbee.db and shrinks the WAL to zero. Best-effort —
+// a checkpoint failure never blocks shutdown (the WAL is still durable for a replay).
 func (s *Store) Close() error {
-	_, _ = s.DB.ExecContext(context.Background(), "PRAGMA wal_checkpoint(TRUNCATE)")
-	return s.DB.Close()
+	err := s.DB.Close()
+	if s.dsn != "" {
+		if db2, e := sql.Open("sqlite", s.dsn); e == nil {
+			_, _ = db2.ExecContext(context.Background(), "PRAGMA wal_checkpoint(TRUNCATE)")
+			_ = db2.Close()
+		}
+	}
+	return err
 }
