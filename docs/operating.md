@@ -99,6 +99,7 @@ What it does:
 - Reports per-job token + cost usage so the control plane can meter spend.
 - Resolves merge conflicts automatically via a dedicated conflict resolver.
 - Streams each worker's logs to journald for live tailing.
+- Backs the job ledger up to object storage on a schedule.
 
 Flags: `--builders N`, `--mirror DIR`, `--agent-cmd` (review/author roles),
 `--build-agent-cmd` (build role — writes files), `--no-smoke`, `--systemd` (print a
