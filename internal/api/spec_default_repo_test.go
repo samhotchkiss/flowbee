@@ -89,6 +89,37 @@ func TestSpecCreateRepoLessNoReposFallsBackToEmpty(t *testing.T) {
 	}
 }
 
+// TestEpicCreateRepoLessDefaultsToPrimaryRepo: a /v1/epics ingest with no "repo" must
+// also land on the primary registered repo (epicCreate shares the same defaulting as
+// specCreate), so the epic barrier + its fanned-out children are drained, not stranded.
+func TestEpicCreateRepoLessDefaultsToPrimaryRepo(t *testing.T) {
+	ctx := context.Background()
+	st, srv := newSpecServer(t)
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "arepo", Owner: "o", Repo: "a", DefaultBranch: "main", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/epics",
+		strings.NewReader(`{"title":"e","issues":[{"task":"a"},{"task":"b"}]}`))
+	srv.PrivateHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /v1/epics status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		EpicID string `json:"epic_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	j, err := st.GetJob(ctx, resp.EpicID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Repo != "arepo" {
+		t.Fatalf("repo-less epic repo=%q, want the primary registered repo \"arepo\" (NOT \"default\")", j.Repo)
+	}
+}
+
 // TestSpecCreateHonorsExplicitRepo: an explicit "repo" is used verbatim.
 func TestSpecCreateHonorsExplicitRepo(t *testing.T) {
 	ctx := context.Background()
