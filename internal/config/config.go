@@ -270,6 +270,27 @@ func (c Config) Validate() error {
 		return fmt.Errorf("lease_ttl_s (%d) must be >= 3*heartbeat_interval_s (%d) per DESIGN §6.3.3",
 			c.LeaseTTLS, 3*c.HeartbeatIntervalS)
 	}
+	// the F9 multi-repo registry: each repo needs a unique handle + GitHub coords, or it
+	// silently fails at runtime (no mirror, no API URL — the loops just no-op). Catch the
+	// typos (dup id, missing owner/repo, reserved id) HERE, before serve, not as a silent
+	// dead repo in production.
+	seen := map[string]bool{}
+	for i, r := range c.Repos {
+		id := strings.TrimSpace(r.ID)
+		if id == "" {
+			return fmt.Errorf("repos[%d]: id is required (the short stable handle that scopes jobs)", i)
+		}
+		if id == "default" {
+			return fmt.Errorf("repos[%d]: id %q is reserved", i, id)
+		}
+		if seen[id] {
+			return fmt.Errorf("repos: duplicate id %q — each repo needs a unique handle", id)
+		}
+		seen[id] = true
+		if strings.TrimSpace(r.Owner) == "" || strings.TrimSpace(r.Repo) == "" {
+			return fmt.Errorf("repos[%q]: owner and repo are required (the GitHub coords)", id)
+		}
+	}
 	return nil
 }
 

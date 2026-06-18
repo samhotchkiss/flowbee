@@ -116,3 +116,37 @@ repos:
 		t.Fatalf("web repo should carry token_env and be parked: %+v", c.Repos[1])
 	}
 }
+
+// TestValidateReposRegistry: a multi-repo registry with a unique handle + GitHub coords
+// per repo validates; the typos that otherwise become a SILENT dead repo at runtime
+// (duplicate/empty/reserved id, missing owner/repo) are caught at config time.
+func TestValidateReposRegistry(t *testing.T) {
+	base := Config{DatabaseURL: "f.db", HeartbeatIntervalS: 30, LeaseTTLS: 1200}
+
+	ok := base
+	ok.Repos = []RepoConfig{
+		{ID: "flowbee", Owner: "o", Repo: "flowbee"},
+		{ID: "russ", Owner: "o", Repo: "russ"},
+	}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("a valid registry must pass: %v", err)
+	}
+
+	bad := []struct {
+		name  string
+		repos []RepoConfig
+	}{
+		{"duplicate id", []RepoConfig{{ID: "a", Owner: "o", Repo: "x"}, {ID: "a", Owner: "o", Repo: "y"}}},
+		{"missing owner", []RepoConfig{{ID: "a", Repo: "x"}}},
+		{"missing repo", []RepoConfig{{ID: "a", Owner: "o"}}},
+		{"empty id", []RepoConfig{{Owner: "o", Repo: "x"}}},
+		{"reserved id", []RepoConfig{{ID: "default", Owner: "o", Repo: "x"}}},
+	}
+	for _, c := range bad {
+		cfg := base
+		cfg.Repos = c.repos
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("%s: expected a validation error, got nil", c.name)
+		}
+	}
+}
