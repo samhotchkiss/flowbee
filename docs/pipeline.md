@@ -4,6 +4,8 @@ Flowbee moves a unit of work from intent to a merged PR through the stages below
 stage that does real work is executed by a **real agent** run by the worker harness — the
 control plane only schedules, reconciles GitHub facts, and merges.
 
+Work enters Flowbee in one of two ways: label a GitHub issue `flowbee:build`, or `POST` a work item to `/v1/specs`.
+
 ## Two entry points
 
 - **Labeled GitHub issue → build.** An issue carrying the `flowbee:build` label already
