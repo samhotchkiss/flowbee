@@ -106,3 +106,26 @@ repos:
 
 When `repos:` is present it takes precedence over the single-repo
 `github_owner`/`github_repo` keys.
+
+## Credential-less remote workers (bundle mode, F3)
+
+By default a remote worker keeps its own local mirror and pushes the issue branch
+itself (it needs repo **read**, and write only to push the branch). For a stricter
+zero-trust posture, a worker can hold **no git access and no GitHub credential at
+all**: it fetches a read-only git bundle of `base_sha`, returns only a diff, and
+the control plane applies the patch and pushes the ref itself.
+
+This requires **both ends to be set** — they are a pair:
+
+| side | setting | meaning |
+|------|---------|---------|
+| worker | `--bundle` / `FLOWBEE_BUNDLE` | fetch a bundle, return a diff, push nothing |
+| control plane | `FLOWBEE_BUNDLE_PROVISIONING` (+ a configured mirror) | apply the returned patch and push the epoch ref on the worker's behalf |
+
+> **Pair them or the build stalls.** A `--bundle` worker pointed at a control
+> plane *without* `FLOWBEE_BUNDLE_PROVISIONING` returns a diff the control plane
+> never applies — there is no commit to open a PR from, so the job reaches the
+> merge gate with no PR and stalls. If you enable `--bundle` on any worker, set
+> `FLOWBEE_BUNDLE_PROVISIONING` on the control plane. Most fleets don't need bundle
+> mode at all — `flowbee fleet`'s default `--remote` workers (own mirror, push the
+> branch) are simpler and the recommended posture.
