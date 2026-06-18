@@ -1,5 +1,7 @@
 # Troubleshooting
 
+This page lists common operational symptoms and their fixes; see [operating.md](operating.md) for the full runbook.
+
 An operator quick-reference for confirming and fixing Flowbee's common failure
 modes. Each row maps a **symptom** to the single **diagnostic** that confirms it
 and the **fix** to apply. Note that two of the modes below are *expected
