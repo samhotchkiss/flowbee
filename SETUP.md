@@ -84,14 +84,51 @@ skipping reachability") do **not** break green — they're the offline path.
 
 ## 5. Run it
 
+### One box, one command
+
 ```bash
-flowbee migrate up          # create the SQLite schema
-flowbee serve &             # the control plane
-flowbee work  &             # a worker — or /loop a Claude session as one
+flowbee up
 ```
+
+`flowbee up` is the whole pipeline in a single command: it creates the schema,
+ensures a local mirror, starts the control plane, and starts **one real-agent
+worker per role** (spec author, issue-review, build, code-review, conflict
+resolver) — with genuine per-role model diversity (Opus reviews what Sonnet
+built, §5.5) — then prints the dashboard URL and supervises everything until
+Ctrl-C. It smoke-tests every agent model first, so a missing/unauthed CLI fails
+loudly at startup instead of silently failing every job.
 
 Open the board at **http://localhost:7070**, submit an epic, and watch the line
 run: issue-review → build → build-review ×N → merge.
+
+### Production: control plane + a worker fleet
+
+For real use, split the control plane from the workers. Run the control plane on
+one box:
+
+```bash
+flowbee migrate up
+flowbee serve               # control plane: reconcile, schedule, merge gate
+```
+
+Then on each worker box, run a **fleet** — `flowbee fleet` is the production
+worker: N build workers plus one of each review role, model diversity, agent
+smoke-test, and cost metering, all in one process:
+
+```bash
+flowbee fleet --url https://<control-plane>:7070 --builders 3
+```
+
+To run the fleet as a managed service, `--systemd` prints a ready-to-install
+unit + env file (then exits) — the one-command fleet install:
+
+```bash
+flowbee fleet --systemd --url https://<control-plane>:7070 --builders 3
+# follow the three printed steps: write the env file, write the unit, enable --now
+```
+
+`flowbee work` (a single bare worker) still exists for dev/test, but `fleet` is
+the production posture — it staffs every role, not just builds.
 
 ---
 
@@ -115,6 +152,7 @@ human in the loop instead, set `allow_self_merge: false` (or
 
 - More repos: see the `repos:` block in `flowbee.yaml` (one control plane, a
   shared worker fleet, a global scheduler). See [docs/config.md](./docs/config.md).
-- More workers: run `flowbee work` on each machine. Ideally they're SSH-reachable
-  from your main box so an install agent can configure them all from one place
-  (see [`AGENTS.md`](./AGENTS.md)).
+- More workers: run `flowbee fleet --url https://<control-plane>:7070 --builders N`
+  on each machine (use `--systemd` to install it as a managed service). Ideally
+  they're SSH-reachable from your main box so an install agent can configure them
+  all from one place (see [`AGENTS.md`](./AGENTS.md)).

@@ -67,8 +67,9 @@ Ask the human these, with the defaults below. Don't ask anything else.
 
 2. **Which machines run workers?**
    - Ideally each is SSH-reachable from this main machine, so you can configure
-     them all from here: `scp` the binary, set the per-stage agent command, and
-     start `flowbee work` on each. No per-box hands-on for the human.
+     them all from here: `scp` the binary and start a `flowbee fleet` on each
+     (N builders + every review role, model diversity, agent smoke-test). No
+     per-box hands-on for the human.
 
 3. **Models per stage?** (recommended defaults — wire into the stage identities
    in `flows/identities/*.yaml`):
@@ -104,11 +105,17 @@ For each machine the human named in Step 3.2:
 
 ```bash
 scp $(command -v flowbee) <host>:/usr/local/bin/flowbee
-ssh <host> 'flowbee work --server http://<main-host>:7070 --agent-cmd "<the per-stage agent command>"'
+# run the fleet as a managed service — --systemd prints the unit + env file to install:
+ssh <host> 'flowbee fleet --systemd --url http://<main-host>:7070 --builders 3'
 ```
 
-The worker dials *out* to the control plane, leases a job, runs it with whatever
-agent it wraps, and reports back. It holds no GitHub creds.
+`flowbee fleet` is the production worker: N build workers plus one of each review
+role, with genuine per-role model diversity, an agent smoke-test at startup, and
+cost metering. `--systemd` emits a ready-to-install unit + env file (follow its
+three printed steps); drop it for a foreground run. Each worker dials *out* to the
+control plane, leases a job, runs it with the per-role agent, and reports back. It
+holds no GitHub creds. (`flowbee work` — a single bare worker — still exists for
+dev/test.)
 
 ## Step 6 — start it
 
@@ -122,8 +129,8 @@ flowbee up --self-merge   # dashboard at http://localhost:7070/dashboard
 `flowbee up` clones the local mirror, starts the control plane, and starts each
 role's worker loop (spawning the configured agent CLI per job). `--self-merge`
 enables Branch-B autonomous merge (no human gate). For a multi-box fleet instead,
-run `flowbee serve &` on the main machine and `flowbee work --role … &` on each
-remote (same binary, no creds on the workers).
+run `flowbee serve` on the main machine and `flowbee fleet --url … --builders N`
+on each remote (same binary, no creds on the workers) — see Step 5.
 
 ### Giving Flowbee work
 
