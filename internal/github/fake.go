@@ -30,6 +30,8 @@ type Fake struct {
 	checks     []string // "name@sha=conclusion"
 	enqueued    []int        // PR numbers enqueued to the merge queue
 	conflictPRs map[int]bool // PRs whose merge returns ErrMergeConflict (set via SetMergeConflict)
+
+	baseModifiedPRs map[int]bool // PRs whose merge returns ErrMergeBaseModified (retryable)
 	drafted         []int    // PR numbers converted back to draft (compensation, §6.5.4)
 	deletedBranches []string // branches deleted post-merge (cleanup)
 	cancelled  []string // SHAs whose CI was cancelled (compensation, §6.5.4)
@@ -277,8 +279,22 @@ func (f *Fake) EnqueueMergeQueue(ctx context.Context, number int) error {
 	if f.conflictPRs[number] {
 		return fmt.Errorf("merge %d: %w", number, ErrMergeConflict)
 	}
+	if f.baseModifiedPRs[number] {
+		return fmt.Errorf("merge %d: %w", number, ErrMergeBaseModified)
+	}
 	f.enqueued = append(f.enqueued, number)
 	return nil
+}
+
+// SetMergeBaseModified makes EnqueueMergeQueue return the retryable ErrMergeBaseModified
+// for a PR — GitHub's 405 "Base branch was modified" when a sibling merged first.
+func (f *Fake) SetMergeBaseModified(number int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.baseModifiedPRs == nil {
+		f.baseModifiedPRs = map[int]bool{}
+	}
+	f.baseModifiedPRs[number] = true
 }
 
 // SetMergeConflict makes EnqueueMergeQueue return ErrMergeConflict for a PR — the

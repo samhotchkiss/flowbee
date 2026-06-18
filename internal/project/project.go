@@ -231,7 +231,7 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 			permanent := errors.As(err, &ghErr) && ghErr.Permanent()
 			if permanent || row.Attempts+1 >= maxOutboxAttempts {
 				if derr := s.store.DeadLetterOutbox(ctx, row.ID, row.JobID,
-					string(job.EscalationProjectOut), criticalAction(row.Action), s.clock.Now()); derr != nil {
+					string(job.EscalationProjectOut), err.Error(), criticalAction(row.Action), s.clock.Now()); derr != nil {
 					return sent, derr
 				}
 				if s.pub != nil {

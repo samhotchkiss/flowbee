@@ -162,7 +162,7 @@ func (s *Store) BumpOutboxAttempts(ctx context.Context, id int64) error {
 // needs_human with `reason` so a human fixes the GitHub state and requeues; a cosmetic
 // action (comment / label / check) is simply dropped. The row is abandoned WITHOUT an
 // audit entry — the action never took effect on GitHub.
-func (s *Store) DeadLetterOutbox(ctx context.Context, rowID int64, jobID, reason string, escalate bool, now time.Time) error {
+func (s *Store) DeadLetterOutbox(ctx context.Context, rowID int64, jobID, reason, detail string, escalate bool, now time.Time) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE outbox SET status='abandoned', sent_at=datetime('now'), attempts=attempts+1 WHERE id = ?`, rowID); err != nil {
@@ -180,10 +180,17 @@ func (s *Store) DeadLetterOutbox(ctx context.Context, rowID int64, jobID, reason
 			return nil
 		}
 		nextSeq := seq + 1
+		// record the failing GitHub error on the escalation event so a needs_human job is
+		// SELF-EXPLAINING (the operator sees why the write was abandoned, instead of having
+		// to reproduce it). RevokeReason is the existing "why forced off the lease" field.
+		if len(detail) > 500 {
+			detail = detail[:500]
+		}
 		ev := ledger.Event{
 			JobID: jobID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
 			FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
 			Actor: "project-out", CreatedAt: now,
+			Payload: ledger.Payload{RevokeReason: detail},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err

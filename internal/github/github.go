@@ -186,6 +186,13 @@ func (e *ErrRetryAfter) Error() string {
 // to a conflict_resolver instead of re-queuing the merge.
 var ErrMergeConflict = errors.New("pull request has merge conflicts (not mergeable)")
 
+// ErrMergeBaseModified signals GitHub's 405 "Base branch was modified. Review and try
+// the merge again." — optimistic concurrency, NOT a failure: the base moved between the
+// mergeability check and the merge (a sibling PR merged first). It is RETRYABLE: once the
+// base settles, re-merging succeeds. It is deliberately NOT an *ErrGitHub so the sender's
+// Permanent() check treats it as transient (retry) rather than dead-lettering it.
+var ErrMergeBaseModified = errors.New("merge base branch was modified (retryable)")
+
 // ErrGitHub is a non-2xx REST response carrying its status code, so the sender can
 // distinguish a PERMANENT failure (a 4xx — a deleted branch/PR, a 422 validation, a
 // 404 not-found: retrying NEVER succeeds) from a TRANSIENT one (a 5xx / network blip:
@@ -216,6 +223,14 @@ func isMergeConflict(err error) bool {
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "405") &&
 		(strings.Contains(s, "merge conflict") || strings.Contains(s, "not mergeable"))
+}
+
+// isBaseModified reports whether a failed merge is GitHub's retryable 405 "Base branch
+// was modified. Review and try the merge again." (the base moved under a concurrent
+// sibling merge) — distinct from an unmergeable conflict, which never succeeds on retry.
+func isBaseModified(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "405") && strings.Contains(s, "base branch was modified")
 }
 
 // RealClient is the genuine GitHub caller. It is CGO-free (stdlib net/http only)
@@ -787,6 +802,15 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
 		// surface a real conflict as the typed error so the sender routes to a resolver
 		// instead of re-queuing a merge that can never succeed.
 		return fmt.Errorf("%w: %v", ErrMergeConflict, err)
+	}
+	if err != nil && isBaseModified(err) {
+		// GitHub's 405 "Base branch was modified. Review and try the merge again." is
+		// OPTIMISTIC-CONCURRENCY, not a failure: main moved between the mergeability check
+		// and this merge (a sibling PR merged first — exactly what concurrent epic-child
+		// merges produce). It is explicitly retryable. Return a TRANSIENT sentinel (NOT an
+		// *ErrGitHub, whose Permanent() is true for any 4xx) so project-out RETRIES the
+		// merge once the base settles instead of dead-lettering the loser to needs_human.
+		return fmt.Errorf("%w: %v", ErrMergeBaseModified, err)
 	}
 	return err
 }
