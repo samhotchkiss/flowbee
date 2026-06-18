@@ -41,7 +41,7 @@ func (s *Store) SeedSpecJob(ctx context.Context, p SeedSpecParams) (job.Job, err
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq, repo,
 			                  task_text, acceptance_criteria)
-			VALUES (?, 'spec', 'spec', 'author', 'spec_authoring', 'spec_author', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 9, 1, ?, ?, ?)`,
+			VALUES (?, 'spec', 'spec', 'author', 'spec_authoring', 'spec_author', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, ?, ?, ?)`,
 			p.ID, p.ChatRef, p.AuthorLens, p.Priority,
 			marshalStrings([]string{"role:spec_author"}), p.Now.Format(rfc3339), p.Repo,
 			p.TaskText, p.AcceptanceCriteria)

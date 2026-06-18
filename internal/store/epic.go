@@ -88,7 +88,7 @@ func (s *Store) SeedEpic(ctx context.Context, p SeedEpicParams) error {
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 			                  epic_id, is_epic)
-			VALUES (?, 'spec', 'spec', 'epic_review', 'spec_review', 'spec_reviewer', ?, ?, ?, ?, ?, ?, 1, '[]', ?, ?, 0, 0, 5, 0, 9, 1, ?, 1)`,
+			VALUES (?, 'spec', 'spec', 'epic_review', 'spec_review', 'spec_reviewer', ?, ?, ?, ?, ?, ?, 1, '[]', ?, ?, 0, 0, 5, 0, 4, 1, ?, 1)`,
 			p.EpicID, p.ChatRef, p.AuthorLens, p.Priority, p.Repo,
 			decomp, decompHash,
 			marshalStrings([]string{"role:spec_reviewer"}), p.Now.Format(rfc3339), p.EpicID); err != nil {
@@ -119,7 +119,7 @@ func (s *Store) SeedEpic(ctx context.Context, p SeedEpicParams) error {
 				                  blocked_by, required_capabilities, enqueued_at,
 				                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 				                  epic_id, is_epic)
-				VALUES (?, 'spec', 'spec', 'epic_issue', 'backlog', 'spec_author', ?, ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 9, 1, ?, 0)`,
+				VALUES (?, 'spec', 'spec', 'epic_issue', 'backlog', 'spec_author', ?, ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, ?, 0)`,
 				iss.ID, p.ChatRef, p.Priority, p.Repo, iss.Task, iss.Acceptance,
 				marshalStrings([]string{"role:spec_author"}), p.Now.Format(rfc3339), p.EpicID); err != nil {
 				return fmt.Errorf("insert epic child %s: %w", iss.ID, err)

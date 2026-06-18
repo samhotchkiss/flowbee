@@ -23,6 +23,12 @@ func TestSameReviewerSixRejectionsParksForHuman(t *testing.T) {
 	policy := job.Policy{}
 
 	driveToCodeReview(t, st, "loopjob", "h0", "b0")
+	// Pin a high total backstop so the per-reviewer cap (6) is what fires, in isolation:
+	// the production default (4) is below MaxReviewerRejections, so the total backstop
+	// would otherwise bind first.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET max_bounces=20 WHERE id='loopjob'`); err != nil {
+		t.Fatal(err)
+	}
 	const reviewer = "reviewer-loopjob" // the identity driveToCodeReview binds
 
 	for i := 1; i <= job.MaxReviewerRejections; i++ {
@@ -76,9 +82,14 @@ func TestDistinctReviewersRideTheTotalBackstop(t *testing.T) {
 	policy := job.Policy{}
 
 	driveToCodeReview(t, st, "distjob", "h0", "b0")
+	// Pin a high total backstop so distinct-reviewer rounds aren't cut short by it; this
+	// isolates the per-reviewer cap, proving it does NOT fire when reviewers differ.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET max_bounces=20 WHERE id='distjob'`); err != nil {
+		t.Fatal(err)
+	}
 
 	// a FRESH reviewer identity each round: no single node accumulates MaxReviewerRejections.
-	// With max_bounces=9 the job survives past MaxReviewerRejections (6) rounds —
+	// With the high total backstop the job survives past MaxReviewerRejections (6) rounds —
 	// proof the per-reviewer cap did NOT fire.
 	rounds := job.MaxReviewerRejections + 1 // 7 distinct reviewers, each rejecting once
 	for i := 1; i <= rounds; i++ {

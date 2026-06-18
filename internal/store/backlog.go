@@ -47,7 +47,7 @@ func (s *Store) SeedBacklog(ctx context.Context, p SeedBacklogParams) (job.Job, 
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 			                  needs_full_spec, task_text, spec_text, acceptance_criteria)
-			VALUES (?, 'spec', 'spec', 'backlog', 'backlog', 'spec_author', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 9, 1, ?, ?, ?, ?)`,
+			VALUES (?, 'spec', 'spec', 'backlog', 'backlog', 'spec_author', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, ?, ?, ?, ?)`,
 			p.ID, p.ChatRef, issue, p.Priority,
 			marshalStrings([]string{"role:spec_author"}), p.Now.Format(rfc3339),
 			needs, p.TaskText, p.SpecText, p.AcceptanceCriteria); err != nil {

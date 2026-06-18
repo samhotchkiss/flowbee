@@ -53,7 +53,7 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 				                  blocked_by, required_capabilities, enqueued_at,
 				                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 				                  adopted, opted_in)
-				VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 9, 1, 1, ?)`,
+				VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, ?)`,
 				id, string(state), pr.Number, pr.BaseRefOid, pr.HeadRefOid,
 				marshalStrings([]string{"role:code_reviewer"}), now.Format(rfc3339), optInI); err != nil {
 				return fmt.Errorf("insert adopted job pr %d: %w", pr.Number, err)
@@ -114,7 +114,7 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 				                  blocked_by, required_capabilities, enqueued_at,
 				                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 				                  adopted, opted_in, task_text, spec_text, acceptance_criteria)
-				VALUES (?, 'spec', 'spec', ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 9, 1, 1, ?, ?, ?, ?)`,
+				VALUES (?, 'spec', 'spec', ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, ?, ?, ?, ?)`,
 				id, stage, string(state), role, issueCol,
 				marshalStrings([]string{"role:" + role}), now.Format(rfc3339), optInI,
 				t.Text, t.Spec, t.AcceptanceCriteria); err != nil {

@@ -84,7 +84,7 @@ func (s *Store) SeedJob(ctx context.Context, p SeedParams) (job.Job, error) {
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 			                  cost_ceiling_micro_usd, flow_id,
 			                  task_text, spec_text, acceptance_criteria, repo)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 9, 0, ?, ?, ?, ?, ?, ?)`,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 4, 0, ?, ?, ?, ?, ?, ?)`,
 			p.ID, string(p.Kind), p.Flow, p.Stage, string(state), string(p.Role), p.BaseSHA, p.Priority,
 			blockedJSON, reqJSON, p.Now.Format(rfc3339), ceiling, flowID,
 			p.TaskText, p.SpecText, p.AcceptanceCriteria, p.Repo)
