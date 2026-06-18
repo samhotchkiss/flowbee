@@ -420,11 +420,26 @@ func runServe(args []string) error {
 				}
 			}
 		}()
+		refetcher := repoRefetcher{mgr: mgr, defaultRepo: firstRepo(mgr)}
+		// crash-replay: re-drive any webhook deliveries recorded 'pending' but interrupted
+		// before their refetch (a CP crash between RecordDelivery and MarkDeliveryProcessed).
+		// The periodic sweep is the correctness floor; this recovers the targeted refetch
+		// promptly and drains inbox rows that would otherwise strand forever.
+		if pend, err := st.PendingDeliveries(ctx); err == nil && len(pend) > 0 {
+			wp := make([]webhook.PendingDelivery, len(pend))
+			for i, d := range pend {
+				wp[i] = webhook.PendingDelivery{DeliveryID: d.DeliveryID, Event: d.Event, PRNumber: d.PRNumber}
+			}
+			done := webhook.ReplayPending(ctx, wp, refetcher, func(id string) error {
+				return st.MarkDeliveryProcessed(ctx, id)
+			})
+			logger.Info("replayed pending webhook deliveries", "replayed", done, "found", len(pend))
+		}
 		// the PUBLIC webhook listener (I-2): only started when a secret is set. Hints
 		// are routed to the right repo's reconciler via the X-Flowbee-Repo header
 		// (default: the sole/first managed repo when unset).
 		if secret := os.Getenv("FLOWBEE_WEBHOOK_SECRET"); secret != "" {
-			wh := webhook.New(secret, st, repoRefetcher{mgr: mgr, defaultRepo: firstRepo(mgr)})
+			wh := webhook.New(secret, st, refetcher)
 			webhookMux := http.NewServeMux()
 			webhookMux.Handle("POST /webhooks", wh)
 			webhookSrv := &http.Server{Addr: cfg.WebhookAddr, Handler: webhookMux}

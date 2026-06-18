@@ -52,6 +52,39 @@ func New(secret string, inbox Inbox, refetcher Refetcher) *Handler {
 	return &Handler{secret: []byte(secret), inbox: inbox, refetcher: refetcher}
 }
 
+// PendingDelivery is one inbox row recorded but not yet processed — a webhook whose
+// refetch was interrupted by a crash between RecordDelivery and MarkDeliveryProcessed.
+type PendingDelivery struct {
+	DeliveryID string
+	Event      string
+	PRNumber   int
+}
+
+// ReplayPending re-drives interrupted webhook deliveries on boot (the §8.1.3 write-ahead
+// inbox is replay-safe by design, but the replay was never wired). Each pending delivery
+// gets its targeted refetch (a PR event) or an intake sweep (an issues event — the raw
+// body is gone, so the idempotent sweep stands in for the parsed action), then is marked
+// processed. The periodic board sweep is the correctness floor; this recovers the
+// targeted refetch promptly and drains inbox rows that would otherwise strand forever.
+// Returns the number successfully replayed.
+func ReplayPending(ctx context.Context, pending []PendingDelivery, refetcher Refetcher, markProcessed func(deliveryID string) error) int {
+	n := 0
+	for _, d := range pending {
+		if refetcher != nil {
+			if d.PRNumber > 0 {
+				refetcher.RefetchHint(ctx, d.PRNumber)
+			}
+			if d.Event == "issues" {
+				refetcher.IntakeSweep(ctx)
+			}
+		}
+		if err := markProcessed(d.DeliveryID); err == nil {
+			n++
+		}
+	}
+	return n
+}
+
 // ServeHTTP implements the §8.1.3 pipeline. Outcomes:
 //   - bad signature / no secret -> 401 (forged/unsigned rejected, I-2)
 //   - duplicate delivery id      -> 200 {"deduped":true} (replay-safe, no action)
