@@ -99,6 +99,20 @@ func runWork(args []string) error {
 		return nil
 	}
 
+	// Fail LOUD on a missing agent (mirrors the fleet smoke-test philosophy). With an
+	// empty agent command the harness runs the "agent" as a no-op that produces no
+	// output, so this worker would CLAIM jobs and complete them with empty results —
+	// silently bouncing every job it touches toward needs_human. A misconfigured worker
+	// must refuse to start, not quietly strand the queue.
+	if *agentCmd == "" {
+		return fmt.Errorf("no agent configured — set --agent-cmd or FLOWBEE_AGENT_CMD " +
+			"(the CLI to run per job, e.g. 'claude --model sonnet -p \"$(cat \"$FLOWBEE_TASK_FILE\")\"'), " +
+			"or pass --stub for the built-in no-op echo worker. Without one, this worker would claim jobs " +
+			"and bounce them with empty results.\n" +
+			"   For production, prefer `flowbee fleet` or `flowbee up` — they wire a real per-role agent " +
+			"(with model diversity) automatically and smoke-test it before starting.")
+	}
+
 	token := os.Getenv("FLOWBEE_WORKER_TOKEN")
 	cfg := worker.HarnessConfig{
 		BaseURL: url, Identity: *identity, ModelFamily: *family, Role: *role,
