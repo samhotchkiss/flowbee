@@ -16,7 +16,7 @@
 <ul class="stage-tl">
   {{range $d.Timings}}
   <li>
-    <span class="st">{{.Stage}}{{if .Open}} <span class="open">●</span>{{end}}</span>
+    <span class="st">{{.Stage}}{{if gt .Attempts 1}} <span class="attempts" title="{{.Attempts}} attempts in this phase">×{{.Attempts}}</span>{{end}}{{if .Open}} <span class="open">●</span>{{end}}</span>
     <span class="times">
       ENTERED {{abs .Entered}}<br>
       LEFT {{abs .Left}} · {{hms .DurationS}}

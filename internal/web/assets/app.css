@@ -218,3 +218,4 @@ th{background:var(--inset);font-weight:700;color:var(--dim);font-size:.7rem;text
 td{font-family:var(--mono);font-size:.74rem;color:var(--dim)}
 .over,.stale{color:var(--bad);font-weight:700}
 .chip{display:inline-block;font-family:var(--mono);background:#0c0e14;border:1px solid var(--line);border-radius:6px;padding:.05rem .4rem;font-size:.68rem;color:var(--dim)}
+.stage-tl .attempts{font-family:var(--mono);font-size:.62rem;color:var(--amber);background:color-mix(in srgb,var(--amber) 14%,transparent);border:1px solid color-mix(in srgb,var(--amber) 35%,var(--line));border-radius:6px;padding:.02rem .32rem;margin-left:.35rem}

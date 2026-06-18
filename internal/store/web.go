@@ -147,6 +147,60 @@ type StageTiming struct {
 	// DurationS is Left-Entered in seconds, or (asOf - Entered) while still open.
 	DurationS int  `json:"duration_s"`
 	Open      bool `json:"open"`
+	// Attempts is how many raw state-entries this row collapsed (>1 means a phase
+	// cycled — e.g. a build retried, or a review/build oscillated while CI settled).
+	// 1 for a single clean pass. Surfaces churn as a count instead of a wall of rows.
+	Attempts int `json:"attempts"`
+}
+
+// stagePhase folds a raw job state into the pipeline PHASE the operator thinks in, so
+// the detail drawer collapses a ready↔leased build-retry churn (or a review oscillation)
+// into one labeled row with an attempt count, instead of a page of 0-second transitions.
+func stagePhase(state string) string {
+	switch state {
+	case "backlog", "ready", "leased", "building":
+		return "Build"
+	case "review_pending", "code_review":
+		return "Review"
+	case "spec_authoring":
+		return "Spec authoring"
+	case "spec_review":
+		return "Issue-review"
+	case "mergeable", "merging":
+		return "Merge"
+	case "resolving_conflict":
+		return "Resolve conflict"
+	case "merge_handoff":
+		return "Merge handoff"
+	case "needs_human", "needs_design":
+		return "Needs you"
+	case "done":
+		return "Done"
+	default:
+		return state
+	}
+}
+
+// collapseByPhase merges consecutive same-PHASE StageTimings into one row, summing the
+// duration and counting the collapsed entries (Attempts). The raw per-state spans stay
+// available via JobStageTimings; this is the readable view the drawer renders.
+func collapseByPhase(raw []StageTiming) []StageTiming {
+	var out []StageTiming
+	for _, st := range raw {
+		ph := stagePhase(st.Stage)
+		if n := len(out); n > 0 && out[n-1].Stage == ph {
+			out[n-1].Attempts++
+			out[n-1].DurationS += st.DurationS
+			out[n-1].Left = st.Left
+			out[n-1].Open = st.Open
+			continue
+		}
+		out = append(out, StageTiming{
+			Stage: ph, Entered: st.Entered, Left: st.Left,
+			DurationS: st.DurationS, Open: st.Open, Attempts: 1,
+		})
+	}
+	return out
 }
 
 // JobStageTimings folds a job's event ledger into per-stage ENTERED/LEFT absolute
@@ -220,6 +274,9 @@ func (s *Store) JobDetail(ctx context.Context, jobID string, now time.Time) (Job
 	if err != nil {
 		return JobDetail{}, err
 	}
+	// the drawer shows the phase-collapsed view (Build/Review/Merge with an attempt
+	// count) so a multi-attempt job reads as a clean lifecycle, not a wall of 0s rows.
+	timings = collapseByPhase(timings)
 	card, err := s.HistoryCardForJob(ctx, jobID)
 	if err != nil {
 		return JobDetail{}, err
