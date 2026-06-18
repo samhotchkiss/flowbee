@@ -1,3 +1,6 @@
+// Dev utility — run once by a developer to seed worker identities into the Flowbee registry.
+// Not part of the engine and not invoked by any automated flow.
+
 // Command seedidentities materializes Flowbee's default per-actor identity files
 // (flows/identities/*.yaml + flows/lenses/*.md) from the `hire` corpus
 // (~/dev/russell/public/hire). It is a one-shot GENERATOR run by a developer, not
