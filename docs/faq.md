@@ -250,3 +250,12 @@ scratch on the new worker — and nothing wedges, because the lease fence preven
 worker from committing anything even if it somehow recovers late.
 
 ---
+
+### How do I give Flowbee work?
+
+There are two front doors: label a GitHub issue with **`flowbee:build`** to trigger the intake
+pipeline, or POST a work item directly to **`/v1/specs`** to go straight to the planner.
+Both paths end up in the same queue — use the label for GitHub-tracked issues and the API
+for programmatic submission.
+
+---
