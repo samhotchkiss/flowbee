@@ -293,6 +293,19 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		if err != nil {
 			return "", fmt.Errorf("load job for issue: %w", err)
 		}
+		// Idempotency: a non-zero issue_number means a prior drain already created this
+		// issue on GitHub and stamped it — this is a re-send after a CP crash between the
+		// stamp and the row being marked sent. Do NOT create a DUPLICATE GitHub issue;
+		// just ensure the build is seeded (idempotent) and consume the row.
+		if j.IssueNum > 0 {
+			detail := fmt.Sprintf("issue=%d (already materialized)", j.IssueNum)
+			if bid, berr := s.seedBuildFromSpec(ctx, j, now); berr != nil {
+				detail += " build_seed_err=" + berr.Error()
+			} else {
+				detail += " build=" + bid
+			}
+			return detail, nil
+		}
 		number, err := s.gh.CreateIssue(ctx, gh.CreateIssueInput{
 			Title:  issueTitle(j),
 			Body:   issueBody(j),
