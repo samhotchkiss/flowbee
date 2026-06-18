@@ -227,3 +227,5 @@ not merge can be reconstructed after the fact. Disabling a guard — for example
 turning self-merge policy off — is an operator action and falls outside the
 threat model; the safe default is for autonomous merge to be **off** until
 explicitly enabled.
+
+See also: [operating.md](operating.md)
