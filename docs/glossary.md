@@ -26,6 +26,10 @@ scheduled until that barrier passes (the epic's spec review is signed off). A
 barrier turns "review the whole plan first" into an enforced ordering rather
 than a convention.
 
+### base_sha
+
+**base_sha** — The commit on the integration branch from which a build is cut. After a sibling branch merges, `base_sha` is refreshed to point at the current tip of `main`, ensuring subsequent builds start from the latest integrated state.
+
 ### content-integrity gate
 
 A deterministic, non-LLM safety check that runs over a change's diff before it
