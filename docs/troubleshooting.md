@@ -22,3 +22,5 @@ behavior* — a safety gate doing its job, not a fault to force past.
 **Cause:** The epic barrier review has not signed off yet, or the fan-out step has not run. Child issues are held until the epic's barrier review passes.
 
 **Fix:** Check the epic job state. Once the barrier review approves and the fan-out runs, the children start automatically — no manual intervention is needed.
+
+When filing a support request, run `flowbee version` to include the running build SHA in your report.
