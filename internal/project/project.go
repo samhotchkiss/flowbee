@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/content"
 	gh "github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
@@ -109,6 +110,10 @@ type HistoryWriter interface {
 	// the resolver's base — else the resolver builds against a stale main lacking the
 	// sibling's merge, the resolution re-conflicts, and the brief is nonsensical.
 	FetchBranch(branch string) error
+	// DiffNames returns the paths changed between base and head in the mirror — the
+	// CP-computed ACTUAL touched set, used to re-verify an autonomous merge's content
+	// against the real branch (not the worker's self-reported patch) before it lands.
+	DiffNames(base, head string) ([]string, error)
 }
 
 // WithHistory wires the local-git history writer + the branch its dedicated
@@ -370,6 +375,36 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		if number == 0 {
 			if n, ok := p["pr_number"].(float64); ok {
 				number = int(n)
+			}
+		}
+		// CP-AUTHORITATIVE content re-check (defense-in-depth, §5.4): before an AUTONOMOUS
+		// merge, re-run the denylist over the ACTUAL base..head diff from the mirror — not
+		// the worker's self-reported patch the verdict-time gate ran over. A denylisted path
+		// on the REAL branch downgrades the job to the HUMAN merge gate, so a worker can
+		// never land a privilege-escalating change on main by under-reporting what it
+		// touched. A verify FAILURE (can't fetch/diff) returns an error → the merge RETRIES
+		// (transient), never a silent autonomous merge of unverified content.
+		if s.history != nil {
+			j, jerr := s.store.GetJob(ctx, row.JobID)
+			if jerr == nil && j.BaseSHA != "" && j.HeadSHA != "" {
+				br := store.IssueBranch(s.resolveIssueNum(ctx, j), row.JobID)
+				if ferr := s.history.FetchBranch(br); ferr != nil {
+					return "", fmt.Errorf("verify autonomous merge: fetch %s: %w", br, ferr)
+				}
+				paths, derr := s.history.DiffNames(j.BaseSHA, j.HeadSHA)
+				if derr != nil {
+					return "", fmt.Errorf("verify autonomous merge: diff %s..%s: %w", j.BaseSHA, j.HeadSHA, derr)
+				}
+				if hits := content.DenylistHits(paths); len(hits) > 0 {
+					reason := "content denylist (actual diff): " + strings.Join(hits, ",")
+					if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
+						return "", fmt.Errorf("route self-merge to handoff: %w", rerr)
+					}
+					if s.pub != nil {
+						s.pub.PublishReconcile(row.JobID, "project_out:self_merge_denied")
+					}
+					return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
+				}
 			}
 		}
 		if err := s.gh.EnqueueMergeQueue(ctx, number); err != nil {

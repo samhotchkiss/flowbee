@@ -13,8 +13,10 @@ import (
 // assert the merge-conflict router fetches the post-merge main BEFORE resolving the
 // resolver's base.
 type fakeHistory struct {
-	fetched []string
-	tip     string
+	fetched   []string
+	tip       string
+	diffPaths []string // scripted DiffNames result (the actual base..head touched set)
+	diffErr   error
 }
 
 func (f *fakeHistory) CommitHistory(branch, message string, files []gitops.HistoryFile) (string, bool, error) {
@@ -24,6 +26,9 @@ func (f *fakeHistory) HeadSHA(ref string) (string, error) { return f.tip, nil }
 func (f *fakeHistory) FetchBranch(branch string) error {
 	f.fetched = append(f.fetched, branch)
 	return nil
+}
+func (f *fakeHistory) DiffNames(base, head string) ([]string, error) {
+	return f.diffPaths, f.diffErr
 }
 
 // TestMergeConflictRoutesToResolverAfterFetch: when a merge returns ErrMergeConflict,

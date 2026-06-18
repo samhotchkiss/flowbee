@@ -369,6 +369,41 @@ func (s *Store) RouteMergeConflict(ctx context.Context, jobID, newBaseSHA string
 	})
 }
 
+// RouteSelfMergeToHandoff downgrades an autonomous self-merge to the HUMAN merge gate
+// (merge_handoff) when project-out's CP-authoritative re-check finds the ACTUAL branch
+// diff (base..head on the mirror) hits the content denylist. The verdict-time gate ran
+// over the worker's SELF-REPORTED patch; this is the defense-in-depth catch for a worker
+// that under-reported what it changed — so a denylisted change can never autonomously
+// merge to main on a worker's say-so. The job settles in merge_handoff for a human;
+// `reason` records the hit (the denylist classes) for the operator queue.
+func (s *Store) RouteSelfMergeToHandoff(ctx context.Context, jobID, reason string, now time.Time) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		j, seq, err := loadJobTx(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		if j.State != job.StateMerging && j.State != job.StateMergeable {
+			return nil // already past the merge arm; nothing to downgrade
+		}
+		nextSeq := seq + 1
+		ev := ledger.Event{
+			JobID: jobID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
+			FromState: j.State, ToState: job.StateMergeHandoff, LeaseEpoch: j.LeaseEpoch,
+			Actor: "project-out", CreatedAt: now,
+			Payload: ledger.Payload{RevokeReason: reason},
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE jobs SET state = 'merge_handoff', updated_at = datetime('now') WHERE id = ?`,
+			jobID); err != nil {
+			return fmt.Errorf("route self-merge to handoff: %w", err)
+		}
+		return setJobSeq(ctx, tx, jobID, nextSeq)
+	})
+}
+
 // StaleReviewBuilds returns the ids of review_pending build jobs whose base_sha is
 // behind the current integration tip (mainTip) and that carry a stored patch to
 // replay. These are the jobs to rebase-before-review (build-list: "rebase before the
