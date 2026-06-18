@@ -209,6 +209,24 @@ building → review_pending → code_review → mergeable → merging → done**
   `review(<id>): APPROVED|CHANGES REQUESTED` commit), and the merge is a merge commit so
   `git log --first-parent main` reads as a clean history of merged work.
 
+### Per-Project Board Marks
+
+When a board serves multiple repositories, each project is automatically assigned two
+distinct visual marks that appear on its cards — no operator configuration required.
+
+**Project emoji.** Each project (repository) receives a unique emoji. The emoji appears on
+every board card belonging to that project, making it easy to identify which repo a card
+comes from at a glance.
+
+**Colored left-border stripe.** Each project is also assigned a distinct color. Board cards
+display a colored left-border stripe in that project's color, letting operators visually
+group and distinguish cards from different projects without reading the repo name. Like the
+emoji, the color is assigned automatically.
+
+**Timer urgency is on the timer chip, not the stripe.** Per-card urgency indicators (overdue,
+due-soon, etc.) appear on the timer chip. The left-border stripe reflects only project
+identity — its color does not change based on timer state.
+
 ---
 
 ## 6. Durability & backup
