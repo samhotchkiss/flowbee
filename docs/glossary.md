@@ -71,7 +71,7 @@ since been handed to someone else.
 A time-bounded, renewable claim of ownership over a job. A worker dials out to
 the control plane, leases a job for the duration of its TTL, executes it with
 whatever agent it wraps, and reports the result; it renews the lease while still
-working and the lease expires if it goes silent. Each lease is fenced by an
+working and the lease expires if it goes silent. Each lease grant is assigned a monotonically increasing **epoch** used as the fencing token for that ownership period. Each lease is fenced by an
 **epoch** so that exactly one worker holds a given job at a time.
 
 ### lease reaping
