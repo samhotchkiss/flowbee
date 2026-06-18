@@ -233,3 +233,31 @@ func TestWatchdogLeavesFreshJobsAlone(t *testing.T) {
 		t.Fatalf("fresh job state=%s, want ready (untouched)", j.State)
 	}
 }
+
+// TestNormalizeStrandedReadyBuilds: a build job re-armed to `ready` with stale review
+// caps (role:code_reviewer) is repaired to role:eng_worker so a builder can claim it.
+func TestNormalizeStrandedReadyBuilds(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	if _, err := st.DB.ExecContext(ctx, `
+		INSERT INTO jobs (id, kind, flow, stage, state, role, blocked_by, required_capabilities,
+		                  enqueued_at, lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq)
+		VALUES ('strand', 'build', 'build', 'build', 'ready', 'code_reviewer', '[]', '["role:code_reviewer"]',
+		        datetime('now'), 0, 0, 5, 0, 4, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	n, err := st.NormalizeStrandedReadyBuilds(ctx, time.Unix(1000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("repaired %d, want 1", n)
+	}
+	j, _ := st.GetJob(ctx, "strand")
+	if j.Role != "eng_worker" {
+		t.Fatalf("role=%s want eng_worker", j.Role)
+	}
+	if len(j.RequiredCapabilities) != 1 || j.RequiredCapabilities[0] != "role:eng_worker" {
+		t.Fatalf("caps=%v want [role:eng_worker]", j.RequiredCapabilities)
+	}
+}

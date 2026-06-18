@@ -298,6 +298,11 @@ func Fold(events []Event) (job.Job, error) {
 			j.State = e.ToState
 			j.Bounces += e.Payload.BouncesDelta
 			j.Role = job.RoleEngWorker
+			// reset the capability to match the re-armed build role: the store UPDATE
+			// sets required_capabilities=[role:eng_worker], so the fold must too, or a
+			// re-armed build job folds to stale role:code_reviewer caps — unleaseable by
+			// any builder (the stranded-ready-job bug).
+			j.RequiredCapabilities = []string{"role:eng_worker"}
 			j.EnqueuedAt = e.CreatedAt
 			j.LeaseID = ""
 			j.BoundIdentity = ""

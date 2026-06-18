@@ -180,6 +180,31 @@ func reviewWaitingOnCITx(ctx context.Context, tx *sql.Tx, id string) (bool, erro
 	return prExists == 1 && ciGreen == 0 && merged == 0, nil
 }
 
+// NormalizeStrandedReadyBuilds is the self-heal safety net for a build job that landed in
+// `ready` carrying STALE review/resolver capabilities — e.g. a re-arm from review or a
+// manual operator re-arm out of needs_human that didn't reset them, leaving
+// required_capabilities pointing at role:code_reviewer. The scheduler matches a `ready`
+// job to a worker BY its required_capabilities, so a build asking for a code_reviewer is
+// unleaseable by EVERY builder and sits forever (no_eligible_worker fires endlessly). A
+// `ready` build job MUST require role:eng_worker; this repairs any that don't, no matter
+// HOW they got there, so a stale capability can never permanently strand a job. Returns
+// the number repaired (a direct projection repair — the canonical re-arm folds already
+// target eng_worker, so this aligns a diverged row, it does not invent a transition).
+func (s *Store) NormalizeStrandedReadyBuilds(ctx context.Context, now time.Time) (int, error) {
+	want := marshalStrings([]string{"role:eng_worker"})
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE jobs
+		   SET role='eng_worker', stage='build', required_capabilities=?, updated_at=datetime('now')
+		 WHERE state='ready' AND kind='build'
+		   AND (role != 'eng_worker' OR required_capabilities != ?)`,
+		want, want)
+	if err != nil {
+		return 0, fmt.Errorf("normalize stranded ready builds: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 func (s *Store) leasableJobIDs(ctx context.Context) ([]string, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT id FROM jobs

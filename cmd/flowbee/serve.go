@@ -367,6 +367,13 @@ func runServe(args []string) error {
 				} else if n > 0 {
 					logger.Info("📤 epic fan-out: released children to build", "issues", n)
 				}
+				// self-heal: a build job re-armed to `ready` with stale review caps is
+				// unleaseable by any builder — repair it so it can never strand.
+				if n, err := st.NormalizeStrandedReadyBuilds(ctx, time.Now()); err != nil {
+					logger.Error("normalize stranded ready builds", "err", err)
+				} else if n > 0 {
+					logger.Warn("🩹 repaired stranded ready build jobs (stale review caps)", "jobs", n)
+				}
 			}
 		}
 	}()
