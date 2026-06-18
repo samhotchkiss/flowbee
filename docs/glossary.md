@@ -1,5 +1,6 @@
 # Glossary
 > Flowbee terms, operator-oriented.
+> Flowbee terms, builder-oriented.
 
 This is the canonical list of Flowbee's domain vocabulary. These terms recur
 throughout the design docs, the issue/PR discussions, and the code; this page
