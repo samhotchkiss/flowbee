@@ -360,3 +360,41 @@ func TestBaseRefreshOnMerge(t *testing.T) {
 		t.Fatalf("merged job state=%s want done", m.State)
 	}
 }
+
+// TestReconcileParksOnClosedUnmergedPR: when a human CLOSES a job's PR without merging,
+// reconcile parks the job at needs_human with the legible pr_closed reason — promptly,
+// instead of waiting on a merge that never comes (the old behavior: a slow, misleading
+// stall escalation ~4×lease_ttl later).
+func TestReconcileParksOnClosedUnmergedPR(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	seedBuildPR(t, st, "jc", 7)
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='review_pending' WHERE id='jc'`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(6000, 0)
+	if _, err := st.ApplyReconciledPR(ctx, "jc", store.ReconciledPR{
+		Number: 7, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", ClosedUnmerged: true,
+	}, now); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	j, _ := st.GetJob(ctx, "jc")
+	if j.State != job.StateNeedsHuman {
+		t.Fatalf("closed-unmerged PR must park the job at needs_human, got %s", j.State)
+	}
+	if j.EscalationReason != string(job.EscalationPRClosed) {
+		t.Fatalf("escalation_reason=%q want %q", j.EscalationReason, job.EscalationPRClosed)
+	}
+
+	// a MERGED PR (not closed-unmerged) still goes to done, not parked.
+	seedBuildPR(t, st, "jm2", 8)
+	_, _ = st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging' WHERE id='jm2'`)
+	if _, err := st.ApplyReconciledPR(ctx, "jm2", store.ReconciledPR{
+		Number: 8, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "m",
+	}, now); err != nil {
+		t.Fatalf("apply merged: %v", err)
+	}
+	if j2, _ := st.GetJob(ctx, "jm2"); j2.State != job.StateDone {
+		t.Fatalf("merged PR must be done, got %s", j2.State)
+	}
+}

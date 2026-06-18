@@ -145,6 +145,10 @@ const (
 	// requeue) rather than hunting the job. A silent indefinite review is a worse failure
 	// than a clear page, so the watchdog surfaces it instead of waiting forever.
 	EscalationCIStalled EscalationReason = "ci_stalled"
+	// EscalationPRClosed: a human CLOSED the job's PR without merging (rejected the
+	// change). The job is parked promptly with this legible reason instead of waiting
+	// on a merge that will never come (and instead of a misleading `stall`).
+	EscalationPRClosed EscalationReason = "pr_closed"
 	// EscalationReviewerRejections is the per-review-node loop trigger (§12.6.1): a
 	// SINGLE review node requested changes on the same task MaxReviewerRejections
 	// times. That is a genuine standoff with one reviewer — park it for a human

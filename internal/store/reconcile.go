@@ -48,6 +48,11 @@ type ReconciledPR struct {
 	// build (rebuild), escalating to needs_human at max_bounces. Transient (not
 	// stored) — recomputed from the rollup each sweep.
 	CIFailed bool
+	// ClosedUnmerged is true for a PR a human CLOSED without merging — the change was
+	// rejected, so the job is parked (pr_closed) instead of waiting on a merge that will
+	// never come (and instead of the slow, misleading stall the watchdog would otherwise
+	// raise ~4×lease_ttl later).
+	ClosedUnmerged bool
 }
 
 // ReconcileOutcome reports what an ingest did, for the runtime to publish / assert.
@@ -185,6 +190,15 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 				}
 			}
 			out.Done = true
+		case pr.ClosedUnmerged && prBoundActive(j.State):
+			// a human CLOSED the PR without merging — the change was rejected. Park the
+			// job promptly with a legible `pr_closed` reason instead of waiting on a merge
+			// that never comes (and instead of the misleading `stall` the watchdog would
+			// otherwise raise ~4×lease_ttl later, or a closed-PR merge looping the resolver).
+			if err := escalatePRClosedTx(ctx, tx, &j, seq, now); err != nil {
+				return err
+			}
+			out.Applied = true
 		case shaMoved && supersedable(j.State):
 			// I-5 / §6.2.4: a head/base move supersedes the SHA-bound verdict and
 			// re-arms review + CI. Invalidate the verdict, revoke any active lease
@@ -231,6 +245,44 @@ func supersedable(s job.State) bool {
 		// too — a merge in flight must not be yanked back to build mid-dispatch.
 		return false
 	}
+}
+
+// prBoundActive reports whether a job is in a non-terminal state that HAS an open PR
+// (post-build, pre-terminal). A human closing the PR in any of these states means the
+// change was rejected — unlike supersedable(), this DOES include merge_handoff, merging,
+// and resolving_conflict, since a closed PR strands all of them.
+func prBoundActive(s job.State) bool {
+	switch s {
+	case job.StateReviewPending, job.StateCodeReview, job.StateMergeable,
+		job.StateMerging, job.StateMergeHandoff, job.StateResolvingConflict:
+		return true
+	default:
+		return false
+	}
+}
+
+// escalatePRClosedTx parks a job whose PR a human closed without merging: needs_human
+// with the legible `pr_closed` reason, the lease cleared. The change was rejected, so
+// there is nothing to retry — an operator decides whether to requeue.
+func escalatePRClosedTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time) error {
+	nextSeq := seq + 1
+	ev := ledger.Event{
+		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
+		FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
+		Actor: "reconcile", CreatedAt: now,
+		Payload: ledger.Payload{RevokeReason: "human closed the PR without merging"},
+	}
+	if err := appendEvent(ctx, tx, ev); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET state='needs_human', escalation_reason=?, lease_id=NULL, bound_identity=NULL,
+		     lease_hb_due=NULL, updated_at=datetime('now') WHERE id=?`,
+		string(job.EscalationPRClosed), j.ID); err != nil {
+		return fmt.Errorf("escalate pr_closed: %w", err)
+	}
+	j.State = job.StateNeedsHuman
+	return setJobSeq(ctx, tx, j.ID, nextSeq)
 }
 
 // upsertDomainBFactsTx writes ONLY Domain-B columns. The monotonic high-water-mark

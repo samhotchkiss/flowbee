@@ -53,7 +53,11 @@ type PullRequest struct {
 	HeadRefOid  string // Domain-B: head SHA
 	BaseRefOid  string // Domain-B: base SHA
 	MergeCommit string // Domain-B: merge commit SHA (terminal fact)
-	CIRollup    CIState
+	// ClosedUnmerged is true for a PR a human CLOSED without merging (GitHub state
+	// CLOSED, not MERGED) — the signal that the change was rejected, so reconcile parks
+	// the job instead of waiting on a merge that will never come.
+	ClosedUnmerged bool
+	CIRollup       CIState
 	Labels      []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
 }
 
@@ -288,6 +292,9 @@ query BoardSweep($owner:String!, $repo:String!, $prCursor:String, $issueCursor:S
     mergedPullRequests: pullRequests(first:50, states:[MERGED], orderBy:{field:UPDATED_AT, direction:DESC}) @include(if: $includeMerged) {
       nodes { ...prFields }
     }
+    closedPullRequests: pullRequests(first:50, states:[CLOSED], orderBy:{field:UPDATED_AT, direction:DESC}) @include(if: $includeMerged) {
+      nodes { ...prFields }
+    }
     issues(first:50, after:$issueCursor, states:[OPEN], orderBy:{field:UPDATED_AT, direction:DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes { number updatedAt title body labels(first:20){ nodes{ name } } }
@@ -378,6 +385,9 @@ type sweepData struct {
 		MergedPullRequests struct {
 			Nodes []prNode `json:"nodes"`
 		} `json:"mergedPullRequests"`
+		ClosedPullRequests struct {
+			Nodes []prNode `json:"nodes"`
+		} `json:"closedPullRequests"`
 		Issues struct {
 			PageInfo pageInfo `json:"pageInfo"`
 			Nodes    []struct {
@@ -435,6 +445,17 @@ func (d sweepData) accumulate(snap *BoardSnapshot, seenPR, seenIssue map[int]boo
 	}
 	for _, n := range d.Repository.MergedPullRequests.Nodes {
 		add(n)
+	}
+	// PRs from the CLOSED connection were closed WITHOUT merging (states:[CLOSED]
+	// excludes MERGED) — mark them so reconcile can park the rejected job.
+	for _, n := range d.Repository.ClosedPullRequests.Nodes {
+		if seenPR[n.Number] {
+			continue
+		}
+		seenPR[n.Number] = true
+		pr := prFromNode(n)
+		pr.ClosedUnmerged = true
+		snap.PullRequests = append(snap.PullRequests, pr)
 	}
 	for _, n := range d.Repository.Issues.Nodes {
 		if seenIssue[n.Number] {
