@@ -157,6 +157,15 @@ const (
 	EscalationDesign EscalationReason = "design"
 )
 
+// Default counters a job is created with. These are the single source of truth: the
+// store INSERTs that create jobs use these values, and the ledger Fold reconstructs
+// them, so projection == Fold(events). DefaultMaxBounces was lowered 9 -> 4 to cap
+// rebuild cost on failing jobs (a doomed job burns ~1 build+review per bounce).
+const (
+	DefaultMaxAttempts = 5
+	DefaultMaxBounces  = 4
+)
+
 // CapabilitiesSatisfy reports whether the attested capability set satisfies every
 // required capability tag. This is the pure §6.6 capability match (matching is on
 // the attested set; the loop wires it into the atomic claim). Required tags are

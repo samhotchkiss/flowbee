@@ -210,9 +210,10 @@ func Fold(events []Event) (job.Job, error) {
 			if e.ToState == job.StateReady {
 				j.EnqueuedAt = e.CreatedAt
 			}
-			// M1 default counters mirror the migration defaults.
-			j.MaxAttempts = 5
-			j.MaxBounces = 3
+			// Default counters mirror the store INSERTs (job.Default*), so
+			// projection == Fold(events) for a freshly created job.
+			j.MaxAttempts = job.DefaultMaxAttempts
+			j.MaxBounces = job.DefaultMaxBounces
 		case KindLeaseClaimed:
 			j.State = e.ToState
 			j.LeaseEpoch = e.LeaseEpoch

@@ -278,4 +278,13 @@ func TestFoldEqualsProjection(t *testing.T) {
 	if folded.Kind != proj.Kind {
 		t.Fatalf("kind: fold=%s proj=%s", folded.Kind, proj.Kind)
 	}
+	// the created-job default counters must round-trip: the store INSERT and the Fold
+	// both source job.Default*, so a future drift between them (the max_bounces 9->4
+	// change exposed exactly this) fails here instead of silently breaking the invariant.
+	if folded.MaxBounces != proj.MaxBounces || folded.MaxBounces != job.DefaultMaxBounces {
+		t.Fatalf("max_bounces: fold=%d proj=%d want %d", folded.MaxBounces, proj.MaxBounces, job.DefaultMaxBounces)
+	}
+	if folded.MaxAttempts != proj.MaxAttempts || folded.MaxAttempts != job.DefaultMaxAttempts {
+		t.Fatalf("max_attempts: fold=%d proj=%d want %d", folded.MaxAttempts, proj.MaxAttempts, job.DefaultMaxAttempts)
+	}
 }
