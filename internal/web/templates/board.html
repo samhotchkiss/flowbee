@@ -9,29 +9,50 @@
   {{end}}
 </div>
 {{end}}
-<div class="lanes">
-{{range .Lanes}}
-  <section class="lane {{.Class}}" data-lane="{{.Key}}">
-    <h3>{{.Title}} <span class="count">{{len .Cards}}</span></h3>
-    {{range .Cards}}
-    <article class="card t-{{.TimerClass}}{{if eq .TimerClass ""}}gray{{end}}" data-job="{{.JobID}}">
-      <div class="ttl">
-        {{if .Flowbee}}<span class="flag" title="flowbee-tracked">🐝</span>{{end}}
-        <span>{{.Title}}</span>
-      </div>
-      <div class="meta">
-        {{if .IsEpic}}<span class="chip epic">epic</span>{{else if .EpicID}}<span class="chip epic">epic·{{.EpicID}}</span>{{end}}
-        {{if .IssueNumber}}<span class="chip">#{{.IssueNumber}}</span>{{end}}
-        <span class="chip">{{.State}}</span>
-        {{if .Identity}}<span class="chip ident">{{.Identity}}</span>{{end}}
-        {{if .NeedsFullSpec}}<span class="chip">needs-spec</span>{{end}}
-        <span class="timer {{.TimerClass}}">{{hms .StageAgeS}}</span>
-      </div>
-    </article>
-    {{else}}
-    <p class="muted" style="font-size:.78rem;margin:.2rem .2rem">—</p>
-    {{end}}
+<div class="buckets">
+{{range .Buckets}}
+  <section class="bucket {{.Class}}" data-bucket="{{.Key}}">
+    <h3>{{.Title}} <span class="count">{{.Count}}</span></h3>
+    {{range .Statuses}}{{if .Cards}}
+    <div class="status" data-status="{{.Key}}">
+      <div class="status-label">{{.Title}} <span class="scount">{{len .Cards}}</span></div>
+      {{range .Cards}}{{template "board-card" .}}{{end}}
+    </div>
+    {{end}}{{end}}
+    {{if eq .Count 0}}<p class="muted bucket-empty">—</p>{{end}}
   </section>
 {{end}}
 </div>
+
+{{if .Done}}
+<div class="done-list">
+  <h3>Done <span class="count">{{len .Done}}</span></h3>
+  <div class="done-rows">
+  {{range .Done}}
+    <article class="card done-row" data-job="{{.JobID}}" style="--proj:{{.ProjectColor}}">
+      <span class="flag" title="{{if .Repo}}{{.Repo}}{{else}}flowbee{{end}}">{{.ProjectEmoji}}</span>
+      <span class="done-ttl">{{.Title}}</span>
+      {{if .IssueNumber}}<span class="chip">#{{.IssueNumber}}</span>{{end}}
+      <span class="done-age">{{hms .StageAgeS}}</span>
+    </article>
+  {{end}}
+  </div>
+</div>
+{{end}}
+{{end}}
+
+{{define "board-card"}}
+<article class="card t-{{.TimerClass}}{{if eq .TimerClass ""}}gray{{end}}" data-job="{{.JobID}}" style="--proj:{{.ProjectColor}}">
+  <div class="ttl">
+    <span class="flag" title="{{if .Repo}}{{.Repo}}{{else}}flowbee{{end}}">{{.ProjectEmoji}}</span>
+    <span>{{.Title}}</span>
+  </div>
+  <div class="meta">
+    {{if .IsEpic}}<span class="chip epic">epic</span>{{else if .EpicID}}<span class="chip epic">epic·{{.EpicID}}</span>{{end}}
+    {{if .IssueNumber}}<span class="chip">#{{.IssueNumber}}</span>{{end}}
+    {{if .Identity}}<span class="chip ident">{{.Identity}}</span>{{end}}
+    {{if .NeedsFullSpec}}<span class="chip">needs-spec</span>{{end}}
+    <span class="timer {{.TimerClass}}">{{hms .StageAgeS}}</span>
+  </div>
+</article>
 {{end}}

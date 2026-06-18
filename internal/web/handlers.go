@@ -1,10 +1,12 @@
 package web
 
 import (
+	"fmt"
+	"hash/fnv"
+	"html/template"
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
@@ -23,26 +25,38 @@ type page struct {
 
 // ── BOARD ──
 
-// boardLane is one column of the board (a stage, or the Backlog / ⚠ Needs-you
-// special lanes). Cards within a lane keep board recency order.
-type boardLane struct {
+// boardBucket is one of the five top-level board buckets (Needs-you, Spec, Build,
+// Review, Merge). It holds ordered sub-status groups, each folding one or more job
+// states under a single label, so the board reads as five columns instead of ~13.
+type boardBucket struct {
 	Key      string
 	Title    string
-	Class    string // "" | "needsyou" | "backlog"
-	Cards    []boardCard
+	Class    string
+	Count    int // total live cards across this bucket's statuses
+	Statuses []boardStatus
 }
 
-// boardCard is a card's render view: the rich store card plus the resolved
-// per-card timer class + a yellow flowbee marker flag (every actively-tracked
-// card carries it; build-list §G "yellow flowbee marker").
+// boardStatus is a sub-status group within a bucket (e.g. "building" under Build).
+type boardStatus struct {
+	Key   string
+	Title string
+	Cards []boardCard
+}
+
+// boardCard is a card's render view: the rich store card plus the resolved per-card
+// timer class, the flowbee marker, and the per-project mark (emoji + left-stripe
+// color) so an operator can tell at a glance which project a task belongs to.
 type boardCard struct {
 	store.BoardCard
-	TimerClass string
-	Flowbee    bool // the yellow flowbee umbrella marker
+	TimerClass   string
+	Flowbee      bool         // the yellow flowbee umbrella marker
+	ProjectEmoji string       // per-project glyph (replaces the generic bee on the card)
+	ProjectColor template.CSS // per-project left-stripe color (derived from the repo)
 }
 
 type boardView struct {
-	Lanes []boardLane
+	Buckets []boardBucket
+	Done    []boardCard // completed jobs, listed below the buckets (newest first)
 	// Repos is the set of distinct non-empty repo scopes present on the board (F9
 	// multi-repo registry), rendered as the filter chips. SelectedRepo is the active
 	// ?repo=<id> filter ("" => the "All" default, every repo shown).
@@ -50,37 +64,95 @@ type boardView struct {
 	SelectedRepo string
 }
 
-// stageLanes is the ordered set of pipeline stage lanes (the flow left-to-right),
-// keyed by the job STATE that occupies them. Backlog + Needs-you are appended as
-// the two special lanes.
-var stageLanes = []struct{ Key, Title string }{
-	{"spec_authoring", "Spec"},
-	{"spec_review", "Issue-review"},
-	{"ready", "Ready"},
-	{"building", "Build"},
-	{"review_pending", "Review queue"},
-	{"code_review", "Build-review"},
-	{"resolving_conflict", "Conflict"},
-	{"mergeable", "Mergeable"},
-	{"merging", "Merging"},
-	{"merge_handoff", "Merge handoff"},
-	{"done", "Done"},
+// statusDef / bucketDef are the static board layout: five buckets, each an ordered
+// list of sub-statuses, each folding one or more job states (first state is the
+// canonical one). Any live state not listed here is parked under Build/ready.
+type statusDef struct {
+	Key, Title string
+	States     []string
+}
+type bucketDef struct {
+	Key, Title, Class string
+	Statuses          []statusDef
 }
 
-// leasedAlias folds the transient `leased` state into the build lane and any
-// escalation/blocked states into the needs-you lane so every live card lands
-// somewhere visible.
-func laneKeyFor(state string) string {
-	switch state {
-	case "leased":
-		return "building"
-	case "needs_human", "needs_design", "failed", "blocked":
-		return "needsyou"
-	case "backlog":
-		return "backlog"
-	default:
-		return state
+var boardBuckets = []bucketDef{
+	{"needsyou", "⚠ Needs-you", "needsyou", []statusDef{
+		{"needs_human", "needs human", []string{"needs_human", "needs_design", "failed", "blocked"}},
+		{"merge_handoff", "merge handoff", []string{"merge_handoff"}},
+		{"needs_input", "needs input", []string{"needs_input"}},
+	}},
+	{"spec", "Spec", "spec", []statusDef{
+		{"backlog", "backlog", []string{"backlog"}},
+		{"spec_authoring", "authoring", []string{"spec_authoring"}},
+		{"spec_review", "issue-review", []string{"spec_review"}},
+	}},
+	{"build", "Build", "build", []statusDef{
+		{"ready", "ready", []string{"ready"}},
+		{"building", "building", []string{"building", "leased"}},
+	}},
+	{"review", "Review", "review", []statusDef{
+		{"review_pending", "review queue", []string{"review_pending"}},
+		{"code_review", "in-review", []string{"code_review"}},
+	}},
+	{"merge", "Merge", "merge", []statusDef{
+		{"resolving_conflict", "conflict", []string{"resolving_conflict"}},
+		{"mergeable", "mergeable", []string{"mergeable"}},
+		{"merging", "merging", []string{"merging"}},
+	}},
+}
+
+// bsLoc locates a state's (bucket, status) slot; stateLoc is built once from
+// boardBuckets so the per-card grouping is a single map lookup.
+type bsLoc struct{ b, s int }
+
+var stateLoc = func() map[string]bsLoc {
+	m := map[string]bsLoc{}
+	for bi, b := range boardBuckets {
+		for si, st := range b.Statuses {
+			for _, state := range st.States {
+				m[state] = bsLoc{bi, si}
+			}
+		}
 	}
+	return m
+}()
+
+// ── per-project marks ──────────────────────────────────────────────────────
+// Each project (repo scope) gets a stable emoji + left-stripe color so cards are
+// visually groupable by project. A couple of favorites are pinned; everything else
+// hashes deterministically into the palettes, so a new project gets a consistent
+// mark with no config.
+var pinnedProjectEmoji = map[string]string{"flowbee": "🐝", "russ": "🐻"}
+
+var projectEmojiPalette = []string{
+	"🦊", "🐙", "🦉", "🐳", "🦄", "🐢", "🦋", "🦅", "🐡", "🦎", "🦀", "🐝", "🐻",
+}
+
+func hashStr(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
+}
+
+func projectEmoji(repo string) string {
+	if repo == "" {
+		return "🐝" // legacy single-repo default
+	}
+	if e, ok := pinnedProjectEmoji[repo]; ok {
+		return e
+	}
+	return projectEmojiPalette[hashStr(repo)%uint32(len(projectEmojiPalette))]
+}
+
+// projectColor maps a repo to a stable hue for the card's left stripe. Returned as
+// template.CSS (trusted: it is derived from the repo name, never user free-text in a
+// CSS-injection sense) so html/template emits it verbatim into the style attribute.
+func projectColor(repo string) template.CSS {
+	if repo == "" {
+		return template.CSS("hsl(48 90% 60%)") // bee yellow default
+	}
+	return template.CSS(fmt.Sprintf("hsl(%d 58%% 56%%)", int(hashStr(repo)%360)))
 }
 
 func (u *UI) board(w http.ResponseWriter, r *http.Request) {
@@ -111,44 +183,63 @@ func (u *UI) board(w http.ResponseWriter, r *http.Request) {
 		cards = filterByRepo(cards, selRepo)
 	}
 
-	lanes := map[string]*boardLane{}
-	order := []string{}
-	add := func(key, title, class string) *boardLane {
-		l := &boardLane{Key: key, Title: title, Class: class}
-		lanes[key] = l
-		order = append(order, key)
-		return l
-	}
-	// the ⚠ Needs-you and Backlog lanes lead; then the pipeline stages.
-	add("needsyou", "⚠ Needs-you", "needsyou")
-	add("backlog", "Backlog", "backlog")
-	for _, s := range stageLanes {
-		add(s.Key, s.Title, "")
-	}
-
-	for _, c := range cards {
-		key := laneKeyFor(c.State)
-		l := lanes[key]
-		if l == nil {
-			l = lanes["ready"] // unknown live state: park it in Ready rather than drop it.
+	// build the five buckets fresh from the static layout, then drop each card into
+	// its (bucket, status) slot. `done` is collected separately for the list below.
+	buckets := make([]boardBucket, len(boardBuckets))
+	for i, b := range boardBuckets {
+		bk := boardBucket{Key: b.Key, Title: b.Title, Class: b.Class}
+		for _, st := range b.Statuses {
+			bk.Statuses = append(bk.Statuses, boardStatus{Key: st.Key, Title: st.Title})
 		}
-		l.Cards = append(l.Cards, boardCard{
-			BoardCard:  c,
-			TimerClass: u.stageClass(c.StageAgeS),
-			Flowbee:    true, // the yellow flowbee umbrella marker rides every tracked card.
-		})
+		buckets[i] = bk
 	}
-	// the Needs-you lane is enriched with the needs-input reasons (design forks):
-	// surface a job that is in needs_design but whose reason the board card lacks.
-	enrichNeedsYou(lanes["needsyou"], ni)
-	// the Backlog lane reflects the dedicated backlog read-model (the canonical
-	// "needs full spec" flag) so it matches /v1/backlog exactly.
-	syncBacklog(lanes["backlog"], bl, now)
+	var done []boardCard
+	for _, c := range cards {
+		card := boardCard{
+			BoardCard:    c,
+			TimerClass:   u.stageClass(c.StageAgeS),
+			Flowbee:      true,
+			ProjectEmoji: projectEmoji(c.Repo),
+			ProjectColor: projectColor(c.Repo),
+		}
+		if c.State == "done" {
+			done = append(done, card)
+			continue
+		}
+		loc, ok := stateLoc[c.State]
+		if !ok {
+			loc = stateLoc["ready"] // unknown live state: park in Build/ready, never drop.
+		}
+		buckets[loc.b].Statuses[loc.s].Cards = append(buckets[loc.b].Statuses[loc.s].Cards, card)
+		buckets[loc.b].Count++
+	}
 
-	view := boardView{Repos: repos, SelectedRepo: selRepo}
-	for _, k := range order {
-		view.Lanes = append(view.Lanes, *lanes[k])
+	// enrich live cards: the needs-input reason (design forks) replaces a bare-id
+	// title, and the canonical "needs full spec" flag is overlaid from the backlog
+	// read-model so the board matches /v1/backlog exactly.
+	reason := map[string]string{}
+	for _, it := range ni {
+		reason[it.JobID] = it.Reason
 	}
+	needs := map[string]bool{}
+	for _, it := range bl {
+		needs[it.JobID] = it.NeedsFullSpec
+	}
+	for bi := range buckets {
+		for si := range buckets[bi].Statuses {
+			for ci := range buckets[bi].Statuses[si].Cards {
+				c := &buckets[bi].Statuses[si].Cards[ci]
+				if r := reason[c.JobID]; r != "" && c.Title == c.JobID {
+					c.Title = r
+				}
+				if v, ok := needs[c.JobID]; ok {
+					c.NeedsFullSpec = v
+				}
+			}
+		}
+	}
+
+	view := boardView{Buckets: buckets, Done: done, Repos: repos, SelectedRepo: selRepo}
 	u.renderPage(w, r, page{Active: "board", Title: "Board", Board: &view})
 }
 
@@ -180,38 +271,6 @@ func filterByRepo(cards []store.BoardCard, repo string) []store.BoardCard {
 		}
 	}
 	return out
-}
-
-// enrichNeedsYou stamps the design-fork reason onto needs-you cards that have one.
-func enrichNeedsYou(lane *boardLane, items []store.NeedsInputItem) {
-	if lane == nil {
-		return
-	}
-	reason := map[string]string{}
-	for _, it := range items {
-		reason[it.JobID] = it.Reason
-	}
-	for i := range lane.Cards {
-		if r := reason[lane.Cards[i].JobID]; r != "" && lane.Cards[i].Title == lane.Cards[i].JobID {
-			lane.Cards[i].Title = r
-		}
-	}
-}
-
-// syncBacklog ensures the Backlog lane reflects the canonical backlog read-model
-// (it is the authoritative "needs full spec" source). The board-card pass already
-// placed backlog cards; this overlays the needs-full-spec flag.
-func syncBacklog(lane *boardLane, items []store.BacklogItem, now time.Time) {
-	if lane == nil {
-		return
-	}
-	needs := map[string]bool{}
-	for _, it := range items {
-		needs[it.JobID] = it.NeedsFullSpec
-	}
-	for i := range lane.Cards {
-		lane.Cards[i].NeedsFullSpec = needs[lane.Cards[i].JobID]
-	}
 }
 
 // ── DRAWER ──

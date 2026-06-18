@@ -115,10 +115,11 @@ func TestF12DashboardsRenderOffRealStore(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Board",                  // pane title
-		"⚠ Needs-you",            // the needs-you lane
-		"Backlog",                // the backlog lane
-		"data-job=\"build-1\"",   // a real card from the store
-		"🐝",                      // the yellow flowbee marker
+		"⚠ Needs-you",            // the needs-you bucket
+		"Spec", "Build", "Review", "Merge", // the five top-level buckets (always rendered)
+		"class=\"bucket",         // the bucket containers
+		"data-job=\"build-1\"",   // a real card from the store (under the Build bucket)
+		"🐝",                      // the per-project marker (bee = flowbee/default)
 		"class=\"timer red\"",    // the per-card stage timer (45m in stage => red)
 		"box-a",                  // the bound identity chip
 		"/assets/board.js",       // the live SSE hook script (EventSource) is wired
