@@ -6,6 +6,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1051,7 +1052,7 @@ func (s *Server) epicCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	repo := body.Repo
 	if repo == "" {
-		repo = "default"
+		repo = s.defaultRepo(r.Context())
 	}
 	epicID := ulid.New()
 	issues := make([]store.EpicIssue, len(body.Issues))
@@ -1072,6 +1073,20 @@ func (s *Server) epicCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"epic_id": epicID, "issue_ids": ids})
 }
 
+// defaultRepo resolves the repo a repo-less ingest (POST /v1/specs or /v1/epics with no
+// "repo") belongs to: the primary registered repo (first by id in the F9 registry).
+// Falls back to "" — the legacy single-repo scope the non-repo-scoped sender drains —
+// when no repos are registered. It must NEVER be the literal "default": no per-repo
+// project-out sender drains a "default" repo, so the materialization outbox row (and the
+// whole spec flow after sign-off) would strand forever, never reaching a GitHub issue.
+func (s *Server) defaultRepo(ctx context.Context) string {
+	repos, err := s.store.ListRepos(ctx, true)
+	if err != nil || len(repos) == 0 {
+		return ""
+	}
+	return repos[0].ID
+}
+
 // specCreate is the planner front-door (ingest): it seeds a spec-authoring job
 // from a submitted work item so the spec flow can run (author -> issue-review ->
 // materialize -> GitHub issue). The planner names the work; an author worker
@@ -1083,7 +1098,7 @@ func (s *Server) specCreate(w http.ResponseWriter, r *http.Request) {
 		Task       string `json:"task"`       // the work item the spec_author must spec ($FLOWBEE_TASK)
 		Acceptance string `json:"acceptance"` // optional done-when
 		Lens       string `json:"lens"`       // author lens (default product_speccer; distinct from the issue-reviewer lens)
-		Repo       string `json:"repo"`       // repos.id this work item belongs to (default "default")
+		Repo       string `json:"repo"`       // repos.id this work item belongs to (default: the primary registered repo)
 		Priority   int    `json:"priority"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1100,7 +1115,7 @@ func (s *Server) specCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	repo := body.Repo
 	if repo == "" {
-		repo = "default"
+		repo = s.defaultRepo(r.Context())
 	}
 	// the task the author specs: prefer an explicit `task`, fall back to the title so
 	// a one-line "title only" ingest still gives the spec_author something to build.
