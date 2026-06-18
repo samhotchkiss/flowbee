@@ -254,6 +254,31 @@ the per-job event timeline is the fine-grained detail. A retention policy that a
 old **terminal** jobs' events is a deliberate, opt-in future feature — terminal jobs are never
 re-folded, but pruning the source of truth is not something to default-on.
 
+### Crash recovery
+
+When the control plane restarts, Flowbee recovers without operator intervention. GitHub is
+the source of truth: the board sweep and targeted per-job refetches run on startup and
+re-derive the full desired state from scratch — no in-memory work is lost.
+
+All GitHub writes are idempotent by design. A re-sent action after a crash recovers rather
+than duplicates: an already-merged PR is treated as success, a duplicate PR-open recovers
+the existing PR on a 422, and issue-create guards on the stamped issue number so a replay
+is a no-op.
+
+The webhook inbox is durable. Deliveries recorded but not yet processed before a crash are
+replayed on boot, so no incoming event is silently dropped.
+
+Worker crashes self-heal. A silently-dead worker stops heartbeating; the lease watchdog
+reaps its lease after a few missed beats (~4 minutes) — well before the absolute
+`lease_ttl_s` cap — and the job re-queues for a live worker without operator action.
+
+The four automatic recovery mechanisms, in summary:
+
+- **Reconcile-from-truth**: restart re-derives all state from GitHub.
+- **Idempotent writes**: merge / PR-open / issue-create are safe to replay.
+- **Webhook replay**: the durable inbox is drained on boot.
+- **Lease reap**: dead workers' leases are reclaimed in ~4 min.
+
 ---
 
 ## 7. Recovering from trouble
