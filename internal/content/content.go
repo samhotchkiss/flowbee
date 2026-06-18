@@ -195,7 +195,11 @@ var denyMatchers = []struct {
 		switch base {
 		case "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json",
 			"Gemfile.lock", "poetry.lock", "Pipfile.lock", "go.sum", "Cargo.lock",
-			"composer.lock":
+			"composer.lock",
+			// go.mod is the dependency MANIFEST: a `replace` directive (redirect a dep to
+			// a malicious fork) or a version bump to a compromised release is a supply-chain
+			// escalation that go.sum alone does not always catch — protect both.
+			"go.mod", "Cargo.toml", "package.json", "pyproject.toml", "Gemfile":
 			return true
 		}
 		if strings.HasSuffix(base, ".lock") {
@@ -243,8 +247,10 @@ var denyMatchers = []struct {
 	{"flowbee_source", func(p string) bool {
 		return strings.HasPrefix(p, "internal/") ||
 			strings.HasPrefix(p, "cmd/flowbee/") ||
-			strings.HasPrefix(p, "tools/archcheck/") ||
-			strings.HasPrefix(p, "tools/providerlint/") ||
+			// ALL of tools/ is flowbee's own dev/build source (archcheck, providerlint,
+			// seedidentities, …) — a broad prefix so a NEW tool can't slip in un-gated, the
+			// way tools/seedidentities/ did when only two subdirs were listed by name.
+			strings.HasPrefix(p, "tools/") ||
 			strings.HasPrefix(p, "flows/") ||
 			baseName(p) == "flowbee.yaml" ||
 			// the denylist source itself is the canonical escalation target.

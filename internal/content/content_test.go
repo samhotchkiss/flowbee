@@ -77,6 +77,16 @@ func TestDenylistClasses(t *testing.T) {
 		{"cmd/flowbee/serve.go", true},
 		{"flows/build.yaml", true},
 		{"flowbee.yaml", true},
+		// ALL of tools/ is flowbee source (regression: seedidentities + any new tool slipped
+		// the gate when only archcheck/providerlint were listed by name).
+		{"tools/seedidentities/main.go", true},
+		{"tools/archcheck/main.go", true},
+		{"tools/somethingnew/x.go", true},
+		// dependency manifests are supply-chain escalation vectors (a replace directive /
+		// compromised version), not just the lockfiles.
+		{"go.mod", true},
+		{"package.json", true},
+		{"Cargo.toml", true},
 		// ordinary application paths are clear.
 		{"pkg/foo.go", false},
 		{"README.md", false},
