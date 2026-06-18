@@ -157,7 +157,13 @@ func Middleware(a Authenticator, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, err := a.Authenticate(r)
 		if err != nil {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			// Actionable body (the worker logs this verbatim on every retry, and the
+			// private listener is loopback/Tailscale-only so it leaks nothing useful to
+			// an attacker): name the two things an operator actually has to line up.
+			http.Error(w, "unauthorized: worker token missing/invalid or identity not enrolled — "+
+				"check the worker's FLOWBEE_WORKER_TOKEN matches the control plane's "+
+				"FLOWBEE_WORKER_AUTH_SECRET, and that this identity is in enrolled_identities",
+				http.StatusUnauthorized)
 			return
 		}
 		ctx := withIdentity(r.Context(), id)

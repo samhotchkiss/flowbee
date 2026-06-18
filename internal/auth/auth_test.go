@@ -3,6 +3,7 @@ package auth
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -109,6 +110,14 @@ func TestMiddlewareRejects401(t *testing.T) {
 	}
 	if reached {
 		t.Fatal("next handler reached on unauthorized request")
+	}
+	// the 401 body must be ACTIONABLE — the worker logs it verbatim, so it has to
+	// name what the operator must line up (token vs secret, and enrollment).
+	body := rec.Body.String()
+	for _, want := range []string{"FLOWBEE_WORKER_TOKEN", "FLOWBEE_WORKER_AUTH_SECRET", "enrolled_identities"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("401 body must mention %q for the operator, got: %q", want, body)
+		}
 	}
 
 	// authorized -> next reached, identity bound.
