@@ -103,24 +103,19 @@ func (m *Mirror) HeadSHA(ref string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-// DiffNames returns the paths changed between base and head (git diff --name-only
-// base..head) in the bare mirror — the ACTUAL touched set on the branch, computed by
-// the control plane from real commits rather than the worker's self-reported patch.
-// It is the CP-authoritative content cross-check before an autonomous self-merge, so
-// the denylist judges what will REALLY land on main, never a worker's say-so. Both
-// commits must be present in the mirror (FetchBranch the head ref first).
-func (m *Mirror) DiffNames(base, head string) ([]string, error) {
-	out, err := run("", "git", "--git-dir", m.Path, "diff", "--name-only", base+".."+head)
+// DiffBetween returns the full unified diff between base and head (git diff base..head)
+// in the bare mirror — the ACTUAL change on the branch, computed by the control plane
+// from real commits rather than the worker's self-reported patch. It is the
+// CP-authoritative input to re-running the WHOLE content gate (denylist + secret-scan +
+// binary/size checks) before an autonomous self-merge, so the gate judges what will
+// REALLY land on main, never a worker's say-so. Both commits must be present in the
+// mirror (FetchBranch the head ref first).
+func (m *Mirror) DiffBetween(base, head string) (string, error) {
+	out, err := run("", "git", "--git-dir", m.Path, "diff", base+".."+head)
 	if err != nil {
-		return nil, fmt.Errorf("diff %s..%s: %w", base, head, err)
+		return "", fmt.Errorf("diff %s..%s: %w", base, head, err)
 	}
-	var paths []string
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if p := strings.TrimSpace(line); p != "" {
-			paths = append(paths, p)
-		}
-	}
-	return paths, nil
+	return out, nil
 }
 
 // FetchBranch force-updates a local branch from the mirror's origin (GitHub), so

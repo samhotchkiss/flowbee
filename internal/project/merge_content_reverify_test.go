@@ -32,6 +32,12 @@ func mergingJob(t *testing.T, st *store.Store, id string) {
 	}
 }
 
+// diffAdding builds a minimal unified diff that adds one line to path.
+func diffAdding(path, line string) string {
+	return "diff --git a/" + path + " b/" + path + "\n" +
+		"--- a/" + path + "\n+++ b/" + path + "\n@@ -0,0 +1 @@\n+" + line + "\n"
+}
+
 // TestAutonomousMergeDeniedWhenActualDiffHitsDenylist: project-out re-checks the ACTUAL
 // base..head diff (from the mirror) before an autonomous merge; if it touches a denylisted
 // path — even though the worker's reported patch was clean — the merge is NOT sent and the
@@ -39,15 +45,14 @@ func mergingJob(t *testing.T, st *store.Store, id string) {
 func TestAutonomousMergeDeniedWhenActualDiffHitsDenylist(t *testing.T) {
 	st, fake, sender, _ := newSender(t)
 	ctx := context.Background()
-	// the mirror reports a denylisted path on the REAL branch (e.g. a sneaked source edit).
-	sender.WithHistory(&fakeHistory{tip: "t", diffPaths: []string{"docs/ok.md", "internal/engine/engine.go"}}, "main")
+	// the mirror's REAL diff touches a denylisted path (e.g. a sneaked source edit).
+	sender.WithHistory(&fakeHistory{tip: "t", diffOut: diffAdding("internal/engine/engine.go", "// x")}, "main")
 	mergingJob(t, st, "j")
 
 	if _, err := sender.DrainOnce(ctx); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
 
-	// the merge must NOT have been sent to GitHub.
 	for _, c := range fake.Calls() {
 		if c == "EnqueueMergeQueue(42)" {
 			t.Fatal("an autonomous merge with a denylisted ACTUAL diff was sent — must route to handoff")
@@ -59,12 +64,35 @@ func TestAutonomousMergeDeniedWhenActualDiffHitsDenylist(t *testing.T) {
 	}
 }
 
+// TestAutonomousMergeDeniedWhenActualDiffLeaksSecret: the full content gate runs on the
+// ACTUAL diff, so a secret introduced on the real branch (in a NON-denylisted file the
+// worker under-reported) also blocks the autonomous merge — not just denylisted paths.
+func TestAutonomousMergeDeniedWhenActualDiffLeaksSecret(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+	secret := `aws_secret_access_key = "AKIAIOSFODNN7EXAMPLEKEYDATA0123456789abcd"`
+	sender.WithHistory(&fakeHistory{tip: "t", diffOut: diffAdding("docs/notes.md", secret)}, "main")
+	mergingJob(t, st, "j")
+
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	for _, c := range fake.Calls() {
+		if c == "EnqueueMergeQueue(42)" {
+			t.Fatal("an autonomous merge whose ACTUAL diff leaks a secret was sent — must route to handoff")
+		}
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateMergeHandoff {
+		t.Fatalf("state=%s, want merge_handoff (secret in actual diff)", j.State)
+	}
+}
+
 // TestAutonomousMergeProceedsWhenActualDiffClean: a clean actual diff (docs only) merges
 // autonomously as before — the cross-check is additive, not a blanket block.
 func TestAutonomousMergeProceedsWhenActualDiffClean(t *testing.T) {
 	st, fake, sender, _ := newSender(t)
 	ctx := context.Background()
-	sender.WithHistory(&fakeHistory{tip: "t", diffPaths: []string{"docs/operating.md", "README.md"}}, "main")
+	sender.WithHistory(&fakeHistory{tip: "t", diffOut: diffAdding("docs/operating.md", "a new clarifying sentence")}, "main")
 	mergingJob(t, st, "j")
 
 	if _, err := sender.DrainOnce(ctx); err != nil {

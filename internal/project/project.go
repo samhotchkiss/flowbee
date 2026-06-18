@@ -28,6 +28,29 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
+// contentDenyReason re-runs the content gate's SAFETY conditions — the path denylist and
+// the deterministic static checks (secret-scan, binary blob, malformed-diff) — over the
+// ACTUAL branch diff, returning a non-empty reason if any fail (so an autonomous merge is
+// downgraded to the human gate). Size/file-count bounds are disabled here: they are a
+// resource/blast-radius policy (operator-configurable, already applied at verdict time),
+// not a content-safety condition, and the Sender does not carry the operator policy. The
+// blast-radius declared-vs-actual check is also omitted (a declaration-consistency tamper
+// signal whose "declared" set is itself worker-reported, not a content-safety property).
+func contentDenyReason(actualDiff string) string {
+	r := content.Check(content.Patch{Diff: actualDiff}, content.Limits{MaxDiffBytes: 1 << 30, MaxChangedFiles: 1 << 20})
+	var reasons []string
+	if !r.DenylistClear {
+		reasons = append(reasons, "denylist:"+strings.Join(r.DenylistHits, ","))
+	}
+	if !r.StaticChecksPass {
+		reasons = append(reasons, "static:"+strings.Join(r.StaticFailures, ","))
+	}
+	if len(reasons) == 0 {
+		return ""
+	}
+	return "content gate (actual diff) " + strings.Join(reasons, "; ")
+}
+
 // Clock is the injected clock (DESIGN: Flowbee is the sole clock).
 type Clock interface{ Now() time.Time }
 
@@ -110,10 +133,10 @@ type HistoryWriter interface {
 	// the resolver's base — else the resolver builds against a stale main lacking the
 	// sibling's merge, the resolution re-conflicts, and the brief is nonsensical.
 	FetchBranch(branch string) error
-	// DiffNames returns the paths changed between base and head in the mirror — the
-	// CP-computed ACTUAL touched set, used to re-verify an autonomous merge's content
-	// against the real branch (not the worker's self-reported patch) before it lands.
-	DiffNames(base, head string) ([]string, error)
+	// DiffBetween returns the full unified diff between base and head in the mirror — the
+	// CP-computed ACTUAL change, used to re-run the WHOLE content gate against the real
+	// branch (not the worker's self-reported patch) before an autonomous merge lands.
+	DiffBetween(base, head string) (string, error)
 }
 
 // WithHistory wires the local-git history writer + the branch its dedicated
@@ -378,12 +401,13 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			}
 		}
 		// CP-AUTHORITATIVE content re-check (defense-in-depth, §5.4): before an AUTONOMOUS
-		// merge, re-run the denylist over the ACTUAL base..head diff from the mirror — not
-		// the worker's self-reported patch the verdict-time gate ran over. A denylisted path
-		// on the REAL branch downgrades the job to the HUMAN merge gate, so a worker can
-		// never land a privilege-escalating change on main by under-reporting what it
-		// touched. A verify FAILURE (can't fetch/diff) returns an error → the merge RETRIES
-		// (transient), never a silent autonomous merge of unverified content.
+		// merge, re-run the WHOLE content gate (denylist + secret-scan + binary/size) over
+		// the ACTUAL base..head diff from the mirror — not the worker's self-reported patch
+		// the verdict-time gate ran over. A failure on the REAL branch downgrades the job to
+		// the HUMAN merge gate, so a worker can never land a privilege-escalating change, a
+		// leaked secret, or a binary blob on main by under-reporting what it touched. A
+		// verify FAILURE (can't fetch/diff) returns an error → the merge RETRIES (transient),
+		// never a silent autonomous merge of unverified content.
 		if s.history != nil {
 			j, jerr := s.store.GetJob(ctx, row.JobID)
 			if jerr == nil && j.BaseSHA != "" && j.HeadSHA != "" {
@@ -391,12 +415,11 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 				if ferr := s.history.FetchBranch(br); ferr != nil {
 					return "", fmt.Errorf("verify autonomous merge: fetch %s: %w", br, ferr)
 				}
-				paths, derr := s.history.DiffNames(j.BaseSHA, j.HeadSHA)
+				actualDiff, derr := s.history.DiffBetween(j.BaseSHA, j.HeadSHA)
 				if derr != nil {
 					return "", fmt.Errorf("verify autonomous merge: diff %s..%s: %w", j.BaseSHA, j.HeadSHA, derr)
 				}
-				if hits := content.DenylistHits(paths); len(hits) > 0 {
-					reason := "content denylist (actual diff): " + strings.Join(hits, ",")
+				if reason := contentDenyReason(actualDiff); reason != "" {
 					if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
 						return "", fmt.Errorf("route self-merge to handoff: %w", rerr)
 					}
