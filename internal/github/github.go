@@ -26,6 +26,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -619,7 +620,44 @@ func (c *RealClient) OpenPR(ctx context.Context, in OpenPRInput) (int, error) {
 	err := c.rest(ctx, http.MethodPost, "/pulls", map[string]any{
 		"title": in.Title, "body": in.Body, "head": in.HeadRef, "base": in.BaseRef, "draft": in.Draft,
 	}, &out)
+	if err != nil && isPRAlreadyExists(err) {
+		// A 422 "A pull request already exists for <head>" means the PR is ALREADY open:
+		// a prior attempt opened it, or an outbox re-send fired after a CP crash between
+		// the create succeeding and the pr_number being recorded. Recover the existing
+		// PR's number so the row consumes cleanly and the job gets its pr_number, instead
+		// of dead-lettering an un-recordable 422 and stranding the job with no PR.
+		if n, ok := c.openPRByHead(ctx, in.HeadRef); ok {
+			return n, nil
+		}
+	}
 	return out.Number, err
+}
+
+// openPRByHead returns the number of the single OPEN PR whose head ref is `head`
+// (owner:branch), if any — the recovery lookup for an "already exists" 422.
+func (c *RealClient) openPRByHead(ctx context.Context, head string) (int, bool) {
+	var prs []struct {
+		Number int `json:"number"`
+	}
+	q := fmt.Sprintf("/pulls?state=open&head=%s:%s", url.QueryEscape(c.Owner), url.QueryEscape(head))
+	if err := c.rest(ctx, http.MethodGet, q, nil, &prs); err != nil {
+		return 0, false
+	}
+	if len(prs) > 0 {
+		return prs[0].Number, true
+	}
+	return 0, false
+}
+
+// isPRAlreadyExists reports whether a failed OpenPR is GitHub's 422 "a pull request
+// already exists for this head" (idempotent re-open) rather than a different validation
+// failure (e.g. a missing base branch), which must keep surfacing as an error.
+func isPRAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "422") && strings.Contains(s, "already exists")
 }
 
 func (c *RealClient) CreateIssue(ctx context.Context, in CreateIssueInput) (int, error) {
