@@ -154,8 +154,27 @@ func runWork(args []string) error {
 	for {
 		if err := run(); err != nil {
 			fmt.Fprintf(envErr(), "work cycle: %v\n", err)
+			// back off after a FAILED attempt (a no-output build, a provision error, a
+			// transient API error) so the worker does not immediately re-poll and
+			// re-claim the SAME job — the ready↔leased churn that floods the ledger and
+			// burns the job's attempt budget in a tight spin. A short pause lets another
+			// worker pick it up or conditions settle; healthy throughput is unaffected
+			// (a successful run returns nil and loops straight to the next long-poll).
+			time.Sleep(errBackoff())
 		}
 	}
+}
+
+// errBackoff is the pause after a failed work attempt before re-polling (default 5s),
+// so a worker that just errored on a job does not tight-spin re-claiming it. Tunable
+// via FLOWBEE_ERR_BACKOFF_S.
+func errBackoff() time.Duration {
+	if v := os.Getenv("FLOWBEE_ERR_BACKOFF_S"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 5 * time.Second
 }
 
 func envErr() *os.File { return os.Stderr }
