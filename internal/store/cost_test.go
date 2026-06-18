@@ -92,6 +92,78 @@ func TestRecordCostEscalatesOverCeiling(t *testing.T) {
 	}
 }
 
+// TestRecordCostDefaultCeilingEngages proves the operator-configured fleet-wide
+// default ceiling (Store.DefaultCostCeilingMicroUSD) caps a job that carries NO
+// per-job ceiling of its own — the §6.7 circuit-breaker an operator arms via
+// FLOWBEE_COST_CEILING_USD without seeding a ceiling on every job.
+func TestRecordCostDefaultCeilingEngages(t *testing.T) {
+	st := newLiveStore(t)
+	st.DefaultCostCeilingMicroUSD = 5_000_000
+	ctx := context.Background()
+	epoch := seedLeasedCost(t, st, "j", "f", nil) // nil per-job ceiling
+
+	res, err := st.RecordCost(ctx, CostParams{
+		JobID: "j", Epoch: epoch, Now: time.Unix(1001, 0),
+		MicroUSDDelta: 6_000_000, // over the default
+	})
+	if err != nil {
+		t.Fatalf("record cost: %v", err)
+	}
+	if !res.Escalated || res.Directive != "cancel" {
+		t.Fatalf("over default ceiling must escalate+cancel: escalated=%v dir=%q", res.Escalated, res.Directive)
+	}
+	j, _ := st.GetJob(ctx, "j")
+	if j.State != job.StateNeedsHuman || !j.OverBudget {
+		t.Fatalf("over budget: state=%s over=%v", j.State, j.OverBudget)
+	}
+	if j.EscalationReason != string(job.EscalationCost) {
+		t.Fatalf("escalation_reason=%q want cost", j.EscalationReason)
+	}
+	// the default is NOT persisted onto the job — it applies per-decision only.
+	if j.CostCeilingMicroUSD != nil {
+		t.Fatalf("default ceiling must not persist onto the job, got %v", *j.CostCeilingMicroUSD)
+	}
+}
+
+// TestRecordCostNoDefaultNeverCaps proves the shipped posture: with no default
+// and no per-job ceiling, an arbitrarily large meter accumulates and never caps.
+func TestRecordCostNoDefaultNeverCaps(t *testing.T) {
+	st := newLiveStore(t) // DefaultCostCeilingMicroUSD == 0
+	ctx := context.Background()
+	epoch := seedLeasedCost(t, st, "j", "f", nil)
+
+	res, err := st.RecordCost(ctx, CostParams{
+		JobID: "j", Epoch: epoch, Now: time.Unix(1001, 0), MicroUSDDelta: 999_000_000,
+	})
+	if err != nil {
+		t.Fatalf("record cost: %v", err)
+	}
+	if res.Escalated || res.Directive != "continue" {
+		t.Fatalf("no ceiling must never cap: escalated=%v dir=%q", res.Escalated, res.Directive)
+	}
+}
+
+// TestRecordCostPerJobCeilingOverridesDefault proves a deliberately-seeded per-job
+// ceiling wins over the fleet default (e.g. a costly epic granted more headroom):
+// a meter under the per-job ceiling but over the default still continues.
+func TestRecordCostPerJobCeilingOverridesDefault(t *testing.T) {
+	st := newLiveStore(t)
+	st.DefaultCostCeilingMicroUSD = 5_000_000
+	ctx := context.Background()
+	high := int64(100_000_000)
+	epoch := seedLeasedCost(t, st, "j", "f", &high) // per-job ceiling >> default
+
+	res, err := st.RecordCost(ctx, CostParams{
+		JobID: "j", Epoch: epoch, Now: time.Unix(1001, 0), MicroUSDDelta: 6_000_000,
+	})
+	if err != nil {
+		t.Fatalf("record cost: %v", err)
+	}
+	if res.Escalated || res.Directive != "continue" {
+		t.Fatalf("per-job ceiling must override default: escalated=%v dir=%q", res.Escalated, res.Directive)
+	}
+}
+
 func TestRecordCostStaleEpoch(t *testing.T) {
 	st := newLiveStore(t)
 	ctx := context.Background()

@@ -30,6 +30,14 @@ type Store struct {
 	// set the content gate runs over a worker's untrusted diff (§9.2, I-11). The zero
 	// value is exactly the shipped defaults. Set by the runtime from config.
 	ContentPolicy content.Policy
+
+	// DefaultCostCeilingMicroUSD is the operator-configured per-job cost circuit-
+	// breaker (§6.7, I-15): when > 0, a metered job that carries NO per-job ceiling
+	// of its own inherits this one for the duration of the cost decision, so the
+	// existing cost_escalated path engages. 0 (the zero value) = no default ceiling,
+	// the shipped posture (cost metered, never capped on spend). Set by the runtime
+	// from config.CostCeilingMicroUSD().
+	DefaultCostCeilingMicroUSD int64
 }
 
 // Open opens the SQLite database with WAL + a busy timeout. A single open

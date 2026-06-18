@@ -79,6 +79,32 @@ func TestContentPolicyEnv(t *testing.T) {
 	}
 }
 
+func TestCostCeilingEnv(t *testing.T) {
+	// zero config => no default ceiling (shipped posture: metered, never capped).
+	if m := Default().CostCeilingMicroUSD(); m != 0 {
+		t.Fatalf("default cost ceiling must be 0 (off), got %d", m)
+	}
+	t.Setenv("FLOWBEE_COST_CEILING_USD", "2.50")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.CostCeilingUSD != 2.50 {
+		t.Fatalf("cost_ceiling_usd not wired: %v", c.CostCeilingUSD)
+	}
+	if m := c.CostCeilingMicroUSD(); m != 2_500_000 {
+		t.Fatalf("dollars must project to micro-USD ×1e6, got %d want 2_500_000", m)
+	}
+}
+
+func TestCostCeilingNegativeRejected(t *testing.T) {
+	c := Default()
+	c.CostCeilingUSD = -1
+	if err := c.Validate(); err == nil {
+		t.Fatalf("negative cost_ceiling_usd must fail Validate")
+	}
+}
+
 // TestReposConfig proves the F9 multi-repo registry parses from YAML, including the
 // active default (true when unset) and explicit park.
 func TestReposConfig(t *testing.T) {

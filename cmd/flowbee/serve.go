@@ -144,6 +144,12 @@ func runServe(args []string) error {
 	ensureControlMirror(logger)
 
 	st.NoEligibleWorkerDelay = cfg.NoEligibleWorker()
+	// §6.7 per-job cost circuit-breaker: 0 (default) keeps the shipped posture
+	// (metered, never spend-capped); FLOWBEE_COST_CEILING_USD > 0 arms it fleet-wide.
+	st.DefaultCostCeilingMicroUSD = cfg.CostCeilingMicroUSD()
+	if c := st.DefaultCostCeilingMicroUSD; c > 0 {
+		logger.Info("cost ceiling armed", "usd", cfg.CostCeilingUSD, "micro_usd", c)
+	}
 
 	// worker-transport mutual auth (§7.6): when a signing secret is configured the
 	// private API requires a signed per-worker bearer token bound to an enrolled

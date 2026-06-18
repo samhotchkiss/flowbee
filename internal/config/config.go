@@ -74,6 +74,16 @@ type Config struct {
 	// is forced to the human gate. Set via FLOWBEE_CONTENT_DENY_EXTRA (comma-separated).
 	ContentDenyExtra []string `yaml:"content_deny_extra"`
 
+	// CostCeilingUSD is the optional per-job cost circuit-breaker (§6.7, I-15): when
+	// > 0, every newly-metered job inherits it as a ceiling, and the FIRST worker
+	// cost report whose accumulated total reaches it revokes the lease (epoch++) and
+	// escalates the job to needs_human (over_budget). 0 (default) = no $ ceiling —
+	// cost is still metered for the rollup, but a runaway job is bounded only by
+	// attempts/bounces, never by spend. A per-job ceiling seeded at creation still
+	// takes precedence. Dollars; converted to micro-USD (×1e6). Set via
+	// FLOWBEE_COST_CEILING_USD.
+	CostCeilingUSD float64 `yaml:"cost_ceiling_usd"`
+
 	// GithubOwner / GithubRepo are the single-repo coordinates `flowbee init`
 	// prefills from the git remote (F13). They are the config-file form of the
 	// legacy FLOWBEE_GITHUB_OWNER/REPO env path: when Repos is empty, serve uses
@@ -120,6 +130,16 @@ func (c Config) ContentPolicy() content.Policy {
 		},
 		ExtraDenyPrefixes: c.ContentDenyExtra,
 	}
+}
+
+// CostCeilingMicroUSD projects the dollars-denominated config knob into the
+// micro-USD unit the engine ceiling predicate (job.CostExceeded) speaks. 0 =>
+// no default ceiling (per-job ceilings seeded at creation still apply).
+func (c Config) CostCeilingMicroUSD() int64 {
+	if c.CostCeilingUSD <= 0 {
+		return 0
+	}
+	return int64(c.CostCeilingUSD * 1_000_000)
 }
 
 func Default() Config {
@@ -228,6 +248,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("FLOWBEE_CONTENT_DENY_EXTRA"); v != "" {
 		c.ContentDenyExtra = splitCSV(v)
 	}
+	if v := os.Getenv("FLOWBEE_COST_CEILING_USD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.CostCeilingUSD = f
+		}
+	}
 	if v := os.Getenv("FLOWBEE_GITHUB_OWNER"); v != "" {
 		c.GithubOwner = v
 	}
@@ -269,6 +294,9 @@ func (c Config) Validate() error {
 	if c.LeaseTTLS < 3*c.HeartbeatIntervalS {
 		return fmt.Errorf("lease_ttl_s (%d) must be >= 3*heartbeat_interval_s (%d) per DESIGN §6.3.3",
 			c.LeaseTTLS, 3*c.HeartbeatIntervalS)
+	}
+	if c.CostCeilingUSD < 0 {
+		return fmt.Errorf("cost_ceiling_usd (%.2f) must be >= 0", c.CostCeilingUSD)
 	}
 	// the F9 multi-repo registry: each repo needs a unique handle + GitHub coords, or it
 	// silently fails at runtime (no mirror, no API URL — the loops just no-op). Catch the

@@ -68,6 +68,12 @@ SHA-bound verdict — never a worker's say-so.
 | `content_max_changed_files` | `FLOWBEE_CONTENT_MAX_CHANGED_FILES` | shipped default | a diff over this is forced to handoff |
 | `content_deny_extra` | `FLOWBEE_CONTENT_DENY_EXTRA` (CSV) | — | extra path-prefix denylist; **augments**, never replaces, the always-on protected set (CI config, lockfiles, secrets, Flowbee's own source) |
 
+## Cost circuit-breaker (§6.7)
+
+| key | env override | default | meaning |
+|-----|--------------|---------|---------|
+| `cost_ceiling_usd` | `FLOWBEE_COST_CEILING_USD` | `0` (off) | per-job spend cap in dollars. When `> 0`, the first worker cost report whose accumulated total reaches it revokes the lease and escalates the job to `needs_human` (`over_budget`). `0` = no cap — cost is still metered for the rollup, but a runaway job is bounded only by attempts/bounces. A per-job ceiling seeded at creation (e.g. a costly epic) takes precedence over this fleet default. |
+
 ## Worker authentication
 
 Empty `worker_auth_secret` = loopback-only dev (the listener must stay on

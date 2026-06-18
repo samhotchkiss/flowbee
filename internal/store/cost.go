@@ -57,6 +57,14 @@ func (s *Store) RecordCost(ctx context.Context, p CostParams) (CostResult, error
 		folded.CostTokensIn = newIn
 		folded.CostTokensOut = newOut
 		folded.CostMicroUSD = newUSD
+		// a job with no per-job ceiling inherits the operator's configured default
+		// for THIS decision only (not persisted) so the §6.7 circuit-breaker engages
+		// fleet-wide without seeding a ceiling on every job. A per-job ceiling always
+		// wins (it was set deliberately, e.g. a costly epic granted more headroom).
+		if folded.CostCeilingMicroUSD == nil && s.DefaultCostCeilingMicroUSD > 0 {
+			c := s.DefaultCostCeilingMicroUSD
+			folded.CostCeilingMicroUSD = &c
+		}
 
 		dec := engine.Decide(
 			engine.EngineState{Job: folded, Now: p.Now, Epoch: j.LeaseEpoch},
