@@ -87,3 +87,5 @@ Workers observe and report; observations reconcile *in*; the control plane recon
 desired against actual and decides; decisions project *out* to workers; workers act —
 and at every write, the gate enforces the lease/epoch fence so no stale actor can
 touch a resource it no longer owns.
+
+See also: [operating.md](operating.md)
