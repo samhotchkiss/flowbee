@@ -42,3 +42,37 @@ func TestServeSystemdCarriesAuthChoice(t *testing.T) {
 		}
 	}
 }
+
+// TestRepoTokenWarning covers the multi-repo token footgun classifier: a repo with
+// no token at all (no-op), a declared token_env that's unset (silent shared fallback),
+// and the healthy cases (per-repo token present, or shared token with no token_env).
+func TestRepoTokenWarning(t *testing.T) {
+	cases := []struct {
+		name, id, tokenEnv, shared, perRepo string
+		wantSub                             string // "" => no warning expected
+	}{
+		{"no token at all, no env", "web", "", "", "", "has NO GitHub token"},
+		{"no token at all, env declared", "web", "WEB_PAT", "", "", "WEB_PAT (or FLOWBEE_GITHUB_TOKEN)"},
+		{"env declared but unset, shared present", "web", "WEB_PAT", "shared", "", "token_env WEB_PAT is unset"},
+		{"per-repo token present", "web", "WEB_PAT", "shared", "tok", ""},
+		{"shared token, no env declared", "web", "", "shared", "", ""},
+		{"per-repo present, no shared", "web", "WEB_PAT", "", "tok", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := repoTokenWarning(c.id, c.tokenEnv, c.shared, c.perRepo)
+			if c.wantSub == "" {
+				if got != "" {
+					t.Fatalf("expected no warning, got %q", got)
+				}
+				return
+			}
+			if !strings.Contains(got, c.wantSub) {
+				t.Fatalf("warning %q must contain %q", got, c.wantSub)
+			}
+			if !strings.Contains(got, c.id) {
+				t.Fatalf("warning %q must name the repo id %q", got, c.id)
+			}
+		})
+	}
+}

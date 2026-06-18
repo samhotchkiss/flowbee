@@ -609,6 +609,28 @@ func repoTokenURL(r store.Repo) string {
 	return "https://x-access-token:" + tok + "@github.com/" + r.Owner + "/" + r.Repo + ".git"
 }
 
+// repoTokenWarning returns a startup warning (or "") for a registered repo whose
+// GitHub token is missing or silently falling back — the multi-repo footgun where a
+// repo you added to the registry never moves because its credential isn't wired. Two
+// cases: (1) no token at all (per-repo env empty AND no shared FLOWBEE_GITHUB_TOKEN) →
+// every GitHub call 401s and the repo's reconcile/project loops no-op; (2) a declared
+// token_env that is UNSET while a shared token exists → the repo quietly uses the
+// shared token, which may lack access to this repo (a later 403, not an obvious cause).
+// doctor flags these too; this is the runtime backstop for an operator who skipped it.
+func repoTokenWarning(id, tokenEnvName, sharedTok, perRepoTok string) string {
+	if perRepoTok == "" && sharedTok == "" {
+		env := "FLOWBEE_GITHUB_TOKEN"
+		if tokenEnvName != "" {
+			env = tokenEnvName + " (or FLOWBEE_GITHUB_TOKEN)"
+		}
+		return fmt.Sprintf("repo %q has NO GitHub token (set %s) — its reconcile/merge loops will no-op until it does", id, env)
+	}
+	if tokenEnvName != "" && perRepoTok == "" && sharedTok != "" {
+		return fmt.Sprintf("repo %q token_env %s is unset — falling back to the shared FLOWBEE_GITHUB_TOKEN, which may lack access to this repo", id, tokenEnvName)
+	}
+	return ""
+}
+
 // ensureRepoMirror clones a repo's bare mirror if absent (F9 per-repo provisioning),
 // locking it down so the baked-in token isn't world/group-readable. A no-op when the
 // mirror is already present or coords are missing.
@@ -664,6 +686,17 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 			continue
 		}
 		tokenEnv[id] = rc.TokenEnv
+		// name a repo that will silently no-op for lack of (the right) token NOW, at
+		// startup, instead of leaving the operator to wonder why one repo never moves.
+		if rc.IsActive() {
+			perRepo := ""
+			if rc.TokenEnv != "" {
+				perRepo = os.Getenv(rc.TokenEnv)
+			}
+			if msg := repoTokenWarning(id, rc.TokenEnv, os.Getenv("FLOWBEE_GITHUB_TOKEN"), perRepo); msg != "" {
+				logger.Warn("⚠️  " + msg)
+			}
+		}
 	}
 
 	// (2) per-repo GitHub factory: each repo gets its OWN RealClient bearing its
