@@ -91,7 +91,7 @@ func Doctor(ctx context.Context, opts DoctorOptions) (DoctorReport, error) {
 
 	// (2) flows + identities: the flow files exist and every referenced identity
 	// resolves to an identity yaml with an existing lens file.
-	checkFlows(root, &rep)
+	checkFlows(root, cfg, &rep)
 
 	// (3) GitHub reachability (skippable offline).
 	checkGitHub(ctx, opts, cfg, &rep)
@@ -118,13 +118,21 @@ func checkConfig(root string, rep *DoctorReport) (config.Config, bool) {
 	rep.add("config", StatusPass, fmt.Sprintf("flowbee.yaml parses; lease_ttl_s=%d heartbeat=%d allow_self_merge=%v",
 		cfg.LeaseTTLS, cfg.HeartbeatIntervalS, cfg.AllowSelfMerge))
 
-	// coords: prefilled is a pass; blank is a warn (user must fill before serve).
-	if cfg.GithubOwner != "" && cfg.GithubRepo != "" {
+	// coords: a multi-repo registry is the production layout; single-repo coords (filled
+	// or env) are the quickstart; neither is a warn (user must wire one before serve).
+	switch {
+	case len(cfg.Repos) > 0:
+		ids := make([]string, 0, len(cfg.Repos))
+		for _, r := range cfg.Repos {
+			ids = append(ids, r.ID)
+		}
+		rep.add("repo-coords", StatusPass, fmt.Sprintf("multi-repo registry: %d repos (%s)", len(cfg.Repos), strings.Join(ids, ", ")))
+	case cfg.GithubOwner != "" && cfg.GithubRepo != "":
 		rep.add("repo-coords", StatusPass, fmt.Sprintf("%s/%s", cfg.GithubOwner, cfg.GithubRepo))
-	} else if os.Getenv("FLOWBEE_GITHUB_OWNER") != "" && os.Getenv("FLOWBEE_GITHUB_REPO") != "" {
+	case os.Getenv("FLOWBEE_GITHUB_OWNER") != "" && os.Getenv("FLOWBEE_GITHUB_REPO") != "":
 		rep.add("repo-coords", StatusPass, "from FLOWBEE_GITHUB_OWNER/REPO env")
-	} else {
-		rep.add("repo-coords", StatusWarn, "github_owner/github_repo unset (set them in flowbee.yaml before serve)")
+	default:
+		rep.add("repo-coords", StatusWarn, "no repos configured — set a repos: registry, or github_owner/github_repo, before serve")
 	}
 	return cfg, true
 }
@@ -147,11 +155,19 @@ type flowDoc struct {
 	} `yaml:"stages"`
 }
 
-func checkFlows(root string, rep *DoctorReport) {
+func checkFlows(root string, cfg config.Config, rep *DoctorReport) {
 	flowsDir := filepath.Join(root, "flows")
 	defaultPath := filepath.Join(flowsDir, "default.yaml")
 	fb, err := os.ReadFile(defaultPath)
 	if err != nil {
+		// A multi-repo control-plane config (repos: registry) legitimately ships NO
+		// flows/ dir — it runs the embedded default flows. Only the single-repo
+		// `flowbee init` layout must scaffold flows/, so missing-flows is a hard fail
+		// THERE but an informational note for a multi-repo deployment.
+		if len(cfg.Repos) > 0 {
+			rep.add("flow", StatusWarn, "no flows/ dir — multi-repo control plane uses the embedded default flows (add flows/ to customize)")
+			return
+		}
 		rep.add("flow", StatusFail, fmt.Sprintf("flows/default.yaml not found (run `flowbee init`): %v", err))
 		return
 	}
@@ -222,15 +238,29 @@ func checkGitHub(ctx context.Context, opts DoctorOptions, cfg config.Config, rep
 		rep.add("github", StatusWarn, "skipped (offline): GitHub reachability not checked")
 		return
 	}
-	probe := opts.Probe
-	if probe == nil {
-		// build a RealClient from the token, if any. No token => warn (the user has
-		// not wired creds yet — not a hard failure for `init`-then-`doctor`).
-		token := os.Getenv("FLOWBEE_GITHUB_TOKEN")
-		if token == "" {
-			rep.add("github", StatusWarn, "FLOWBEE_GITHUB_TOKEN unset; skipping reachability (set it or pass --offline)")
-			return
+	timeout := opts.ProbeTimeout
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+
+	// The targets to preflight: every registered repo (F9 multi-repo registry — the
+	// production layout), or the single-repo coords (legacy / `flowbee init` quickstart)
+	// when no registry is configured. Each repo gets its OWN reachability + preflight, so
+	// a multi-repo deployment is validated per repo instead of silently skipped.
+	type target struct{ owner, repo, branch, label, tokenEnv string }
+	var targets []target
+	if len(cfg.Repos) > 0 {
+		for _, r := range cfg.Repos {
+			if !r.IsActive() {
+				continue
+			}
+			br := r.DefaultBranch
+			if br == "" {
+				br = "main"
+			}
+			targets = append(targets, target{r.Owner, r.Repo, br, "github[" + r.ID + "]", r.TokenEnv})
 		}
+	} else {
 		owner, repo := cfg.GithubOwner, cfg.GithubRepo
 		if v := os.Getenv("FLOWBEE_GITHUB_OWNER"); v != "" {
 			owner = v
@@ -238,59 +268,76 @@ func checkGitHub(ctx context.Context, opts DoctorOptions, cfg config.Config, rep
 		if v := os.Getenv("FLOWBEE_GITHUB_REPO"); v != "" {
 			repo = v
 		}
-		if owner == "" || repo == "" {
-			rep.add("github", StatusWarn, "no repo coords; skipping reachability")
-			return
-		}
-		probe = gh.NewRealClient(owner, repo, func(context.Context) (string, error) { return token, nil })
+		targets = append(targets, target{owner, repo, cfg.GithubDefaultBranch, "github", ""})
 	}
 
-	timeout := opts.ProbeTimeout
-	if timeout == 0 {
-		timeout = 10 * time.Second
+	for _, t := range targets {
+		probe := opts.Probe
+		if probe == nil {
+			token := os.Getenv("FLOWBEE_GITHUB_TOKEN")
+			if t.tokenEnv != "" {
+				if v := os.Getenv(t.tokenEnv); v != "" {
+					token = v
+				}
+			}
+			if token == "" {
+				rep.add(t.label, StatusWarn, "no token (set FLOWBEE_GITHUB_TOKEN or the repo's token_env, or pass --offline)")
+				continue
+			}
+			if t.owner == "" || t.repo == "" {
+				rep.add(t.label, StatusWarn, "no repo coords; skipping reachability")
+				continue
+			}
+			probe = gh.NewRealClient(t.owner, t.repo, func(context.Context) (string, error) { return token, nil })
+		}
+		cctx, cancel := context.WithTimeout(ctx, timeout)
+		checkOneRepo(cctx, probe, t.branch, t.label, rep)
+		cancel()
 	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+}
+
+// checkOneRepo runs the reachability + deployment preflight (token write-scope, CI,
+// branch protection, token least-privilege) for a single repo, prefixing each check
+// with `label` so a multi-repo report names which repo each result belongs to.
+func checkOneRepo(cctx context.Context, probe GitHubProbe, branch, label string, rep *DoctorReport) {
 	snap, err := probe.BoardSweep(cctx)
 	if err != nil {
-		rep.add("github", StatusFail, fmt.Sprintf("GitHub unreachable: %v (re-run with --offline to skip)", err))
+		rep.add(label, StatusFail, fmt.Sprintf("GitHub unreachable: %v (re-run with --offline to skip)", err))
 		return
 	}
-	rep.add("github", StatusPass, fmt.Sprintf("reachable; rate-limit remaining=%d, board has %d PRs / %d issues",
+	rep.add(label, StatusPass, fmt.Sprintf("reachable; rate-limit remaining=%d, board has %d PRs / %d issues",
 		snap.RateLimit.Remaining, len(snap.PullRequests), len(snap.Issues)))
 
-	// deployment preflight (the make-or-break misconfigs): token write-scope, CI, and
-	// branch protection. Only when the probe is a real client (the fake skips these).
 	pf, ok := probe.(preflighter)
 	if !ok {
 		return
 	}
-	pre, perr := pf.Preflight(cctx, cfg.GithubDefaultBranch)
+	pre, perr := pf.Preflight(cctx, branch)
 	if perr != nil {
-		rep.add("github write access", StatusWarn, fmt.Sprintf("could not read repo permissions: %v", perr))
+		rep.add(label+" write", StatusWarn, fmt.Sprintf("could not read repo permissions: %v", perr))
 		return
 	}
 	if pre.CanWrite {
-		rep.add("github write access", StatusPass, "token can write (push branches / open + merge PRs / close issues)")
+		rep.add(label+" write", StatusPass, "token can write (push branches / open + merge PRs / close issues)")
 	} else {
-		rep.add("github write access", StatusFail, "token lacks WRITE — use a fine-grained PAT with Contents + Pull requests + Issues = write (read-only can't push or merge)")
+		rep.add(label+" write", StatusFail, "token lacks WRITE — use a fine-grained PAT with Contents + Pull requests + Issues = write (read-only can't push or merge)")
 	}
 	switch {
 	case pre.CITriggersOnPR:
-		rep.add("ci configured", StatusPass, "a workflow triggers on pull_request (Flowbee's merge gate can go green)")
+		rep.add(label+" ci", StatusPass, "a workflow triggers on pull_request (Flowbee's merge gate can go green)")
 	case pre.HasCI:
-		rep.add("ci configured", StatusWarn, "workflows exist but NONE trigger on pull_request — Flowbee gates the merge on green PR CI, so PRs will sit forever; add `on: pull_request` to a workflow")
+		rep.add(label+" ci", StatusWarn, "workflows exist but NONE trigger on pull_request — Flowbee gates the merge on green PR CI, so PRs will sit forever; add `on: pull_request` to a workflow")
 	default:
-		rep.add("ci configured", StatusWarn, "no GitHub Actions workflow found — Flowbee merges ONLY on green CI, so nothing will merge until the repo reports a CI status check on PRs")
+		rep.add(label+" ci", StatusWarn, "no GitHub Actions workflow found — Flowbee merges ONLY on green CI, so nothing will merge until the repo reports a CI status check on PRs")
 	}
 	if pre.BranchProtected {
-		rep.add("branch protection", StatusWarn, "integration branch is protected — autonomous merge needs the token to satisfy the required checks, or turn protection off")
+		rep.add(label+" protection", StatusWarn, "integration branch is protected — autonomous merge needs the token to satisfy the required checks, or turn protection off")
 	} else {
-		rep.add("branch protection", StatusPass, "integration branch unprotected — autonomous merge OK")
+		rep.add(label+" protection", StatusPass, "integration branch unprotected — autonomous merge OK")
 	}
 	if pre.TokenScopes != "" {
-		rep.add("token scope", StatusWarn, "broadly-scoped CLASSIC PAT (scopes: "+pre.TokenScopes+") — prefer a fine-grained PAT limited to Contents + Pull requests + Issues (least privilege)")
+		rep.add(label+" token", StatusWarn, "broadly-scoped CLASSIC PAT (scopes: "+pre.TokenScopes+") — prefer a fine-grained PAT limited to Contents + Pull requests + Issues (least privilege)")
 	} else {
-		rep.add("token scope", StatusPass, "fine-grained / least-privilege token")
+		rep.add(label+" token", StatusPass, "fine-grained / least-privilege token")
 	}
 }

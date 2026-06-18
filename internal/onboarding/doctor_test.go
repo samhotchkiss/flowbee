@@ -8,8 +8,37 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/samhotchkiss/flowbee/internal/config"
 	gh "github.com/samhotchkiss/flowbee/internal/github"
 )
+
+// TestDoctorMultiRepoPreflightsEachRepo: with a multi-repo registry (the production
+// layout), doctor must preflight EACH registered repo — not warn "repo-coords unset" and
+// skip the make-or-break checks (token write, CI-on-PR, branch protection), as it did
+// when it only understood the single-repo github_owner/github_repo coords.
+func TestDoctorMultiRepoPreflightsEachRepo(t *testing.T) {
+	cfg := config.Config{Repos: []config.RepoConfig{
+		{ID: "flowbee", Owner: "o", Repo: "flowbee", DefaultBranch: "main"},
+		{ID: "russ", Owner: "o", Repo: "russ", DefaultBranch: "main"},
+	}}
+	rep := &DoctorReport{}
+	probe := preflightProbe{gh.Preflight{CanWrite: true, HasCI: true, CITriggersOnPR: true}}
+	checkGitHub(context.Background(), DoctorOptions{Probe: probe}, cfg, rep)
+
+	for _, want := range []string{
+		"github[flowbee]", "github[russ]",
+		"github[flowbee] write", "github[russ] write",
+		"github[flowbee] ci", "github[russ] ci",
+	} {
+		c := findCheck(*rep, want)
+		if c.Name == "" {
+			t.Fatalf("missing per-repo check %q — multi-repo deploy not preflighted", want)
+		}
+		if c.Status == StatusFail {
+			t.Fatalf("per-repo check %q failed: %+v", want, c)
+		}
+	}
+}
 
 // initGitRepo makes a temp git repo with an origin remote pointing at
 // github.com/acme/widgets, so DetectRemote / Init can prefill coords. Shared by
@@ -69,7 +98,7 @@ func TestDoctorPreflight(t *testing.T) {
 	if !rep.Green() {
 		t.Fatalf("expected green:\n%s", dump(rep))
 	}
-	for _, n := range []string{"github write access", "ci configured", "branch protection"} {
+	for _, n := range []string{"github write", "github ci", "github protection"} {
 		if c := findCheck(rep, n); c.Status != StatusPass {
 			t.Fatalf("%q should pass, got %+v", n, c)
 		}
@@ -80,7 +109,7 @@ func TestDoctorPreflight(t *testing.T) {
 	if !rep.Green() {
 		t.Fatalf("a CI warning must not break green:\n%s", dump(rep))
 	}
-	if c := findCheck(rep, "ci configured"); c.Status != StatusWarn {
+	if c := findCheck(rep, "github ci"); c.Status != StatusWarn {
 		t.Fatalf("workflows-without-PR-trigger should warn, got %+v", c)
 	}
 
@@ -88,7 +117,7 @@ func TestDoctorPreflight(t *testing.T) {
 	if rep.Green() {
 		t.Fatal("a token without write access must break green")
 	}
-	if c := findCheck(rep, "github write access"); c.Status != StatusFail {
+	if c := findCheck(rep, "github write"); c.Status != StatusFail {
 		t.Fatalf("write access should fail, got %+v", c)
 	}
 
@@ -96,10 +125,10 @@ func TestDoctorPreflight(t *testing.T) {
 	if !rep.Green() {
 		t.Fatalf("warnings must not break green:\n%s", dump(rep))
 	}
-	if c := findCheck(rep, "ci configured"); c.Status != StatusWarn {
+	if c := findCheck(rep, "github ci"); c.Status != StatusWarn {
 		t.Fatalf("missing CI should warn, got %+v", c)
 	}
-	if c := findCheck(rep, "branch protection"); c.Status != StatusWarn {
+	if c := findCheck(rep, "github protection"); c.Status != StatusWarn {
 		t.Fatalf("protected branch should warn, got %+v", c)
 	}
 }
