@@ -190,18 +190,22 @@ keeps itself fed without hand-holding. If a box does go down entirely, restart
 
 ### What happens if a reviewer keeps rejecting the same task?
 
-After **6 changes-requested rejections by the same review node**, Flowbee parks the job
-for human intervention with escalation reason `reviewer_rejections`. The job moves to
-`needs_human` so an operator can inspect the disagreement between builder and reviewer
-before more cycles are spent.
+A job parks at `needs_human` once it has accumulated **`max_bounces` changes-requested
+rejections in total** (default **4**, across all reviewers combined), with escalation reason
+`bounces` — so an operator can inspect the builder/reviewer disagreement before more cycles
+(and agent budget) are spent.
 
-This per-reviewer cap is distinct from — and fires before — the cruder `max_bounces`
-backstop, which counts total rejections across **all** reviewers combined. You can think of
-them as two separate circuit breakers: `reviewer_rejections` catches the case where one
-particular reviewer is consistently unhappy with the work; `max_bounces` catches the case
-where the job has accumulated too many total review trips regardless of which node did the
-rejecting. Both land the job in `needs_human`; use `flowbee requeue <job-id>` once the
-underlying issue is resolved to re-arm it with a fresh budget.
+There are two circuit breakers, and the **tighter one binds**:
+
+- **`max_bounces`** (default 4) — total review trips regardless of which node rejected. At
+  the default this is the practical limit.
+- **`reviewer_rejections`** (6) — rejections by *one* review node on the same job, for the
+  case of a single consistently-unhappy reviewer. Because a single reviewer's count can
+  never exceed the total, this cap only comes into play when `max_bounces` is configured
+  **above 6**; at the default (4) the total backstop fires first and this one stays dormant.
+
+Both land the job in `needs_human`; use `flowbee requeue <job-id>` once the underlying issue
+is resolved to re-arm it with a fresh budget.
 
 ---
 
