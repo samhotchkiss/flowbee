@@ -650,6 +650,21 @@ func Fold(events []Event) (job.Job, error) {
 			j.EscalationReason = ""
 			j.OverBudget = false
 		}
+		// Invariant sync (projection == Fold) for the build-lease caps. A `ready` BUILD is
+		// always an eng_worker surface — the live projection guarantees role=eng_worker +
+		// required_capabilities=[role:eng_worker] there (store.NormalizeStrandedReadyBuilds).
+		// KindReviewBounced / KindSuperseded reset both, but the OTHER re-arm-to-ready paths
+		// (operator requeue via KindStateChanged, stall KindLeaseRevoked, KindFastCancelled)
+		// fold the state WITHOUT resetting the caps, so a job re-armed out of a review
+		// (caps=[role:code_reviewer]) or out of needs_human folded with STALE review caps —
+		// a real projection!=Fold divergence. Its two self-heal watchdogs then repair it in
+		// OPPOSITE directions every cycle (resync-to-Fold vs normalize-to-eng_worker), churning
+		// forever until the job happens to dispatch. Mirror the projection's invariant here so
+		// the Fold is already correct: the watchdogs agree, and a DR rebuild is leasable.
+		if j.State == job.StateReady && j.Kind == job.KindBuild {
+			j.Role = job.RoleEngWorker
+			j.RequiredCapabilities = []string{"role:eng_worker"}
+		}
 		j.JobSeq = e.JobSeq
 	}
 	return j, nil

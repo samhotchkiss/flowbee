@@ -7,6 +7,40 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/job"
 )
 
+// TestFoldResetsBuildCapsOnReArmToReady locks the fix for the projection!=Fold churn:
+// a build that reached review_pending (caps become role:code_reviewer) and is then
+// re-armed to `ready` via a path that ISN'T bounce/supersede — an operator requeue out
+// of needs_human (KindStateChanged) — must fold back to the eng_worker build caps. If the
+// fold keeps the stale review caps, it diverges from the projection (which
+// NormalizeStrandedReadyBuilds pins to eng_worker), and the resync + normalize watchdogs
+// repair it in opposite directions forever. A `ready` build is ALWAYS an eng_worker surface.
+func TestFoldResetsBuildCapsOnReArmToReady(t *testing.T) {
+	now := time.Unix(100, 0)
+	events := []Event{
+		{JobID: "B1", JobSeq: 1, Kind: KindJobCreated, ToState: job.StateReady, CreatedAt: now,
+			Payload: Payload{Kind: job.KindBuild, Role: job.RoleEngWorker, RequiredCapabilities: []string{"role:eng_worker"}}},
+		{JobID: "B1", JobSeq: 2, Kind: KindLeaseClaimed, ToState: job.StateLeased, LeaseEpoch: 1, CreatedAt: now},
+		{JobID: "B1", JobSeq: 3, Kind: KindResultAccepted, ToState: job.StateReviewPending, CreatedAt: now}, // caps -> code_reviewer
+		{JobID: "B1", JobSeq: 4, Kind: KindStateChanged, ToState: job.StateNeedsHuman, CreatedAt: now,
+			Payload: Payload{EscalationReason: "attempts"}},
+		{JobID: "B1", JobSeq: 5, Kind: KindStateChanged, ToState: job.StateReady, CreatedAt: now,
+			Payload: Payload{ResetCounters: true}}, // operator requeue back to ready
+	}
+	j, err := Fold(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.State != job.StateReady {
+		t.Fatalf("state=%v want ready", j.State)
+	}
+	if j.Role != job.RoleEngWorker {
+		t.Errorf("role=%q want eng_worker (a ready build is an eng_worker surface)", j.Role)
+	}
+	if len(j.RequiredCapabilities) != 1 || j.RequiredCapabilities[0] != "role:eng_worker" {
+		t.Errorf("caps=%v want [role:eng_worker] — stale review caps strand the build + churn the watchdogs", j.RequiredCapabilities)
+	}
+}
+
 func TestFoldHappyPath(t *testing.T) {
 	now := time.Unix(100, 0)
 	events := []Event{
