@@ -22,20 +22,22 @@ type Fake struct {
 	calls       []string // "BoardSweep" / "PullRequest(N)" / "OpenPR" / ... in order, for assertions
 
 	// project-OUT write state (§8.2).
-	nextPR     int
-	nextIssue  int
-	issues     map[int]CreateIssueInput
-	comments   map[int][]string // issue/PR number -> comment bodies in order (reviewer findings, §F)
-	labels     map[int][]string
-	checks     []string // "name@sha=conclusion"
+	nextPR      int
+	nextIssue   int
+	issues      map[int]CreateIssueInput
+	comments    map[int][]string // issue/PR number -> comment bodies in order (reviewer findings, §F)
+	labels      map[int][]string
+	checks      []string     // "name@sha=conclusion"
 	enqueued    []int        // PR numbers enqueued to the merge queue
 	conflictPRs map[int]bool // PRs whose merge returns ErrMergeConflict (set via SetMergeConflict)
 
-	baseModifiedPRs map[int]bool // PRs whose merge returns ErrMergeBaseModified (retryable)
-	drafted         []int    // PR numbers converted back to draft (compensation, §6.5.4)
-	deletedBranches []string // branches deleted post-merge (cleanup)
-	cancelled  []string // SHAs whose CI was cancelled (compensation, §6.5.4)
-	protection map[string]Protection
+	baseModifiedPRs map[int]bool   // PRs whose merge returns ErrMergeBaseModified (retryable)
+	headMovedPRs    map[int]string // PRs whose live head != this SHA -> merge returns ErrMergeHeadModified
+	mergeHeads      map[int]string // expectedHead passed to EnqueueMergeQueue, for pin assertions
+	drafted         []int          // PR numbers converted back to draft (compensation, §6.5.4)
+	deletedBranches []string       // branches deleted post-merge (cleanup)
+	cancelled       []string       // SHAs whose CI was cancelled (compensation, §6.5.4)
+	protection      map[string]Protection
 
 	// retryAfter, when >0, makes the NEXT write return *ErrRetryAfter (§8.2.4),
 	// then resets — so a test can prove the sender parks the outbox and retries.
@@ -269,12 +271,21 @@ func (f *Fake) CreateCheck(ctx context.Context, sha, name, conclusion string) er
 	return nil
 }
 
-func (f *Fake) EnqueueMergeQueue(ctx context.Context, number int) error {
+func (f *Fake) EnqueueMergeQueue(ctx context.Context, number int, expectedHead string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, fmt.Sprintf("EnqueueMergeQueue(%d)", number))
+	if f.mergeHeads == nil {
+		f.mergeHeads = map[int]string{}
+	}
+	f.mergeHeads[number] = expectedHead
 	if err := f.retryGate(); err != nil {
 		return err
+	}
+	// SHA interlock: if the test declared the PR's live head moved to something other
+	// than the pinned expectedHead, GitHub would 409 — model that here.
+	if live, ok := f.headMovedPRs[number]; ok && expectedHead != "" && expectedHead != live {
+		return fmt.Errorf("merge %d: %w", number, ErrMergeHeadModified)
 	}
 	if f.conflictPRs[number] {
 		return fmt.Errorf("merge %d: %w", number, ErrMergeConflict)
@@ -284,6 +295,24 @@ func (f *Fake) EnqueueMergeQueue(ctx context.Context, number int) error {
 	}
 	f.enqueued = append(f.enqueued, number)
 	return nil
+}
+
+// SetHeadMoved makes PR `number`'s live head `live` so a merge pinned to any other
+// expectedHead returns ErrMergeHeadModified (the approve-then-push race).
+func (f *Fake) SetHeadMoved(number int, live string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.headMovedPRs == nil {
+		f.headMovedPRs = map[int]string{}
+	}
+	f.headMovedPRs[number] = live
+}
+
+// MergeHead returns the expectedHead the sender pinned on PR `number`'s merge call.
+func (f *Fake) MergeHead(number int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mergeHeads[number]
 }
 
 // SetMergeBaseModified makes EnqueueMergeQueue return the retryable ErrMergeBaseModified

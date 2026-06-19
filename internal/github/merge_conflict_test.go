@@ -36,11 +36,11 @@ func TestIsMergeConflictDetection(t *testing.T) {
 func TestFakeMergeConflictIsTyped(t *testing.T) {
 	f := NewFake()
 	f.SetMergeConflict(42)
-	err := f.EnqueueMergeQueue(nil, 42)
+	err := f.EnqueueMergeQueue(nil, 42, "")
 	if !errors.Is(err, ErrMergeConflict) {
 		t.Fatalf("flagged PR merge err=%v, want ErrMergeConflict", err)
 	}
-	if err := f.EnqueueMergeQueue(nil, 7); err != nil {
+	if err := f.EnqueueMergeQueue(nil, 7, ""); err != nil {
 		t.Fatalf("unflagged PR merge err=%v, want nil", err)
 	}
 	_ = fmt.Sprint(err)

@@ -423,9 +423,16 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		// leaked secret, or a binary blob on main by under-reporting what it touched. A
 		// verify FAILURE (can't fetch/diff) returns an error → the merge RETRIES (transient),
 		// never a silent autonomous merge of unverified content.
+		// expectedHead pins the GitHub merge to the EXACT head the gate reviewed.
+		// `merging` is non-supersedable, so a commit pushed to the feature branch
+		// after the verdict was minted would otherwise merge unreviewed (the merge
+		// API merges the live head). Passing it as the merge `sha` makes GitHub 409
+		// if the head moved, routing to retry/handoff instead of a silent bad merge.
+		var expectedHead string
 		if s.history != nil {
 			j, jerr := s.store.GetJob(ctx, row.JobID)
 			if jerr == nil && j.BaseSHA != "" && j.HeadSHA != "" {
+				expectedHead = j.HeadSHA
 				br := store.IssueBranch(s.resolveIssueNum(ctx, j), row.JobID)
 				if ferr := s.history.FetchBranch(br); ferr != nil {
 					return "", fmt.Errorf("verify autonomous merge: fetch %s: %w", br, ferr)
@@ -445,7 +452,20 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 				}
 			}
 		}
-		if err := s.gh.EnqueueMergeQueue(ctx, number); err != nil {
+		if err := s.gh.EnqueueMergeQueue(ctx, number, expectedHead); err != nil {
+			if errors.Is(err, gh.ErrMergeHeadModified) {
+				// The feature branch moved after the gate reviewed it: a commit landed
+				// post-approval, so the head that would merge is unreviewed. `merging` is
+				// non-supersedable, so route to the HUMAN merge gate rather than retry the
+				// moved head or dead-letter — a human re-reviews the new head.
+				if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, "head_modified_after_review", s.clock.Now()); rerr != nil {
+					return "", fmt.Errorf("route head-modified to handoff: %w", rerr)
+				}
+				if s.pub != nil {
+					s.pub.PublishReconcile(row.JobID, "project_out:head_modified")
+				}
+				return "autonomous merge DEFERRED (head moved after review) -> merge_handoff", nil
+			}
 			return "", err
 		}
 		return fmt.Sprintf("merge_enqueue pr=%d", number), nil

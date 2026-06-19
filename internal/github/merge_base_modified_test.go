@@ -27,7 +27,7 @@ func TestEnqueueMergeQueueBaseModifiedIsRetryable(t *testing.T) {
 		HTTP:     srv.Client(),
 		RESTBase: srv.URL,
 	}
-	err := c.EnqueueMergeQueue(context.Background(), 5)
+	err := c.EnqueueMergeQueue(context.Background(), 5, "")
 	if !errors.Is(err, ErrMergeBaseModified) {
 		t.Fatalf("base-modified 405 err=%v, want ErrMergeBaseModified", err)
 	}

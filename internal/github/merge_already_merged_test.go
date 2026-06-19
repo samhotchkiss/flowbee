@@ -52,7 +52,7 @@ func TestEnqueueMergeQueueAlreadyMerged(t *testing.T) {
 				Endpoint: srv.URL + "/graphql",
 				RESTBase: srv.URL,
 			}
-			err := c.EnqueueMergeQueue(context.Background(), 5)
+			err := c.EnqueueMergeQueue(context.Background(), 5, "")
 			switch {
 			case tc.wantNilOK && err != nil:
 				t.Fatalf("already-merged PR should be success, got err=%v", err)

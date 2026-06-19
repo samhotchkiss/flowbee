@@ -58,7 +58,7 @@ type PullRequest struct {
 	// the job instead of waiting on a merge that will never come.
 	ClosedUnmerged bool
 	CIRollup       CIState
-	Labels      []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
+	Labels         []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
 }
 
 // Issue is the Domain-B snapshot of one open issue from a BoardSweep. Title/Body
@@ -140,7 +140,7 @@ type Writer interface {
 	CreateCheck(ctx context.Context, sha, name, conclusion string) error
 	// EnqueueMergeQueue enqueues a PR to GitHub's native merge queue — how BOTH
 	// merge arms physically merge (§5.4, §8.5). Workers never call this.
-	EnqueueMergeQueue(ctx context.Context, number int) error
+	EnqueueMergeQueue(ctx context.Context, number int, expectedHead string) error
 	// ConvertToDraft transitions a PR back to draft — the compensation step that
 	// never leaves a revoked zombie's PR ready-for-review (§6.5.4 draft-back, I-12).
 	ConvertToDraft(ctx context.Context, number int) error
@@ -197,15 +197,24 @@ var ErrMergeConflict = errors.New("pull request has merge conflicts (not mergeab
 // Permanent() check treats it as transient (retry) rather than dead-lettering it.
 var ErrMergeBaseModified = errors.New("merge base branch was modified (retryable)")
 
+// ErrMergeHeadModified signals GitHub's 409 "Head branch was modified. Review and try
+// the merge again." — returned when the merge call pins an expected-head `sha` and the
+// PR's live head no longer matches it. This is the SAFETY interlock against an
+// approve-then-push race: the gate minted its verdict against the reviewed head, but a
+// commit landed on the feature branch afterward. Because `merging` is non-supersedable,
+// without this pin GitHub would merge the unreviewed head. The sender routes this to the
+// human merge gate (handoff) — never a silent merge, never a blind retry of the moved head.
+var ErrMergeHeadModified = errors.New("merge head branch was modified after review")
+
 // ErrGitHub is a non-2xx REST response carrying its status code, so the sender can
 // distinguish a PERMANENT failure (a 4xx — a deleted branch/PR, a 422 validation, a
 // 404 not-found: retrying NEVER succeeds) from a TRANSIENT one (a 5xx / network blip:
 // GitHub will recover). Without this the outbox cannot tell a poison row from a brief
 // outage and would either wedge forever (head-of-line) or dead-letter good work.
 type ErrGitHub struct {
-	StatusCode     int
-	Method, Path   string
-	Body           string
+	StatusCode   int
+	Method, Path string
+	Body         string
 }
 
 func (e *ErrGitHub) Error() string {
@@ -235,6 +244,16 @@ func isMergeConflict(err error) bool {
 func isBaseModified(err error) bool {
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "405") && strings.Contains(s, "base branch was modified")
+}
+
+// isHeadModified reports GitHub's 409 "Head branch was modified. Review and try the merge
+// again." — returned when the merge `sha` interlock no longer matches the PR head (a
+// commit landed on the feature branch after the gate reviewed it). Distinct from
+// base-modified (a sibling moved main, retryable): the HEAD moving means the bytes that
+// would merge are unreviewed, so this routes to the human gate, not a retry.
+func isHeadModified(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "409") && strings.Contains(s, "head branch was modified")
 }
 
 // RealClient is the genuine GitHub caller. It is CGO-free (stdlib net/http only)
@@ -730,7 +749,7 @@ func (c *RealClient) CreateCheck(ctx context.Context, sha, name, conclusion stri
 type Preflight struct {
 	CanWrite        bool
 	HasCI           bool
-	CITriggersOnPR  bool   // an active workflow triggers on pull_request (Flowbee gates on PR CI)
+	CITriggersOnPR  bool // an active workflow triggers on pull_request (Flowbee gates on PR CI)
 	BranchProtected bool
 	TokenScopes     string // X-OAuth-Scopes: non-empty = a broadly-scoped CLASSIC PAT; empty = fine-grained / least-privilege
 }
@@ -795,7 +814,7 @@ func (c *RealClient) Preflight(ctx context.Context, branch string) (Preflight, e
 	return pf, nil
 }
 
-func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
+func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int, expectedHead string) error {
 	// GitHub's native merge-queue is a GraphQL mutation that requires the repo to
 	// have a merge queue configured. When it isn't, integrate the PR directly via
 	// the merge API — the batch-size-1 integration the design's merge queue models
@@ -807,9 +826,24 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int) error {
 	// and a merge commit keeps that whole trail REACHABLE from main (so you can see
 	// how the change was built), while `git log --first-parent main` stays clean. A
 	// squash would discard the history the per-issue-branch model exists to preserve.
-	err := c.rest(ctx, http.MethodPut, fmt.Sprintf("/pulls/%d/merge", number), map[string]any{
+	body := map[string]any{
 		"merge_method": "merge",
-	}, nil)
+	}
+	if expectedHead != "" {
+		// SHA interlock: GitHub merges ONLY if the PR head still equals the head the
+		// gate reviewed. If a commit landed after approval, GitHub 409s rather than
+		// merging the unreviewed head (see ErrMergeHeadModified). `merging` is
+		// non-supersedable, so this pin is the only thing standing between an
+		// approve-then-push race and an unreviewed autonomous merge.
+		body["sha"] = expectedHead
+	}
+	err := c.rest(ctx, http.MethodPut, fmt.Sprintf("/pulls/%d/merge", number), body, nil)
+	if err != nil && isHeadModified(err) {
+		// the reviewed head moved under us — do NOT merge, do NOT blind-retry (the head
+		// is still the unreviewed one); surface the typed error so the sender routes to
+		// the human merge gate.
+		return fmt.Errorf("%w: %v", ErrMergeHeadModified, err)
+	}
 	if err != nil && isMergeConflict(err) {
 		// A 405 "not mergeable" is ambiguous: a REAL conflict, GitHub still recomputing
 		// mergeability after a sibling merge (transient), OR the PR is ALREADY MERGED — a
