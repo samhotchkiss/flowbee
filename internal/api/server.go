@@ -1191,6 +1191,9 @@ type specReviewRequest struct {
 	// to the amended hash. Issue-review amends in place; it never bounces to the author.
 	AmendedSpecMarkdown string `json:"amended_spec_markdown,omitempty"`
 	AmendedVersion      int    `json:"amended_version,omitempty"`
+	// Notes are the issue-reviewer's findings; carried to the spec-author rebuild on a
+	// changes-requested bounce (§F read side).
+	Notes string `json:"notes,omitempty"`
 }
 
 // specReview runs the I-9 spec gate for a fenced spec-review result (§11.5). The
@@ -1225,6 +1228,7 @@ func (s *Server) specReview(w http.ResponseWriter, r *http.Request) {
 		AmendedHash:       amendedHash,
 		AmendedVersion:    req.AmendedVersion,
 		IdempotencyKey:    r.Header.Get("Idempotency-Key"),
+		Notes:             req.Notes, // carried to the spec-author rebuild on a bounce (§F read)
 		Now:               s.clock.Now(),
 	})
 	if err != nil {

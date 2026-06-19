@@ -98,7 +98,7 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 		// the actionable feedback FIRST (before the raw verdict JSON): a prior review
 		// requested changes — the agent must address these, not re-submit the same patch.
 		b.WriteString("\n## A prior review requested changes — ADDRESS THESE\n\n")
-		b.WriteString("Your previous attempt was rejected in code review with this feedback. " +
+		b.WriteString("Your previous attempt was rejected in review with this feedback. " +
 			"Fix exactly what is called out below before resubmitting; do not repeat the rejected approach.\n\n")
 		b.WriteString(c.PriorReviewFindings)
 		b.WriteString("\n")

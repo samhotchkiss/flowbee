@@ -496,7 +496,11 @@ type SpecReviewResultParams struct {
 	AmendedHash    string // resolved by the caller (api) via spec.ContentHash
 	AmendedVersion int
 	IdempotencyKey string
-	Now            time.Time
+	// Notes are the issue-reviewer's findings; on a changes-requested bounce they are
+	// carried onto the job (LastReviewNotes) so the spec-author rebuild surfaces them
+	// (§F compounding-memory read side — symmetric with the code-review path).
+	Notes string
+	Now   time.Time
 }
 
 // SpecReviewResultResponse is the spec gate's reply.
@@ -613,6 +617,10 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 			if t.To == job.StateNeedsHuman {
 				pay.EscalationReason = reviewerRejectionReason
 			}
+			// carry the issue-reviewer's findings forward on a bounce (§F read side).
+			if in.Claim == job.VerdictChangesRequested {
+				pay.ReviewNotes = in.Notes
+			}
 			ev := ledger.Event{
 				JobID: in.JobID, JobSeq: nextSeq, Kind: t.Kind,
 				FromState: t.From, ToState: t.To, LeaseEpoch: j.LeaseEpoch,
@@ -714,10 +722,11 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 				UPDATE jobs
 				   SET state = 'spec_authoring', stage = 'author', role = 'spec_author',
 				       required_capabilities = ?, bounces = bounces + ?,
+				       last_review_notes = CASE WHEN ? <> '' THEN ? ELSE last_review_notes END,
 				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 				       lease_hb_due = NULL, updated_at = datetime('now')
 				 WHERE id = ?`,
-				marshalStrings([]string{"role:spec_author"}), bouncesDelta, in.JobID); err != nil {
+				marshalStrings([]string{"role:spec_author"}), bouncesDelta, in.Notes, in.Notes, in.JobID); err != nil {
 				return fmt.Errorf("apply spec bounce projection: %w", err)
 			}
 			resp.Superseded = superseded

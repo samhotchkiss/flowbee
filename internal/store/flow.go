@@ -388,12 +388,13 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 				UPDATE jobs
 				   SET state = 'ready', role = 'eng_worker', stage = 'build',
 				       required_capabilities = ?, bounces = bounces + ?,
-				       enqueued_at = ?, last_review_notes = ?,
+				       enqueued_at = ?,
+				       last_review_notes = CASE WHEN ? <> '' THEN ? ELSE last_review_notes END,
 				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 				       lease_hb_due = NULL, updated_at = datetime('now')
 				 WHERE id = ?`,
 				marshalStrings([]string{"role:eng_worker"}), bouncesDelta,
-				in.Now.Format(rfc3339), in.Notes, in.JobID); err != nil {
+				in.Now.Format(rfc3339), in.Notes, in.Notes, in.JobID); err != nil {
 				return fmt.Errorf("apply bounce projection: %w", err)
 			}
 		} else if _, err := tx.ExecContext(ctx, `
