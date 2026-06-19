@@ -27,6 +27,18 @@ func TestAttestOpenAllowlistGatesArchOSByHandshake(t *testing.T) {
 	}
 }
 
+// TestAttestPassesThroughModelTag: model:<backend> is a self-declared display tag that
+// never gates a lease, so the attestor passes it through as-is (so it shows on the roster
+// and in `flowbee status`) — even under a STRICT allowlist that gates role:/model_family:.
+func TestAttestPassesThroughModelTag(t *testing.T) {
+	a := OpenAllowlist()
+	got := sortedAttest(a, "alice", []string{"role:eng_worker", "model:codex", "model_family:sonnet"}, "arm64", "macos")
+	want := []string{"model:codex", "model_family:sonnet", "role:eng_worker"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("attested=%v want %v (model: tag must pass through for display)", got, want)
+	}
+}
+
 func TestAttestStrictAllowlistGatesRoleFamilyTool(t *testing.T) {
 	// strict: only enrolled identities may attest, and only listed caps.
 	a := Allowlist{Permit: map[string][]string{

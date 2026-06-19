@@ -116,6 +116,13 @@ func (a Allowlist) attest(identity string, claimed []string, arch, osName string
 			if a.permits(identity, c) {
 				out = append(out, c)
 			}
+		case strings.HasPrefix(c, "model:"):
+			// model:<backend> is a SELF-DECLARED, display-only tag (which model the worker
+			// actually runs, e.g. codex) — there is no allowlist or handshake to verify it,
+			// and NO job ever requires it, so it never gates a lease (no spoofing risk).
+			// Attest it as-is so it surfaces on the roster + in `flowbee status`. If it ever
+			// becomes a matching axis, gate it like role:/model_family: above.
+			out = append(out, c)
 		default:
 			// unknown shape: not attested, never matched.
 		}
