@@ -120,6 +120,11 @@ also `FLOWBEE_FLEET_AGENT`), `--agent-cmd` (review/author roles),
 `--build-agent-cmd` (build role — writes files), `--no-smoke`, `--systemd` (print
 a managed-service unit + env file and exit).
 
+`fleet` and `up` also accept `--model-label`, which sets the model label shown on
+§F history cards. Each card node records the model that performed that node's work,
+for example `Lease claimed by feller-builder-2 (codex)`. With `--agent codex`, the
+label is `codex`; for Claude agents, it is the Claude model family unless overridden.
+
 Run it as a service so it survives reboots:
 
 ```sh
