@@ -107,6 +107,7 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVGSK41ZQSF1T2CVJFMR0WDK`](./01KVGSK41ZQSF1T2CVJFMR0WDK.md) | Document the F5 multi-reviewer consensus panel (required_reviewers) | done | — | #199 | 2026-06-19T20:58:48Z |
 | [`01KVGTXP16Q7MVYB9R7P73H1MY`](./01KVGTXP16Q7MVYB9R7P73H1MY.md) | Add a one-line comment clarifying the panel any-veto reset in engine.go | done | — | #201 | 2026-06-19T21:18:18Z |
 | [`01KVGXGA44F1X2HTEBFJ0N8HFS`](./01KVGXGA44F1X2HTEBFJ0N8HFS.md) | Note the single-commit §F archive in docs/operating.md durability section | done | — | #203 | 2026-06-19T21:51:44Z |
+| [`01KVGY25NQEQ8643JCFP0DG7Q2`](./01KVGY25NQEQ8643JCFP0DG7Q2.md) | Add a cohesive 'Running on Codex' subsection to docs/operating.md | done | — | #205 | 2026-06-19T22:00:44Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
