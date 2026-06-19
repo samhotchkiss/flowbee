@@ -8,6 +8,21 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
+// TestPrintStatusModelBreakdown: the fleet line shows the live-worker per-backend tally
+// (sorted, stable) so an operator sees the fleet is on codex; no models => no suffix.
+func TestPrintStatusModelBreakdown(t *testing.T) {
+	var buf bytes.Buffer
+	printStatus(&buf, nil, store.FleetHealth{LiveWorkers: 16, ByModel: map[string]int{"codex": 14, "sonnet": 2}}, false)
+	if got := buf.String(); !strings.Contains(got, "16 live") || !strings.Contains(got, "(codex:14, sonnet:2)") {
+		t.Errorf("expected live count + sorted model breakdown, got:\n%s", got)
+	}
+	var buf2 bytes.Buffer
+	printStatus(&buf2, nil, store.FleetHealth{LiveWorkers: 3}, false)
+	if got := buf2.String(); strings.Contains(got, "(") {
+		t.Errorf("no models => no breakdown suffix, got:\n%s", got)
+	}
+}
+
 func TestPrintStatusMergeHandoff(t *testing.T) {
 	jobs := []store.BoardJob{
 		{ID: "1", Repo: "acme/api", State: "merge_handoff"},

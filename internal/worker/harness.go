@@ -289,6 +289,17 @@ type HarnessConfig struct {
 	Branch     string
 }
 
+// modelTag is the worker's ACTUAL backend/model for the `model:<tag>` registration
+// capability, so the roster + `flowbee status` show which model the fleet runs (e.g.
+// "codex") — not the model_family anti-affinity tag, which under --agent codex no longer
+// names the real backend. Falls back to the family when no explicit label was given.
+func (cfg HarnessConfig) modelTag() string {
+	if cfg.ModelLabel != "" {
+		return cfg.ModelLabel
+	}
+	return cfg.ModelFamily
+}
+
 // HarnessOutcome reports what one lease cycle did.
 type HarnessOutcome struct {
 	Got        bool
@@ -318,7 +329,7 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	}
 	caps := cfg.Capabilities
 	if len(caps) == 0 {
-		caps = []string{"role:eng_worker", "model_family:" + cfg.ModelFamily, "arch:" + arch, "os:" + osName}
+		caps = []string{"role:eng_worker", "model_family:" + cfg.ModelFamily, "model:" + cfg.modelTag(), "arch:" + arch, "os:" + osName}
 	}
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
@@ -482,7 +493,7 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	}
 	caps := cfg.Capabilities
 	if len(caps) == 0 {
-		caps = []string{"role:eng_worker", "model_family:" + cfg.ModelFamily, "arch:" + arch, "os:" + osName}
+		caps = []string{"role:eng_worker", "model_family:" + cfg.ModelFamily, "model:" + cfg.modelTag(), "arch:" + arch, "os:" + osName}
 	}
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
@@ -620,7 +631,7 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	}
 	caps := cfg.Capabilities
 	if len(caps) == 0 {
-		caps = []string{"role:" + role, "model_family:" + cfg.ModelFamily, "arch:" + arch, "os:" + osName}
+		caps = []string{"role:" + role, "model_family:" + cfg.ModelFamily, "model:" + cfg.modelTag(), "arch:" + arch, "os:" + osName}
 	}
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)

@@ -51,7 +51,7 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	}
 	caps := cfg.Capabilities
 	if len(caps) == 0 {
-		caps = []string{"role:" + cfg.Role, "model_family:" + cfg.ModelFamily, "arch:" + arch, "os:" + osName}
+		caps = []string{"role:" + cfg.Role, "model_family:" + cfg.ModelFamily, "model:" + cfg.modelTag(), "arch:" + arch, "os:" + osName}
 	}
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)

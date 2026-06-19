@@ -60,6 +60,25 @@ func runStatus(args []string) error {
 	return nil
 }
 
+// modelBreakdown renders the live-worker per-backend tally as " (codex:14, sonnet:2)"
+// (sorted, stable), so an operator sees WHICH model the fleet runs — the live complement
+// to the per-node model on a §F card. Empty (no worker advertised a model) renders "".
+func modelBreakdown(byModel map[string]int) string {
+	if len(byModel) == 0 {
+		return ""
+	}
+	models := make([]string, 0, len(byModel))
+	for m := range byModel {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+	parts := make([]string, 0, len(models))
+	for _, m := range models {
+		parts = append(parts, fmt.Sprintf("%s:%d", m, byModel[m]))
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
+}
+
 // printStatus writes the operator summary to w. Kept separate from runStatus
 // so it is unit-testable without a live database.
 func printStatus(w io.Writer, jobs []store.BoardJob, health store.FleetHealth, paused bool) {
@@ -110,7 +129,7 @@ func printStatus(w io.Writer, jobs []store.BoardJob, health store.FleetHealth, p
 	tw.Flush() //nolint:errcheck
 
 	fmt.Fprintf(w, "\nawaiting human: %d merge_handoff, %d needs_human\n", mergeHandoff, needsHuman)
-	fmt.Fprintf(w, "fleet: %d live, %d stale workers\n", health.LiveWorkers, health.StaleWorkers)
+	fmt.Fprintf(w, "fleet: %d live, %d stale workers%s\n", health.LiveWorkers, health.StaleWorkers, modelBreakdown(health.ByModel))
 	if paused {
 		fmt.Fprintln(w, "\n*** PAUSED — no new leases are being issued (`flowbee resume` to unpause) ***")
 	}

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 )
 
@@ -41,6 +42,10 @@ type FleetHealth struct {
 	LiveWorkers  int
 	StaleWorkers int
 	WaitingJobs  int
+	// ByModel counts LIVE workers per actual backend/model (the `model:<x>` capability the
+	// worker registers — "codex", "sonnet", …), so the operator can see which model the
+	// fleet is running at a glance. Empty when no worker advertises one (older workers).
+	ByModel map[string]int
 }
 
 // Stranded reports the silent-stall condition: work to do, but no live worker for it.
@@ -58,8 +63,17 @@ func (s *Store) FleetHealth(ctx context.Context, now time.Time, staleAfter time.
 	for _, w := range roster {
 		if w.StaleHB {
 			h.StaleWorkers++
-		} else {
-			h.LiveWorkers++
+			continue
+		}
+		h.LiveWorkers++
+		for _, cap := range w.Attested {
+			if m, ok := strings.CutPrefix(cap, "model:"); ok && m != "" {
+				if h.ByModel == nil {
+					h.ByModel = map[string]int{}
+				}
+				h.ByModel[m]++
+				break
+			}
 		}
 	}
 	if err := s.DB.QueryRowContext(ctx, `
