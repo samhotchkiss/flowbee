@@ -15,7 +15,8 @@ the world from GitHub + the ledger — there is no hidden in-memory state to los
 - **Go 1.22+** to build (`go build -o bin/flowbee ./cmd/flowbee`).
 - A **GitHub token** (`FLOWBEE_GITHUB_TOKEN`) with `repo` scope for each managed repo.
 - An **agent CLI** on every worker box — by default `claude` (authenticated, on `PATH`).
-  Verify with `claude --version`; the fleet smoke-tests it before starting.
+  Verify with `claude --version`; use `codex` instead when running `--agent codex`.
+  The fleet smoke-tests the selected agent before starting.
 - **SSH push access** from each worker box to the managed repos if you run SSH remotes
   (`FLOWBEE_GIT_REMOTE=ssh`); otherwise an HTTPS token URL.
 
@@ -162,10 +163,27 @@ flowbee fleet --url http://<host>:7070 --builders 3 --agent-cmd "claude --model 
 ```
 
 With `--agent claude`, Flowbee keeps genuine cross-model review: Sonnet builds while Opus
-reviews and resolves. With `--agent codex`, every role runs `codex exec` on one Codex model;
-roles differ by task context, not model, so use it to spend Codex quota instead of the Claude
-weekly limit. Explicit `--agent-cmd` and `--build-agent-cmd` overrides still take precedence,
-and distinct `model_family` anti-affinity tags keep a build off its own review/resolve.
+reviews and resolves.
+
+### Running on Codex
+
+Install the `codex` CLI on every worker box, authenticate it with `codex login`
+(ChatGPT-authenticated), and verify it with `codex --version`. The fleet smoke-tests the
+selected agent at startup, just as it does for Claude.
+
+Enable Codex with `flowbee fleet --agent codex` or `FLOWBEE_FLEET_AGENT=codex`. Explicit
+per-role overrides still win: `--agent-cmd` for review/author roles and `--build-agent-cmd`
+for build/spec-author roles.
+
+With `--agent codex`, every role runs `codex exec` on one Codex model. Roles differ by task
+context, not model, so the fleet spends Codex quota instead of the Claude weekly limit. This
+trades the §5.5 cross-model review diversity for cost; distinct `model_family` anti-affinity
+tags still keep a build off its own review/resolve.
+
+Use `flowbee status` to confirm the live fleet backend, for example
+`fleet: 14 live, 0 stale workers (codex:14)`. Use `flowbee card <job-id>` to inspect the
+model recorded for each node. Switch back with `--agent claude` (the default), which restores
+Sonnet builds and Opus reviews/resolves for cross-model review.
 
 ---
 
