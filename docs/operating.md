@@ -197,7 +197,17 @@ issue; the next reconcile sweep adopts it (no command needed). The issue body is
 into task / spec / acceptance-criteria sections.
 
 **An idea → the full spec flow.** When you start from a vague idea rather than a written
-issue, ingest it so a **spec author** drafts the spec first:
+issue, ingest it so a **spec author** drafts the spec first. The first-class CLI for this
+front door is `flowbee spec`:
+
+```sh
+flowbee spec "add request timeouts to the HTTP client" \
+  --repo flowbee --title "HTTP timeouts" --acceptance "context deadline is honored"
+```
+
+Only the task description is required (`--repo` defaults to the primary registered repo).
+It prints the seeded job id; watch it with `flowbee board` / `flowbee card <id>`. The same
+endpoint is reachable directly for scripted ingest:
 
 ```sh
 curl -s -X POST http://<host>:7070/v1/specs \
@@ -205,7 +215,7 @@ curl -s -X POST http://<host>:7070/v1/specs \
   -d '{"title":"…","task":"…","acceptance":"…","repo":"flowbee","priority":5}'
 ```
 
-This creates a `spec_authoring` job that flows: **spec_authoring → spec_review → ready →
+Either path creates a `spec_authoring` job that flows: **spec_authoring → spec_review → ready →
 building → review_pending → code_review → mergeable → merging → done** (see
 [`pipeline.md`](pipeline.md)). Every stage is run by a real agent via the worker harness.
 

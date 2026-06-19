@@ -421,6 +421,33 @@ func (c *Client) Cancel(ctx context.Context, jobID string, force bool) (status i
 	return c.postJSONStatus(ctx, path, nil, nil, &out)
 }
 
+// SpecRequest is the /v1/specs intake payload (the planner front door): a work item a
+// spec_author drafts into a spec. Repo defaults to the primary registered repo.
+type SpecRequest struct {
+	Task       string `json:"task"`
+	Title      string `json:"title,omitempty"`
+	Acceptance string `json:"acceptance,omitempty"`
+	Repo       string `json:"repo,omitempty"`
+}
+
+// CreateSpec POSTs a work item to /v1/specs; the control plane seeds a spec job that a
+// spec_author drafts, an issue-reviewer signs off, and which then materializes a GitHub
+// issue -> a build. Returns the spec job id + its initial state.
+func (c *Client) CreateSpec(ctx context.Context, req SpecRequest) (jobID, state string, err error) {
+	var out struct {
+		JobID string `json:"job_id"`
+		State string `json:"state"`
+	}
+	st, err := c.postJSONStatus(ctx, "/v1/specs", nil, req, &out)
+	if err != nil {
+		return "", "", err
+	}
+	if st != 200 {
+		return "", "", fmt.Errorf("create spec: status %d", st)
+	}
+	return out.JobID, out.State, nil
+}
+
 // ReleaseNoPenalty re-arms WITHOUT burning an attempt — for a non-failure abandon
 // (the worker built fine but lost a fast-forward race to a branch move). Keeps the
 // attempt budget for genuine build failures so re-validation churn can't escalate a
