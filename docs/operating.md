@@ -330,7 +330,9 @@ not a near-term limit. The `jobs` table (one row per job, the final projection +
 counters), the GitHub `audit_log`, and the git history are the durable record of *what happened*;
 the per-job event timeline is the fine-grained detail. A retention policy that archives + prunes
 old **terminal** jobs' events is a deliberate, opt-in future feature — terminal jobs are never
-re-folded, but pruning the source of truth is not something to default-on.
+re-folded, but pruning the source of truth is not something to default-on. Each merged job also
+adds one `flowbee: archive history for <id>` commit to the integration branch, containing the
+`docs/history` card and regenerated TOC together, and a re-drain is idempotent.
 
 ### Crash recovery
 
