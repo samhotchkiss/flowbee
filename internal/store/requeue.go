@@ -44,6 +44,9 @@ func (s *Store) RequeueJob(ctx context.Context, jobID string, now time.Time) (jo
 			JobID: jobID, JobSeq: seq + 1, Kind: ledger.KindStateChanged,
 			FromState: j.State, ToState: target, LeaseEpoch: j.LeaseEpoch + 1,
 			Actor: "operator", CreatedAt: now,
+			// the requeue zeroes the attempts/bounces budget; carry that on the event so a
+			// re-fold reproduces it (over_budget + escalation_reason clear via the state rule).
+			Payload: ledger.Payload{ResetCounters: true},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err

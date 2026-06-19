@@ -136,6 +136,11 @@ type Payload struct {
 	// counter deltas (lease_released / state_changed / review_bounced)
 	AttemptsDelta int
 	BouncesDelta  int
+	// ResetCounters marks a re-arm that ZEROES the attempts + bounces budget (the
+	// operator requeue): the live UPDATE sets attempts=0/bounces=0, so the fold must
+	// reset them too or a rebuild-from-ledger keeps the pre-requeue counts (a divergence
+	// that could trip premature re-escalation after a DR rebuild).
+	ResetCounters bool `json:",omitempty"`
 	// stall_revocations governor counter delta (M8, §10.7); set on lease_revoked /
 	// stall_escalated. Distinct from attempts/bounces.
 	StallRevocationsDelta int `json:",omitempty"`
@@ -245,6 +250,12 @@ func Fold(events []Event) (job.Job, error) {
 			j.BoundModelFamily = ""
 		case KindStateChanged:
 			j.State = e.ToState
+			if e.Payload.ResetCounters {
+				// operator requeue re-arms the job with a fresh budget (attempts/bounces
+				// zeroed); mirror the live UPDATE so projection == Fold(events) holds.
+				j.Attempts = 0
+				j.Bounces = 0
+			}
 		case KindBaseRefreshed:
 			// a sibling PR merged; this still-`ready` job's base advances to the new main
 			// so it builds on current code (state/role unchanged — it was never leased).
