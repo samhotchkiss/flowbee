@@ -68,6 +68,34 @@ SHA-bound verdict — never a worker's say-so.
 | `content_max_changed_files` | `FLOWBEE_CONTENT_MAX_CHANGED_FILES` | shipped default | a diff over this is forced to handoff |
 | `content_deny_extra` | `FLOWBEE_CONTENT_DENY_EXTRA` (CSV) | — | extra path-prefix denylist; **augments**, never replaces, the always-on protected set (CI config, lockfiles, secrets, Flowbee's own source) |
 
+### Per-repo: `allow_own_source_merge`
+
+Set on a repo in the `repos:` registry (not a global key). The shipped denylist
+includes a **`flowbee_source`** class — `internal/`, `cmd/flowbee/`, `tools/`,
+`flows/`, `flowbee.yaml` — that stops an agent autonomously merging changes to
+**Flowbee's own control-plane source**. That protection is correct **only for the
+repo that actually contains Flowbee's source**. For any *other* managed repo, those
+are the repo's own paths (most Go projects have `internal/` + `cmd/`), so leaving it
+on wrongly forces every such change to the human gate, defeating autonomous
+self-merge.
+
+```yaml
+repos:
+  - id: web                    # a repo you manage that is NOT Flowbee itself
+    owner: acme
+    repo: web
+    allow_own_source_merge: true   # its internal//cmd/ are ITS code → may self-merge
+  - id: flowbee                # the control plane's OWN repo
+    owner: acme
+    repo: flowbee
+    # (omit the flag → default false → fully protected; NEVER set it here)
+```
+
+Default **false** = the fully-protected posture (no behavior change). It relaxes
+**only** the `flowbee_source` class — the universal classes (CI config, lockfiles,
+Dockerfiles, secrets) are **never** relaxed in any repo. Never set it for the repo
+that *is* Flowbee.
+
 ## Cost circuit-breaker (§6.7)
 
 | key | env override | default | meaning |
