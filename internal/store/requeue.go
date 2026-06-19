@@ -96,3 +96,55 @@ func (s *Store) RequeueJob(ctx context.Context, jobID string, force bool, now ti
 	})
 	return final, err
 }
+
+// CancelJob terminally CANCELS a job the operator has decided NOT to pursue — the
+// complement to RequeueJob (give up vs. retry). It transitions the job to `cancelled`
+// (a terminal state), bumps the lease epoch (fencing any worker), and clears the lease,
+// event-sourced. Use it to clear a rejected/dead-end job from the needs_human triage view
+// without hand-editing the table. Idempotent: a no-op on an already-terminal job. Like
+// requeue, a job holding an ACTIVE lease is rejected unless force (cancelling fences the
+// live worker, discarding its in-flight work). Returns the resulting state.
+func (s *Store) CancelJob(ctx context.Context, jobID string, force bool, now time.Time) (job.State, error) {
+	var final job.State
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		j, seq, err := loadJobTx(ctx, tx, jobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrJobNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if j.State == job.StateDone || j.State == job.StateCancelled {
+			final = j.State // already terminal: idempotent no-op
+			return nil
+		}
+		if !force && job.HasActiveLease(j.State) {
+			return ErrJobActivelyLeased
+		}
+		ev := ledger.Event{
+			JobID: jobID, JobSeq: seq + 1, Kind: ledger.KindStateChanged,
+			FromState: j.State, ToState: job.StateCancelled, LeaseEpoch: j.LeaseEpoch + 1,
+			Actor: "operator", CreatedAt: now,
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs
+			   SET state = 'cancelled',
+			       lease_epoch = lease_epoch + 1,
+			       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
+			       lease_hb_due = NULL, lease_deadline = NULL, updated_at = datetime('now')
+			 WHERE id = ?`, jobID); err != nil {
+			return fmt.Errorf("cancel: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE leases SET ended_at = datetime('now'), end_reason = 'cancelled'
+			 WHERE job_id = ? AND ended_at IS NULL`, jobID); err != nil {
+			return err
+		}
+		final = job.StateCancelled
+		return setJobSeq(ctx, tx, jobID, seq+1)
+	})
+	return final, err
+}

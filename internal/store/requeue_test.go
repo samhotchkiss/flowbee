@@ -103,3 +103,52 @@ func TestRequeueRejectsActivelyLeasedJob(t *testing.T) {
 		t.Fatalf("forced requeue state=%s want ready", j.State)
 	}
 }
+
+// TestCancelJob: the operator "give up" complement to requeue — a stranded needs_human
+// job cancels to the terminal `cancelled` state, fold-consistently. An active-leased job
+// is rejected without force (cancelling fences the live worker); already-terminal is a
+// no-op.
+func TestCancelJob(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	mk := func(id, state string) {
+		if _, err := st.SeedJob(ctx, store.SeedParams{ID: id, Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: now}); err != nil {
+			t.Fatal(err)
+		}
+		if state != "ready" {
+			st.DB.ExecContext(ctx, `UPDATE jobs SET state=? WHERE id=?`, state, id)
+		}
+	}
+
+	// a stranded needs_human job cancels to terminal + folds consistently.
+	mk("stranded", "needs_human")
+	final, err := st.CancelJob(ctx, "stranded", false, now)
+	if err != nil || final != job.StateCancelled {
+		t.Fatalf("cancel stranded -> %s err=%v, want cancelled", final, err)
+	}
+	if j, _ := st.GetJob(ctx, "stranded"); j.State != job.StateCancelled {
+		t.Fatalf("state=%s want cancelled", j.State)
+	}
+	assertFoldMatchesProjection(t, st, "stranded")
+
+	// an actively-leased job is rejected without force.
+	mk("live", "ready")
+	if _, err := st.ClaimReadyJob(ctx, store.ClaimParams{JobID: "live", LeaseID: "L", Identity: "w", ModelFamily: "claude", Role: job.RoleEngWorker, Attested: []string{"role:eng_worker"}, TTL: time.Minute, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CancelJob(ctx, "live", false, now); !errors.Is(err, store.ErrJobActivelyLeased) {
+		t.Fatalf("cancel of leased job want ErrJobActivelyLeased, got %v", err)
+	}
+	if _, err := st.CancelJob(ctx, "live", true, now); err != nil { // force fences + cancels
+		t.Fatalf("forced cancel: %v", err)
+	}
+	if j, _ := st.GetJob(ctx, "live"); j.State != job.StateCancelled {
+		t.Fatalf("forced cancel state=%s want cancelled", j.State)
+	}
+
+	// already-terminal is an idempotent no-op.
+	if final, err := st.CancelJob(ctx, "stranded", false, now); err != nil || final != job.StateCancelled {
+		t.Fatalf("cancel of already-cancelled -> %s err=%v (must be idempotent)", final, err)
+	}
+}

@@ -276,6 +276,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	// operator retry: re-arm a job stranded in needs_human (escalated from a now-fixed
 	// transient failure) back to ready. Same operator surface as promote/adopt.
 	mux.HandleFunc("POST /v1/jobs/{job}/requeue", s.requeue)
+	mux.HandleFunc("POST /v1/jobs/{job}/cancel", s.cancel)
 	// the planner front-door (ingest): seed a spec-authoring job from a submitted
 	// work item so the spec flow (author -> issue-review -> materialize) can run.
 	mux.HandleFunc("POST /v1/specs", s.specCreate)
@@ -1475,6 +1476,29 @@ func (s *Server) requeue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.broker.Publish(LifeEvent{JobID: jobID, State: string(final), Event: "requeued"})
+	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID, "state": string(final)})
+}
+
+// cancel terminally cancels a stranded job the operator has decided not to pursue (the
+// complement to requeue). It clears the job from the needs_human triage view without
+// jobs-table surgery. An ADMIN action (same trust posture as requeue).
+func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job")
+	force := r.URL.Query().Get("force") == "true" || r.URL.Query().Get("force") == "1"
+	final, err := s.store.CancelJob(r.Context(), jobID, force, s.clock.Now())
+	if errors.Is(err, store.ErrJobNotFound) {
+		http.Error(w, "cancel: no such job "+jobID+" (check the FULL job id, not a truncated one)", http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, store.ErrJobActivelyLeased) {
+		http.Error(w, "cancel: "+err.Error()+" — re-run with --force if you really mean to", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		http.Error(w, "cancel: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.broker.Publish(LifeEvent{JobID: jobID, State: string(final), Event: "cancelled"})
 	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID, "state": string(final)})
 }
 

@@ -399,6 +399,15 @@ func (c *Client) Requeue(ctx context.Context, jobID string, force bool) (status 
 	return c.postJSONStatus(ctx, path, nil, nil, &out)
 }
 
+func (c *Client) Cancel(ctx context.Context, jobID string, force bool) (status int, err error) {
+	var out map[string]string
+	path := "/v1/jobs/" + jobID + "/cancel"
+	if force {
+		path += "?force=true"
+	}
+	return c.postJSONStatus(ctx, path, nil, nil, &out)
+}
+
 // ReleaseNoPenalty re-arms WITHOUT burning an attempt — for a non-failure abandon
 // (the worker built fine but lost a fast-forward race to a branch move). Keeps the
 // attempt budget for genuine build failures so re-validation churn can't escalate a

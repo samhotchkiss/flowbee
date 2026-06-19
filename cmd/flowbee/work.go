@@ -319,6 +319,36 @@ func runRequeue(args []string) error {
 	return nil
 }
 
+// runCancel terminally cancels a stranded job the operator has decided not to pursue
+// (the complement to requeue): `flowbee cancel <job-id>`. Clears it from the needs_human
+// triage view. Run on the control-plane box (loopback) or with FLOWBEE_WORKER_TOKEN set.
+func runCancel(args []string) error {
+	fs := flag.NewFlagSet("cancel", flag.ContinueOnError)
+	force := fs.Bool("force", false, "cancel even if the job is actively leased (fences the live worker, discarding its in-flight work)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: flowbee cancel [--force] <job-id>")
+	}
+	jobID := fs.Arg(0)
+	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
+	c := client.NewWithToken(url, os.Getenv("FLOWBEE_WORKER_TOKEN"))
+	st, err := c.Cancel(context.Background(), jobID, *force)
+	if err != nil {
+		return err
+	}
+	if st == 409 {
+		return fmt.Errorf("job %s is actively leased — a worker is building/reviewing it now; "+
+			"re-run with --force to cancel anyway (this discards the live worker's work)", jobID)
+	}
+	if st != 200 {
+		return fmt.Errorf("cancel status %d", st)
+	}
+	fmt.Printf("cancelled %s\n", jobID)
+	return nil
+}
+
 // runSubmit is the Mode-B thin client (DESIGN §7.1, the MCP-shim surface): post a
 // result / heartbeat / release for a held lease. For a build job it can also
 // PROVISION a worktree off the mirror, spawn an agent CLI, and push to the epoch
