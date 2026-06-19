@@ -51,7 +51,7 @@ Workers are thin, self-identifying pull-loops. They dial **out** to Flowbee, lea
 
 🪶&nbsp; **Lightweight by obsession.** One static Go binary, a single SQLite file, zero services. Laptop, homelab, or rack — same binary, over LAN or Tailscale.
 
-🔁&nbsp; **Flows are config.** Drop the issue-review stage. Add three build-reviewers that each test something different. It's a YAML file.
+🔁&nbsp; **Reviewers are config.** Staff the review roster in YAML — each reviewer an identity with its own lens (correctness / tests / security) and model family; anti-affinity then guarantees the reviewer is a different, uncorrelated actor from the builder. (The pipeline *shape* — build → review → merge — is fixed today; what's configurable is who fills each role.)
 
 ## Quickstart
 
