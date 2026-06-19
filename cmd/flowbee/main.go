@@ -96,6 +96,8 @@ func main() {
 		err = runRequeue(args)
 	case "cancel":
 		err = runCancel(args)
+	case "card":
+		err = runCard(args)
 	case "backup":
 		err = runBackup(args)
 	case "restore":
@@ -118,5 +120,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|status|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|backup|restore|pause|resume|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|status|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|backup|restore|pause|resume|seed|version>")
 }
