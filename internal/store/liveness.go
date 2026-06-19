@@ -373,13 +373,22 @@ func (s *Store) MarkTimerFired(ctx context.Context, id string) error {
 	return s.markTimerFired(ctx, id)
 }
 
-// ActiveLeaseJobs returns the ids of every job currently holding an active lease
-// (for the Rung-2 sweep + the liveness evaluation pass to iterate).
+// ActiveLeaseJobs returns the ids of every job whose lease is held by a WORKER that
+// should be heartbeating — the scope the Rung-2 sweep + liveness pass evaluate for a
+// stall/heartbeat-miss kill. This is the worker-leased SUBSET of ActiveLeaseStates: it
+// deliberately EXCLUDES merge_handoff, which holds the one-active-lease uniqueness slot
+// (so it stays in the ActiveLeaseStates map + the migration index) but has NO bound
+// worker — it is parked awaiting a HUMAN merge. Including it made the liveness ladder
+// read its stale build-phase heartbeat as a stall and escalate a perfectly healthy
+// handoff to needs_human (reason "stall") minutes after the PR opened (the live #175/#177
+// regression): a human merge gate can legitimately sit open for hours/days. A forgotten
+// handoff is surfaced by the board (it shows merge_handoff) and resolved by reconcile
+// (PR merged -> done, or PR closed -> pr_closed escalation), not by the stall ladder.
 func (s *Store) ActiveLeaseJobs(ctx context.Context) ([]string, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT id FROM jobs
 		 WHERE state IN ('leased','building','code_review','merging',
-		                 'merge_handoff','spec_authoring','spec_review',
+		                 'spec_authoring','spec_review',
 		                 'resolving_conflict')`)
 	if err != nil {
 		return nil, err
