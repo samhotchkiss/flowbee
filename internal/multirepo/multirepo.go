@@ -82,7 +82,8 @@ type HistoryFactory func(r store.Repo) HistoryWriter
 type Option func(*managerConfig)
 
 type managerConfig struct {
-	history HistoryFactory
+	history        HistoryFactory
+	allowOwnSource map[string]bool
 }
 
 // WithHistory wires the F11 history writer per repo so each repo's project-OUT
@@ -91,6 +92,15 @@ type managerConfig struct {
 // not materialized).
 func WithHistory(f HistoryFactory) Option {
 	return func(c *managerConfig) { c.history = f }
+}
+
+// WithAllowOwnSource marks the repo ids (by registry id) whose own source is NOT the
+// Flowbee control plane's, relaxing the flowbee_source content class for their merge
+// cross-check — so their internal//cmd/ changes self-merge instead of forced handoff.
+// MUST be the SAME set as store.AllowOwnSourceRepos so the two gate sites agree. Empty
+// (default) = every repo fully protected. NEVER include the repo that IS Flowbee.
+func WithAllowOwnSource(repos map[string]bool) Option {
+	return func(c *managerConfig) { c.allowOwnSource = repos }
 }
 
 // New builds a Manager over every ACTIVE registered repo, constructing each repo's
@@ -114,6 +124,8 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 		recClk := reconcileClock{clk}
 		projClk := projectClock{clk}
 		sender := project.NewForRepo(r.ID, r.DefaultBranch, st, writer, projClk, asProjectPub(pub))
+		// relax flowbee_source for a non-control-plane repo (mirrors store.AllowOwnSourceRepos).
+		sender.SetAllowOwnSource(cfg.allowOwnSource[r.ID])
 		rec := reconcile.NewForRepo(r.ID, st, client, recClk, asReconcilePub(pub))
 		// F11 (build-list §F): wire the per-repo history writer so the merged->done
 		// post-merge archive commit lands on the repo's integration branch. The same

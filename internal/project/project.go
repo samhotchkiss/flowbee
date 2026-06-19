@@ -36,8 +36,11 @@ import (
 // not a content-safety condition, and the Sender does not carry the operator policy. The
 // blast-radius declared-vs-actual check is also omitted (a declaration-consistency tamper
 // signal whose "declared" set is itself worker-reported, not a content-safety property).
-func contentDenyReason(actualDiff string) string {
-	r := content.Check(content.Patch{Diff: actualDiff}, content.Limits{MaxDiffBytes: 1 << 30, MaxChangedFiles: 1 << 20})
+func contentDenyReason(actualDiff string, allowOwnSource bool) string {
+	r := content.CheckWithPolicy(content.Patch{Diff: actualDiff}, content.Policy{
+		Limits:         content.Limits{MaxDiffBytes: 1 << 30, MaxChangedFiles: 1 << 20},
+		AllowOwnSource: allowOwnSource, // a NON-control-plane repo: its internal//cmd/ are its own
+	})
 	var reasons []string
 	if !r.DenylistClear {
 		reasons = append(reasons, "denylist:"+strings.Join(r.DenylistHits, ","))
@@ -105,6 +108,13 @@ type Sender struct {
 	// omits one). Empty defaults to "main".
 	baseBranch string
 
+	// allowOwnSource relaxes the flowbee_source content class for THIS repo's merge
+	// cross-check — set true for a managed repo that is NOT the Flowbee control plane,
+	// so its own internal//cmd/ changes self-merge instead of forced handoff. Default
+	// false = fully protected. MUST mirror the store's AllowOwnSourceRepos[repo] so the
+	// two gate sites agree (else a job clears one and is denied at the other).
+	allowOwnSource bool
+
 	// parkedUntil is the Retry-After park horizon (§8.2.4): while now < it, the
 	// WHOLE outbox is parked. Single-sender, so a plain field is safe (Drain is
 	// not called concurrently with itself).
@@ -163,6 +173,11 @@ func NewForRepo(repo, baseBranch string, st *store.Store, w gh.Writer, clk Clock
 
 // Repo returns the repo-scope handle this sender is bound to ("" = legacy).
 func (s *Sender) Repo() string { return s.repo }
+
+// SetAllowOwnSource relaxes the flowbee_source merge cross-check for this repo (a
+// managed repo that is NOT the Flowbee control plane). MUST mirror the store's
+// AllowOwnSourceRepos[repo] so both gate sites agree. Default false = fully protected.
+func (s *Sender) SetAllowOwnSource(v bool) { s.allowOwnSource = v }
 
 // DrainOnce drains every currently-pending outbox row, oldest first, ≤1 in-flight
 // (§8.2.4). It stops early if a Retry-After parks the outbox or a send errors
@@ -419,7 +434,7 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 				if derr != nil {
 					return "", fmt.Errorf("verify autonomous merge: diff %s..%s: %w", j.BaseSHA, j.HeadSHA, derr)
 				}
-				if reason := contentDenyReason(actualDiff); reason != "" {
+				if reason := contentDenyReason(actualDiff, s.allowOwnSource); reason != "" {
 					if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
 						return "", fmt.Errorf("route self-merge to handoff: %w", rerr)
 					}

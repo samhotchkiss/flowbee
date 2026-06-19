@@ -176,3 +176,27 @@ func TestValidateReposRegistry(t *testing.T) {
 		}
 	}
 }
+
+func TestRepoAllowOwnSourceMergeParses(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/flowbee.yaml"
+	if err := os.WriteFile(path, []byte(
+		"repos:\n  - id: web\n    owner: o\n    repo: web\n    allow_own_source_merge: true\n  - id: cp\n    owner: o\n    repo: flowbee\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLOWBEE_CONFIG", path)
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	by := map[string]RepoConfig{}
+	for _, r := range c.Repos {
+		by[r.ID] = r
+	}
+	if !by["web"].AllowOwnSourceMerge {
+		t.Fatal("web should have allow_own_source_merge: true")
+	}
+	if by["cp"].AllowOwnSourceMerge {
+		t.Fatal("cp (the control plane) must default to false — fully protected")
+	}
+}

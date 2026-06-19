@@ -249,3 +249,18 @@ func TestCheckIsDeterministic(t *testing.T) {
 		t.Fatal("Check must be deterministic")
 	}
 }
+
+func TestAllowOwnSourceRelaxesOnlyFlowbeeSource(t *testing.T) {
+	mixed := "--- a/internal/x.go\n+++ b/internal/x.go\n@@ -0,0 +1 @@\n+x\n" +
+		"--- a/go.sum\n+++ b/go.sum\n@@ -0,0 +1 @@\n+dep\n"
+	if CheckWithPolicy(Patch{Diff: mixed}, Policy{AllowOwnSource: true}).DenylistClear {
+		t.Fatal("AllowOwnSource must NOT drop the universal lockfile (go.sum) class")
+	}
+	pureSrc := "--- a/cmd/flowbee/x.go\n+++ b/cmd/flowbee/x.go\n@@ -0,0 +1 @@\n+x\n"
+	if !CheckWithPolicy(Patch{Diff: pureSrc}, Policy{AllowOwnSource: true}).DenylistClear {
+		t.Fatal("AllowOwnSource must clear a pure flowbee-source diff (the repo's own code)")
+	}
+	if Check(Patch{Diff: pureSrc}, Limits{}).DenylistClear {
+		t.Fatal("default (control-plane) posture must STILL deny its own source")
+	}
+}

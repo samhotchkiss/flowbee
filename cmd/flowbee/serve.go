@@ -694,6 +694,7 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 	// single-repo FLOWBEE_GITHUB_OWNER/REPO env path (registered under id "default").
 	repos := cfg.Repos
 	tokenEnv := map[string]string{} // repo id -> token env-var name ("" = shared default)
+	allowOwn := map[string]bool{}   // repo id -> relax flowbee_source (non-control-plane repo)
 	if len(repos) == 0 {
 		// env wins (legacy path); else fall back to the flowbee.yaml coords
 		// `flowbee init` prefills (F13).
@@ -726,6 +727,9 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 			continue
 		}
 		tokenEnv[id] = rc.TokenEnv
+		if rc.AllowOwnSourceMerge {
+			allowOwn[id] = true
+		}
 		// name a repo that will silently no-op for lack of (the right) token NOW, at
 		// startup, instead of leaving the operator to wonder why one repo never moves.
 		if rc.IsActive() {
@@ -757,7 +761,12 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 	// (docs/history/<id>.md + the TOC) on the integration branch. The shared bare
 	// mirror is the same one workers' worktrees/bundles come off; an unset mirror
 	// path leaves history.write rows as audited no-ops (the ledger stays canonical).
+	// F2: relax flowbee_source for non-control-plane repos at BOTH gate sites — the
+	// store's per-job content check AND the project-OUT merge cross-check (they must
+	// agree). Empty (no repo opted in) = the shipped fully-protected posture.
+	st.AllowOwnSourceRepos = allowOwn
 	var historyOpt []multirepo.Option
+	historyOpt = append(historyOpt, multirepo.WithAllowOwnSource(allowOwn))
 	if os.Getenv("FLOWBEE_MIRROR_PATH") != "" {
 		// F9: each repo's history archive + base_sha resolution come off ITS OWN bare
 		// mirror (provisioned lazily), not one shared mirror — so a non-default repo

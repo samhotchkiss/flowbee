@@ -272,3 +272,24 @@ func TestTransientNotMergeableRetriedNotResolved(t *testing.T) {
 		t.Fatal("a transient not-mergeable must never route to the resolver")
 	}
 }
+
+// TestContentDenyReasonAllowOwnSource pins the F2 per-repo relaxation at the merge
+// cross-check (the FINAL gate before self-merge). A non-control-plane repo's own
+// internal//cmd/ changes must clear; but the universal classes (secrets, lockfiles)
+// must STILL deny even when own-source is allowed — and the default stays protected.
+func TestContentDenyReasonAllowOwnSource(t *testing.T) {
+	ownSrc := "--- a/internal/x.go\n+++ b/internal/x.go\n@@ -0,0 +1 @@\n+x\n"
+	// default (control plane): own source denied.
+	if contentDenyReason(ownSrc, false) == "" {
+		t.Fatal("default posture must DENY a flowbee-source diff")
+	}
+	// non-control-plane repo: own source clears.
+	if r := contentDenyReason(ownSrc, true); r != "" {
+		t.Fatalf("allowOwnSource must clear a pure internal/ diff, got %q", r)
+	}
+	// a universal class still denies even with allowOwnSource (a secret file).
+	secret := "--- a/internal/app/.env\n+++ b/internal/app/.env\n@@ -0,0 +1 @@\n+KEY=v\n"
+	if contentDenyReason(secret, true) == "" {
+		t.Fatal("allowOwnSource must NOT relax the universal secret_material class")
+	}
+}

@@ -115,6 +115,17 @@ type RepoConfig struct {
 	TokenEnv      string `yaml:"token_env"`
 	// Active defaults to true; set false to register-but-park a repo.
 	Active *bool `yaml:"active"`
+	// AllowOwnSourceMerge relaxes the `flowbee_source` content-denylist class
+	// (internal/, cmd/flowbee/, tools/, flows/, flowbee.yaml, content.go) for THIS
+	// repo. That class exists to stop Flowbee autonomously merging changes to its OWN
+	// control-plane source; it is correct ONLY for the repo that actually contains
+	// Flowbee's source. For any OTHER managed repo those are the repo's own paths (most
+	// Go repos have internal/ + cmd/), so leaving it on wrongly forces every such change
+	// to the human gate. Set true for a managed repo that is NOT the Flowbee control
+	// plane, so its own internal//cmd/ changes can self-merge. Default false = fully
+	// protected (the control-plane-self posture; never relax the repo that IS Flowbee).
+	// Universal classes (CI, lockfiles, dockerfiles, secrets) are NEVER relaxed.
+	AllowOwnSourceMerge bool `yaml:"allow_own_source_merge"`
 }
 
 // IsActive reports whether the repo is active (default true when unset).

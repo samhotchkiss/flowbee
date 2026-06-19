@@ -22,14 +22,20 @@ import (
 // at this seam we treat the apply fact as UNKNOWN (not failed) unless a caller has
 // recorded a definite negative — keeping the gate a pure function of stored inputs.
 func (s *Store) contentResultTx(ctx context.Context, tx *sql.Tx, jobID string) (content.Result, error) {
-	var diff, declared string
+	var diff, declared, repo string
 	err := tx.QueryRowContext(ctx,
-		`SELECT patch_diff, declared_blast_radius FROM jobs WHERE id = ?`, jobID).
-		Scan(&diff, &declared)
+		`SELECT patch_diff, declared_blast_radius, COALESCE(repo,'') FROM jobs WHERE id = ?`, jobID).
+		Scan(&diff, &declared, &repo)
 	if err != nil {
 		return content.Result{}, err
 	}
-	return computeContent(diff, declared, s.ContentPolicy), nil
+	pol := s.ContentPolicy
+	// a managed repo that is NOT the Flowbee control plane has the flowbee_source class
+	// relaxed (its internal//cmd/ are its OWN code). Default (empty map) protects all.
+	if s.AllowOwnSourceRepos[repo] {
+		pol.AllowOwnSource = true
+	}
+	return computeContent(diff, declared, pol), nil
 }
 
 // computeContent runs the content-integrity gate over the stored diff + declared

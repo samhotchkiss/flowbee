@@ -38,6 +38,14 @@ type Store struct {
 	// the shipped posture (cost metered, never capped on spend). Set by the runtime
 	// from config.CostCeilingMicroUSD().
 	DefaultCostCeilingMicroUSD int64
+
+	// AllowOwnSourceRepos is the set of repo ids whose own source (internal/, cmd/,
+	// tools/, flows/) is NOT the Flowbee control plane's, so the `flowbee_source`
+	// content-denylist class is relaxed for them — letting their internal//cmd/ changes
+	// self-merge instead of being forced to the human gate. Empty (the default) = every
+	// repo is fully protected (the shipped posture). Set from config by the runtime;
+	// applied per-job in contentResultTx. NEVER include the repo that IS Flowbee.
+	AllowOwnSourceRepos map[string]bool
 }
 
 // Open opens the SQLite database with WAL + a busy timeout. A single open

@@ -133,6 +133,17 @@ type Policy struct {
 	// ExtraDenyPrefixes are additional protected path prefixes (normalized; a leading
 	// "./" or "/" is stripped). They EXTEND — never replace — the shipped denylist.
 	ExtraDenyPrefixes []string
+	// AllowOwnSource drops ONLY the `flowbee_source` denylist class for THIS check.
+	// That class (internal/, cmd/flowbee/, tools/, flows/, flowbee.yaml, content.go)
+	// protects the CONTROL PLANE's own source — "the agent editing the orchestrator it
+	// runs under." It is correct ONLY for the repo that actually contains Flowbee's
+	// source. For any OTHER managed repo those are the repo's OWN paths (most Go repos
+	// have internal/ + cmd/), so applying flowbee_source there wrongly forces every such
+	// change to the human gate, defeating autonomous self-merge. An operator sets this
+	// per-repo (allow_own_source_merge) for repos that are NOT the Flowbee control plane.
+	// Default false = the shipped, fully-protected posture (no behavior change). The
+	// UNIVERSAL classes (CI, lockfiles, dockerfiles, secrets) are NEVER dropped.
+	AllowOwnSource bool
 }
 
 // Check runs the full content-integrity gate over a patch and returns the
@@ -156,6 +167,11 @@ func CheckWithPolicy(p Patch, pol Policy) Result {
 	// (a) path denylist — §9.2(a). Any hit (shipped set OR the operator's extra
 	// prefixes) forces the human gate.
 	hits := denylistHitsWith(touched, pol.ExtraDenyPrefixes)
+	if pol.AllowOwnSource {
+		// drop ONLY flowbee_source hits — this repo's internal//cmd//tools//flows/ are
+		// its OWN source, not the control plane's. Every other class stays in force.
+		hits = withoutClass(hits, "flowbee_source")
+	}
 	r.DenylistHits = hits
 	r.DenylistClear = len(hits) == 0
 
@@ -263,6 +279,19 @@ var denyMatchers = []struct {
 // set (no operator-configured extra prefixes).
 func DenylistHits(touched []string) []string {
 	return denylistHitsWith(touched, nil)
+}
+
+// withoutClass drops every hit of the given denylist class (hits are "class:path").
+// Used to relax the flowbee_source class for a repo that is NOT the control plane.
+func withoutClass(hits []string, class string) []string {
+	prefix := class + ":"
+	var out []string
+	for _, h := range hits {
+		if !strings.HasPrefix(h, prefix) {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // denylistHitsWith is DenylistHits plus an operator-supplied EXTRA set of denied
