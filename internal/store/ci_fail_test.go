@@ -2,10 +2,12 @@ package store_test
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
@@ -66,6 +68,72 @@ func TestCIFailBouncesThenEscalates(t *testing.T) {
 	j, _ := st.GetJob(ctx, "j")
 	if j.State != job.StateNeedsHuman {
 		t.Fatalf("after max_bounces CI failures state=%s, want needs_human", j.State)
+	}
+}
+
+// TestFoldEqualsProjectionAcrossCIBounce drives a build through a REAL CI-fail bounce
+// (seed → claim → result → reconciled CI red → re-armed ready) entirely through store
+// methods — every step appends a ledger event — then asserts Fold(events) deep-equals
+// the projection on the re-armed field set, crucially RequiredCapabilities. That is the
+// field the stranded-ready bug (#2217) diverged on: the projection reset the build cap
+// but an earlier Fold did not, so a projection-RESYNC (which replays the ledger) folded
+// the job back to role:code_reviewer caps no builder could claim — wedging it. No raw
+// UPDATEs here: this is exactly the replay a resync performs, so a fold that forgets to
+// reset the caps strands the re-armed job in THIS test, not in production.
+func TestFoldEqualsProjectionAcrossCIBounce(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+
+	seedBuild(t, st, "j")
+	ls, err := claim(st, "j", "w1")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := st.Heartbeat(ctx, store.HeartbeatParams{JobID: "j", Epoch: ls.Epoch, Now: time.Unix(3000, 0)}); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	if _, err := st.Result(ctx, store.ResultParams{JobID: "j", Epoch: ls.Epoch, Now: time.Unix(3200, 0)}); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	// reconciled CI is definitively red → KindReviewBounced → ready (caps MUST reset).
+	if _, err := st.ApplyReconciledPR(ctx, "j",
+		store.ReconciledPR{Number: 1, HeadSHA: "h1", BaseSHA: "b1", CIFailed: true}, time.Unix(3500, 0)); err != nil {
+		t.Fatalf("reconcile ci-fail: %v", err)
+	}
+
+	proj, _ := st.GetJob(ctx, "j")
+	evs, _ := st.LoadEvents(ctx, "j")
+	folded, err := ledger.Fold(evs)
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+
+	// the re-armed build must be a leasable eng_worker build in BOTH the live projection
+	// and the replay — or a resync strands it (no builder matches role:code_reviewer).
+	if proj.State != job.StateReady {
+		t.Fatalf("projection state=%s, want ready (re-armed build)", proj.State)
+	}
+	if folded.State != proj.State {
+		t.Fatalf("state: fold=%s proj=%s", folded.State, proj.State)
+	}
+	if folded.Role != proj.Role || folded.Role != job.RoleEngWorker {
+		t.Fatalf("role: fold=%s proj=%s want eng_worker", folded.Role, proj.Role)
+	}
+	if !reflect.DeepEqual(folded.RequiredCapabilities, proj.RequiredCapabilities) {
+		t.Fatalf("required_capabilities DIVERGED on the bounce: fold=%v proj=%v (the stranded-ready bug class)",
+			folded.RequiredCapabilities, proj.RequiredCapabilities)
+	}
+	if len(proj.RequiredCapabilities) != 1 || proj.RequiredCapabilities[0] != "role:eng_worker" {
+		t.Fatalf("re-armed caps=%v, want [role:eng_worker] (else unleaseable)", proj.RequiredCapabilities)
+	}
+	if folded.Bounces != proj.Bounces || folded.Bounces != 1 {
+		t.Fatalf("bounces: fold=%d proj=%d want 1", folded.Bounces, proj.Bounces)
+	}
+	if folded.LeaseEpoch != proj.LeaseEpoch {
+		t.Fatalf("epoch: fold=%d proj=%d", folded.LeaseEpoch, proj.LeaseEpoch)
+	}
+	if folded.BaseSHA != proj.BaseSHA {
+		t.Fatalf("base_sha: fold=%q proj=%q", folded.BaseSHA, proj.BaseSHA)
 	}
 }
 
