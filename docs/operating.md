@@ -184,6 +184,11 @@ building → review_pending → code_review → mergeable → merging → done**
 
 ## 5. Watching it run
 
+- **Local status:** `flowbee status` is a read-only, no-network snapshot: per-repo
+  job-state counts, `awaiting human` totals (`merge_handoff`, `needs_human`), and
+  the fleet line. The fleet line breaks down live workers by backend, for example
+  `fleet: 14 live, 0 stale workers (codex:14)`, so you can confirm at a glance
+  which model family a `--agent codex` fleet is running.
 - **Liveness:** `GET /v1/fleet-health` → `{live_workers, stale_workers, waiting_jobs,
   stranded}`. `stranded: true` (work waiting, no live worker) is the loud "is the fleet
   up?" signal.
@@ -192,7 +197,8 @@ building → review_pending → code_review → mergeable → merging → done**
   off, this is your whole merge queue); `GET /v1/needs-human` lists escalated jobs, each
   tagged with the trigger (attempts/bounces/reviewer_rejections/cost/stall/ci_stalled/project_out); `GET /v1/needs-input` lists design
   forks awaiting an answer. Inspect a job's full story first with **`flowbee card <job-id>`**
-  (its verdicts, lessons, and timeline, folded from the ledger), then act:
+  (its verdicts, lessons, timeline, and per-node model labels such as
+  `Lease claimed by feller-builder-2 (codex)`, folded from the ledger), then act:
   **`flowbee requeue <job-id>`** re-arms it for a fresh attempt, or **`flowbee cancel
   <job-id>`** terminally dismisses a dead end so it leaves the triage view (both take
   `--force` for an actively-leased job; the matching POST endpoints are
