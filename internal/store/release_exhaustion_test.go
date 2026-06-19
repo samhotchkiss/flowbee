@@ -71,6 +71,9 @@ func assertFoldMatchesProjection(t *testing.T, st *store.Store, id string) {
 	if folded.OverBudget != proj.OverBudget {
 		t.Fatalf("fold over_budget=%v != projection %v", folded.OverBudget, proj.OverBudget)
 	}
+	if folded.LastReviewNotes != proj.LastReviewNotes {
+		t.Fatalf("fold last_review_notes=%q != projection %q (review-findings carry-forward must fold)", folded.LastReviewNotes, proj.LastReviewNotes)
+	}
 }
 
 // TestReleaseEscalatesOnAttemptsExhaustion: a penalty release that burns the LAST

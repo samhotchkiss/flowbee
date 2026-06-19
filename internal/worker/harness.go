@@ -94,6 +94,15 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 		b.WriteString(c.AcceptanceCriteria)
 		b.WriteString("\n")
 	}
+	if c.PriorReviewFindings != "" {
+		// the actionable feedback FIRST (before the raw verdict JSON): a prior review
+		// requested changes — the agent must address these, not re-submit the same patch.
+		b.WriteString("\n## A prior review requested changes — ADDRESS THESE\n\n")
+		b.WriteString("Your previous attempt was rejected in code review with this feedback. " +
+			"Fix exactly what is called out below before resubmitting; do not repeat the rejected approach.\n\n")
+		b.WriteString(c.PriorReviewFindings)
+		b.WriteString("\n")
+	}
 	if c.PriorVerdict != nil {
 		if raw, err := json.Marshal(c.PriorVerdict); err == nil {
 			b.WriteString("\n## Prior verdict\n\n```json\n")

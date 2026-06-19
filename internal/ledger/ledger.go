@@ -141,6 +141,9 @@ type Payload struct {
 	// reset them too or a rebuild-from-ledger keeps the pre-requeue counts (a divergence
 	// that could trip premature re-escalation after a DR rebuild).
 	ResetCounters bool `json:",omitempty"`
+	// ReviewNotes carries a code-review's changes-requested findings on the bounce event,
+	// so the rebuild can surface them (§F compounding memory). Folded onto LastReviewNotes.
+	ReviewNotes string `json:",omitempty"`
 	// stall_revocations governor counter delta (M8, §10.7); set on lease_revoked /
 	// stall_escalated. Distinct from attempts/bounces.
 	StallRevocationsDelta int `json:",omitempty"`
@@ -616,6 +619,12 @@ func Fold(events []Event) (job.Job, error) {
 		// KindCostEscalated and cleared by no Fold case). Both are true iff the job sits in
 		// a human-gate state: derive them from the folded state + the entering event's
 		// reason payload, mirroring the live projection exactly.
+		// the most recent review's changes-requested findings ride the bounce event; fold
+		// them onto LastReviewNotes so the rebuild's lease context can surface them. Only
+		// the bounce event carries it (empty elsewhere -> the prior findings are retained).
+		if e.Payload.ReviewNotes != "" {
+			j.LastReviewNotes = e.Payload.ReviewNotes
+		}
 		switch j.State {
 		case job.StateNeedsHuman, job.StateNeedsDesign:
 			// On ENTRY the transition event carries the reason; while PARKED (a later

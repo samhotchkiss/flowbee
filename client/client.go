@@ -138,6 +138,9 @@ type LeaseContext struct {
 	Spec               string         `json:"spec,omitempty"`
 	AcceptanceCriteria string         `json:"acceptance_criteria,omitempty"`
 	PriorVerdict       map[string]any `json:"prior_verdict,omitempty"`
+	// PriorReviewFindings is the most recent code-review's changes-requested findings,
+	// carried to a rebuild so the agent fixes what was flagged (§F compounding memory).
+	PriorReviewFindings string `json:"prior_review_findings,omitempty"`
 	// Diff is the eng_worker's build patch, shipped to a code_reviewer so its agent
 	// can judge the actual change (the review harness writes it to .flowbee/diff.patch
 	// + $FLOWBEE_DIFF). Empty for non-review roles.

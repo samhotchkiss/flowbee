@@ -671,6 +671,10 @@ type LeaseContext struct {
 	// PriorVerdict is the last minted gate verdict on this job, if any (e.g. a
 	// build re-armed after a bounce sees the reviewer's prior changes-requested).
 	PriorVerdict *job.Verdict `json:"prior_verdict,omitempty"`
+	// PriorReviewFindings is the most recent code-review's changes-requested findings
+	// (the reviewer's "fix X, Y, Z"), carried to a rebuild so the agent addresses what
+	// was flagged instead of re-submitting a patch that already failed review (§F).
+	PriorReviewFindings string `json:"prior_review_findings,omitempty"`
 	// Diff is the eng_worker's build patch, shipped to a code_reviewer so its agent
 	// judges the actual change (the review harness writes .flowbee/diff.patch).
 	Diff string `json:"diff,omitempty"`
@@ -834,11 +838,12 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 				}
 				grant.Context = &LeaseContext{
 					Identity: identity, ModelFamily: family, Lens: ctxLens, Role: string(j.Role),
-					BaseSHA:            j.BaseSHA,
-					Task:               j.TaskText,
-					Spec:               j.SpecText,
-					AcceptanceCriteria: j.AcceptanceCriteria,
-					PriorVerdict:       j.Verdict,
+					BaseSHA:             j.BaseSHA,
+					Task:                j.TaskText,
+					Spec:                j.SpecText,
+					AcceptanceCriteria:  j.AcceptanceCriteria,
+					PriorVerdict:        j.Verdict,
+					PriorReviewFindings: j.LastReviewNotes,
 				}
 				// the per-issue branch the node commits to (worker-push): builds + reviews
 				// both target it. Resolved from the job's bound issue (adopted) or its spec
@@ -979,6 +984,7 @@ func (s *Server) review(w http.ResponseWriter, r *http.Request) {
 		Claim:          job.VerdictValue(req.Verdict),
 		Disposition:    job.Disposition(req.Disposition),
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+		Notes:          req.Notes, // carried forward to the rebuild on a bounce (§F read)
 		Now:            s.clock.Now(),
 	})
 	if err != nil {

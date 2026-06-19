@@ -208,7 +208,11 @@ type ReviewResultParams struct {
 	Claim          job.VerdictValue
 	Disposition    job.Disposition
 	IdempotencyKey string
-	Now            time.Time
+	// Notes are the reviewer's findings (the "fix X, Y, Z"). On a changes-requested
+	// bounce they are carried forward onto the job (LastReviewNotes) so the rebuild's
+	// lease context surfaces them — the §F compounding-memory read side.
+	Notes string
+	Now   time.Time
 }
 
 // ReviewResultResponse is the gate's reply.
@@ -342,6 +346,11 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			if t.To == job.StateNeedsHuman {
 				pay.EscalationReason = reviewerRejectionReason
 			}
+			// carry the reviewer's findings forward on the bounce so the rebuild surfaces
+			// them (§F read side); folded onto LastReviewNotes.
+			if in.Claim == job.VerdictChangesRequested {
+				pay.ReviewNotes = in.Notes
+			}
 			ev := ledger.Event{
 				JobID: in.JobID, JobSeq: nextSeq, Kind: t.Kind,
 				FromState: t.From, ToState: t.To, LeaseEpoch: j.LeaseEpoch,
@@ -379,12 +388,12 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 				UPDATE jobs
 				   SET state = 'ready', role = 'eng_worker', stage = 'build',
 				       required_capabilities = ?, bounces = bounces + ?,
-				       enqueued_at = ?,
+				       enqueued_at = ?, last_review_notes = ?,
 				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 				       lease_hb_due = NULL, updated_at = datetime('now')
 				 WHERE id = ?`,
 				marshalStrings([]string{"role:eng_worker"}), bouncesDelta,
-				in.Now.Format(rfc3339), in.JobID); err != nil {
+				in.Now.Format(rfc3339), in.Notes, in.JobID); err != nil {
 				return fmt.Errorf("apply bounce projection: %w", err)
 			}
 		} else if _, err := tx.ExecContext(ctx, `

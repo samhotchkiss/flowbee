@@ -324,6 +324,12 @@ type Job struct {
 	BoundModelFamily string
 	BoundLens        string
 
+	// LastReviewNotes carries the most recent code-review's changes-requested findings
+	// (the reviewer's "fix X, Y, Z") forward to the rebuild's lease context, so the agent
+	// addresses what was flagged instead of rebuilding blind (§F compounding memory, read
+	// side). A projection field folded from the bounce event's payload.
+	LastReviewNotes string
+
 	// counters (§6.7)
 	Attempts         int
 	MaxAttempts      int
