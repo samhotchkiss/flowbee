@@ -16,6 +16,7 @@ func runDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	dir := fs.String("dir", ".", "repo root to validate")
 	offline := fs.Bool("offline", false, "skip the GitHub reachability check")
+	quiet := fs.Bool("quiet", false, "suppress per-check lines; print only the summary")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -28,20 +29,25 @@ func runDoctor(args []string) error {
 		return err
 	}
 
-	for _, c := range rep.Checks {
-		mark := "ok  "
-		switch c.Status {
-		case onboarding.StatusWarn:
-			mark = "warn"
-		case onboarding.StatusFail:
-			mark = "FAIL"
+	if !*quiet {
+		for _, c := range rep.Checks {
+			mark := "ok  "
+			switch c.Status {
+			case onboarding.StatusWarn:
+				mark = "warn"
+			case onboarding.StatusFail:
+				mark = "FAIL"
+			}
+			fmt.Printf("  [%s] %-13s %s\n", mark, c.Name, c.Detail)
 		}
-		fmt.Printf("  [%s] %-13s %s\n", mark, c.Name, c.Detail)
 	}
 
 	if rep.Green() {
 		fmt.Println("\nflowbee doctor: green")
 		return nil
+	}
+	if *quiet {
+		return fmt.Errorf("flowbee doctor: FAIL")
 	}
 	return fmt.Errorf("doctor found failing checks (see above)")
 }

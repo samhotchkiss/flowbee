@@ -127,6 +127,67 @@ func TestF13_RunbookDocsExist(t *testing.T) {
 	}
 }
 
+func TestDoctorQuiet_Green(t *testing.T) {
+	bin := buildFlowbee(t)
+
+	repo := t.TempDir()
+	gitInit(t, repo)
+	gitRun(t, repo, "remote", "add", "origin", "git@github.com:acme/widgets.git")
+	runFlowbeeIn(t, bin, repo, nil, "init")
+
+	cmd := exec.Command(bin, "doctor", "--quiet", "--offline")
+	cmd.Dir = repo
+	cmd.Env = os.Environ()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("doctor --quiet exited non-zero: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "flowbee doctor: green") {
+		t.Errorf("stdout missing summary line\nstdout: %s", stdout.String())
+	}
+	for _, banned := range []string{"[ok", "[FAIL", "[warn"} {
+		if strings.Contains(stdout.String(), banned) {
+			t.Errorf("stdout contains per-check line %q in quiet mode\nstdout: %s", banned, stdout.String())
+		}
+	}
+}
+
+func TestDoctorQuiet_Fail(t *testing.T) {
+	bin := buildFlowbee(t)
+
+	repo := t.TempDir()
+	gitInit(t, repo)
+	gitRun(t, repo, "remote", "add", "origin", "git@github.com:acme/widgets.git")
+	runFlowbeeIn(t, bin, repo, nil, "init")
+
+	// corrupt the repo so doctor reports a FAIL.
+	if err := os.Remove(filepath.Join(repo, "flowbee.yaml")); err != nil {
+		t.Fatalf("remove flowbee.yaml: %v", err)
+	}
+
+	cmd := exec.Command(bin, "doctor", "--quiet", "--offline")
+	cmd.Dir = repo
+	cmd.Env = os.Environ()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("doctor --quiet expected non-zero exit, got 0\nstdout: %s\nstderr: %s", stdout.String(), stderr.String())
+	}
+	combined := stdout.String() + stderr.String()
+	if !strings.Contains(combined, "FAIL") {
+		t.Errorf("combined output missing FAIL\nstdout: %s\nstderr: %s", stdout.String(), stderr.String())
+	}
+	for _, banned := range []string{"[FAIL", "[ok"} {
+		if strings.Contains(stdout.String(), banned) {
+			t.Errorf("stdout contains per-check line %q in quiet mode\nstdout: %s", banned, stdout.String())
+		}
+	}
+}
+
 // --- helpers ---
 
 func gitInit(t *testing.T, dir string) {
