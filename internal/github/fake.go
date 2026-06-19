@@ -31,12 +31,13 @@ type Fake struct {
 	enqueued    []int        // PR numbers enqueued to the merge queue
 	conflictPRs map[int]bool // PRs whose merge returns ErrMergeConflict (set via SetMergeConflict)
 
-	baseModifiedPRs map[int]bool   // PRs whose merge returns ErrMergeBaseModified (retryable)
-	headMovedPRs    map[int]string // PRs whose live head != this SHA -> merge returns ErrMergeHeadModified
-	mergeHeads      map[int]string // expectedHead passed to EnqueueMergeQueue, for pin assertions
-	drafted         []int          // PR numbers converted back to draft (compensation, §6.5.4)
-	deletedBranches []string       // branches deleted post-merge (cleanup)
-	cancelled       []string       // SHAs whose CI was cancelled (compensation, §6.5.4)
+	baseModifiedPRs map[int]bool      // PRs whose merge returns ErrMergeBaseModified (retryable)
+	headMovedPRs    map[int]string    // PRs whose live head != this SHA -> merge returns ErrMergeHeadModified
+	mergeHeads      map[int]string    // expectedHead passed to EnqueueMergeQueue, for pin assertions
+	drafted         []int             // PR numbers converted back to draft (compensation, §6.5.4)
+	deletedBranches []string          // branches deleted post-merge (cleanup)
+	cancelled       []string          // SHAs whose CI was cancelled (compensation, §6.5.4)
+	putFiles        map[string][]byte // path -> last content written via PutFile (§F archive)
 	protection      map[string]Protection
 
 	// retryAfter, when >0, makes the NEXT write return *ErrRetryAfter (§8.2.4),
@@ -369,6 +370,31 @@ func (f *Fake) DeleteBranch(ctx context.Context, branch string) error {
 	}
 	f.deletedBranches = append(f.deletedBranches, branch)
 	return nil
+}
+
+func (f *Fake) PutFile(ctx context.Context, path string, content []byte, message, branch string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("PutFile(%s@%s)", path, branch))
+	if err := f.retryGate(); err != nil {
+		return err
+	}
+	if f.putFiles == nil {
+		f.putFiles = map[string][]byte{}
+	}
+	f.putFiles[path] = append([]byte(nil), content...)
+	return nil
+}
+
+// PutFiles returns the path->content map written via PutFile (a copy), for assertions.
+func (f *Fake) PutFiles() map[string][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string][]byte, len(f.putFiles))
+	for k, v := range f.putFiles {
+		out[k] = append([]byte(nil), v...)
+	}
+	return out
 }
 
 // DeletedBranches returns the branches deleted (post-merge cleanup assertions).

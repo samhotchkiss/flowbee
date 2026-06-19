@@ -131,6 +131,12 @@ type RepoConfig struct {
 	// protected (the control-plane-self posture; never relax the repo that IS Flowbee).
 	// Universal classes (CI, lockfiles, dockerfiles, secrets) are NEVER relaxed.
 	AllowOwnSourceMerge bool `yaml:"allow_own_source_merge"`
+	// ArchiveHistory opts this repo into the §F durable history archive: on every merge,
+	// Flowbee lands docs/history/<id>.md + a regenerated TOC on the integration branch
+	// (the "compounding memory" — in-repo provenance of how each issue was built). Default
+	// false: it commits to the repo's main on every merge, so enable it only for a repo
+	// whose owner wants that. Set via `archive_history: true` in the repo's registry entry.
+	ArchiveHistory bool `yaml:"archive_history"`
 }
 
 // IsActive reports whether the repo is active (default true when unset).

@@ -157,6 +157,12 @@ type Writer interface {
 	// BranchProtection reads the server-side protection on a branch (I-8, §9.6):
 	// the orchestrator-independent backstop Flowbee asserts on startup.
 	BranchProtection(ctx context.Context, branch string) (Protection, bool, error)
+	// PutFile creates-or-updates a file on `branch` via the Contents API — one atomic
+	// commit per call, onto the branch's current tip (no force-push, no fast-forward
+	// race with concurrent merges). Used for the §F history archive (docs/history/*.md):
+	// the durable, reconcile-first way to land a Flowbee-authored doc on the integration
+	// branch. Idempotent: a re-PUT of byte-identical content is a no-op.
+	PutFile(ctx context.Context, path string, content []byte, message, branch string) error
 }
 
 // BranchProtectionReader is the narrow read surface the I-8 startup assertion
@@ -895,6 +901,31 @@ func (c *RealClient) DeleteBranch(ctx context.Context, branch string) error {
 		}
 	}
 	return err
+}
+
+func (c *RealClient) PutFile(ctx context.Context, path string, content []byte, message, branch string) error {
+	// fetch the current file's blob sha (an UPDATE needs it; a 404 means CREATE). Also
+	// short-circuit if the content already matches — a re-drain after a CP crash must not
+	// mint a redundant commit (idempotency).
+	var cur struct {
+		SHA     string `json:"sha"`
+		Content string `json:"content"` // base64, may carry newlines
+	}
+	getErr := c.rest(ctx, http.MethodGet, "/contents/"+path+"?ref="+url.QueryEscape(branch), nil, &cur)
+	if getErr == nil && cur.Content != "" {
+		if existing, derr := base64.StdEncoding.DecodeString(strings.ReplaceAll(cur.Content, "\n", "")); derr == nil && bytes.Equal(existing, content) {
+			return nil // unchanged: idempotent no-op
+		}
+	}
+	body := map[string]any{
+		"message": message,
+		"content": base64.StdEncoding.EncodeToString(content),
+		"branch":  branch,
+	}
+	if getErr == nil && cur.SHA != "" {
+		body["sha"] = cur.SHA // update in place
+	}
+	return c.rest(ctx, http.MethodPut, "/contents/"+path, body, nil)
 }
 
 // prNodeQuery resolves a PR's GraphQL node ID (+ current draft state) from its

@@ -50,7 +50,10 @@ func TestF11HistoryWiredPerRepo(t *testing.T) {
 	hist := &recordingHistory{}
 	mgr, err := multirepo.New(ctx, st, clk, nil,
 		func(store.Repo) (gh.Client, gh.Writer, error) { return fake, fake, nil },
-		multirepo.WithHistory(func(store.Repo) multirepo.HistoryWriter { return hist }))
+		multirepo.WithHistory(func(store.Repo) multirepo.HistoryWriter { return hist }),
+		// opt the web repo into the durable §F archive: it now lands via the Contents API
+		// (gh.PutFile) on the repo's integration branch, not a local-only git commit.
+		multirepo.WithArchiveHistory(map[string]bool{"web": true}))
 	if err != nil {
 		t.Fatalf("manager: %v", err)
 	}
@@ -84,28 +87,38 @@ func TestF11HistoryWiredPerRepo(t *testing.T) {
 	if _, err := mgr.DrainAll(ctx); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if hist.calls != 1 {
-		t.Fatalf("history writer called %d times, want 1", hist.calls)
+	// the archive landed DURABLY via the Contents API: the card + the TOC, on the repo's
+	// integration branch ('trunk'), idempotent per file.
+	puts := fake.PutFiles()
+	if len(puts) != 2 {
+		t.Fatalf("archive must put the card + the TOC, got %d files: %v", len(puts), keysOf(puts))
 	}
-	if hist.branch != "trunk" {
-		t.Fatalf("history landed on %q, want the repo integration branch 'trunk'", hist.branch)
+	card, ok := puts["docs/history/"+id+".md"]
+	if !ok {
+		t.Fatalf("card not put at docs/history/%s.md: %v", id, keysOf(puts))
 	}
-	if len(hist.files) != 2 {
-		t.Fatalf("history write must carry the card + the TOC, got %d files", len(hist.files))
+	if !strings.Contains(string(card), "Wire the navbar") {
+		t.Fatalf("card missing curated title:\n%s", card)
 	}
-	var sawCard, sawTOC bool
-	for _, f := range hist.files {
-		if strings.Contains(f.Path, "docs/history/"+id+".md") {
-			sawCard = true
-			if !strings.Contains(f.Content, "Wire the navbar") {
-				t.Fatalf("card missing curated title:\n%s", f.Content)
-			}
+	if _, ok := puts["docs/history/README.md"]; !ok {
+		t.Fatalf("TOC not put at docs/history/README.md: %v", keysOf(puts))
+	}
+	// the put targeted the repo's integration branch, not a default.
+	var onTrunk bool
+	for _, c := range fake.Calls() {
+		if strings.Contains(c, "docs/history/"+id+".md@trunk") {
+			onTrunk = true
 		}
-		if strings.HasSuffix(f.Path, "docs/history/README.md") {
-			sawTOC = true
-		}
 	}
-	if !sawCard || !sawTOC {
-		t.Fatalf("history files missing card=%v toc=%v: %+v", sawCard, sawTOC, hist.files)
+	if !onTrunk {
+		t.Fatalf("archive did not target the repo integration branch 'trunk': %v", fake.Calls())
 	}
+}
+
+func keysOf(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

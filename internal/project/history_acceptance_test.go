@@ -53,7 +53,11 @@ func TestF11HistoryArchiveOnMerge(t *testing.T) {
 	// the project-OUT sender, wired with the LOCAL-git history writer (the §F sole
 	// writer) landing dedicated commits on main.
 	clk := clock.NewFake(time.Unix(5000, 0))
-	sender := New(st, gh.NewFake(), clk, nil).WithHistory(mirror, "main")
+	fake := gh.NewFake()
+	// the archive now lands DURABLY via the Contents API (gh.PutFile), opted-in per repo;
+	// the mirror is still wired for FetchBranch/DiffBetween but no longer the archive sink.
+	sender := New(st, fake, clk, nil).WithHistory(mirror, "main")
+	sender.SetArchiveHistory(true)
 
 	const id = "build-healthz"
 	const head = "headSHA-aaaaaaaaaaaa"
@@ -114,33 +118,36 @@ func TestF11HistoryArchiveOnMerge(t *testing.T) {
 		t.Fatalf("drain history: n=%d err=%v (want 2: history write + post-merge branch delete)", n, err)
 	}
 
-	// ── PROVE the archive on disk: the card + the TOC are committed on main.
+	// ── PROVE the archive landed DURABLY via the Contents API: card + TOC on main.
+	puts := fake.PutFiles()
 	cardPath := history.CardPath(id)
-	card, found, err := mirror.ReadFileAtRef("refs/heads/main", cardPath)
-	if err != nil || !found {
-		t.Fatalf("history card not committed at %s: found=%v err=%v", cardPath, found, err)
+	cardB, ok := puts[cardPath]
+	if !ok {
+		t.Fatalf("history card not put at %s (got %d files)", cardPath, len(puts))
 	}
+	card := string(cardB)
 	for _, want := range []string{
-		"# Add a /healthz endpoint",         // curated title
-		"**Status:** done",                  // status
-		"**PR:** #42",                       // linked PR
+		"# Add a /healthz endpoint", // curated title
+		"**Status:** done",          // status
+		"**PR:** #42",               // linked PR
 		"**Merge commit:** `mergecommit-abc123`",
-		"**Attempts:**",                     // attempts
-		"## Verdicts",                       // verdicts section
-		"approved",                          // the minted verdict
-		"## Lessons",                        // curated lessons
-		"bounced",                           // the bounce lesson (precedent)
-		"## Timeline",                       // institutional timeline
+		"**Attempts:**", // attempts
+		"## Verdicts",   // verdicts section
+		"approved",      // the minted verdict
+		"## Lessons",    // curated lessons
+		"bounced",       // the bounce lesson (precedent)
+		"## Timeline",   // institutional timeline
 	} {
 		if !strings.Contains(card, want) {
 			t.Fatalf("history card missing %q:\n%s", want, card)
 		}
 	}
 
-	toc, found, err := mirror.ReadFileAtRef("refs/heads/main", history.TOCPath)
-	if err != nil || !found {
-		t.Fatalf("history TOC not committed: found=%v err=%v", found, err)
+	tocB, ok := puts[history.TOCPath]
+	if !ok {
+		t.Fatalf("history TOC not put at %s (got %d files)", history.TOCPath, len(puts))
 	}
+	toc := string(tocB)
 	if !strings.Contains(toc, id) || !strings.Contains(toc, "Add a /healthz endpoint") {
 		t.Fatalf("TOC does not index the completed job:\n%s", toc)
 	}
@@ -148,25 +155,13 @@ func TestF11HistoryArchiveOnMerge(t *testing.T) {
 		t.Fatalf("TOC missing card link for %s:\n%s", id, toc)
 	}
 
-	// ── PROVE the dedicated commit is NOT entangled with the feature PR: its parent
-	// is the prior main tip (the init commit), it touches ONLY docs/history/*, and it
-	// is authored by Flowbee.
-	headSHA, _ := mirror.RefSHA("refs/heads/main")
-	if headSHA == base {
-		t.Fatalf("history commit did not advance main")
-	}
-	parent := revParse(t, mirror, headSHA+"^")
-	if parent != base {
-		t.Fatalf("history commit parent %s != prior main %s (entangled with other work)", parent, base)
-	}
-	changed := commitFiles(t, mirror, headSHA)
-	for _, f := range changed {
-		if !strings.HasPrefix(f, "docs/history/") {
-			t.Fatalf("history commit touched a non-archive file %q (entangled): %v", f, changed)
+	// ── PROVE NOT entangled with the feature PR: every archive write targets ONLY
+	// docs/history/* (each PutFile is its own Flowbee-authored Contents-API commit on the
+	// integration branch — it can never carry, or be carried by, the feature diff).
+	for p := range puts {
+		if !strings.HasPrefix(p, "docs/history/") {
+			t.Fatalf("archive put a non-archive file %q (entangled)", p)
 		}
-	}
-	if author := commitAuthor(t, mirror, headSHA); author != "flowbee" {
-		t.Fatalf("history commit not authored by Flowbee (sole writer): %q", author)
 	}
 
 	// ── PROVE reconstructable from job_events: independently fold the ledger and
@@ -243,7 +238,7 @@ func buildAndReview(t *testing.T, st *store.Store, src store.FactSource, policy 
 	rls, err := st.ClaimReviewJob(ctx, store.ClaimReviewParams{
 		JobID: id, LeaseID: "rl-" + suffix, Identity: "senior-code-reviewer", ModelFamily: "opus",
 		Attested: []string{"role:code_reviewer", "model_family:opus"},
-		TTL: time.Minute, Now: time.Unix(int64(1080+attempt*100), 0),
+		TTL:      time.Minute, Now: time.Unix(int64(1080+attempt*100), 0),
 	})
 	if err != nil {
 		t.Fatalf("claim review attempt %d: %v", attempt, err)
@@ -255,4 +250,3 @@ func buildAndReview(t *testing.T, st *store.Store, src store.FactSource, policy 
 		t.Fatalf("review result attempt %d: %v", attempt, err)
 	}
 }
-

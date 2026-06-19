@@ -84,6 +84,7 @@ type Option func(*managerConfig)
 type managerConfig struct {
 	history        HistoryFactory
 	allowOwnSource map[string]bool
+	archiveHistory map[string]bool
 }
 
 // WithHistory wires the F11 history writer per repo so each repo's project-OUT
@@ -101,6 +102,13 @@ func WithHistory(f HistoryFactory) Option {
 // (default) = every repo fully protected. NEVER include the repo that IS Flowbee.
 func WithAllowOwnSource(repos map[string]bool) Option {
 	return func(c *managerConfig) { c.allowOwnSource = repos }
+}
+
+// WithArchiveHistory opts the named repo ids into the durable §F history archive (every
+// merge lands docs/history/*.md on the repo's integration branch via the Contents API).
+// Per-repo opt-in (default off) because it commits to the repo's main on every merge.
+func WithArchiveHistory(repos map[string]bool) Option {
+	return func(c *managerConfig) { c.archiveHistory = repos }
 }
 
 // New builds a Manager over every ACTIVE registered repo, constructing each repo's
@@ -126,6 +134,7 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 		sender := project.NewForRepo(r.ID, r.DefaultBranch, st, writer, projClk, asProjectPub(pub))
 		// relax flowbee_source for a non-control-plane repo (mirrors store.AllowOwnSourceRepos).
 		sender.SetAllowOwnSource(cfg.allowOwnSource[r.ID])
+		sender.SetArchiveHistory(cfg.archiveHistory[r.ID])
 		rec := reconcile.NewForRepo(r.ID, st, client, recClk, asReconcilePub(pub))
 		// F11 (build-list §F): wire the per-repo history writer so the merged->done
 		// post-merge archive commit lands on the repo's integration branch. The same

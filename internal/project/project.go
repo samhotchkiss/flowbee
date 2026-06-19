@@ -115,6 +115,13 @@ type Sender struct {
 	// two gate sites agree (else a job clears one and is denied at the other).
 	allowOwnSource bool
 
+	// archiveHistory opts THIS repo into the §F durable history archive: on every merge,
+	// Flowbee lands docs/history/<id>.md + the regenerated TOC on the integration branch
+	// via the Contents API. Per-repo opt-in (default false) because it commits to the
+	// repo's main on every merge — correct for a repo whose owner wants in-repo
+	// provenance, not something to impose on an arbitrary managed repo.
+	archiveHistory bool
+
 	// parkedUntil is the Retry-After park horizon (§8.2.4): while now < it, the
 	// WHOLE outbox is parked. Single-sender, so a plain field is safe (Drain is
 	// not called concurrently with itself).
@@ -178,6 +185,9 @@ func (s *Sender) Repo() string { return s.repo }
 // managed repo that is NOT the Flowbee control plane). MUST mirror the store's
 // AllowOwnSourceRepos[repo] so both gate sites agree. Default false = fully protected.
 func (s *Sender) SetAllowOwnSource(v bool) { s.allowOwnSource = v }
+
+// SetArchiveHistory opts this repo into the durable §F history archive (default off).
+func (s *Sender) SetArchiveHistory(v bool) { s.archiveHistory = v }
 
 // DrainOnce drains every currently-pending outbox row, oldest first, ≤1 in-flight
 // (§8.2.4). It stops early if a Retry-After parks the outbox or a send errors
@@ -515,32 +525,30 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		return "deleted_branch " + branch, nil
 
 	case store.ActionWriteHistory:
-		// build-list §F: the dedicated post-merge issue-archive commit. Flowbee folds
-		// the job's ledger into a curated card + regenerates the TOC, then commits both
-		// as ONE dedicated commit on the integration branch (the sole writer; never
-		// entangled with the feature PR). No GitHub call — a LOCAL git write.
+		// build-list §F: the post-merge issue-archive. Flowbee folds the job's ledger into
+		// a curated card + regenerates the TOC, then lands both on the integration branch
+		// via the Contents API — one atomic commit per file onto the branch's current tip
+		// (reconcile-first: no force-push, no fast-forward race with concurrent merges; the
+		// CP is the sole writer, never entangled with the feature PR). Idempotent per file.
 		arts, err := s.store.BuildHistoryArtifacts(ctx, row.JobID)
 		if err != nil {
 			return "", fmt.Errorf("build history: %w", err)
 		}
-		if s.history == nil {
-			// no writer wired: the ledger stays canonical, the markdown is just not
-			// materialized. Drop to sent (audited) so the queue never wedges.
+		if !s.archiveHistory {
+			// not opted in (default): the ledger stays canonical; the markdown is not
+			// materialized on GitHub (archiving commits docs/history/*.md to the repo's
+			// integration branch on every merge, so it is per-repo opt-in). Drop to sent
+			// (audited) so the queue never wedges.
 			return fmt.Sprintf("history:noop files=%d", len(arts)), nil
 		}
-		files := make([]gitops.HistoryFile, 0, len(arts))
+		branch := orDefault(s.baseBranch, "main") // the repo's integration branch
+		msg := fmt.Sprintf("flowbee: archive history for %s", row.JobID)
 		for _, a := range arts {
-			files = append(files, gitops.HistoryFile{Path: a.Path, Content: a.Content})
+			if err := s.gh.PutFile(ctx, a.Path, []byte(a.Content), msg, branch); err != nil {
+				return "", fmt.Errorf("archive %s: %w", a.Path, err)
+			}
 		}
-		sha, ok, err := s.history.CommitHistory(orDefault(s.historyBranch, "main"),
-			fmt.Sprintf("flowbee: archive history for %s", row.JobID), files)
-		if err != nil {
-			return "", fmt.Errorf("commit history: %w", err)
-		}
-		if !ok {
-			return "history:nochange", nil
-		}
-		return fmt.Sprintf("history sha=%s files=%d", sha, len(files)), nil
+		return fmt.Sprintf("history:archived files=%d", len(arts)), nil
 
 	default:
 		// an unknown action is dropped to sent (audited) so the queue never wedges.

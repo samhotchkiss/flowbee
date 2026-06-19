@@ -706,8 +706,9 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 	// (1) seed the registry. cfg.Repos (structured list) wins; else fall back to the
 	// single-repo FLOWBEE_GITHUB_OWNER/REPO env path (registered under id "default").
 	repos := cfg.Repos
-	tokenEnv := map[string]string{} // repo id -> token env-var name ("" = shared default)
-	allowOwn := map[string]bool{}   // repo id -> relax flowbee_source (non-control-plane repo)
+	tokenEnv := map[string]string{}  // repo id -> token env-var name ("" = shared default)
+	allowOwn := map[string]bool{}    // repo id -> relax flowbee_source (non-control-plane repo)
+	archiveHist := map[string]bool{} // repo id -> opt into the durable §F history archive
 	if len(repos) == 0 {
 		// env wins (legacy path); else fall back to the flowbee.yaml coords
 		// `flowbee init` prefills (F13).
@@ -742,6 +743,9 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 		tokenEnv[id] = rc.TokenEnv
 		if rc.AllowOwnSourceMerge {
 			allowOwn[id] = true
+		}
+		if rc.ArchiveHistory {
+			archiveHist[id] = true
 		}
 		// name a repo that will silently no-op for lack of (the right) token NOW, at
 		// startup, instead of leaving the operator to wonder why one repo never moves.
@@ -780,6 +784,7 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 	st.AllowOwnSourceRepos = allowOwn
 	var historyOpt []multirepo.Option
 	historyOpt = append(historyOpt, multirepo.WithAllowOwnSource(allowOwn))
+	historyOpt = append(historyOpt, multirepo.WithArchiveHistory(archiveHist))
 	if os.Getenv("FLOWBEE_MIRROR_PATH") != "" {
 		// F9: each repo's history archive + base_sha resolution come off ITS OWN bare
 		// mirror (provisioned lazily), not one shared mirror — so a non-default repo
