@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -141,7 +142,7 @@ func runServe(args []string) error {
 	// self-provision the control-plane mirror from the GitHub token if it's
 	// configured but absent — so the operator need not pre-clone it, and a PRIVATE
 	// repo works (a plain `git clone` would fail for lack of credentials).
-	ensureControlMirror(logger)
+	ensureControlMirror(logger, cfg)
 
 	st.NoEligibleWorkerDelay = cfg.NoEligibleWorker()
 	// §6.7 per-job cost circuit-breaker: 0 (default) keeps the shipped posture
@@ -502,7 +503,7 @@ func isLoopbackAddr(addr string) bool {
 // when FLOWBEE_MIRROR_PATH is set but the directory is absent. The token is baked
 // into the mirror's origin so the periodic fetch and branch pushes work against a
 // private repo; the mirror lives on the control plane, which holds the token anyway.
-func ensureControlMirror(logger *slog.Logger) {
+func ensureControlMirror(logger *slog.Logger, cfg config.Config) {
 	mp := os.Getenv("FLOWBEE_MIRROR_PATH")
 	if mp == "" {
 		return
@@ -510,9 +511,19 @@ func ensureControlMirror(logger *slog.Logger) {
 	if _, err := os.Stat(mp); err == nil {
 		return // already provisioned
 	}
+	// Prefer the legacy single-repo env; else fall back to the F9 repos REGISTRY (the
+	// production layout) — the legacy-env-only path left the shared mirror unprovisioned
+	// on every registry deployment and emitted a misleading "set FLOWBEE_GITHUB_OWNER/
+	// REPO" warning, even though the same-box-worker + bundle paths that consume the
+	// shared mirror were then silently broken. The shared mirror is single-repo by
+	// nature, so it tracks the PRIMARY registered repo.
 	url := githubPushURL()
 	if url == "" {
-		logger.Warn("FLOWBEE_MIRROR_PATH set but absent and no FLOWBEE_GITHUB_OWNER/REPO/TOKEN to clone it", "path", mp)
+		url = registryControlMirrorURL(cfg)
+	}
+	if url == "" {
+		logger.Warn("FLOWBEE_MIRROR_PATH set but absent and no GitHub coords/token to clone it "+
+			"(set FLOWBEE_GITHUB_TOKEN + a repos: registry, or the legacy FLOWBEE_GITHUB_OWNER/REPO)", "path", mp)
 		return
 	}
 	logger.Info("provisioning control-plane mirror from GitHub", "path", mp)
@@ -525,6 +536,35 @@ func ensureControlMirror(logger *slog.Logger) {
 	// mirror down as defense-in-depth.
 	_ = os.Chmod(mp, 0o700)
 	_ = os.Chmod(filepath.Join(mp, "config"), 0o600)
+}
+
+// registryControlMirrorURL builds the shared-control-mirror clone URL from the F9
+// repos registry when the legacy single-repo env is unset. The shared mirror is
+// single-repo by nature, so it tracks the PRIMARY active repo (first by id — the same
+// repo a repo-less ingest defaults to). The token is the repo's token_env, else the
+// shared FLOWBEE_GITHUB_TOKEN. Empty when no active repo has both coords and a token.
+func registryControlMirrorURL(cfg config.Config) string {
+	var active []config.RepoConfig
+	for _, r := range cfg.Repos {
+		if r.IsActive() && r.Owner != "" && r.Repo != "" {
+			active = append(active, r)
+		}
+	}
+	if len(active) == 0 {
+		return ""
+	}
+	sort.Slice(active, func(i, j int) bool { return active[i].ID < active[j].ID })
+	r := active[0]
+	tok := os.Getenv("FLOWBEE_GITHUB_TOKEN")
+	if r.TokenEnv != "" {
+		if v := os.Getenv(r.TokenEnv); v != "" {
+			tok = v
+		}
+	}
+	if tok == "" {
+		return ""
+	}
+	return "https://x-access-token:" + tok + "@github.com/" + r.Owner + "/" + r.Repo + ".git"
 }
 
 // githubPushURL builds the credential-bearing https remote the control plane

@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/samhotchkiss/flowbee/internal/config"
 )
 
 // TestServeSystemdDefaultsToStartable: with no security env set, the --systemd
@@ -74,5 +76,36 @@ func TestRepoTokenWarning(t *testing.T) {
 				t.Fatalf("warning %q must name the repo id %q", got, c.id)
 			}
 		})
+	}
+}
+
+func TestRegistryControlMirrorURL(t *testing.T) {
+	t.Setenv("FLOWBEE_GITHUB_TOKEN", "shared-tok")
+	t.Setenv("WEB_PAT", "web-tok")
+
+	// primary = first ACTIVE repo by id; per-repo token_env wins over the shared token.
+	cfg := config.Config{Repos: []config.RepoConfig{
+		{ID: "zrepo", Owner: "o", Repo: "z"},
+		{ID: "arepo", Owner: "o", Repo: "a", TokenEnv: "WEB_PAT"},
+	}}
+	got := registryControlMirrorURL(cfg)
+	want := "https://x-access-token:web-tok@github.com/o/a.git"
+	if got != want {
+		t.Fatalf("primary-by-id with token_env: got %q want %q", got, want)
+	}
+
+	// no repos => empty (legacy/no-registry path).
+	if u := registryControlMirrorURL(config.Config{}); u != "" {
+		t.Fatalf("no repos must yield empty, got %q", u)
+	}
+
+	// a parked (inactive) primary is skipped.
+	no := false
+	cfg2 := config.Config{Repos: []config.RepoConfig{
+		{ID: "arepo", Owner: "o", Repo: "a", Active: &no},
+		{ID: "brepo", Owner: "o", Repo: "b"},
+	}}
+	if u := registryControlMirrorURL(cfg2); u != "https://x-access-token:shared-tok@github.com/o/b.git" {
+		t.Fatalf("inactive primary must be skipped, got %q", u)
 	}
 }
