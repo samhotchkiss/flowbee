@@ -218,6 +218,18 @@ hand off to a human, never to permit:
 - Self-merge requires the full predicate; any unmet condition routes to human
   handoff.
 
+**Grounding the anti-affinity axis (`model_family`).** Anti-affinity compares the
+builder's and reviewer's `model_family`. That value is supplied by the worker, so on
+an authenticated deployment you should **bind it to the enrolled identity** rather than
+trust the worker's word: write enrolled entries as `identity:family` (e.g.
+`enrolled_identities: ["reviewer-bob:claude-opus", "builder-ann:codex"]`). The control
+plane then clamps each worker's self-asserted `model_family` to the operator-declared
+value, so an enrolled worker cannot lie about its family to review a same-family (or its
+own model's) build. A bare `identity` entry leaves `model_family` worker-asserted — fine
+on a fully trusted single-operator fleet, but bind families whenever distinct workers
+share one enrolled secret. (The *identity* axis is always credential-bound: a worker can
+never review its own build regardless.)
+
 Operators can observe enforcement through Flowbee's records: minted verdicts and
 their dispositions, recorded denylist hits (for audit of why a change was held),
 lease activity (including roles that were withheld for anti-affinity), and

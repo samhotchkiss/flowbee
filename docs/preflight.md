@@ -71,6 +71,11 @@ Run it first; the rest of this list is the human judgement `doctor` can't make.
         network (e.g. Tailscale) as the only boundary. Acceptable on a locked-down
         tailnet; never on the public internet, **especially with self-merge on**.
 - [ ] `flowbee doctor`'s `worker-auth` line reflects your choice — confirm it.
+- [ ] If distinct workers share one enrolled secret AND you rely on anti-affinity,
+      **bind each identity's model family**: write enrolled entries as `identity:family`
+      (e.g. `reviewer-bob:claude-opus`). The control plane then clamps the worker's
+      self-asserted `model_family`, so it can't be spoofed to defeat the same-family
+      review exclusion (§5.5). See [security-model.md](./security-model.md).
 
 ## 6. Durability & backup
 
