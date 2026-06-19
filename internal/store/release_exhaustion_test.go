@@ -62,6 +62,15 @@ func assertFoldMatchesProjection(t *testing.T, st *store.Store, id string) {
 	if folded.Attempts != proj.Attempts {
 		t.Fatalf("fold attempts=%d != projection %d", folded.Attempts, proj.Attempts)
 	}
+	// escalation_reason and over_budget are projection fields that several escalation
+	// paths set via a direct UPDATE; the fold must reproduce them or a rebuild-from-ledger
+	// silently corrupts the §12.6.1 triage signal (and strands over_budget=true forever).
+	if folded.EscalationReason != proj.EscalationReason {
+		t.Fatalf("fold escalation_reason=%q != projection %q (rebuild-from-ledger would lose it)", folded.EscalationReason, proj.EscalationReason)
+	}
+	if folded.OverBudget != proj.OverBudget {
+		t.Fatalf("fold over_budget=%v != projection %v", folded.OverBudget, proj.OverBudget)
+	}
 }
 
 // TestReleaseEscalatesOnAttemptsExhaustion: a penalty release that burns the LAST

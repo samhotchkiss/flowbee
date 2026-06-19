@@ -137,6 +137,9 @@ func (s *Store) ReconcileStuck(ctx context.Context, now time.Time, staleHB, stal
 				JobID: id, JobSeq: seq + 1, Kind: ledger.KindStateChanged,
 				FromState: cur.State, ToState: job.StateNeedsHuman, LeaseEpoch: cur.LeaseEpoch,
 				Actor: "watchdog", CreatedAt: now,
+				// reason is "ci_stalled" for a CI-wedged review, else "" (the live UPDATE's
+				// CASE keeps the prior reason; on entry from an active state that is "").
+				Payload: ledger.Payload{EscalationReason: reason},
 			}
 			if err := appendEvent(ctx, tx, ev); err != nil {
 				return err

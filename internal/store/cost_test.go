@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/lease"
 )
 
@@ -89,6 +90,55 @@ func TestRecordCostEscalatesOverCeiling(t *testing.T) {
 		JobID: "j", Epoch: epoch, Now: time.Unix(1002, 0), MicroUSDDelta: 1,
 	}); err != lease.ErrStaleEpoch {
 		t.Fatalf("stale cost report want ErrStaleEpoch, got %v", err)
+	}
+}
+
+// TestCostEscalationFoldsOverBudgetAndReason proves the projection == Fold(events)
+// invariant holds across a cost escalation AND the requeue that clears it — the two
+// fields (over_budget, escalation_reason) that a direct UPDATE sets. A rebuild-from-
+// ledger (DR / restore's "pure fold" claim) must reproduce both, then drop both on
+// requeue, or it diverges from the live projection.
+func TestCostEscalationFoldsOverBudgetAndReason(t *testing.T) {
+	st := newLiveStore(t)
+	ctx := context.Background()
+	ceiling := int64(5_000_000)
+	epoch := seedLeasedCost(t, st, "j", "f", &ceiling)
+	if _, err := st.RecordCost(ctx, CostParams{
+		JobID: "j", Epoch: epoch, Now: time.Unix(1001, 0),
+		TokensInDelta: 1, TokensOutDelta: 1, MicroUSDDelta: 6_000_000,
+	}); err != nil {
+		t.Fatalf("record cost: %v", err)
+	}
+	// escalated: over_budget=true, reason="cost". The fold must reproduce both.
+	assertCostFold(t, st, "j", true, string(job.EscalationCost))
+
+	// requeue re-arms the job (active again) -> live clears over_budget + reason; the
+	// fold must clear them too (this was the second half of the latent divergence).
+	if _, err := st.RequeueJob(ctx, "j", time.Unix(1002, 0)); err != nil {
+		t.Fatalf("requeue: %v", err)
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.OverBudget || j.EscalationReason != "" {
+		t.Fatalf("requeue must clear: over=%v reason=%q", j.OverBudget, j.EscalationReason)
+	}
+	assertCostFold(t, st, "j", false, "")
+}
+
+// assertCostFold folds the job's ledger and checks the rebuilt over_budget/escalation
+// fields match both the expected values AND the live projection.
+func assertCostFold(t *testing.T, st *Store, id string, wantOver bool, wantReason string) {
+	t.Helper()
+	ctx := context.Background()
+	proj, _ := st.GetJob(ctx, id)
+	events, _ := st.LoadEvents(ctx, id)
+	folded, err := ledger.Fold(events)
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if folded.OverBudget != wantOver || folded.OverBudget != proj.OverBudget {
+		t.Fatalf("fold over_budget=%v want %v (projection %v)", folded.OverBudget, wantOver, proj.OverBudget)
+	}
+	if folded.EscalationReason != wantReason || folded.EscalationReason != proj.EscalationReason {
+		t.Fatalf("fold escalation_reason=%q want %q (projection %q)", folded.EscalationReason, wantReason, proj.EscalationReason)
 	}
 }
 

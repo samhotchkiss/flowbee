@@ -270,7 +270,7 @@ func escalatePRClosedTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, no
 		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
 		FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
 		Actor: "reconcile", CreatedAt: now,
-		Payload: ledger.Payload{RevokeReason: "human closed the PR without merging"},
+		Payload: ledger.Payload{RevokeReason: "human closed the PR without merging", EscalationReason: string(job.EscalationPRClosed)},
 	}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return err

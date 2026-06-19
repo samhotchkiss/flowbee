@@ -596,6 +596,29 @@ func Fold(events []Event) (job.Job, error) {
 			// audit event records the new base + the parent PR; the actual re-arm rides a
 			// following rebased/conflict_detected event. No projection field changes here.
 		}
+		// Invariant sync (projection == Fold(events)) for the two state-determined
+		// human-gate fields. Many live paths set these via a direct UPDATE alongside the
+		// transition (attempts-exhaustion, stall/cap kill, reviewer-rejection,
+		// dead-letter, pr_closed, ci-stall watchdog, cost) — NOT on a folded event field —
+		// so a rebuild-from-ledger would otherwise silently zero escalation_reason (the
+		// §12.6.1 triage signal) and strand over_budget=true forever (it is set by
+		// KindCostEscalated and cleared by no Fold case). Both are true iff the job sits in
+		// a human-gate state: derive them from the folded state + the entering event's
+		// reason payload, mirroring the live projection exactly.
+		switch j.State {
+		case job.StateNeedsHuman, job.StateNeedsDesign:
+			// On ENTRY the transition event carries the reason; while PARKED (a later
+			// non-escalating event folds, e.g. a trailing cost meter) the payload is empty
+			// and the prior reason is retained. over_budget is owned by KindCostEscalated.
+			if e.Payload.EscalationReason != "" {
+				j.EscalationReason = e.Payload.EscalationReason
+			}
+		default:
+			// Any active/terminal state clears both — this is the requeue / re-arm /
+			// design-resolved / done path the live UPDATEs perform.
+			j.EscalationReason = ""
+			j.OverBudget = false
+		}
 		j.JobSeq = e.JobSeq
 	}
 	return j, nil

@@ -213,23 +213,21 @@ func (s *Store) EvaluateLiveness(ctx context.Context, jobID string, now time.Tim
 		if t.BumpEpoch {
 			newEpoch = j.LeaseEpoch + 1
 		}
-		if err := applyRevokeTx(ctx, tx, &j, seq, t, newEpoch, now); err != nil {
-			return err
-		}
-		// M10 (§12.6.1): on an escalation to needs_human, stamp the canonical trigger
-		// so the unified chokepoint view distinguishes the §6.7 conditions. The
-		// absolute cap escalates for one of two reasons — max_attempts exhausted (the
-		// attempts ceiling) or the Rung-4 governor (a genuine stall) — disambiguated
-		// by the booleans the engine consumed. A two-rung stall kill is always stall.
+		// M10 (§12.6.1): on an escalation to needs_human, the canonical trigger so the
+		// unified chokepoint view distinguishes the §6.7 conditions. The absolute cap
+		// escalates for one of two reasons — max_attempts exhausted (the attempts ceiling)
+		// or the Rung-4 governor (a genuine stall) — disambiguated by the booleans the
+		// engine consumed. A two-rung stall kill is always stall. Computed BEFORE the
+		// revoke so it rides the event payload (folded), not just the projection.
+		var escReason string
 		if t.To == job.StateNeedsHuman {
-			reason := job.EscalationStall
+			escReason = string(job.EscalationStall)
 			if attemptsExhausted && !governorReached {
-				reason = job.EscalationAttempts
+				escReason = string(job.EscalationAttempts)
 			}
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE jobs SET escalation_reason = ? WHERE id = ?`, string(reason), j.ID); err != nil {
-				return fmt.Errorf("stamp escalation reason: %w", err)
-			}
+		}
+		if err := applyRevokeTx(ctx, tx, &j, seq, t, newEpoch, now, escReason); err != nil {
+			return err
 		}
 		res.Killed = true
 		res.ToState = t.To
@@ -252,7 +250,7 @@ func (s *Store) EvaluateLiveness(ctx context.Context, jobID string, now time.Tim
 // reconnecting worker's next fenced call gets 409). All within the caller's tx, so a
 // crash mid-revoke replays cleanly (§10.7).
 func applyRevokeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int,
-	t engine.Transition, newEpoch int, now time.Time) error {
+	t engine.Transition, newEpoch int, now time.Time, escReason string) error {
 	nextSeq := seq + 1
 	ev := ledger.Event{
 		JobID: j.ID, JobSeq: nextSeq, Kind: t.Kind,
@@ -262,6 +260,9 @@ func applyRevokeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int,
 			AttemptsDelta:         t.AttemptsDelta,
 			StallRevocationsDelta: t.StallRevocationsDelta,
 			RevokeReason:          t.RevokeReason,
+			// the human-gate trigger rides the event so a re-fold preserves it (a revoke
+			// to needs_human is the §6.7 ceiling; "" for a re-arm revoke to ready/failed).
+			EscalationReason: escReason,
 		},
 	}
 	if t.To == job.StateReady {
@@ -282,6 +283,15 @@ func applyRevokeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int,
 		roleClause = ", role = 'eng_worker', required_capabilities = '[\"role:eng_worker\"]', enqueued_at = ?"
 		args = append(args, now.Format(rfc3339))
 	}
+	// stamp the §12.6.1 trigger on the projection too (a needs_human revoke). The event
+	// payload above carries it for the fold; this keeps the live row in sync so the
+	// NeedsHumanView shows the explicit reason rather than an inferred one. "" leaves the
+	// column untouched (a re-arm revoke to ready/failed is not an escalation).
+	escClause := ""
+	if escReason != "" {
+		escClause = ", escalation_reason = ?"
+		args = append(args, escReason)
+	}
 	args = append(args, j.ID)
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE jobs
@@ -292,7 +302,7 @@ func applyRevokeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int,
 		       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 		       lease_hb_due = NULL, lease_deadline = NULL, phase_deadline_at = NULL,
 		       agent_health = '', rung1_class = '', rung2_last_verdict = 'abstain',
-		       rung2_window_head = '', rung2_window_started_at = NULL, ci_running = 0`+roleClause+`,
+		       rung2_window_head = '', rung2_window_started_at = NULL, ci_running = 0`+roleClause+escClause+`,
 		       updated_at = datetime('now')
 		 WHERE id = ?`, args...); err != nil {
 		return fmt.Errorf("apply revoke projection: %w", err)

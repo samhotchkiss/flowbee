@@ -581,6 +581,14 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 		var minted *job.SpecSignoff
 		amended := false
 		needsDesign := false
+		// the per-reviewer rejection cap parks a spec review at needs_human while total
+		// bounces is still under max — stamp the distinct reason on the entering event so a
+		// re-fold preserves it (mirrors flow.go's build-review gate). needs_design carries
+		// its own folded reason ("design") via KindSpecNeedsDesign, so it is untouched here.
+		reviewerRejectionReason := ""
+		if in.Claim == job.VerdictChangesRequested && reviewerPrior+1 >= job.MaxReviewerRejections {
+			reviewerRejectionReason = string(job.EscalationReviewerRejections)
+		}
 		for _, t := range dec.Transitions {
 			nextSeq++
 			pay := ledger.Payload{BouncesDelta: t.BouncesDelta, SpecSignoff: t.SpecSignoff}
@@ -593,6 +601,9 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 			}
 			if t.Kind == ledger.KindSpecNeedsDesign {
 				needsDesign = true
+			}
+			if t.To == job.StateNeedsHuman {
+				pay.EscalationReason = reviewerRejectionReason
 			}
 			ev := ledger.Event{
 				JobID: in.JobID, JobSeq: nextSeq, Kind: t.Kind,

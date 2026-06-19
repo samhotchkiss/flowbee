@@ -322,13 +322,25 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 		// 2) apply the gate decision (mint verdict / bounce / exhaust).
 		final := j.State
 		var minted *job.Verdict
+		// the per-reviewer rejection cap is what parks a review at needs_human while total
+		// bounces is still under max — stamp that distinct reason on the entering event so
+		// a re-fold preserves it (else the §12.6.1 view would mislabel the park). Computed
+		// here, off the loop, because the condition doesn't depend on which transition fires.
+		reviewerRejectionReason := ""
+		if in.Claim == job.VerdictChangesRequested && reviewerPrior+1 >= job.MaxReviewerRejections {
+			reviewerRejectionReason = string(job.EscalationReviewerRejections)
+		}
 		for _, t := range dec.Transitions {
 			nextSeq++
+			pay := ledger.Payload{BouncesDelta: t.BouncesDelta, Verdict: t.Verdict}
+			if t.To == job.StateNeedsHuman {
+				pay.EscalationReason = reviewerRejectionReason
+			}
 			ev := ledger.Event{
 				JobID: in.JobID, JobSeq: nextSeq, Kind: t.Kind,
 				FromState: t.From, ToState: t.To, LeaseEpoch: j.LeaseEpoch,
 				Actor: "system", CreatedAt: in.Now,
-				Payload: ledger.Payload{BouncesDelta: t.BouncesDelta, Verdict: t.Verdict},
+				Payload: pay,
 			}
 			if err := appendEvent(ctx, tx, ev); err != nil {
 				return err

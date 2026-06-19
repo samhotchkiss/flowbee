@@ -157,7 +157,7 @@ type ClaimParams struct {
 	// the flow layer fences into the lease so a multi-reviewer fan-out's reviewers
 	// each carry their own lens. Empty for non-review stages.
 	Lens string
-	Role        job.Role
+	Role job.Role
 	// Attested is the worker's attested capability set; the claim only succeeds
 	// if it satisfies the job's required_capabilities (§6.6). A worker lacking a
 	// required capability gets ErrLostRace (the job stays `ready`).
@@ -357,7 +357,8 @@ func (s *Store) Heartbeat(ctx context.Context, p HeartbeatParams) (engine.Direct
 			if t.BumpEpoch {
 				newEpoch = j.LeaseEpoch + 1
 			}
-			return applyRevokeTx(ctx, tx, &j, seq, t, newEpoch, p.Now)
+			// §10.6 fast-path revokes go to failed/ready, never needs_human -> no reason.
+			return applyRevokeTx(ctx, tx, &j, seq, t, newEpoch, p.Now, "")
 		}
 		// record liveness: bump last-seen + the Rung-0/1 hints (the absolute lease
 		// deadline is unchanged — only the un-gameable Rung-3 clock can move it).
@@ -627,6 +628,7 @@ func (s *Store) Release(ctx context.Context, p ReleaseParams) error {
 				JobID: p.JobID, JobSeq: escSeq, Kind: ledger.KindStateChanged,
 				FromState: toState, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
 				Actor: "attempts-exhausted", CreatedAt: p.Now,
+				Payload: ledger.Payload{EscalationReason: string(job.EscalationAttempts)},
 			}
 			if err := appendEvent(ctx, tx, esc); err != nil {
 				return err

@@ -91,7 +91,7 @@ func (s *Store) NextPendingOutbox(ctx context.Context) (OutboxRow, bool, error) 
 // to the given F9 repo scope (build-list F9). One control plane runs one project-OUT
 // Sender per repo — each over the repo's own github.Writer — so the drains must be
 // repo-scoped: a sender only renders side-effects for its own repo's jobs, never
-// another repo's. An empty repo scopes to legacy single-repo (repo='') jobs, so the
+// another repo's. An empty repo scopes to legacy single-repo (repo=”) jobs, so the
 // pre-F9 NextPendingOutbox is the degenerate single-repo case of this one.
 func (s *Store) NextPendingOutboxForRepo(ctx context.Context, repo string) (OutboxRow, bool, error) {
 	var row OutboxRow
@@ -190,7 +190,7 @@ func (s *Store) DeadLetterOutbox(ctx context.Context, rowID int64, jobID, reason
 			JobID: jobID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
 			FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
 			Actor: "project-out", CreatedAt: now,
-			Payload: ledger.Payload{RevokeReason: detail},
+			Payload: ledger.Payload{RevokeReason: detail, EscalationReason: reason},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err
