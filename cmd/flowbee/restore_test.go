@@ -216,3 +216,40 @@ func TestRestoreLatest(t *testing.T) {
 		t.Fatal("older_job must NOT be present — wrong snapshot selected by --latest")
 	}
 }
+
+// TestRestoreFlagsAfterPath is the #182 review-catch regression: `restore <snapshot>
+// --force` (flags AFTER the positional path) must work, not only `--force <snapshot>`.
+// Go's flag.Parse stops at the first non-flag arg, so the original parse left --force
+// unparsed and the natural usage silently no-op'd.
+func TestRestoreFlagsAfterPath(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	srcDB := filepath.Join(dir, "flowbee.db")
+	seedTestDB(t, ctx, srcDB, "j")
+	backupDir := filepath.Join(dir, "backups")
+	t.Setenv("FLOWBEE_DATABASE_URL", srcDB)
+	t.Setenv("FLOWBEE_BACKUP_DIR", backupDir)
+	t.Setenv("FLOWBEE_CONFIG", "")
+	if err := runBackup([]string{"--keep", "10"}); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	snaps, _ := filepath.Glob(filepath.Join(backupDir, "flowbee-*.db"))
+	if len(snaps) != 1 {
+		t.Fatalf("want 1 snapshot, got %d", len(snaps))
+	}
+
+	liveDB := filepath.Join(dir, "live.db")
+	t.Setenv("FLOWBEE_DATABASE_URL", liveDB)
+	// flags AFTER the path — the previously-broken ordering.
+	if err := runRestore([]string{snaps[0], "--force"}); err != nil {
+		t.Fatalf("restore with flags-after-path failed: %v", err)
+	}
+	st, err := store.Open(ctx, liveDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.GetJob(ctx, "j"); err != nil {
+		t.Fatalf("seeded job not restored via flags-after-path: %v", err)
+	}
+}

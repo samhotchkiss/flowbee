@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/config"
@@ -32,10 +33,22 @@ func runRestore(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
+	// Go's flag.Parse STOPS at the first non-flag arg, so `restore <snap> --force` would
+	// leave flags after the path unparsed (the #182 review catch). Pull the explicit
+	// snapshot path (first non-flag positional) out and re-parse the remainder, so flags
+	// work in ANY position.
 	var snapPath string
+	if pos := fs.Args(); len(pos) >= 1 && !strings.HasPrefix(pos[0], "-") {
+		snapPath = pos[0]
+		if len(pos) > 1 {
+			if err := fs.Parse(pos[1:]); err != nil {
+				return err
+			}
+		}
+	}
+
 	switch {
-	case *latest && len(fs.Args()) > 0:
+	case *latest && snapPath != "":
 		return fmt.Errorf("--latest and an explicit snapshot path are mutually exclusive")
 	case *latest:
 		p, err := latestSnapshot(*dir)
@@ -43,10 +56,8 @@ func runRestore(args []string) error {
 			return err
 		}
 		snapPath = p
-	case len(fs.Args()) == 1:
-		snapPath = fs.Args()[0]
-	default:
-		return fmt.Errorf("usage: flowbee restore <snapshot.db>  OR  flowbee restore --latest")
+	case snapPath == "":
+		return fmt.Errorf("usage: flowbee restore <snapshot.db> [--force]  OR  flowbee restore --latest --force")
 	}
 
 	if abs, err := filepath.Abs(snapPath); err == nil {
