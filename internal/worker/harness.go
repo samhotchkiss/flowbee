@@ -94,6 +94,17 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 		b.WriteString(c.AcceptanceCriteria)
 		b.WriteString("\n")
 	}
+	if c.Role == "eng_worker" || c.Role == "spec_author" {
+		// §F compounding memory (cross-issue read): point the PRODUCING roles at the durable
+		// issue archive and let the AGENT judge relevance (its strength) — no brittle
+		// server-side matching heuristic. Self-gating: absent dir => the agent skips it.
+		b.WriteString("\n## Precedent — consult the issue archive first\n\n" +
+			"If this repo has a `docs/history/` directory, it archives how PRIOR issues were built — " +
+			"status, attempts, the reviewers' findings, and the lessons learned. Before committing to an " +
+			"approach, grep it for relevant precedent (e.g. `grep -rli \"<keyword>\" docs/history/`) so you " +
+			"do NOT re-derive a dead end or repeat an approach that already failed review. " +
+			"Skip this if the directory is absent.\n")
+	}
 	if c.PriorReviewFindings != "" {
 		// the actionable feedback FIRST (before the raw verdict JSON): a prior review
 		// requested changes — the agent must address these, not re-submit the same patch.
