@@ -21,6 +21,7 @@ func TestMergedWithoutCommitDefersDone(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
 	seedBuildPR(t, st, "jw", 11)
+	markMergeable(t, st, "jw")
 
 	t1 := time.Unix(6000, 0)
 	// the eventual-consistency window: merged=true, but the commit hasn't resolved.

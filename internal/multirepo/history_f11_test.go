@@ -67,6 +67,11 @@ func TestF11HistoryWiredPerRepo(t *testing.T) {
 	if err := st.BindPRNumber(ctx, id, 77); err != nil {
 		t.Fatalf("bind pr: %v", err)
 	}
+	// a realistic pre-merge state: a merged PR completes a job only from a state that
+	// owns a reviewable/merging PR (prBoundActive), not bare `ready`.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='mergeable' WHERE id=?`, id); err != nil {
+		t.Fatalf("mark mergeable: %v", err)
+	}
 	out, err := st.ApplyReconciledPR(ctx, id, store.ReconciledPR{
 		Number: 77, UpdatedAt: clk.Now(), HeadSHA: "h", BaseSHA: "base0",
 		Merged: true, MergeCommit: "mc-web", CIGreen: true,

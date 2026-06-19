@@ -30,6 +30,17 @@ func seedBuildPR(t *testing.T, st *store.Store, id string, pr int) {
 	}
 }
 
+// markMergeable moves a seeded job into `mergeable` — a realistic pre-merge state that
+// legitimately owns a reviewable/merging PR. A merged PR completes a job only from such
+// a state (prBoundActive), never from bare `ready`/`building` or a parked `needs_human`.
+func markMergeable(t *testing.T, st *store.Store, id string) {
+	t.Helper()
+	if _, err := st.DB.ExecContext(context.Background(),
+		`UPDATE jobs SET state='mergeable' WHERE id=?`, id); err != nil {
+		t.Fatalf("mark mergeable %s: %v", id, err)
+	}
+}
+
 // TestReconcileWritesDomainBFacts: a sweep populates the Domain-B fact columns to
 // match the scripted PR. (The DONE-WHEN "sweep populates Domain-B columns".)
 func TestReconcileWritesDomainBFacts(t *testing.T) {
@@ -166,6 +177,8 @@ func TestTerminalSHAGuard(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
 	seedBuildPR(t, st, "jt", 9)
+
+	markMergeable(t, st, "jt")
 
 	t1 := time.Unix(6000, 0)
 	// reconcile a merged PR: terminal. The job goes done; merge_commit recorded.
@@ -347,8 +360,10 @@ func TestBaseRefreshOnMerge(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// a sibling that merges.
+	// a sibling that merges (in a realistic pre-merge state: a merged PR completes a job
+	// only from a state that owns a reviewable/merging PR, not bare `ready`).
 	seedBuildPR(t, st, "merged1", 9)
+	markMergeable(t, st, "merged1")
 	if _, err := st.ApplyReconciledPR(ctx, "merged1", store.ReconciledPR{
 		Number: 9, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "NEWMAIN",
 	}, now); err != nil {
@@ -406,5 +421,37 @@ func TestReconcileParksOnClosedUnmergedPR(t *testing.T) {
 	}
 	if j2, _ := st.GetJob(ctx, "jm2"); j2.State != job.StateDone {
 		t.Fatalf("merged PR must be done, got %s", j2.State)
+	}
+}
+
+// TestMergedPRDoesNotCompleteIllegalStates locks the §6.2 edge-legality fix: a merged
+// PR completes a job ONLY from a state that legitimately owns a reviewable/merging PR
+// (prBoundActive). It must NOT drag a parked or pre-review job to `done` — most
+// importantly a `needs_human` job (escalated, pr_number not cleared) whose PR a human
+// merges, which would silently ERASE the §12.6.1 human gate; nor a superseded-back-to-
+// `ready` job (skipping re-review).
+func TestMergedPRDoesNotCompleteIllegalStates(t *testing.T) {
+	ctx := context.Background()
+	for _, st0 := range []string{"needs_human", "ready", "building"} {
+		t.Run(st0, func(t *testing.T) {
+			st := testutil.NewStore(t)
+			seedBuildPR(t, st, "j", 9)
+			if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state=? WHERE id='j'`, st0); err != nil {
+				t.Fatal(err)
+			}
+			out, err := st.ApplyReconciledPR(ctx, "j", store.ReconciledPR{
+				Number: 9, UpdatedAt: time.Unix(9000, 0), HeadSHA: "h", BaseSHA: "b",
+				Merged: true, MergeCommit: "deadbeef",
+			}, time.Unix(9000, 0))
+			if err != nil {
+				t.Fatalf("apply: %v", err)
+			}
+			if out.Done {
+				t.Fatalf("a merged PR illegally completed a %s job (review skipped / human gate erased)", st0)
+			}
+			if j, _ := st.GetJob(ctx, "j"); j.State != job.State(st0) {
+				t.Fatalf("state mutated %s -> %s on an illegal merge-complete", st0, j.State)
+			}
+		})
 	}
 }

@@ -153,8 +153,16 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		// reconcile-driven transitions (§3.4). These move STATE only as a consequence
 		// of a GitHub-owned fact changing — never a stage/role/verdict edit.
 		switch {
-		case pr.Merged && pr.MergeCommit != "" && j.State != job.StateDone:
+		case pr.Merged && pr.MergeCommit != "" && prBoundActive(j.State):
 			// the terminal Domain-B fact: the job is done. No counter or verdict edit.
+			// GATE on prBoundActive (a non-terminal state that HAS an open PR), NOT merely
+			// "not done": a merged PR completes a job ONLY from a state that legitimately
+			// owns a reviewable/merging PR (review_pending..merge_handoff, resolving_conflict).
+			// Without this, ANY pr_number-bearing job is dragged to done on merge — e.g. a
+			// `needs_human` job (escalated for cost/stall/bounce; pr_number not cleared) whose
+			// PR a human later merges would SILENTLY un-park, ERASING the §12.6.1 human gate;
+			// or a superseded-back-to-`ready` job whose stale PR merges would skip re-review.
+			// Fold blindly applies ToState, so that corruption survives a ledger rebuild.
 			// REQUIRE a resolved merge commit, not merely Merged=true: GitHub's GraphQL
 			// flips pullRequest.merged before mergeCommit.oid resolves, so a refetch can
 			// return Merged=true/MergeCommit="". Transitioning to done on that empty window
