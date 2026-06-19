@@ -41,6 +41,35 @@ func lifecycle() []ledger.Event {
 	}
 }
 
+// TestCardShowsModelPerNode: a card timeline names the ACTUAL model that did each node
+// (BoundModel), so an operator opening a card sees codex vs claude per node. BoundModel
+// wins over BoundModelFamily (which, under --agent codex, is the misleading sonnet/opus
+// anti-affinity tag); a legacy event with only the family falls back to it; none => bare.
+func TestCardShowsModelPerNode(t *testing.T) {
+	leaseCodex := ledger.Event{Kind: ledger.KindLeaseClaimed,
+		Payload: ledger.Payload{BoundIdentity: "feller-builder-2", BoundModel: "codex", BoundModelFamily: "sonnet"}}
+	if got := timelineNote(leaseCodex); !strings.Contains(got, "feller-builder-2 (codex)") {
+		t.Errorf("lease note must show the real model: %q", got)
+	}
+	if strings.Contains(timelineNote(leaseCodex), "(sonnet)") {
+		t.Errorf("must show the real model, not the anti-affinity tag: %q", timelineNote(leaseCodex))
+	}
+	reviewCodex := ledger.Event{Kind: ledger.KindReviewClaimed,
+		Payload: ledger.Payload{BoundIdentity: "buncher-code_reviewer", BoundModel: "codex"}}
+	if got := timelineNote(reviewCodex); !strings.Contains(got, "buncher-code_reviewer (codex)") {
+		t.Errorf("review note must show the model: %q", got)
+	}
+	legacy := ledger.Event{Kind: ledger.KindLeaseClaimed,
+		Payload: ledger.Payload{BoundIdentity: "go-dev", BoundModelFamily: "sonnet"}}
+	if got := timelineNote(legacy); !strings.Contains(got, "go-dev (sonnet)") {
+		t.Errorf("legacy event must fall back to the family tag: %q", got)
+	}
+	bare := ledger.Event{Kind: ledger.KindLeaseClaimed, Payload: ledger.Payload{BoundIdentity: "x"}}
+	if got := timelineNote(bare); got != "Lease claimed by x." {
+		t.Errorf("bare event must show only the identity: %q", got)
+	}
+}
+
 func TestFoldReconstructsCard(t *testing.T) {
 	c, err := Fold(lifecycle())
 	if err != nil {

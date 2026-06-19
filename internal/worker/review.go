@@ -20,9 +20,9 @@ import (
 type reviewVerdict struct {
 	Decision     string `json:"decision"`           // approved|changes_requested|signed_off|amended|needs_design
 	Disposition  string `json:"disposition"`        // self_merge|handoff (code_review)
-	MeetsStyle   bool   `json:"meets_style"`         // spec_review
-	MeetsReq     bool   `json:"meets_requirements"`  // spec_review
-	SpecMarkdown string `json:"spec_markdown"`       // spec_author authored spec, or the amended spec
+	MeetsStyle   bool   `json:"meets_style"`        // spec_review
+	MeetsReq     bool   `json:"meets_requirements"` // spec_review
+	SpecMarkdown string `json:"spec_markdown"`      // spec_author authored spec, or the amended spec
 	Notes        string `json:"notes"`
 }
 
@@ -55,6 +55,7 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	}
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
+	c.Model = cfg.ModelLabel
 	if _, err := c.Register(ctx, client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,

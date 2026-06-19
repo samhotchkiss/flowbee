@@ -137,7 +137,7 @@ func runUp(args []string) error {
 	// shadow of it: conflict_resolver is included (a real merge conflict routes to a
 	// resolving_conflict job only it can claim — omit it and every conflict escalates).
 	for _, r := range upRoles(*agent, *agentCmd, *buildCmd) {
-		spawn(r.role, "work", "--role", r.role, "--identity", r.identity, "--model-family", r.family, "--agent-cmd", r.cmd)
+		spawn(r.role, "work", "--role", r.role, "--identity", r.identity, "--model-family", r.family, "--model-label", r.label, "--agent-cmd", r.cmd)
 	}
 
 	fmt.Printf("\n🐝 Flowbee is up.\n   dashboard: %s/dashboard\n   board:     %s/board\n   intake:    label a GitHub issue `flowbee:build`, or POST %s/v1/specs\n   merge:     %s\n\n",
@@ -155,7 +155,7 @@ func runUp(args []string) error {
 // upRole is one supervised worker loop `flowbee up` spawns: a pipeline role, its
 // identity, its model_family (= the --model alias, also the anti-affinity tag), and
 // the fully-rendered agent command.
-type upRole struct{ role, identity, family, cmd string }
+type upRole struct{ role, identity, family, label, cmd string }
 
 // upRoles is the single-box role roster — one worker per pipeline stage, with the
 // SAME per-role model/prompt machinery as `flowbee fleet` (roleAgentCmd). Builders
@@ -167,11 +167,11 @@ type upRole struct{ role, identity, family, cmd string }
 func upRoles(agent, agentOverride, buildOverride string) []upRole {
 	const reviewFamily = "opus" // the review/resolve model; differs from the builder family
 	return []upRole{
-		{"spec_author", "spec-author", fleetBuilderFamily, roleAgentCmd(agent, fleetBuilderFamily, false, agentOverride, buildOverride)},
-		{"spec_reviewer", "issue-reviewer", reviewFamily, roleAgentCmd(agent, reviewFamily, false, agentOverride, buildOverride)},
-		{"eng_worker", "builder", fleetBuilderFamily, roleAgentCmd(agent, fleetBuilderFamily, true, agentOverride, buildOverride)},
-		{"code_reviewer", "code-reviewer", reviewFamily, roleAgentCmd(agent, reviewFamily, false, agentOverride, buildOverride)},
-		{"conflict_resolver", "conflict-resolver", reviewFamily, roleAgentCmd(agent, reviewFamily, true, agentOverride, buildOverride)},
+		{"spec_author", "spec-author", fleetBuilderFamily, modelLabelFor(agent, fleetBuilderFamily), roleAgentCmd(agent, fleetBuilderFamily, false, agentOverride, buildOverride)},
+		{"spec_reviewer", "issue-reviewer", reviewFamily, modelLabelFor(agent, reviewFamily), roleAgentCmd(agent, reviewFamily, false, agentOverride, buildOverride)},
+		{"eng_worker", "builder", fleetBuilderFamily, modelLabelFor(agent, fleetBuilderFamily), roleAgentCmd(agent, fleetBuilderFamily, true, agentOverride, buildOverride)},
+		{"code_reviewer", "code-reviewer", reviewFamily, modelLabelFor(agent, reviewFamily), roleAgentCmd(agent, reviewFamily, false, agentOverride, buildOverride)},
+		{"conflict_resolver", "conflict-resolver", reviewFamily, modelLabelFor(agent, reviewFamily), roleAgentCmd(agent, reviewFamily, true, agentOverride, buildOverride)},
 	}
 }
 

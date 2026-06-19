@@ -86,6 +86,7 @@ type ClaimSpecAuthorParams struct {
 	LeaseID     string
 	Identity    string
 	ModelFamily string
+	Model       string // ACTUAL model/agent doing the work (e.g. "codex"); recorded on the bound event for the card. Distinct from the ModelFamily anti-affinity tag.
 	Attested    []string
 	TTL         time.Duration
 	Now         time.Time
@@ -146,7 +147,7 @@ func (s *Store) ClaimSpecAuthor(ctx context.Context, p ClaimSpecAuthorParams) (*
 			JobID: p.JobID, JobSeq: nextSeq, Kind: ledger.KindLeaseClaimed,
 			FromState: job.StateSpecAuthoring, ToState: job.StateSpecAuthoring,
 			LeaseEpoch: newEpoch, Actor: p.Identity, CreatedAt: p.Now,
-			Payload: ledger.Payload{LeaseID: p.LeaseID, BoundIdentity: p.Identity, BoundModelFamily: p.ModelFamily},
+			Payload: ledger.Payload{LeaseID: p.LeaseID, BoundIdentity: p.Identity, BoundModelFamily: p.ModelFamily, BoundModel: p.Model},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err
@@ -386,6 +387,7 @@ type ClaimSpecReviewParams struct {
 	LeaseID     string
 	Identity    string
 	ModelFamily string
+	Model       string // ACTUAL model/agent doing the work (e.g. "codex"); recorded on the bound event for the card. Distinct from the ModelFamily anti-affinity tag.
 	Lens        string
 	Attested    []string
 	TTL         time.Duration
@@ -452,7 +454,7 @@ func (s *Store) ClaimSpecReview(ctx context.Context, p ClaimSpecReviewParams) (*
 			JobID: p.JobID, JobSeq: nextSeq, Kind: ledger.KindReviewClaimed,
 			FromState: job.StateSpecReview, ToState: job.StateSpecReview,
 			LeaseEpoch: newEpoch, Actor: p.Identity, CreatedAt: p.Now,
-			Payload: ledger.Payload{LeaseID: p.LeaseID, BoundIdentity: p.Identity, BoundModelFamily: p.ModelFamily},
+			Payload: ledger.Payload{LeaseID: p.LeaseID, BoundIdentity: p.Identity, BoundModelFamily: p.ModelFamily, BoundModel: p.Model},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err

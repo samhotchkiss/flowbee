@@ -165,6 +165,7 @@ type ClaimParams struct {
 	LeaseID     string
 	Identity    string
 	ModelFamily string
+	Model       string // ACTUAL model/agent doing the work (e.g. "codex"); recorded on the bound event for the card. Distinct from the ModelFamily anti-affinity tag.
 	// WorkerID is the box claiming (F6): used to gate the claim on the box's
 	// advertised PER-MODEL slot budget (don't start a 4th claude job on a box that
 	// advertised claude:3). Empty skips the slot gate (legacy single-slot worker).
@@ -289,7 +290,7 @@ func (s *Store) ClaimReadyJob(ctx context.Context, p ClaimParams) (*lease.Lease,
 			Actor:      p.Identity,
 			CreatedAt:  p.Now,
 			Payload: ledger.Payload{
-				LeaseID: p.LeaseID, BoundIdentity: p.Identity, BoundModelFamily: p.ModelFamily,
+				LeaseID: p.LeaseID, BoundIdentity: p.Identity, BoundModelFamily: p.ModelFamily, BoundModel: p.Model,
 			},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {

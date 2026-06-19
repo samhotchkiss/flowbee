@@ -47,6 +47,7 @@ func runWork(args []string) error {
 	bundle := fs.Bool("bundle", os.Getenv("FLOWBEE_BUNDLE") != "", "credential-less bundle mode for remote workers (control plane does git writes)")
 	identity := fs.String("identity", envOr("FLOWBEE_IDENTITY", "worker"), "worker identity")
 	family := fs.String("model-family", envOr("FLOWBEE_MODEL_TAG", "stub"), "model family tag")
+	modelLabel := fs.String("model-label", envOr("FLOWBEE_MODEL_LABEL", ""), "actual backend/model for the §F card (e.g. codex, sonnet); defaults to the model-family tag if unset")
 	role := fs.String("role", envOr("FLOWBEE_ROLE", ""), "role filter")
 	agentCmd := fs.String("agent-cmd", envOr("FLOWBEE_AGENT_CMD", ""), "agent CLI to spawn per lease (reads $FLOWBEE_TASK_FILE / .flowbee/task.md)")
 	// F6 capacity advertisement (optional). --model-slots "claude:3,codex:3" is the
@@ -115,7 +116,7 @@ func runWork(args []string) error {
 
 	token := os.Getenv("FLOWBEE_WORKER_TOKEN")
 	cfg := worker.HarnessConfig{
-		BaseURL: url, Identity: *identity, ModelFamily: *family, Role: *role,
+		BaseURL: url, Identity: *identity, ModelFamily: *family, ModelLabel: *modelLabel, Role: *role,
 		AgentCmd: *agentCmd, BearerToken: token,
 		ModelSlots: slots, Weight: *weight, Accounts: accts,
 		MirrorPath: *mirror, RepoURL: *repoURL, Branch: *branch,

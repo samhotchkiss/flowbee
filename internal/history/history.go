@@ -203,11 +203,11 @@ func timelineNote(e ledger.Event) string {
 	case ledger.KindJobCreated:
 		return "Job created."
 	case ledger.KindLeaseClaimed:
-		return "Lease claimed by " + nonEmpty(e.Payload.BoundIdentity, "a worker") + "."
+		return "Lease claimed by " + boundWorker(e, "a worker") + "."
 	case ledger.KindResultAccepted:
 		return "Build result accepted -> review pending."
 	case ledger.KindReviewClaimed:
-		return "Code review claimed by " + nonEmpty(e.Payload.BoundIdentity, "a reviewer") + "."
+		return "Code review claimed by " + boundWorker(e, "a reviewer") + "."
 	case ledger.KindVerdictMinted:
 		if e.Payload.Verdict != nil {
 			return "Verdict minted: " + string(e.Payload.Verdict.Value) + " (" + string(e.Payload.Verdict.Disposition) + ")."
@@ -269,6 +269,23 @@ func nonEmpty(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// boundWorker renders the node's worker plus the model that actually did the work, e.g.
+// "feller-builder-2 (codex)" — so a card shows WHICH model built/reviewed each node. It
+// prefers BoundModel (the real backend, recorded since the codex migration); for older
+// events that predate it, it falls back to BoundModelFamily (the anti-affinity tag, which
+// for a pre-codex job WAS the real model). No model on either field => just the identity.
+func boundWorker(e ledger.Event, fallbackIdentity string) string {
+	who := nonEmpty(e.Payload.BoundIdentity, fallbackIdentity)
+	model := strings.TrimSpace(e.Payload.BoundModel)
+	if model == "" {
+		model = strings.TrimSpace(e.Payload.BoundModelFamily)
+	}
+	if model != "" {
+		return who + " (" + model + ")"
+	}
+	return who
 }
 
 func shortSHA(s string) string {

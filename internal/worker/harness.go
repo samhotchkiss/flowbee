@@ -251,7 +251,12 @@ type HarnessConfig struct {
 	BaseURL     string
 	Identity    string
 	ModelFamily string
-	Role        string
+	// ModelLabel is the ACTUAL backend/model this worker runs (e.g. "codex", "sonnet"),
+	// sent on every lease so the §F card shows which model did each node. Distinct from
+	// ModelFamily (the anti-affinity tag, which under --agent codex no longer names the
+	// real backend). Empty => no model shown on the card (older/unlabeled worker).
+	ModelLabel string
+	Role       string
 	// AgentCmd is the command line spawned per lease inside the fresh worktree
 	// (FLOWBEE_AGENT_CMD). It is a black box; the harness extracts a diff against
 	// base_sha afterward, never a parsed transcript.
@@ -317,6 +322,7 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	}
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
+	c.Model = cfg.ModelLabel
 	if _, err := c.Register(ctx, client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
@@ -480,6 +486,7 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	}
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
+	c.Model = cfg.ModelLabel
 	if _, err := c.Register(ctx, client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
@@ -617,6 +624,7 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	}
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
+	c.Model = cfg.ModelLabel
 	if _, err := c.Register(ctx, client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,

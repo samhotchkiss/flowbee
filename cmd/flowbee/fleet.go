@@ -83,6 +83,16 @@ func roleAgentCmd(agent, family string, writesFiles bool, agentOverride, buildOv
 	return fmt.Sprintf(reviewAgentTmpl, family)
 }
 
+// modelLabelFor is the worker's ACTUAL model label for the §F card: under --agent codex
+// every role runs Codex (so the family tag sonnet/opus would mislead), else the family IS
+// the real claude model. Sent via --model-label so a card shows which model did each node.
+func modelLabelFor(agent, family string) string {
+	if agent == "codex" {
+		return "codex"
+	}
+	return family
+}
+
 // fleetRole is one non-builder worker a fleet box runs (exactly one each).
 type fleetRole struct {
 	role        string
@@ -255,7 +265,8 @@ func runFleet(args []string) error {
 		id := fmt.Sprintf("%s-builder-%d", host, i)
 		supervise(id, "work", "--role", "eng_worker", "--remote",
 			"--mirror", *mirror, "--repo-url", repoURL,
-			"--identity", id, "--model-family", fleetBuilderFamily, "--agent-cmd", builderCmd)
+			"--identity", id, "--model-family", fleetBuilderFamily,
+			"--model-label", modelLabelFor(*agent, fleetBuilderFamily), "--agent-cmd", builderCmd)
 	}
 	// The non-builder roles (one each). Distinct model_family per role so a reviewer/
 	// resolver is never the builder's family (anti-affinity, enforced server-side) AND
@@ -269,6 +280,7 @@ func runFleet(args []string) error {
 	for _, r := range nonBuilderFleetRoles() {
 		id := host + "-" + r.role
 		argv := []string{"work", "--role", r.role, "--identity", id, "--model-family", r.family,
+			"--model-label", modelLabelFor(*agent, r.family),
 			"--agent-cmd", roleAgentCmd(*agent, r.family, r.writesFiles, *agentCmd, *buildCmd)}
 		if r.writesFiles {
 			argv = append(argv, "--remote")

@@ -79,6 +79,7 @@ type ClaimReviewParams struct {
 	LeaseID     string
 	Identity    string
 	ModelFamily string
+	Model       string // ACTUAL model/agent doing the work (e.g. "codex"); recorded on the bound event for the card. Distinct from the ModelFamily anti-affinity tag.
 	// Lens is the resolved review lens (F5) fenced into the lease for this
 	// reviewer (correctness|tests|security). It records WHICH lens of a
 	// multi-reviewer fan-out this reviewer is acting under.
@@ -171,7 +172,7 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 			Actor:      p.Identity,
 			CreatedAt:  p.Now,
 			Payload: ledger.Payload{
-				LeaseID: p.LeaseID, BoundIdentity: p.Identity, BoundModelFamily: p.ModelFamily,
+				LeaseID: p.LeaseID, BoundIdentity: p.Identity, BoundModelFamily: p.ModelFamily, BoundModel: p.Model,
 			},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {

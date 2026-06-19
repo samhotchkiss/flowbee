@@ -132,6 +132,12 @@ type Payload struct {
 	LeaseID          string
 	BoundIdentity    string
 	BoundModelFamily string
+	// BoundModel is the ACTUAL model/agent that did the node's work (e.g. "codex",
+	// "sonnet", "opus"), for human display in the §F card — distinct from BoundModelFamily,
+	// which is the anti-affinity TAG and (under --agent codex) no longer reflects the real
+	// backend (every codex role tags sonnet/opus but runs codex). Event-payload only: it is
+	// NOT folded into the projection, so it adds no jobs-table column and can't diverge.
+	BoundModel string `json:",omitempty"`
 
 	// counter deltas (lease_released / state_changed / review_bounced)
 	AttemptsDelta int

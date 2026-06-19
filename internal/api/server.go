@@ -734,6 +734,11 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	if bound, ok := auth.FamilyFrom(r); ok {
 		family = bound
 	}
+	// model is the ACTUAL backend/model the worker runs (e.g. "codex", "sonnet") — a
+	// display label recorded on the bound event so the §F card shows which model did each
+	// node, since model_family is now only the anti-affinity tag (codex tags sonnet/opus).
+	// Self-asserted is fine: it's display-only, never a gate (unlike identity/family).
+	model := r.URL.Query().Get("model")
 	roleFilter := job.Role(r.URL.Query().Get("role"))
 
 	// polling for work is proof of liveness: bump last_seen so an idle worker (no
@@ -797,27 +802,27 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 			case reviewing:
 				ls, err = s.store.ClaimReviewJob(r.Context(), store.ClaimReviewParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
-					ModelFamily: family, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+					ModelFamily: family, Model: model, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
 				})
 			case specAuthoring:
 				ls, err = s.store.ClaimSpecAuthor(r.Context(), store.ClaimSpecAuthorParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
-					ModelFamily: family, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+					ModelFamily: family, Model: model, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
 				})
 			case specReviewing:
 				ls, err = s.store.ClaimSpecReview(r.Context(), store.ClaimSpecReviewParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
-					ModelFamily: family, Lens: lens, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+					ModelFamily: family, Model: model, Lens: lens, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
 				})
 			case resolvingConflict:
 				ls, err = s.store.ClaimConflictJob(r.Context(), store.ClaimConflictParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
-					ModelFamily: family, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+					ModelFamily: family, Model: model, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
 				})
 			default:
 				ls, err = s.store.ClaimReadyJob(r.Context(), store.ClaimParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
-					ModelFamily: family, Role: role, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+					ModelFamily: family, Model: model, Role: role, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
 				})
 			}
 			if err == nil {

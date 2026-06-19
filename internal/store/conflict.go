@@ -568,6 +568,7 @@ type ClaimConflictParams struct {
 	LeaseID     string
 	Identity    string
 	ModelFamily string
+	Model       string // ACTUAL model/agent doing the work (e.g. "codex"); recorded on the bound event for the card. Distinct from the ModelFamily anti-affinity tag.
 	Attested    []string
 	TTL         time.Duration
 	Now         time.Time
@@ -641,7 +642,7 @@ func (s *Store) ClaimConflictJob(ctx context.Context, p ClaimConflictParams) (*l
 			FromState: job.StateResolvingConflict, ToState: job.StateResolvingConflict,
 			LeaseEpoch: newEpoch, Actor: p.Identity, CreatedAt: p.Now,
 			Payload: ledger.Payload{
-				LeaseID: p.LeaseID, BoundIdentity: p.Identity, BoundModelFamily: p.ModelFamily,
+				LeaseID: p.LeaseID, BoundIdentity: p.Identity, BoundModelFamily: p.ModelFamily, BoundModel: p.Model,
 			},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {

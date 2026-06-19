@@ -21,6 +21,10 @@ type Client struct {
 	// call as Authorization: Bearer. Empty on a loopback dev client (the server's
 	// loopback bypass accepts it); REQUIRED for a non-loopback listener.
 	BearerToken string
+	// Model is the worker's ACTUAL backend/model label (e.g. "codex", "sonnet") sent on
+	// every lease so the server can record it on the bound event for the §F card. Display
+	// only; empty omits the param (older/unlabeled workers just show no model on the card).
+	Model string
 }
 
 func New(baseURL string) *Client {
@@ -187,6 +191,9 @@ func (c *Client) LeaseWithLens(ctx context.Context, identity, family, role, lens
 	q := url.Values{}
 	q.Set("identity", identity)
 	q.Set("model_family", family)
+	if c.Model != "" {
+		q.Set("model", c.Model)
+	}
 	if role != "" {
 		q.Set("role", role)
 	}
