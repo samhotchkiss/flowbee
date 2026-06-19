@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -257,6 +258,15 @@ func TestSupersedeOnSHAMove(t *testing.T) {
 	if folded.State != j.State || folded.Role != j.Role || folded.BaseSHA != j.BaseSHA ||
 		folded.LeaseEpoch != j.LeaseEpoch || folded.Verdict != nil {
 		t.Fatalf("fold != projection:\n fold=%+v\n proj=%+v", folded, j)
+	}
+	// the supersede resets Stage + RequiredCapabilities too (the job re-arms as a
+	// build): a one-sided change to supersedeTx or the KindSuperseded fold that drops
+	// either would strand the re-armed job on a resync — guard both like the bounce path.
+	if folded.Stage != j.Stage {
+		t.Fatalf("stage diverged on supersede: fold=%q proj=%q", folded.Stage, j.Stage)
+	}
+	if !reflect.DeepEqual(folded.RequiredCapabilities, j.RequiredCapabilities) {
+		t.Fatalf("required_capabilities diverged on supersede: fold=%v proj=%v", folded.RequiredCapabilities, j.RequiredCapabilities)
 	}
 }
 
