@@ -97,6 +97,9 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVG7AD7B30JEET7KAPY5NZFT`](./01KVG7AD7B30JEET7KAPY5NZFT.md) | Instant approval-queue refresh after resolve without clobbering optimistic state (re-do #2300 correctly) | done | — | #2319 | 2026-06-19T16:01:26Z |
 | [`01KVG7AD7CHX221SJH70NX5K19`](./01KVG7AD7CHX221SJH70NX5K19.md) | Activity log: dark-native surface + contrast fix | done | — | #2318 | 2026-06-19T16:00:41Z |
 | [`01KVG9EVWJEB2PKBRW9N75VNMG`](./01KVG9EVWJEB2PKBRW9N75VNMG.md) | Add `flowbee version --json` for machine-readable version output | done | — | #187 | 2026-06-19T16:04:25Z |
+| [`01KVGA8081TEF65K9KCHRDATX9`](./01KVGA8081TEF65K9KCHRDATX9.md) | 01KVGA8081TEF65K9KCHRDATX9 | done | #188 | — | 2026-06-19T16:09:29Z |
+| [`01KVGB3PRY6MFGTK2CJWMXWR85`](./01KVGB3PRY6MFGTK2CJWMXWR85.md) | 01KVGB3PRY6MFGTK2CJWMXWR85 | done | #190 | — | 2026-06-19T16:25:04Z |
+| [`01KVGB3PRY6MFGTK2CJWMXWR85-build`](./01KVGB3PRY6MFGTK2CJWMXWR85-build.md) | # Spec: Log per-repo merge/archive policy at startup | done | — | #191 | 2026-06-19T16:34:29Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
