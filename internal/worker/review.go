@@ -233,8 +233,8 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		// the reviewer, so the branch history records the review the same way the issue
 		// comment does. Best-effort: the verdict is canonical in Flowbee's ledger; a push
 		// failure (e.g. the branch moved) is logged, never voids a valid review.
-		reviewerEmptyCommit(cfg, grant, verdict, v.Notes)
-		resp, st, err := c.Review(ctx, grant.JobID, grant.LeaseEpoch, idem, verdict, disp, v.Notes)
+		reviewerHead := reviewerEmptyCommit(cfg, grant, verdict, v.Notes)
+		resp, st, err := c.Review(ctx, grant.JobID, grant.LeaseEpoch, idem, verdict, disp, v.Notes, reviewerHead)
 		if err != nil {
 			return out, fmt.Errorf("review: %w", err)
 		}
@@ -259,7 +259,13 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 // best-effort: the verdict is canonical in Flowbee's ledger, so any git failure here
 // is swallowed (the issue comment + the ledger still record the review). A no-op when
 // the reviewer has no branch/remote configured (same-box / bundle deployments).
-func reviewerEmptyCommit(cfg HarnessConfig, grant client.LeaseGrant, verdict, notes string) {
+// reviewerEmptyCommit returns the issue-branch HEAD it pushed (empty when it did not push
+// — no branch/remote, a git failure, or a push race), so the caller can report it on the
+// review submission. That lets Flowbee track the head the reviewer just advanced: an N>1
+// consensus panel keeps the job in review across rounds, and without tracking this move the
+// async reconcile would see the reviewer's own empty commit as a SHA move and supersede the
+// round (resetting the accumulated approvals).
+func reviewerEmptyCommit(cfg HarnessConfig, grant client.LeaseGrant, verdict, notes string) (head string) {
 	issueBranch, repoURL := "", cfg.RepoURL
 	if grant.Context != nil {
 		issueBranch = grant.Context.IssueBranch
@@ -312,7 +318,11 @@ func reviewerEmptyCommit(cfg HarnessConfig, grant client.LeaseGrant, verdict, no
 	if err != nil || sha == "" {
 		return
 	}
-	_ = wt.PushTo(repoURL, issueBranch, false)
+	if err := wt.PushTo(repoURL, issueBranch, false); err != nil {
+		return // push failed (e.g. the branch moved): the remote head did NOT advance, so report nothing
+	}
+	head = sha
+	return
 }
 
 func readVerdict(path string) (reviewVerdict, error) {

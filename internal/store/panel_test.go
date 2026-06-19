@@ -127,6 +127,36 @@ func TestPanelChangesRequestedResetsTheRound(t *testing.T) {
 	assertFoldMatchesProjection(t, st, "rj")
 }
 
+// TestPanelAccumulateTracksReviewerHead: when a sub-threshold approval accumulates, the job's
+// head_sha advances to the head the reviewer reported (its empty findings-commit). Without
+// this the async reconcile reads that commit as a SHA move and supersedes the round. The fold
+// tracks it too (projection == Fold), so a DR rebuild keeps the head current.
+func TestPanelAccumulateTracksReviewerHead(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	src := store.DBFactSource{DB: st.DB}
+	panel := job.Policy{RequiredReviewers: 2}
+	now := time.Unix(3000, 0)
+
+	driveToCodeReview(t, st, "ht", "h0", "b0")
+	mustGreen(t, st, "ht", "h0", "b0")
+
+	if _, err := st.ReviewResult(ctx, src, panel, store.ReviewResultParams{
+		JobID: "ht", Epoch: epochOf(t, st, "ht"), Claim: job.VerdictApproved,
+		ReviewerHead: "h-reviewer1-commit", Now: now,
+	}); err != nil {
+		t.Fatalf("approve 1: %v", err)
+	}
+	j, _ := st.GetJob(ctx, "ht")
+	if j.State != job.StateReviewPending {
+		t.Fatalf("state=%s want review_pending (accumulate)", j.State)
+	}
+	if j.HeadSHA != "h-reviewer1-commit" {
+		t.Fatalf("accumulate must track the reviewer's pushed head (else reconcile supersedes the round); head=%q", j.HeadSHA)
+	}
+	assertFoldMatchesProjection(t, st, "ht")
+}
+
 func mustGreen(t *testing.T, st *store.Store, id, head, base string) {
 	t.Helper()
 	if err := st.SetReconciledFacts(context.Background(), id, store.ReconciledPR{

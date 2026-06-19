@@ -336,7 +336,7 @@ func TestM11_ToggleOnCleanDiffMergesUnattended(t *testing.T) {
 	if err != nil || !ok || rg.JobID != jobID {
 		t.Fatalf("reviewer lease ok=%v err=%v", ok, err)
 	}
-	rv, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "r1", "approved", "self_merge", "")
+	rv, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "r1", "approved", "self_merge", "", "")
 	if err != nil || code != http.StatusOK {
 		t.Fatalf("review code=%d err=%v", code, err)
 	}
@@ -405,7 +405,7 @@ func TestM11_DenylistAndSHAMovedFallToHandoff(t *testing.T) {
 		reviewer, rg := driveBuildWithPatch(t, ctx, e.st, e.private.URL, jobID, diff,
 			content.BlastRadius{Paths: []string{".github/workflows/ci.yml"}})
 		seedGreenFacts(t, ctx, e.st, jobID)
-		resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "r", "approved", "self_merge", "")
+		resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "r", "approved", "self_merge", "", "")
 		if err != nil || code != http.StatusOK {
 			t.Fatalf("review code=%d err=%v", code, err)
 		}
@@ -473,7 +473,7 @@ func TestM11_ToggleOffRestoresBranchA(t *testing.T) {
 	reviewer, rg := driveBuildWithPatch(t, ctx, e.st, e.private.URL, jobID, diff,
 		content.BlastRadius{Paths: []string{"ok.go"}})
 	seedGreenFacts(t, ctx, e.st, jobID)
-	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "r", "approved", "self_merge", "")
+	resp, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "r", "approved", "self_merge", "", "")
 	if err != nil || code != http.StatusOK {
 		t.Fatalf("review code=%d err=%v", code, err)
 	}

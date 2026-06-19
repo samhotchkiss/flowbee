@@ -225,7 +225,12 @@ type ReviewResultParams struct {
 	// bounce they are carried forward onto the job (LastReviewNotes) so the rebuild's
 	// lease context surfaces them — the §F compounding-memory read side.
 	Notes string
-	Now   time.Time
+	// ReviewerHead is the issue-branch HEAD the reviewer advanced with its empty findings-
+	// commit (empty when none). On a panel ACCUMULATE the job stays in review across rounds,
+	// so the store records this as the job's head — otherwise the async reconcile reads the
+	// reviewer's own commit as a SHA move and supersedes the round.
+	ReviewerHead string
+	Now          time.Time
 }
 
 // ReviewResultResponse is the gate's reply.
@@ -376,6 +381,12 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			if t.To == job.StateNeedsHuman {
 				pay.EscalationReason = reviewerRejectionReason
 			}
+			// F5 panel accumulate: carry the head the reviewer just advanced so the fold tracks
+			// it (the projection does too, below) — keeps the job's head current across rounds so
+			// reconcile doesn't read the reviewer's own empty commit as a SHA move and supersede.
+			if t.Kind == ledger.KindReviewApproved && in.ReviewerHead != "" {
+				pay.HeadSHA = in.ReviewerHead
+			}
 			// carry the reviewer's findings forward on the bounce so the rebuild surfaces
 			// them (§F read side); folded onto LastReviewNotes.
 			if in.Claim == job.VerdictChangesRequested {
@@ -436,10 +447,11 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 				UPDATE jobs
 				   SET state = 'review_pending', role = 'eng_worker',
 				       required_capabilities = ?,
+				       head_sha = CASE WHEN ? <> '' THEN ? ELSE head_sha END,
 				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 				       lease_hb_due = NULL, updated_at = datetime('now')
 				 WHERE id = ?`,
-				marshalStrings([]string{"role:code_reviewer"}), in.JobID); err != nil {
+				marshalStrings([]string{"role:code_reviewer"}), in.ReviewerHead, in.ReviewerHead, in.JobID); err != nil {
 				return fmt.Errorf("apply panel-accumulate projection: %w", err)
 			}
 		} else if _, err := tx.ExecContext(ctx, `

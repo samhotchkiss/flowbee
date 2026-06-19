@@ -977,6 +977,7 @@ type reviewRequest struct {
 	Verdict     string `json:"verdict"`     // approved | changes_requested
 	Disposition string `json:"disposition"` // self_merge | handoff (only meaningful on approved)
 	Notes       string `json:"notes"`       // the reviewer's findings — posted into the GitHub issue + the §F record
+	HeadSHA     string `json:"head_sha"`    // the issue-branch HEAD the reviewer advanced (empty findings-commit); tracked on a panel accumulate
 }
 
 // review runs the I-9 code-review gate for a fenced code_review result. The
@@ -1018,6 +1019,7 @@ func (s *Server) review(w http.ResponseWriter, r *http.Request) {
 		Disposition:    job.Disposition(req.Disposition),
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
 		Notes:          req.Notes, // carried forward to the rebuild on a bounce (§F read)
+		ReviewerHead:   req.HeadSHA,
 		Now:            s.clock.Now(),
 	})
 	if err != nil {

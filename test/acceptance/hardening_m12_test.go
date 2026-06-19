@@ -259,7 +259,7 @@ func TestM12_RestartRecoveryZeroJobLoss(t *testing.T) {
 	if err != nil || !ok2 || rg.JobID != jobID {
 		t.Fatalf("post-restart reviewer lease ok=%v err=%v job=%s", ok2, err, rg.JobID)
 	}
-	rv, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-restart", "approved", "handoff", "")
+	rv, code, err := reviewer.Review(ctx, jobID, rg.LeaseEpoch, "rev-restart", "approved", "handoff", "", "")
 	if err != nil || code != http.StatusOK || !rv.Minted {
 		t.Fatalf("post-restart review code=%d minted=%v err=%v", code, rv.Minted, err)
 	}
@@ -350,12 +350,12 @@ func TestM12_DashboardRendersLive(t *testing.T) {
 	// budget/roster/cost/audit/needs-human).
 	html := httpGetBody(t, ts, "/dashboard")
 	for _, want := range []string{
-		"Dashboard",          // header
-		"dash.codex",         // roster pane
-		"4321",               // budget gauge
-		"4500",               // cost pane (micro-USD)
-		"pulls.create",       // audit pane
-		"/assets/board.js",   // SSE live-refresh hook (EventSource lives in the asset)
+		"Dashboard",        // header
+		"dash.codex",       // roster pane
+		"4321",             // budget gauge
+		"4500",             // cost pane (micro-USD)
+		"pulls.create",     // audit pane
+		"/assets/board.js", // SSE live-refresh hook (EventSource lives in the asset)
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("dashboard missing %q:\n%s", want, html)

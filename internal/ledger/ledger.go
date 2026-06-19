@@ -343,6 +343,11 @@ func Fold(events []Event) (job.Job, error) {
 			j.State = e.ToState
 			j.Role = job.RoleEngWorker
 			j.RequiredCapabilities = []string{"role:code_reviewer"}
+			// track the head the reviewer advanced (mirrors the projection) so a rebuild keeps
+			// the job's head current and the panel round isn't superseded by the reviewer's commit.
+			if e.Payload.HeadSHA != "" {
+				j.HeadSHA = e.Payload.HeadSHA
+			}
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""
