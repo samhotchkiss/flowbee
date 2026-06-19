@@ -101,7 +101,73 @@ func Doctor(ctx context.Context, opts DoctorOptions) (DoctorReport, error) {
 	// production recommendation, not a start-up blocker).
 	checkDurability(&rep)
 
+	// (5) worker-API security posture: catch the serve-refuses-to-start misconfig (a
+	// non-loopback bind with no auth and no insecure opt-in) at the readiness gate,
+	// and surface an OPEN API even when it's the intended (trusted-tailnet) posture.
+	checkWorkerAuth(cfg, &rep)
+
 	return rep, nil
+}
+
+// checkWorkerAuth mirrors serve's §7.6 trust-boundary decision so an operator sees the
+// outcome BEFORE `flowbee serve` enforces it: mutual-auth configured (pass), loopback-
+// only (pass), a non-loopback bind with no auth and no FLOWBEE_INSECURE (FAIL — serve
+// refuses to start), or an explicitly-open API on a trusted network (warn).
+func checkWorkerAuth(cfg config.Config, rep *DoctorReport) {
+	// serve resolves these from env too (config.Load), but doctor's cfg is the parsed
+	// FILE — so apply the same env overrides here, or the check disagrees with what
+	// `serve` will actually do.
+	addr := cfg.PrivateAddr
+	if v := os.Getenv("FLOWBEE_PRIVATE_ADDR"); v != "" {
+		addr = v
+	}
+	if addr == "" {
+		addr = ":7070"
+	}
+	authSecret := cfg.WorkerAuthSecret
+	if v := os.Getenv("FLOWBEE_WORKER_AUTH_SECRET"); v != "" {
+		authSecret = v
+	}
+	if authSecret != "" {
+		rep.add("worker-auth", StatusPass,
+			fmt.Sprintf("worker mutual-auth configured (%d enrolled identities, loopback_bypass=%v)",
+				len(cfg.EnrolledIdentities), cfg.AuthLoopbackBypass))
+		return
+	}
+	if isLoopbackBind(addr) {
+		rep.add("worker-auth", StatusPass,
+			"loopback-only bind ("+addr+") — no auth needed; set worker_auth_secret before binding non-loopback")
+		return
+	}
+	if os.Getenv("FLOWBEE_INSECURE") == "" {
+		// WARN, not FAIL: the scaffold is valid (a fresh init stays green) — but serve
+		// enforces a security CHOICE before it will bind a non-loopback addr. Surface it
+		// so the operator picks one instead of hitting the refusal at `serve`.
+		rep.add("worker-auth", StatusWarn,
+			fmt.Sprintf("`flowbee serve` will REFUSE to start until you choose a posture: worker API binds %s "+
+				"(non-loopback) with NO auth — set worker_auth_secret (recommended), or FLOWBEE_INSECURE=1 on a "+
+				"trusted tailnet to accept an open API", addr))
+		return
+	}
+	rep.add("worker-auth", StatusWarn,
+		fmt.Sprintf("worker API will be OPEN (no auth) on %s — relying on the network (e.g. Tailscale) as the "+
+			"only trust boundary (self_merge=%v). Intended for a trusted tailnet; set worker_auth_secret otherwise",
+			addr, cfg.AllowSelfMerge))
+}
+
+// isLoopbackBind mirrors serve's isLoopbackAddr: an addr is loopback-only when its host
+// is 127.0.0.1/::1/localhost. ":7070" (host empty) binds ALL interfaces — NOT loopback.
+func isLoopbackBind(addr string) bool {
+	host := addr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		host = addr[:i]
+	}
+	switch host {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	default:
+		return false
+	}
 }
 
 // checkDurability warns when no backup strategy is detected. It PASSES on either a

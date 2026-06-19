@@ -354,3 +354,38 @@ func TestRecentSnapshot(t *testing.T) {
 		t.Fatal("empty dir path must yield ok=false")
 	}
 }
+
+func TestCheckWorkerAuth(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  config.Config
+		env  map[string]string
+		want CheckStatus
+	}{
+		{"auth secret set", config.Config{PrivateAddr: ":7070", WorkerAuthSecret: "s"}, nil, StatusPass},
+		{"loopback bind", config.Config{PrivateAddr: "127.0.0.1:7070"}, nil, StatusPass},
+		{"open + insecure", config.Config{PrivateAddr: ":7070"}, map[string]string{"FLOWBEE_INSECURE": "1"}, StatusWarn},
+		{"non-loopback, no auth, no insecure", config.Config{PrivateAddr: ":7070"}, nil, StatusWarn},
+		{"env addr override -> loopback", config.Config{PrivateAddr: ":7070"}, map[string]string{"FLOWBEE_PRIVATE_ADDR": "127.0.0.1:7070"}, StatusPass},
+		{"env auth secret override", config.Config{PrivateAddr: ":7070"}, map[string]string{"FLOWBEE_WORKER_AUTH_SECRET": "s"}, StatusPass},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("FLOWBEE_INSECURE", "")
+			t.Setenv("FLOWBEE_PRIVATE_ADDR", "")
+			t.Setenv("FLOWBEE_WORKER_AUTH_SECRET", "")
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+			var rep DoctorReport
+			checkWorkerAuth(c.cfg, &rep)
+			got := findCheck(rep, "worker-auth")
+			if got.Name == "" {
+				t.Fatal("worker-auth check missing")
+			}
+			if got.Status != c.want {
+				t.Fatalf("status=%v want %v (detail: %s)", got.Status, c.want, got.Detail)
+			}
+		})
+	}
+}
