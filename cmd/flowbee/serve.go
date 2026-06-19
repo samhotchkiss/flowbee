@@ -195,7 +195,7 @@ func runServe(args []string) error {
 		Authenticator:      authn,
 		// THE ONE DECISION (§14, F2): Branch B (autonomous merge) when
 		// FLOWBEE_ALLOW_SELF_MERGE is set; default false = Branch A (handoff).
-		Policy: job.Policy{AllowSelfMerge: cfg.AllowSelfMerge},
+		Policy: job.Policy{AllowSelfMerge: cfg.AllowSelfMerge, RequiredReviewers: cfg.RequiredReviewers},
 		// F2: the operator content-integrity posture (ceilings + extra denylist).
 		ContentPolicy: cfg.ContentPolicy(),
 		// build-list §7.3: the credential-bearing GitHub remote the control plane

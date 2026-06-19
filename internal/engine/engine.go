@@ -104,6 +104,12 @@ type ReviewClaim struct {
 	// per-reviewer loop cap in the gate — deterministic given the ledger, like the
 	// reconciled facts.
 	ReviewerPriorRejections int
+	// PriorApprovals is how many DISTINCT reviewers have ALREADY approved this job in the
+	// CURRENT review round (counted from the ledger by the runtime, reset by a bounce or a
+	// SHA move). With Policy.RequiredReviewers=N, an approval is the Nth iff
+	// PriorApprovals+1 >= N — otherwise the gate accumulates (re-arms for the next reviewer)
+	// instead of minting. 0 for the single-reviewer gate, so the first approval mints.
+	PriorApprovals int
 }
 
 // MergeDispatch advances a `mergeable` job onto its branch-point arm (§5.4),
@@ -405,6 +411,18 @@ func Decide(s EngineState, e Event) Decision {
 		})
 		switch out.Trigger {
 		case job.TriggerApproved:
+			// F5 multi-reviewer consensus (all-must-pass): an approval BELOW the required
+			// count re-arms the job to review_pending for the NEXT distinct reviewer instead
+			// of minting; the Nth distinct approval mints. RequiredReviewers=1 (the default)
+			// makes the first approval the Nth, so it mints immediately — byte-for-byte the
+			// proven single-reviewer gate. A changes_requested (TriggerBounce) or a SHA move
+			// resets the round, so the N approvals are always of the SAME reviewed head.
+			if ev.PriorApprovals+1 < s.Policy.RequiredReviewersOrDefault() {
+				return Decision{Transitions: []Transition{{
+					From: job.StateCodeReview, To: job.StateReviewPending,
+					Kind: ledger.KindReviewApproved,
+				}}}
+			}
 			return Decision{
 				VerdictMint: out.Verdict,
 				Transitions: []Transition{{
@@ -437,14 +455,14 @@ func Decide(s EngineState, e Event) Decision {
 		// bytes, the only ground truth pre-SHA) — NOT the claim. A hostile
 		// `signed_off` over a stale binding or a failed conjunction never mints.
 		out := job.EvaluateSpecGate(job.SpecGateInputs{
-			Claim:             ev.Claim,
-			ClaimBindsTo:      ev.ClaimBindsTo,
-			MeetsStyle:        ev.MeetsStyle,
-			MeetsRequirements: ev.MeetsRequirements,
-			CurrentSpecHash:   s.Spec.CurrentHash,
-			SpecVersion:       s.Spec.Version,
-			ReviewerLens:      s.Spec.ReviewerLens,
-			AuthorLens:        s.Spec.AuthorLens,
+			Claim:              ev.Claim,
+			ClaimBindsTo:       ev.ClaimBindsTo,
+			MeetsStyle:         ev.MeetsStyle,
+			MeetsRequirements:  ev.MeetsRequirements,
+			CurrentSpecHash:    s.Spec.CurrentHash,
+			SpecVersion:        s.Spec.Version,
+			ReviewerLens:       s.Spec.ReviewerLens,
+			AuthorLens:         s.Spec.AuthorLens,
 			Bounces:            s.Job.Bounces,
 			MaxBounce:          s.Job.MaxBounces,
 			ReviewerRejections: ev.ReviewerPriorRejections,

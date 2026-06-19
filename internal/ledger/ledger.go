@@ -33,6 +33,7 @@ const (
 	KindVerdictClaim    EventKind = "verdict_claim"    // the reviewer's CLAIM (untrusted, I-9)
 	KindVerdictMinted   EventKind = "verdict_minted"   // the gate MINTED a tamper-evident verdict (I-9)
 	KindReviewBounced   EventKind = "review_bounced"   // code_review -> building (changes_requested)
+	KindReviewApproved  EventKind = "review_approved"  // F5 panel: a sub-threshold approval; code_review -> review_pending for the next reviewer (no mint yet)
 	KindBounceExhausted EventKind = "bounce_exhausted" // code_review -> needs_human (max_bounces)
 	KindMergeHandoff    EventKind = "merge_handoff"    // mergeable -> merge_handoff
 	KindMergeStarted    EventKind = "merge_started"    // mergeable -> merging (self_merge)
@@ -329,6 +330,19 @@ func Fold(events []Event) (job.Job, error) {
 			// any builder (the stranded-ready-job bug).
 			j.RequiredCapabilities = []string{"role:eng_worker"}
 			j.EnqueuedAt = e.CreatedAt
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+		case KindReviewApproved:
+			// F5 panel sub-threshold approval: code_review -> review_pending for the NEXT
+			// distinct reviewer (no mint yet). Release THIS reviewer's lease but restore the
+			// review-pending baseline — role:eng_worker + caps=[role:code_reviewer] (the same
+			// shape KindResultAccepted produces) — so the gate stays claimable by a reviewer,
+			// NOT re-armed to a builder like a bounce. The approval itself is the preceding
+			// verdict_claim (the runtime counts those for PriorApprovals); this only re-arms.
+			j.State = e.ToState
+			j.Role = job.RoleEngWorker
+			j.RequiredCapabilities = []string{"role:code_reviewer"}
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""

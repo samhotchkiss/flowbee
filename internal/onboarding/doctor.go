@@ -11,6 +11,7 @@ import (
 
 	"github.com/samhotchkiss/flowbee/internal/config"
 	gh "github.com/samhotchkiss/flowbee/internal/github"
+	"github.com/samhotchkiss/flowbee/internal/job"
 	"gopkg.in/yaml.v3"
 )
 
@@ -269,8 +270,8 @@ func checkConfig(path string, rep *DoctorReport) (config.Config, bool) {
 		rep.add("config", StatusFail, fmt.Sprintf("flowbee.yaml fails validation: %v", err))
 		return cfg, false
 	}
-	rep.add("config", StatusPass, fmt.Sprintf("flowbee.yaml parses; lease_ttl_s=%d heartbeat=%d allow_self_merge=%v",
-		cfg.LeaseTTLS, cfg.HeartbeatIntervalS, cfg.AllowSelfMerge))
+	rep.add("config", StatusPass, fmt.Sprintf("flowbee.yaml parses; lease_ttl_s=%d heartbeat=%d allow_self_merge=%v required_reviewers=%d",
+		cfg.LeaseTTLS, cfg.HeartbeatIntervalS, cfg.AllowSelfMerge, job.Policy{RequiredReviewers: cfg.RequiredReviewers}.RequiredReviewersOrDefault()))
 
 	// cost-ceiling: informational — both armed and off are valid postures.
 	if cfg.CostCeilingUSD > 0 {

@@ -149,10 +149,22 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 			         WHERE sib.id = COALESCE(jobs.eng_worker_job, jobs.id)
 			           AND ( sib.builder_identity     = ?
 			              OR sib.builder_model_family = ? ) )
+			   AND NOT EXISTS (
+			        -- F5 panel anti-affinity: a reviewer may not be TWO of the N consensus
+			        -- approvals. Exclude any identity that already approved in THIS round
+			        -- (since the last result_accepted). DISTINCT IDENTITY only, not family —
+			        -- a codex panel runs every reviewer under one model, so requiring distinct
+			        -- families would make N>1 unsatisfiable.
+			        SELECT 1 FROM job_events ja
+			         WHERE ja.job_id = jobs.id AND ja.kind = 'verdict_claim'
+			           AND ja.actor = ?
+			           AND json_extract(ja.payload, '$.VerdictClaim') = 'approved'
+			           AND ja.job_seq > (SELECT COALESCE(MAX(job_seq),0) FROM job_events
+			                              WHERE job_id = jobs.id AND kind = 'result_accepted') )
 			RETURNING lease_epoch, job_seq`,
 			p.Identity, p.ModelFamily, p.Lens, p.LeaseID,
 			deadline.Format(rfc3339), deadline.Format(rfc3339),
-			p.JobID, p.Identity, p.ModelFamily,
+			p.JobID, p.Identity, p.ModelFamily, p.Identity,
 		)
 		var newEpoch, prevSeq int
 		if err := row.Scan(&newEpoch, &prevSeq); err != nil {
@@ -306,9 +318,26 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			}
 		}
 
+		// F5 multi-reviewer consensus: count the DISTINCT reviewers who have already approved
+		// in the CURRENT round (since the last result_accepted — a bounce/supersede re-enters
+		// review only via a fresh result_accepted, so this scopes to the current reviewed
+		// head). With RequiredReviewers=N, the gate mints only on the Nth distinct approval;
+		// below N it accumulates (re-arms review_pending for the next reviewer). The panel
+		// anti-affinity at claim time guarantees these approvers are distinct identities.
+		var priorApprovals int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(DISTINCT actor) FROM job_events
+			 WHERE job_id = ? AND kind = 'verdict_claim'
+			   AND json_extract(payload, '$.VerdictClaim') = 'approved'
+			   AND job_seq > (SELECT COALESCE(MAX(job_seq),0) FROM job_events
+			                   WHERE job_id = ? AND kind = 'result_accepted')`,
+			in.JobID, in.JobID).Scan(&priorApprovals); err != nil {
+			return fmt.Errorf("count round approvals: %w", err)
+		}
+
 		dec := engine.Decide(engine.EngineState{
 			Job: j, Now: in.Now, Epoch: j.LeaseEpoch, GitHub: facts, Policy: p, Content: &chk,
-		}, engine.ReviewClaim{Epoch: in.Epoch, Value: in.Claim, Disposition: in.Disposition, ReviewerPriorRejections: reviewerPrior})
+		}, engine.ReviewClaim{Epoch: in.Epoch, Value: in.Claim, Disposition: in.Disposition, ReviewerPriorRejections: reviewerPrior, PriorApprovals: priorApprovals})
 		if dec.Reject != nil {
 			return lease.ErrStaleEpoch
 		}
@@ -397,6 +426,21 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 				marshalStrings([]string{"role:eng_worker"}), bouncesDelta,
 				in.Now.Format(rfc3339), in.Notes, in.Notes, in.JobID); err != nil {
 				return fmt.Errorf("apply bounce projection: %w", err)
+			}
+		} else if final == job.StateReviewPending {
+			// F5 panel sub-threshold approval: re-arm review_pending for the NEXT distinct
+			// reviewer. Restore the review-pending baseline (role:eng_worker + the reviewer
+			// capability) and release this reviewer's lease, mirroring the KindReviewApproved
+			// fold exactly so projection == Fold(events).
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE jobs
+				   SET state = 'review_pending', role = 'eng_worker',
+				       required_capabilities = ?,
+				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
+				       lease_hb_due = NULL, updated_at = datetime('now')
+				 WHERE id = ?`,
+				marshalStrings([]string{"role:code_reviewer"}), in.JobID); err != nil {
+				return fmt.Errorf("apply panel-accumulate projection: %w", err)
 			}
 		} else if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs

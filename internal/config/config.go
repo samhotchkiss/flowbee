@@ -68,6 +68,14 @@ type Config struct {
 	// SHA-bound verdict. Set via FLOWBEE_ALLOW_SELF_MERGE.
 	AllowSelfMerge bool `yaml:"allow_self_merge"`
 
+	// RequiredReviewers is the F5 multi-reviewer consensus size: how many DISTINCT
+	// reviewers must approve at the current head before a verdict mints (all-must-pass).
+	// 0 or 1 (the default) = the single-reviewer gate (first approval mints) — unchanged.
+	// N>1 makes an approval below N re-arm the job for the next distinct reviewer; the Nth
+	// approval mints. A changes_requested (any-veto) or a SHA move resets the round. Set via
+	// FLOWBEE_REQUIRED_REVIEWERS.
+	RequiredReviewers int `yaml:"required_reviewers"`
+
 	// ContentMaxDiffBytes / ContentMaxChangedFiles are the operator-configurable
 	// content-integrity ceilings (F2, §9.2c): a diff over either bound fails static
 	// checks and is forced to handoff. 0 => the shipped content.DefaultLimits.
@@ -260,6 +268,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("FLOWBEE_ALLOW_SELF_MERGE"); v != "" {
 		c.AllowSelfMerge = v == "1" || v == "true"
+	}
+	if v := envInt("FLOWBEE_REQUIRED_REVIEWERS"); v > 0 {
+		c.RequiredReviewers = v
 	}
 	if v := envInt("FLOWBEE_CONTENT_MAX_DIFF_BYTES"); v > 0 {
 		c.ContentMaxDiffBytes = v

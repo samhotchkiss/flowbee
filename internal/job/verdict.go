@@ -101,6 +101,23 @@ func (v Verdict) Verify(headSHA, baseSHA string) bool {
 // takes handoff -> human. Flipping the bool is a policy flip, never a rewire.
 type Policy struct {
 	AllowSelfMerge bool
+	// RequiredReviewers is the F5 multi-reviewer consensus size: how many DISTINCT
+	// reviewers must approve at the current head before a verdict mints (all-must-pass).
+	// 0 or 1 = the single-reviewer gate (first approval mints) — the default, byte-for-byte
+	// today's proven behavior. N>1 makes an approval below N re-arm the job to review_pending
+	// for the NEXT distinct reviewer instead of minting; the Nth approval mints. A
+	// changes_requested at any point bounces (any-veto) and a SHA move supersedes — either
+	// resets the round, so the N approvals are always of the SAME reviewed head.
+	RequiredReviewers int
+}
+
+// RequiredReviewersOrDefault clamps RequiredReviewers to a sane floor of 1 (0/negative =
+// the single-reviewer gate), so callers never special-case the zero value.
+func (p Policy) RequiredReviewersOrDefault() int {
+	if p.RequiredReviewers < 1 {
+		return 1
+	}
+	return p.RequiredReviewers
 }
 
 // DomainBFacts are the reconciled GitHub-owned facts (§3.1.B) the build-flow gate
