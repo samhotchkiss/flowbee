@@ -77,6 +77,23 @@ func assertFoldMatchesProjection(t *testing.T, st *store.Store, id string) {
 	if folded.LeaseEpoch != proj.LeaseEpoch {
 		t.Fatalf("fold lease_epoch=%d != projection %d (epoch bumps must fold)", folded.LeaseEpoch, proj.LeaseEpoch)
 	}
+	// role + required_capabilities decide WHO can lease the job. Several re-arm-to-ready
+	// paths (operator requeue, stall revoke, fast-cancel) set them via a direct UPDATE, NOT
+	// a folded field, so a rebuild-from-ledger could keep STALE review caps on a re-armed
+	// build (role:code_reviewer) — unleaseable by every builder, and the resync + normalize
+	// watchdogs then churn it forever. The role must fold exactly; for caps we assert the
+	// FUNCTIONAL invariant — an eng_worker can lease the build iff the projection says so —
+	// which catches the stale-review-cap strand while tolerating the benign empty-vs-
+	// [eng_worker] difference a fresh adopt (empty) vs the normalize watchdog ([eng_worker])
+	// produces, both of which a builder can claim.
+	if folded.Role != proj.Role {
+		t.Fatalf("fold role=%q != projection %q (re-arm paths must fold the role)", folded.Role, proj.Role)
+	}
+	eng := []string{"role:eng_worker"}
+	if job.CapabilitiesSatisfy(eng, folded.RequiredCapabilities) != job.CapabilitiesSatisfy(eng, proj.RequiredCapabilities) {
+		t.Fatalf("fold caps=%v vs projection %v diverge on eng_worker leaseability (stale caps strand a re-armed build + churn the watchdogs)",
+			folded.RequiredCapabilities, proj.RequiredCapabilities)
+	}
 }
 
 // TestReleaseEscalatesOnAttemptsExhaustion: a penalty release that burns the LAST
