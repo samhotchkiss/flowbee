@@ -213,6 +213,8 @@ func timelineNote(e ledger.Event) string {
 			return "Verdict minted: " + string(e.Payload.Verdict.Value) + " (" + string(e.Payload.Verdict.Disposition) + ")."
 		}
 		return "Verdict minted."
+	case ledger.KindReviewApproved:
+		return "Consensus approval recorded -> re-armed review_pending for the next reviewer (F5 panel, below quorum)."
 	case ledger.KindReviewBounced:
 		return "Review bounced -> build re-armed (changes requested)."
 	case ledger.KindBounceExhausted:

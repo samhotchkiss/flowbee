@@ -70,6 +70,16 @@ func TestCardShowsModelPerNode(t *testing.T) {
 	}
 }
 
+// TestCardRendersPanelApproval: a consensus-panel sub-threshold approval (KindReviewApproved)
+// shows on the timeline, so an operator sees the panel accumulate (not a silent gap between
+// the review claim and the eventual mint).
+func TestCardRendersPanelApproval(t *testing.T) {
+	got := timelineNote(ledger.Event{Kind: ledger.KindReviewApproved})
+	if got == "" || !strings.Contains(got, "Consensus") {
+		t.Errorf("panel approval must render on the timeline; got %q", got)
+	}
+}
+
 func TestFoldReconstructsCard(t *testing.T) {
 	c, err := Fold(lifecycle())
 	if err != nil {
