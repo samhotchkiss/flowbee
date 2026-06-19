@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -76,6 +77,10 @@ type Server struct {
 	workerGitSSH  bool
 	// staleHB is the roster's stale-heartbeat threshold (§12.6.2).
 	staleHB time.Duration
+	// pauseMarkerPath is the filesystem path whose EXISTENCE signals a fleet
+	// pause. When present, the lease endpoint returns no-work (204) without
+	// attempting a claim — in-flight leases/heartbeats/results are unaffected.
+	pauseMarkerPath string
 	// authn is the worker-transport authenticator (§7.6). Nil = loopback-only dev
 	// (no mutual auth); set for a non-loopback listener (bearer token / mTLS).
 	authn auth.Authenticator
@@ -134,6 +139,10 @@ type Config struct {
 	// boxes authenticate to GitHub with SSH keys (no HTTPS credential helper / no
 	// token at rest). Default false (HTTPS).
 	WorkerGitSSH bool
+	// PauseMarkerPath is the filesystem path whose EXISTENCE pauses leasing.
+	// `flowbee pause` creates it; `flowbee resume` removes it. Empty disables
+	// the check (dev/test with no DB-backed file path).
+	PauseMarkerPath string
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -180,6 +189,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		staleHB:            staleHB,
 		authn:              cfg.Authenticator,
 		ui:                 ui,
+		pauseMarkerPath:    cfg.PauseMarkerPath,
 	}
 	// seed GitHub health to "just succeeded" so the age metric starts ~0, not at the
 	// unix epoch, before the first sweep runs.
@@ -684,6 +694,17 @@ type LeaseContext struct {
 	Conflict bool `json:"conflict,omitempty"`
 }
 
+// isPaused reports whether the fleet is currently paused. It checks for the
+// marker file on every call so pause/resume take effect immediately without a
+// server restart. A missing marker path (empty or stat error) means not paused.
+func (s *Server) isPaused() bool {
+	if s.pauseMarkerPath == "" {
+		return false
+	}
+	_, err := os.Stat(s.pauseMarkerPath)
+	return err == nil
+}
+
 // lease long-polls: rank `ready` candidates (scheduler: priority + aging +
 // capability match), try them best-first via the atomic claim up to LongPollWait.
 // On grant -> 200 + envelope; on timeout / persistent lost-race / no eligible
@@ -722,6 +743,13 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	specAuthoring := role == job.RoleSpecAuthor
 	specReviewing := role == job.RoleSpecReviewer
 	resolvingConflict := role == job.RoleConflictResolver
+
+	// Fleet pause: stop issuing new leases while letting in-flight jobs finish.
+	// Heartbeats and result submissions are NOT affected (separate handlers).
+	if s.isPaused() {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 
 	deadline := time.Now().Add(s.longPollWait)
 	for {

@@ -206,6 +206,9 @@ func runServe(args []string) error {
 		// (git@github.com:owner/repo.git) — for fleets whose boxes auth with SSH keys
 		// (no HTTPS credential helper / no token at rest). Default HTTPS.
 		WorkerGitSSH: strings.EqualFold(os.Getenv("FLOWBEE_GIT_REMOTE"), "ssh"),
+		// PauseMarkerPath: a file beside the live DB whose presence stops new leases.
+		// `flowbee pause` creates it; `flowbee resume` removes it; no server restart needed.
+		PauseMarkerPath: markerPath(cfg.DatabaseURL),
 	}, buildVersion())
 	if cfg.AllowSelfMerge {
 		logger.Info("autonomous merge enabled (Branch B): self_merge eligible jobs merge without a human gate")

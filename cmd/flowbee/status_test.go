@@ -18,7 +18,7 @@ func TestPrintStatusMergeHandoff(t *testing.T) {
 	health := store.FleetHealth{LiveWorkers: 2, StaleWorkers: 1}
 
 	var buf bytes.Buffer
-	printStatus(&buf, jobs, health)
+	printStatus(&buf, jobs, health, false)
 	out := buf.String()
 
 	for _, want := range []string{
@@ -37,7 +37,7 @@ func TestPrintStatusMergeHandoff(t *testing.T) {
 
 func TestPrintStatusEmpty(t *testing.T) {
 	var buf bytes.Buffer
-	printStatus(&buf, nil, store.FleetHealth{})
+	printStatus(&buf, nil, store.FleetHealth{}, false)
 	out := buf.String()
 
 	if !strings.Contains(out, "no jobs") {
@@ -55,7 +55,7 @@ func TestPrintStatusRepoStateCounts(t *testing.T) {
 		{ID: "3", Repo: "corp/svc", State: "ready"},
 	}
 	var buf bytes.Buffer
-	printStatus(&buf, jobs, store.FleetHealth{LiveWorkers: 1})
+	printStatus(&buf, jobs, store.FleetHealth{LiveWorkers: 1}, false)
 	out := buf.String()
 
 	if !strings.Contains(out, "running:2") {
@@ -63,5 +63,15 @@ func TestPrintStatusRepoStateCounts(t *testing.T) {
 	}
 	if !strings.Contains(out, "ready:1") {
 		t.Errorf("expected 'ready:1' in output:\n%s", out)
+	}
+}
+
+func TestPrintStatusPausedBanner(t *testing.T) {
+	var buf bytes.Buffer
+	printStatus(&buf, nil, store.FleetHealth{}, true)
+	out := buf.String()
+
+	if !strings.Contains(out, "PAUSED") {
+		t.Errorf("expected PAUSED banner in paused output:\n%s", out)
 	}
 }
