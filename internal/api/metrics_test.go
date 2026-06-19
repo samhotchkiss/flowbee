@@ -13,6 +13,40 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/ulid"
 )
 
+// TestMetricsOutboxAbandoned: dead-lettered GitHub writes surface as a per-action gauge so an
+// operator can alert on silently-dropped work; with none abandoned, the series is absent.
+func TestMetricsOutboxAbandoned(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir()+"/flowbee.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
+		t.Fatal(err)
+	}
+	srv := api.New(st, clock.Real{}, ulid.NewMinter(nil), api.Config{}, "v")
+	get := func() string {
+		rec := httptest.NewRecorder()
+		srv.HealthHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		return rec.Body.String()
+	}
+	if strings.Contains(get(), "flowbee_outbox_abandoned") {
+		t.Fatal("no abandoned actions => the series must be absent")
+	}
+	if _, err := st.DB.ExecContext(ctx,
+		`INSERT INTO outbox (job_id, action, head_sha, status) VALUES ('j','issues.create','h1','abandoned'),('k','issues.create','h2','abandoned'),('m','pulls.comment','h3','abandoned')`); err != nil {
+		t.Fatal(err)
+	}
+	body := get()
+	if !strings.Contains(body, `flowbee_outbox_abandoned{action="issues.create"} 2`) {
+		t.Errorf("want issues.create=2:\n%s", body)
+	}
+	if !strings.Contains(body, `flowbee_outbox_abandoned{action="pulls.comment"} 1`) {
+		t.Errorf("want pulls.comment=1:\n%s", body)
+	}
+}
+
 // TestMetricsEndpoint: GET /metrics on the health handler returns Prometheus
 // text-format output with the baseline operational series, unauthenticated.
 func TestMetricsEndpoint(t *testing.T) {

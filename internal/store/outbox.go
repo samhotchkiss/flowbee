@@ -154,6 +154,30 @@ func (s *Store) BumpOutboxAttempts(ctx context.Context, id int64) error {
 	return err
 }
 
+// OutboxAbandonedByAction counts abandoned (dead-lettered) outbox actions per action type —
+// GitHub writes that never took effect. Critical abandons (create-issue/merge) also escalate
+// the owning job to needs_human, but cosmetic ones (comments, the §F archive) are otherwise
+// silent, so this is the one alertable signal for "work was dropped". A growing count is the
+// page (e.g. an expired token, a persistent 4xx).
+func (s *Store) OutboxAbandonedByAction(ctx context.Context) (map[string]int, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT action, COUNT(*) FROM outbox WHERE status='abandoned' GROUP BY action`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var action string
+		var n int
+		if err := rows.Scan(&action, &n); err != nil {
+			return nil, err
+		}
+		out[action] = n
+	}
+	return out, rows.Err()
+}
+
 // DeadLetterOutbox abandons a poison outbox row — a PERMANENT GitHub failure (a 4xx:
 // deleted branch/PR, 422, 404) or one that exhausted its retry budget — so the rest of
 // the repo's GitHub writes keep flowing instead of wedging behind it (the outbox is

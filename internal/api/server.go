@@ -566,6 +566,17 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&b, "flowbee_jobs_over_budget %d\n", overBudget)
 	}
 
+	// Abandoned (dead-lettered) GitHub writes: work that never took effect. Critical ones
+	// (create-issue/merge) also escalate to needs_human, but cosmetic ones (comments, the §F
+	// archive) are otherwise silent — alert on any growth here.
+	if ab, err := s.store.OutboxAbandonedByAction(ctx); err == nil && len(ab) > 0 {
+		fmt.Fprintf(&b, "# HELP flowbee_outbox_abandoned Dead-lettered GitHub writes by action (never took effect).\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_outbox_abandoned gauge\n")
+		for action, n := range ab {
+			fmt.Fprintf(&b, "flowbee_outbox_abandoned{action=%q} %d\n", action, n)
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))
 }
