@@ -115,9 +115,10 @@ What it does:
 - Backs the job ledger up to object storage on a schedule.
 - Rotates each worker's auth token before it expires.
 
-Flags: `--builders N`, `--mirror DIR`, `--agent-cmd` (review/author roles),
-`--build-agent-cmd` (build role — writes files), `--no-smoke`, `--systemd` (print a
-managed-service unit + env file and exit).
+Flags: `--builders N`, `--mirror DIR`, `--agent claude|codex` (default `claude`;
+also `FLOWBEE_FLEET_AGENT`), `--agent-cmd` (review/author roles),
+`--build-agent-cmd` (build role — writes files), `--no-smoke`, `--systemd` (print
+a managed-service unit + env file and exit).
 
 Run it as a service so it survives reboots:
 
@@ -143,6 +144,12 @@ roles), or the equivalent environment variables `FLOWBEE_AGENT_CMD` and
 ```sh
 flowbee fleet --url http://<host>:7070 --builders 3 --agent-cmd "claude --model opus-custom"
 ```
+
+With `--agent claude`, Flowbee keeps genuine cross-model review: Sonnet builds while Opus
+reviews and resolves. With `--agent codex`, every role runs `codex exec` on one Codex model;
+roles differ by task context, not model, so use it to spend Codex quota instead of the Claude
+weekly limit. Explicit `--agent-cmd` and `--build-agent-cmd` overrides still take precedence,
+and distinct `model_family` anti-affinity tags keep a build off its own review/resolve.
 
 ---
 
