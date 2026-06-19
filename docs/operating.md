@@ -141,14 +141,14 @@ reviewer default to Opus (`claude --model opus`). Because the reviewer never sha
 builder's model, it cannot share the same blind spots — a systematic mistake the builder
 would miss is more likely to be caught.
 
-Set `required_reviewers` above 1 to require an all-must-pass panel: N distinct reviewers
-must approve at the current head before the verdict mints. Each approval below N re-arms the
-job for the next distinct reviewer; the Nth approval mints the verdict. Any
-`changes_requested` at any point bounces the whole job to rebuild, and a new build resets the round.
-Configure it globally with `FLOWBEE_REQUIRED_REVIEWERS` or top-level
-`required_reviewers:`, or per repo with `required_reviewers:` in that repo's registry
-entry, which overrides the global value. The default is 1, preserving the single-reviewer
-gate. Under `--agent codex`, panel reviewers use the same model but distinct identities;
+Set `required_reviewers` above 1 to require an all-must-pass consensus panel: N distinct
+reviewers must approve at the current head before the verdict mints. Each approval below N
+re-arms the job for the next distinct reviewer; the Nth approval mints the verdict. Any
+`changes_requested` at any point bounces the whole job to rebuild, and a new build resets
+the round. Configure it globally with `FLOWBEE_REQUIRED_REVIEWERS` or top-level
+`required_reviewers:`, or per repo with `required_reviewers:` in that repo's registry entry,
+which overrides the global value. The default is 1, preserving the single-reviewer gate.
+Under `--agent codex`, panel reviewers use the same model but distinct identities;
 anti-affinity is per identity, not per model family, so an N>1 panel is satisfiable on a
 single-backend fleet.
 
