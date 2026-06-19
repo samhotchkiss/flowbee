@@ -104,6 +104,7 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVGM7ZNFBX4T4544N7MJXF5X`](./01KVGM7ZNFBX4T4544N7MJXF5X.md) | 01KVGM7ZNFBX4T4544N7MJXF5X | done | #194 | — | 2026-06-19T19:04:05Z |
 | [`01KVGM7ZNFBX4T4544N7MJXF5X-build`](./01KVGM7ZNFBX4T4544N7MJXF5X-build.md) | # Spec: Document Per-Node Model Labels in History Cards | done | — | #195 | 2026-06-19T19:12:35Z |
 | [`01KVGQG2PZXY4DGFSTG4SMWJ3Q`](./01KVGQG2PZXY4DGFSTG4SMWJ3Q.md) | Document `flowbee status` + the fleet/per-node model display in operating.md §5 | done | — | #197 | 2026-06-19T20:05:59Z |
+| [`01KVGSK41ZQSF1T2CVJFMR0WDK`](./01KVGSK41ZQSF1T2CVJFMR0WDK.md) | Document the F5 multi-reviewer consensus panel (required_reviewers) | done | — | #199 | 2026-06-19T20:58:48Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
