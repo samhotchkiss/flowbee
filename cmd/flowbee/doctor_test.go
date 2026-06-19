@@ -1,0 +1,107 @@
+package main
+
+import (
+	"encoding/json"
+	"os/exec"
+	"path/filepath"
+	"testing"
+)
+
+// initTestRepo makes a temp git repo and runs flowbee Init on it.
+func initTestRepo(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init")
+	run("remote", "add", "origin", "git@github.com:acme/widgets.git")
+	if err := runInit([]string{"--dir", root}); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
+	return root
+}
+
+func TestDoctorJSONOutput(t *testing.T) {
+	root := initTestRepo(t)
+	t.Setenv("FLOWBEE_CONFIG", "")
+	t.Setenv("FLOWBEE_GITHUB_TOKEN", "")
+
+	out := captureStdout(t, func() {
+		_ = runDoctor([]string{"--dir", root, "--offline", "--json"})
+	})
+
+	var checks []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal([]byte(out), &checks); err != nil {
+		t.Fatalf("--json output did not parse as JSON: %v\noutput: %q", err, out)
+	}
+	if len(checks) == 0 {
+		t.Fatal("--json output is an empty array; expected at least one check")
+	}
+	for i, c := range checks {
+		if c.Name == "" {
+			t.Errorf("check[%d] has empty name", i)
+		}
+		if c.Status == "" {
+			t.Errorf("check[%d] has empty status", i)
+		}
+		switch c.Status {
+		case "pass", "warn", "fail":
+		default:
+			t.Errorf("check[%d] has unexpected status %q", i, c.Status)
+		}
+		// detail may legitimately be empty for some checks, so no assertion there.
+	}
+
+	// Verify known checks are present with expected stable names.
+	named := map[string]string{}
+	for _, c := range checks {
+		named[c.Name] = c.Status
+	}
+	for _, want := range []string{"config", "flow", "identities"} {
+		if _, ok := named[want]; !ok {
+			t.Errorf("expected check %q to be present in JSON output", want)
+		}
+	}
+	// github check must be present; offline run yields "warn", not "fail".
+	if s, ok := named["github"]; !ok {
+		t.Error("expected check \"github\" to be present in JSON output")
+	} else if s != "warn" {
+		t.Errorf("offline github check should be \"warn\", got %q", s)
+	}
+}
+
+func TestDoctorJSONExitCodeOnFail(t *testing.T) {
+	root := t.TempDir() // no flowbee.yaml → config check fails
+	t.Setenv("FLOWBEE_CONFIG", "")
+	var doctorErr error
+	captureStdout(t, func() {
+		doctorErr = runDoctor([]string{"--dir", root, "--offline", "--json"})
+	})
+	if doctorErr == nil {
+		t.Fatal("expected non-nil error when a check fails under --json")
+	}
+}
+
+func TestDoctorJSONWinsOverQuiet(t *testing.T) {
+	root := initTestRepo(t)
+	cfgPath := filepath.Join(root, "flowbee.yaml")
+	t.Setenv("FLOWBEE_CONFIG", cfgPath)
+	t.Setenv("FLOWBEE_GITHUB_TOKEN", "")
+
+	out := captureStdout(t, func() {
+		_ = runDoctor([]string{"--dir", root, "--offline", "--json", "--quiet"})
+	})
+	// when --json wins, output must be valid JSON (not the human summary line).
+	var checks []map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &checks); err != nil {
+		t.Fatalf("--json --quiet should emit JSON, got: %q\nerr: %v", out, err)
+	}
+}
