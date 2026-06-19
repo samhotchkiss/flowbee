@@ -110,6 +110,12 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 		if !job.CapabilitiesSatisfy(p.Attested, unmarshalStrings(reqJSON)) {
 			return lease.ErrLostRace
 		}
+		// F6 per-model slot gate: a review spawns a real agent, so it counts against the
+		// box's advertised budget exactly like a build. Without this a box at its claude
+		// limit could still claim a review and overcommit. No-op when no slots advertised.
+		if err := modelSlotGateTx(ctx, tx, "", p.Identity, p.ModelFamily); err != nil {
+			return err
+		}
 
 		// §6.3.1 atomic claim of the gate stage. The anti-affinity NOT EXISTS clause
 		// excludes the eng_worker's identity AND model_family (I-10): a reviewer may

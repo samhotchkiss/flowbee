@@ -4,7 +4,11 @@
 // passed IN as values; the type `time.Time` is used only as a value, never read.
 package job
 
-import "time"
+import (
+	"sort"
+	"strings"
+	"time"
+)
 
 // State is the §6.2.1 state-machine catalogue. M1 exercises the build subset.
 type State string
@@ -114,6 +118,20 @@ var ActiveLeaseStates = map[State]bool{
 
 // HasActiveLease reports whether s is a state that holds an active lease.
 func HasActiveLease(s State) bool { return ActiveLeaseStates[s] }
+
+// ActiveLeaseStatesSQL renders ActiveLeaseStates as a SQL IN-list literal —
+// ('building','code_review',...) — sorted for determinism. The per-box slot gate and
+// the roster MUST count exactly these states; deriving the clause here means it can
+// never drift from the canonical set (a hand-copied clause that dropped
+// resolving_conflict let a running resolver escape the slot gate → box overcommit).
+func ActiveLeaseStatesSQL() string {
+	lits := make([]string, 0, len(ActiveLeaseStates))
+	for s := range ActiveLeaseStates {
+		lits = append(lits, "'"+string(s)+"'")
+	}
+	sort.Strings(lits)
+	return "(" + strings.Join(lits, ",") + ")"
+}
 
 // livenessEvaluableStates is ActiveLeaseStates MINUS the two worker-LESS states
 // (merge_handoff, merging), derived so it can never drift from the source of truth.

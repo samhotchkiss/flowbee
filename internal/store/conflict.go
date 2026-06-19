@@ -12,8 +12,8 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/content"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
-	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/lease"
+	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/scheduler"
 )
 
@@ -599,6 +599,13 @@ func (s *Store) ClaimConflictJob(ctx context.Context, p ClaimConflictParams) (*l
 		}
 		if !job.CapabilitiesSatisfy(p.Attested, unmarshalStrings(reqJSON)) {
 			return lease.ErrLostRace
+		}
+		// F6 per-model slot gate: a conflict_resolver is a real running agent — this closes
+		// a resolver dispatched onto a box with zero free slots (the claim was ungated, and
+		// resolving_conflict was missing from the slot-count clause, so the box was doubly
+		// invisible to capacity). No-op without advertised slots.
+		if err := modelSlotGateTx(ctx, tx, "", p.Identity, p.ModelFamily); err != nil {
+			return err
 		}
 		row := tx.QueryRowContext(ctx, `
 			UPDATE jobs

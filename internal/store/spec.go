@@ -112,6 +112,10 @@ func (s *Store) ClaimSpecAuthor(ctx context.Context, p ClaimSpecAuthorParams) (*
 		if !job.CapabilitiesSatisfy(p.Attested, unmarshalStrings(reqJSON)) {
 			return lease.ErrLostRace
 		}
+		// F6 per-model slot gate (a spec-author run is a real agent on the box).
+		if err := modelSlotGateTx(ctx, tx, "", p.Identity, p.ModelFamily); err != nil {
+			return err
+		}
 		// Live-lease guard: unlike the build/review claims (which transition state on
 		// claim, so a second claimer's WHERE no longer matches), the spec_author stage
 		// STAYS spec_authoring while worked — so without this guard a SECOND spec_author
@@ -411,6 +415,10 @@ func (s *Store) ClaimSpecReview(ctx context.Context, p ClaimSpecReviewParams) (*
 		}
 		if !job.CapabilitiesSatisfy(p.Attested, unmarshalStrings(reqJSON)) {
 			return lease.ErrLostRace
+		}
+		// F6 per-model slot gate (a spec-review run is a real agent on the box).
+		if err := modelSlotGateTx(ctx, tx, "", p.Identity, p.ModelFamily); err != nil {
+			return err
 		}
 		// §5.5 distinct-lens anti-affinity: a reviewer lens equal to the author lens
 		// may NOT judge the spec (the independent-lens guarantee, I-10).

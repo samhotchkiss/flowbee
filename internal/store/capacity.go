@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/capacity"
+	"github.com/samhotchkiss/flowbee/internal/job"
 )
 
 // ErrNoCapacity means a box has no free per-model SLOT (its advertised concurrency
@@ -16,10 +17,14 @@ import (
 // no_eligible_worker alarm can eventually fire, §C capacity alarm).
 var ErrNoCapacity = errors.New("no per-model capacity (slot full or all accounts at ceiling)")
 
-// activeLeaseStates are the job states that hold a live lease (one per running
-// agent). Counting a worker's jobs in these states gives its in-flight slot usage.
-const activeLeaseStatesClause = `('leased','building','code_review','merging',
-	'merge_handoff','spec_authoring','spec_review')`
+// activeLeaseStatesClause is the SQL IN-list of states that hold a live lease (one per
+// running agent). Counting a worker's jobs in these states gives its in-flight slot
+// usage. DERIVED from the canonical job.ActiveLeaseStates so it can never drift — a
+// previous hand-copied literal omitted resolving_conflict, so a box running a
+// conflict_resolver was invisible to the gate and could overcommit (run advertised+N
+// agents). resolving_conflict and the worker-less merge states are now counted exactly
+// as the canonical set defines them.
+var activeLeaseStatesClause = job.ActiveLeaseStatesSQL()
 
 // SetWorkerModelSlots advertises a box's PER-MODEL concurrency (§C "box =
 // multi-model, multi-slot"): a set of (model_family -> max_slots) replacing the
