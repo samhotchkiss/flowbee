@@ -258,10 +258,23 @@ sudo systemctl enable --now litestream
 litestream restore -o /home/sam/.flowbee/flowbee.db s3://my-bucket/flowbee-db
 ```
 
-No object store handy? A periodic `sqlite3 flowbee.db ".backup '/backups/flowbee-$(date +%F).db'"`
-is a coarse floor, but litestream's continuous WAL replication is the production answer
-(point-in-time recovery, seconds of data loss vs. a day). The ledger is append-only, so a
-restore is always internally consistent — replay folds the jobs table back exactly.
+No object store handy? **`flowbee backup`** is the turnkey on-disk floor: it takes a
+consistent snapshot (safe to run while `serve` is live — WAL), **integrity-checks it**,
+and prunes to the most recent N:
+
+```bash
+flowbee backup                 # snapshot -> ~/.flowbee/backups/, keep last 7
+flowbee backup --dir /mnt/ext/flowbee-backups --keep 30   # an external disk is better than the same one
+# schedule it (cron/launchd) for an ongoing floor:
+# 0 * * * *  flowbee backup --dir /mnt/ext/flowbee-backups
+```
+
+It's the equivalent of `sqlite3 .backup` but it knows the DB path, verifies the copy, and
+rotates — a backup you can't restore is no backup. **It is still a *floor*:** same-disk
+snapshots don't survive disk loss, so litestream's continuous WAL replication to object
+storage is the production answer (point-in-time recovery, seconds of data loss vs. a day).
+The ledger is append-only, so a restore is always internally consistent — replay folds the
+jobs table back exactly.
 
 **On growth:** `job_events` is the append-only ledger (the source of truth), so the DB grows
 with throughput — watch `flowbee_db_size_bytes`. SQLite handles multi-GB comfortably and it is
