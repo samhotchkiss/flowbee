@@ -417,6 +417,7 @@ func Decide(s EngineState, e Event) Decision {
 			// makes the first approval the Nth, so it mints immediately — byte-for-byte the
 			// proven single-reviewer gate. A changes_requested (TriggerBounce) or a SHA move
 			// resets the round, so the N approvals are always of the SAME reviewed head.
+			// TriggerBounce is an any-veto: it rebuilds the whole job and discards round approvals.
 			if ev.PriorApprovals+1 < s.Policy.RequiredReviewersOrDefault() {
 				return Decision{Transitions: []Transition{{
 					From: job.StateCodeReview, To: job.StateReviewPending,
