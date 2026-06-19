@@ -5,6 +5,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -42,6 +43,18 @@ func buildVersion() string {
 		}
 	}
 	return version
+}
+
+func runVersion(args []string) error {
+	for _, a := range args {
+		if a == "--json" {
+			out, _ := json.Marshal(map[string]string{"version": buildVersion()})
+			fmt.Println(string(out))
+			return nil
+		}
+	}
+	fmt.Printf("flowbee %s\n", buildVersion())
+	return nil
 }
 
 func main() {
@@ -90,7 +103,7 @@ func main() {
 	case "resume":
 		err = runResume(args)
 	case "version", "-v", "--version":
-		fmt.Printf("flowbee %s\n", buildVersion())
+		err = runVersion(args)
 	default:
 		usage()
 		os.Exit(2)
