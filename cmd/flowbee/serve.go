@@ -747,6 +747,7 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 		if rc.ArchiveHistory {
 			archiveHist[id] = true
 		}
+		logger.Info("repo config", "repo_id", id, "repo", rc.Owner+"/"+rc.Repo, "self_merge", rc.AllowOwnSourceMerge, "archive_history", rc.ArchiveHistory)
 		// name a repo that will silently no-op for lack of (the right) token NOW, at
 		// startup, instead of leaving the operator to wonder why one repo never moves.
 		if rc.IsActive() {
