@@ -27,6 +27,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -752,7 +753,17 @@ type Preflight struct {
 	CITriggersOnPR  bool // an active workflow triggers on pull_request (Flowbee gates on PR CI)
 	BranchProtected bool
 	TokenScopes     string // X-OAuth-Scopes: non-empty = a broadly-scoped CLASSIC PAT; empty = fine-grained / least-privilege
+	// TokenScopesProbed is true only when the X-OAuth-Scopes header was actually read. A
+	// FAILED probe leaves TokenScopes "" — which must NOT be reported as "least-privilege"
+	// (a green-when-unknown false signal). doctor reports unknown/warn when this is false.
+	TokenScopesProbed bool
 }
+
+// prTriggerRe matches the `pull_request` workflow trigger as a WHOLE word, so a naive
+// substring no longer green-lights a workflow that only has `pull_request_target` /
+// `pull_request_review` / `pull_request_comment` (different trigger semantics that do NOT
+// put a status check on the bot's PR head) — the merge gate would never go green.
+var prTriggerRe = regexp.MustCompile(`\bpull_request\b`)
 
 func (c *RealClient) Preflight(ctx context.Context, branch string) (Preflight, error) {
 	var pf Preflight
@@ -775,6 +786,7 @@ func (c *RealClient) Preflight(ctx context.Context, branch string) (Preflight, e
 			req.Header.Set("Authorization", "Bearer "+tok)
 			if resp, derr := c.HTTP.Do(req); derr == nil {
 				pf.TokenScopes = strings.TrimSpace(resp.Header.Get("X-OAuth-Scopes"))
+				pf.TokenScopesProbed = true // distinguish "probed: none (fine-grained)" from "probe failed: unknown"
 				_ = resp.Body.Close()
 			}
 		}
@@ -801,7 +813,7 @@ func (c *RealClient) Preflight(ctx context.Context, branch string) (Preflight, e
 				Content string `json:"content"`
 			}
 			if err := c.rest(ctx, http.MethodGet, "/contents/"+w.Path+"?ref="+branch, nil, &content); err == nil {
-				if raw, derr := base64.StdEncoding.DecodeString(strings.ReplaceAll(content.Content, "\n", "")); derr == nil && strings.Contains(string(raw), "pull_request") {
+				if raw, derr := base64.StdEncoding.DecodeString(strings.ReplaceAll(content.Content, "\n", "")); derr == nil && prTriggerRe.Match(raw) {
 					pf.CITriggersOnPR = true
 				}
 			}

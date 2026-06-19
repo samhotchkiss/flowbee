@@ -216,8 +216,11 @@ func runServe(args []string) error {
 	healthSrv := &http.Server{Addr: cfg.HealthAddr, Handler: srv.HealthHandler()}
 	privateSrv := &http.Server{Addr: cfg.PrivateAddr, Handler: srv.PrivateHandler()}
 
-	go serveHTTP(logger, "health", healthSrv)
-	go serveHTTP(logger, "private", privateSrv)
+	// a bind failure on any listener is fatal — surfaced here so main exits non-zero
+	// rather than running on as a dead process.
+	srvErr := make(chan error, 3)
+	go serveHTTP(logger, "health", healthSrv, srvErr)
+	go serveHTTP(logger, "private", privateSrv, srvErr)
 
 	// the single durable-timer polling goroutine (project override #2): drives the
 	// no_eligible_worker alarm + the M8 liveness deadlines (Rung-3), epoch-guarded.
@@ -460,7 +463,7 @@ func runServe(args []string) error {
 			webhookMux := http.NewServeMux()
 			webhookMux.Handle("POST /webhooks", wh)
 			webhookSrv := &http.Server{Addr: cfg.WebhookAddr, Handler: webhookMux}
-			go serveHTTP(logger, "webhook", webhookSrv)
+			go serveHTTP(logger, "webhook", webhookSrv, srvErr)
 			defer func() {
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
@@ -473,14 +476,21 @@ func runServe(args []string) error {
 	logger.Info("flowbee serve started",
 		"version", buildVersion(), "health", cfg.HealthAddr, "private", cfg.PrivateAddr)
 
-	<-ctx.Done()
-	logger.Info("shutting down")
+	var bindErr error
+	select {
+	case <-ctx.Done():
+		logger.Info("shutting down")
+	case bindErr = <-srvErr:
+		// a listener failed to bind — shut down and exit non-zero so the operator (and
+		// `flowbee up`'s health wait) sees a loud failure, not a silent dead process.
+		logger.Error("fatal: a listener failed; shutting down", "err", bindErr)
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = healthSrv.Shutdown(shutdownCtx)
 	_ = privateSrv.Shutdown(shutdownCtx)
-	return nil
+	return bindErr
 }
 
 // wireMultiRepo seeds the F9 repos registry from config (or the legacy single-repo
@@ -822,9 +832,17 @@ func firstRepo(mgr *multirepo.Manager) string {
 	return ""
 }
 
-func serveHTTP(logger *slog.Logger, name string, srv *http.Server) {
+func serveHTTP(logger *slog.Logger, name string, srv *http.Server, errc chan<- error) {
 	logger.Info("listening", "server", name, "addr", srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// a bind failure (e.g. the port is already in use — a duplicate serve/up) is FATAL:
+		// the control plane cannot do its job without this listener. Surface it so main exits
+		// LOUDLY (non-zero) instead of lingering as a healthy-looking process that never
+		// serves — which would let `flowbee up` proceed against the wrong control plane.
 		logger.Error("http server", "server", name, "err", err)
+		select {
+		case errc <- fmt.Errorf("%s listener (%s): %w", name, srv.Addr, err):
+		default:
+		}
 	}
 }

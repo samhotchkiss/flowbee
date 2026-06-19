@@ -498,6 +498,10 @@ func checkOneRepo(cctx context.Context, probe GitHubProbe, branch, label string,
 	}
 	if pre.TokenScopes != "" {
 		rep.add(label+" token", StatusWarn, "broadly-scoped CLASSIC PAT (scopes: "+pre.TokenScopes+") — prefer a fine-grained PAT limited to Contents + Pull requests + Issues (least privilege)")
+	} else if !pre.TokenScopesProbed {
+		// the scope probe failed (transient/network) — scopes UNKNOWN. Do NOT report
+		// least-privilege (a green-when-unknown false signal that could mask a broad PAT).
+		rep.add(label+" token", StatusWarn, "could not read token scopes (probe failed) — unable to confirm least-privilege; re-run doctor")
 	} else {
 		rep.add(label+" token", StatusPass, "fine-grained / least-privilege token")
 	}
