@@ -55,8 +55,9 @@ func runStatus(args []string) error {
 	if err != nil {
 		return err
 	}
+	abandoned, _ := st.OutboxAbandonedByAction(ctx) // dropped GitHub writes (best-effort)
 
-	printStatus(os.Stdout, jobs, health, isPausedDB(cfg.DatabaseURL))
+	printStatus(os.Stdout, jobs, health, abandoned, isPausedDB(cfg.DatabaseURL))
 	return nil
 }
 
@@ -67,21 +68,29 @@ func modelBreakdown(byModel map[string]int) string {
 	if len(byModel) == 0 {
 		return ""
 	}
-	models := make([]string, 0, len(byModel))
-	for m := range byModel {
-		models = append(models, m)
+	return " (" + sortedCounts(byModel) + ")"
+}
+
+// sortedCounts renders a count map as "k:v, k:v" sorted by key (stable). Empty => "".
+func sortedCounts(m map[string]int) string {
+	if len(m) == 0 {
+		return ""
 	}
-	sort.Strings(models)
-	parts := make([]string, 0, len(models))
-	for _, m := range models {
-		parts = append(parts, fmt.Sprintf("%s:%d", m, byModel[m]))
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
-	return " (" + strings.Join(parts, ", ") + ")"
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", k, m[k]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // printStatus writes the operator summary to w. Kept separate from runStatus
 // so it is unit-testable without a live database.
-func printStatus(w io.Writer, jobs []store.BoardJob, health store.FleetHealth, paused bool) {
+func printStatus(w io.Writer, jobs []store.BoardJob, health store.FleetHealth, abandoned map[string]int, paused bool) {
 	// Single pass: tally per-repo state counts and human-action totals.
 	repoStates := make(map[string]map[string]int)
 	var mergeHandoff, needsHuman int
@@ -130,6 +139,11 @@ func printStatus(w io.Writer, jobs []store.BoardJob, health store.FleetHealth, p
 
 	fmt.Fprintf(w, "\nawaiting human: %d merge_handoff, %d needs_human\n", mergeHandoff, needsHuman)
 	fmt.Fprintf(w, "fleet: %d live, %d stale workers%s\n", health.LiveWorkers, health.StaleWorkers, modelBreakdown(health.ByModel))
+	// dropped GitHub writes (dead-lettered) — work that never took effect. Surface it in the
+	// human view too (not just the metric/log), pointing at the recovery command.
+	if len(abandoned) > 0 {
+		fmt.Fprintf(w, "⚠ abandoned GitHub writes: %s — fix the cause, then `flowbee retry-outbox <job-id>`\n", sortedCounts(abandoned))
+	}
 	if paused {
 		fmt.Fprintln(w, "\n*** PAUSED — no new leases are being issued (`flowbee resume` to unpause) ***")
 	}

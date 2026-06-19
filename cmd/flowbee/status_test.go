@@ -12,14 +12,30 @@ import (
 // (sorted, stable) so an operator sees the fleet is on codex; no models => no suffix.
 func TestPrintStatusModelBreakdown(t *testing.T) {
 	var buf bytes.Buffer
-	printStatus(&buf, nil, store.FleetHealth{LiveWorkers: 16, ByModel: map[string]int{"codex": 14, "sonnet": 2}}, false)
+	printStatus(&buf, nil, store.FleetHealth{LiveWorkers: 16, ByModel: map[string]int{"codex": 14, "sonnet": 2}}, nil, false)
 	if got := buf.String(); !strings.Contains(got, "16 live") || !strings.Contains(got, "(codex:14, sonnet:2)") {
 		t.Errorf("expected live count + sorted model breakdown, got:\n%s", got)
 	}
 	var buf2 bytes.Buffer
-	printStatus(&buf2, nil, store.FleetHealth{LiveWorkers: 3}, false)
+	printStatus(&buf2, nil, store.FleetHealth{LiveWorkers: 3}, nil, false)
 	if got := buf2.String(); strings.Contains(got, "(") {
 		t.Errorf("no models => no breakdown suffix, got:\n%s", got)
+	}
+}
+
+// TestPrintStatusAbandoned: dropped GitHub writes surface in the human view (sorted, pointing
+// at the recovery command); none => no line.
+func TestPrintStatusAbandoned(t *testing.T) {
+	var buf bytes.Buffer
+	printStatus(&buf, nil, store.FleetHealth{}, map[string]int{"issues.create": 4, "mergeQueue.enqueue": 6}, false)
+	out := buf.String()
+	if !strings.Contains(out, "abandoned GitHub writes: issues.create:4, mergeQueue.enqueue:6") || !strings.Contains(out, "flowbee retry-outbox") {
+		t.Errorf("expected the abandoned line + recovery hint, got:\n%s", out)
+	}
+	var buf2 bytes.Buffer
+	printStatus(&buf2, nil, store.FleetHealth{}, nil, false)
+	if strings.Contains(buf2.String(), "abandoned") {
+		t.Errorf("no abandoned actions => no line, got:\n%s", buf2.String())
 	}
 }
 
@@ -33,7 +49,7 @@ func TestPrintStatusMergeHandoff(t *testing.T) {
 	health := store.FleetHealth{LiveWorkers: 2, StaleWorkers: 1}
 
 	var buf bytes.Buffer
-	printStatus(&buf, jobs, health, false)
+	printStatus(&buf, jobs, health, nil, false)
 	out := buf.String()
 
 	for _, want := range []string{
@@ -52,7 +68,7 @@ func TestPrintStatusMergeHandoff(t *testing.T) {
 
 func TestPrintStatusEmpty(t *testing.T) {
 	var buf bytes.Buffer
-	printStatus(&buf, nil, store.FleetHealth{}, false)
+	printStatus(&buf, nil, store.FleetHealth{}, nil, false)
 	out := buf.String()
 
 	if !strings.Contains(out, "no jobs") {
@@ -70,7 +86,7 @@ func TestPrintStatusRepoStateCounts(t *testing.T) {
 		{ID: "3", Repo: "corp/svc", State: "ready"},
 	}
 	var buf bytes.Buffer
-	printStatus(&buf, jobs, store.FleetHealth{LiveWorkers: 1}, false)
+	printStatus(&buf, jobs, store.FleetHealth{LiveWorkers: 1}, nil, false)
 	out := buf.String()
 
 	if !strings.Contains(out, "running:2") {
@@ -83,7 +99,7 @@ func TestPrintStatusRepoStateCounts(t *testing.T) {
 
 func TestPrintStatusPausedBanner(t *testing.T) {
 	var buf bytes.Buffer
-	printStatus(&buf, nil, store.FleetHealth{}, true)
+	printStatus(&buf, nil, store.FleetHealth{}, nil, true)
 	out := buf.String()
 
 	if !strings.Contains(out, "PAUSED") {
