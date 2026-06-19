@@ -246,18 +246,25 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 				// sibling's change present), or the resolution would build on a stale base and
 				// re-conflict.
 				mainBranch := orDefault(s.baseBranch, "main")
-				_ = s.history.FetchBranch(mainBranch)
-				mainTip, terr := s.history.HeadSHA("refs/heads/" + mainBranch)
-				if terr == nil && mainTip != "" {
-					if rerr := s.store.RouteMergeConflict(ctx, row.JobID, mainTip, s.clock.Now()); rerr == nil {
-						if err := s.store.MarkOutboxSent(ctx, row.ID, "merge conflict -> resolving_conflict"); err != nil {
-							return sent, err
+				// no local mirror wired (the legacy New() path, or a repo whose history
+				// factory returned nil): we cannot resolve the post-merge main to rebase the
+				// resolver against, so skip the route and fall through to the transient/
+				// dead-letter path. Dereferencing a nil s.history here would PANIC the whole
+				// single serialized sender and wedge every other GitHub write for the repo.
+				if s.history != nil {
+					_ = s.history.FetchBranch(mainBranch)
+					mainTip, terr := s.history.HeadSHA("refs/heads/" + mainBranch)
+					if terr == nil && mainTip != "" {
+						if rerr := s.store.RouteMergeConflict(ctx, row.JobID, mainTip, s.clock.Now()); rerr == nil {
+							if err := s.store.MarkOutboxSent(ctx, row.ID, "merge conflict -> resolving_conflict"); err != nil {
+								return sent, err
+							}
+							if s.pub != nil {
+								s.pub.PublishReconcile(row.JobID, "project_out:merge_conflict")
+							}
+							sent++
+							continue
 						}
-						if s.pub != nil {
-							s.pub.PublishReconcile(row.JobID, "project_out:merge_conflict")
-						}
-						sent++
-						continue
 					}
 				}
 				// could not route (no local mirror to resolve main, or route failed) — fall
@@ -310,6 +317,14 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		// handler) under the deterministic name store.PRBranch(jobID); the payload's
 		// epoch ref is not a GitHub branch, so reference the published branch here.
 		j, _ := s.store.GetJob(ctx, row.JobID)
+		// Idempotency (mirrors ActionCreateIssue): a non-zero PR number means a prior
+		// drain already opened + stamped this PR — a re-send after a CP crash between the
+		// GitHub create and the row being marked sent. Don't open a DUPLICATE PR; consume
+		// the row. (RealClient.OpenPR also recovers via GitHub's 422-already-exists, but
+		// that is a single GitHub-layer guard; this is the cheaper, authoritative check.)
+		if j.PRNumber > 0 {
+			return fmt.Sprintf("pr=%d (already open)", j.PRNumber), nil
+		}
 		number, err := s.gh.OpenPR(ctx, gh.OpenPRInput{
 			Title:   prTitle(j, row.JobID),
 			Body:    s.prBody(ctx, j),
