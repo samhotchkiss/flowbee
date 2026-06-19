@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/samhotchkiss/flowbee/internal/config"
@@ -263,4 +264,62 @@ func dump(rep DoctorReport) string {
 		s += string(c.Status) + " " + c.Name + ": " + c.Detail + "\n"
 	}
 	return s
+}
+
+func TestDoctorCostCeilingOff(t *testing.T) {
+	root := initGitRepo(t)
+	if _, err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	// Default init sets no cost_ceiling_usd — ceiling should be off.
+	rep, err := Doctor(context.Background(), DoctorOptions{Root: root, SkipGitHub: true})
+	if err != nil {
+		t.Fatalf("Doctor: %v", err)
+	}
+	c := findCheck(rep, "cost-ceiling")
+	if c.Name == "" {
+		t.Fatal("cost-ceiling check missing from doctor output")
+	}
+	if c.Status != StatusPass {
+		t.Fatalf("cost-ceiling off should be pass, got %+v", c)
+	}
+	if !strings.Contains(c.Detail, "off") {
+		t.Fatalf("unset cost-ceiling should report off, got: %q", c.Detail)
+	}
+	if !rep.Green() {
+		t.Fatalf("cost-ceiling off must not break green:\n%s", dump(rep))
+	}
+}
+
+func TestDoctorCostCeilingArmed(t *testing.T) {
+	root := initGitRepo(t)
+	if _, err := Init(root); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	// Append cost_ceiling_usd to the scaffolded config.
+	cfgPath := filepath.Join(root, "flowbee.yaml")
+	f, err := os.OpenFile(cfgPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open flowbee.yaml: %v", err)
+	}
+	_, _ = f.WriteString("\ncost_ceiling_usd: 2.50\n")
+	f.Close()
+
+	rep, err := Doctor(context.Background(), DoctorOptions{Root: root, SkipGitHub: true})
+	if err != nil {
+		t.Fatalf("Doctor: %v", err)
+	}
+	c := findCheck(rep, "cost-ceiling")
+	if c.Name == "" {
+		t.Fatal("cost-ceiling check missing from doctor output")
+	}
+	if c.Status != StatusPass {
+		t.Fatalf("cost-ceiling armed should be pass, got %+v", c)
+	}
+	if !strings.Contains(c.Detail, "$2.50") {
+		t.Fatalf("armed cost-ceiling should show dollar amount, got: %q", c.Detail)
+	}
+	if !rep.Green() {
+		t.Fatalf("cost-ceiling armed must not break green:\n%s", dump(rep))
+	}
 }

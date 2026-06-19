@@ -118,6 +118,13 @@ func checkConfig(root string, rep *DoctorReport) (config.Config, bool) {
 	rep.add("config", StatusPass, fmt.Sprintf("flowbee.yaml parses; lease_ttl_s=%d heartbeat=%d allow_self_merge=%v",
 		cfg.LeaseTTLS, cfg.HeartbeatIntervalS, cfg.AllowSelfMerge))
 
+	// cost-ceiling: informational — both armed and off are valid postures.
+	if cfg.CostCeilingUSD > 0 {
+		rep.add("cost-ceiling", StatusPass, fmt.Sprintf("$%.2f per job (over-budget jobs escalate to needs_human)", cfg.CostCeilingUSD))
+	} else {
+		rep.add("cost-ceiling", StatusPass, "off (jobs bounded by attempts/bounces only)")
+	}
+
 	// coords: a multi-repo registry is the production layout; single-repo coords (filled
 	// or env) are the quickstart; neither is a warn (user must wire one before serve).
 	switch {
