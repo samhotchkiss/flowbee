@@ -36,19 +36,49 @@ const (
 	buildAgentTmpl  = `claude -p "$(cat "$FLOWBEE_TASK_FILE") Create the file(s) on disk now. Make only the change described." --model %s --output-format json --dangerously-skip-permissions`
 )
 
+// Codex (OpenAI) agent commands, selected by `--agent codex`. Both build and review run
+// the SAME codex model — the per-role difference is the TASK CONTEXT (the harness renders
+// a role-specific task into $FLOWBEE_TASK_FILE: a builder is told to write code, a
+// reviewer to write a verdict file), not the model (so this forgoes §5.5 cross-MODEL
+// diversity to spend Codex quota instead of the Claude weekly limit — the operator's
+// explicit choice). Codex still runs under DISTINCT model_family anti-affinity tags so a
+// build's own worker can never review/resolve it (§I-10).
+//
+//	< /dev/null  — `codex exec` reads stdin IN ADDITION to the prompt arg and BLOCKS on an
+//	               open stdin; redirecting from /dev/null gives it immediate EOF.
+//	--dangerously-bypass-approvals-and-sandbox — non-interactive, may write files + run
+//	               commands without prompting (the trusted-tailnet equivalent of claude's
+//	               --dangerously-skip-permissions); needed so it can write the work-product
+//	               (build) or the absolute $FLOWBEE_VERDICT_FILE / $FLOWBEE_SPEC_FILE (review).
+//	--skip-git-repo-check — review roles run in a non-git temp dir; without this codex aborts.
+//	The build prompt forbids git: Flowbee owns the commit (§3.5), and a self-committing agent
+//	is also normalized harness-side (Worktree.SoftResetTo), but telling codex up front avoids
+//	the wasted round-trip.
+const (
+	codexReviewTmpl = `codex exec "$(cat "$FLOWBEE_TASK_FILE")" --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check < /dev/null`
+	codexBuildTmpl  = `codex exec "$(cat "$FLOWBEE_TASK_FILE") Create the file(s) on disk now. Make only the change described. Do NOT run git add, git commit, or any git command — Flowbee records the commit for you." --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check < /dev/null`
+)
+
 // roleAgentCmd returns the agent CLI for a role: the operator override if non-empty,
-// else the per-role default with `--model <family>` injected. writesFiles picks the
-// file-writing build template (eng_worker, conflict_resolver) over the verdict/spec
-// review template.
-func roleAgentCmd(family string, writesFiles bool, agentOverride, buildOverride string) string {
+// else the per-role default for the selected agent backend. For claude the family doubles
+// as the `--model` alias (genuine cross-model review); for codex both roles share one
+// model and differ only by task context. writesFiles picks the file-writing build template
+// (eng_worker, conflict_resolver) over the verdict/spec review template.
+func roleAgentCmd(agent, family string, writesFiles bool, agentOverride, buildOverride string) string {
 	if writesFiles {
 		if buildOverride != "" {
 			return buildOverride
+		}
+		if agent == "codex" {
+			return codexBuildTmpl
 		}
 		return fmt.Sprintf(buildAgentTmpl, family)
 	}
 	if agentOverride != "" {
 		return agentOverride
+	}
+	if agent == "codex" {
+		return codexReviewTmpl
 	}
 	return fmt.Sprintf(reviewAgentTmpl, family)
 }
@@ -95,8 +125,13 @@ func runFleet(args []string) error {
 	// forgoing per-role model diversity (the operator's explicit choice).
 	// --output-format json makes claude print total_cost_usd + usage so the harness can
 	// meter per-job cost (I-15); the harness unwraps `.result` for any text it needs.
-	agentCmd := fs.String("agent-cmd", os.Getenv("FLOWBEE_AGENT_CMD"), "override the review/author agent CLI (empty = per-role --model defaults)")
-	buildCmd := fs.String("build-agent-cmd", os.Getenv("FLOWBEE_BUILD_AGENT_CMD"), "override the build agent CLI (empty = per-role --model defaults)")
+	agentCmd := fs.String("agent-cmd", os.Getenv("FLOWBEE_AGENT_CMD"), "override the review/author agent CLI (empty = per-role defaults for --agent)")
+	buildCmd := fs.String("build-agent-cmd", os.Getenv("FLOWBEE_BUILD_AGENT_CMD"), "override the build agent CLI (empty = per-role defaults for --agent)")
+	// --agent selects the backend CLI for the built-in per-role commands: claude (default,
+	// Sonnet builds / Opus reviews — genuine §5.5 cross-model review) or codex (one Codex
+	// model for all roles, differing only by task context — spends Codex quota instead of
+	// the Claude weekly limit). Explicit --agent-cmd / --build-agent-cmd still override either.
+	agent := fs.String("agent", envOr("FLOWBEE_FLEET_AGENT", "claude"), "agent backend for the built-in role commands: claude|codex")
 	noSmoke := fs.Bool("no-smoke", false, "skip the agent smoke test at startup")
 	systemd := fs.Bool("systemd", false, "print a systemd unit + env file to run the fleet as a managed service (then exit), instead of starting it")
 	if err := fs.Parse(args); err != nil {
@@ -105,8 +140,11 @@ func runFleet(args []string) error {
 	if *url == "" {
 		return fmt.Errorf("flowbee fleet: --url (or FLOWBEE_URL) is required — the control-plane address")
 	}
+	if *agent != "claude" && *agent != "codex" {
+		return fmt.Errorf("flowbee fleet: --agent must be claude or codex, got %q", *agent)
+	}
 	if *systemd {
-		printFleetSystemd(*url, *builders, *agentCmd, *buildCmd)
+		printFleetSystemd(*url, *builders, *agent, *agentCmd, *buildCmd)
 		return nil
 	}
 	repoURL := os.Getenv("FLOWBEE_REPO_URL")
@@ -130,7 +168,7 @@ func runFleet(args []string) error {
 	// verify the agent actually works BEFORE starting workers — a not-authed /
 	// rate-limited / mis-configured agent otherwise stalls every job as the vague
 	// "agent produced no changes". Fail loudly here instead.
-	builderCmd := roleAgentCmd(fleetBuilderFamily, true, *agentCmd, *buildCmd)
+	builderCmd := roleAgentCmd(*agent, fleetBuilderFamily, true, *agentCmd, *buildCmd)
 	// the review roles default to a DIFFERENT model than the builder (§5.5), so resolve a
 	// representative review command (the code_reviewer's) to smoke-test separately.
 	reviewFamily := "opus"
@@ -139,7 +177,7 @@ func runFleet(args []string) error {
 			reviewFamily = r.family
 		}
 	}
-	reviewerCmd := roleAgentCmd(reviewFamily, false, *agentCmd, *buildCmd)
+	reviewerCmd := roleAgentCmd(*agent, reviewFamily, false, *agentCmd, *buildCmd)
 	if !*noSmoke {
 		fmt.Printf("smoke-testing the build agent on %s ...\n", host)
 		if err := smokeAgent(builderCmd); err != nil {
@@ -231,7 +269,7 @@ func runFleet(args []string) error {
 	for _, r := range nonBuilderFleetRoles() {
 		id := host + "-" + r.role
 		argv := []string{"work", "--role", r.role, "--identity", id, "--model-family", r.family,
-			"--agent-cmd", roleAgentCmd(r.family, r.writesFiles, *agentCmd, *buildCmd)}
+			"--agent-cmd", roleAgentCmd(*agent, r.family, r.writesFiles, *agentCmd, *buildCmd)}
 		if r.writesFiles {
 			argv = append(argv, "--remote")
 		}
@@ -271,7 +309,7 @@ func nextRespawnBackoff(d time.Duration) time.Duration {
 // as a managed service: clean `systemctl restart` (no stale processes), reboot
 // survival, logs via journalctl. Solves the operability pain the first live run hit —
 // nohup/pkill fragility, stale binaries, fleets not surviving restarts.
-func printFleetSystemd(url string, builders int, agentCmd, buildCmd string) {
+func printFleetSystemd(url string, builders int, agent, agentCmd, buildCmd string) {
 	self, err := os.Executable()
 	if err != nil {
 		self = os.Args[0]
@@ -318,6 +356,12 @@ func printFleetSystemd(url string, builders int, agentCmd, buildCmd string) {
 	}
 	fmt.Printf("\n")
 
+	// Pin the agent backend in ExecStart only when it's not the default (claude), so a
+	// codex fleet survives restarts/reboots without an env var.
+	agentFlag := ""
+	if agent != "" && agent != "claude" {
+		agentFlag = " --agent " + agent
+	}
 	fmt.Printf("# 2. Write /etc/systemd/system/flowbee-fleet.service:\n")
 	fmt.Printf(`[Unit]
 Description=Flowbee fleet
@@ -328,14 +372,14 @@ Wants=network-online.target
 Type=simple
 User=%s
 EnvironmentFile=%s
-ExecStart=%s fleet --builders %d
+ExecStart=%s fleet --builders %d%s
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 
-`, user, envPath, self, builders)
+`, user, envPath, self, builders, agentFlag)
 
 	fmt.Printf("# 3. Enable + start (clean restart any time with `systemctl restart flowbee-fleet`):\n")
 	fmt.Printf("sudo systemctl daemon-reload && sudo systemctl enable --now flowbee-fleet\n")

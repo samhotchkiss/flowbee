@@ -540,6 +540,24 @@ func (w *Worktree) HasChanges() (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// SoftResetTo moves HEAD back to ref while KEEPING every change in the worktree (the
+// index and working tree are untouched). Flowbee owns the commit — the harness commits
+// the work-product authored as the node (§3.5) — but an AGENTIC CLI (e.g. codex) may run
+// `git commit` on its own. A self-committing agent leaves a CLEAN worktree, so
+// HasChanges (git status --porcelain) reads false and the build is wrongly rejected as
+// "agent produced no changes", and CommitAndPushEpoch/CommitAuthored then fail on the
+// empty tree. Calling this right after the agent exits, with ref = the worktree's cut
+// point (base/startRef), undoes ONLY this run's agent commits and re-exposes the changes
+// as pending — the exact state the harness expects, whether the agent committed or not.
+// It is a no-op when HEAD already equals ref (the non-committing agent, e.g. claude), so
+// it is safe and backward-compatible on every harness.
+func (w *Worktree) SoftResetTo(ref string) error {
+	if _, err := run(w.Dir, "git", "reset", "--soft", ref); err != nil {
+		return fmt.Errorf("soft reset to %s: %w", ref, err)
+	}
+	return nil
+}
+
 // Diff returns the unified diff of the worktree against its base SHA (the
 // work-product the worker submits as `patch`, §7.3). It stages everything first
 // so new files are included, then diffs the index against base.

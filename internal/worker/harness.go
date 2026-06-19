@@ -381,6 +381,13 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	if err := runAgentHeartbeat(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
 		return out, err
 	}
+	// Normalize a self-committing agent: an agentic CLI (codex) may `git commit` its own
+	// work, which would leave a clean worktree that HasChanges/CommitAndPushEpoch misread
+	// as "no changes". Soft-reset any agent commits back to base so the changes are pending
+	// again (no-op for a non-committing agent like claude). See Worktree.SoftResetTo.
+	if err := wt.SoftResetTo(grant.BaseSHA); err != nil {
+		return out, fmt.Errorf("normalize worktree: %w", err)
+	}
 
 	// The .flowbee/ scaffolding is Flowbee's INPUT to the agent, not the agent's
 	// capture the node's own detailed commit message (the agent's .flowbee/commit.md)
@@ -710,6 +717,13 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	agentEnv = append(agentEnv, taskEnv...)
 	if err := runAgentHeartbeat(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
 		return out, err
+	}
+	// Normalize a self-committing agent (codex may `git commit` on its own): soft-reset
+	// any agent commits back to the worktree's cut point (startRef) so the changes are
+	// pending again — otherwise the clean tree reads as "no changes" and CommitAuthored
+	// fails on the empty tree. No-op for a non-committing agent. See Worktree.SoftResetTo.
+	if err := wt.SoftResetTo(startRef); err != nil {
+		return out, fmt.Errorf("normalize worktree: %w", err)
 	}
 	commitMsg := nodeCommitMessage(wsDir, cfg.Identity, grant.Role, grant.JobID, grant.Context)
 	_ = os.RemoveAll(filepath.Join(wsDir, ".flowbee"))

@@ -30,13 +30,17 @@ func runUp(args []string) error {
 	// file-writing prompt for builders/resolvers, and `--output-format json` for cost
 	// metering — the SAME machinery `flowbee fleet` uses. A flag (or FLOWBEE_*_CMD env)
 	// override replaces it for every role.
-	agentCmd := fs.String("agent-cmd", os.Getenv("FLOWBEE_AGENT_CMD"), "override the review/author agent CLI (empty = per-role --model defaults)")
-	buildCmd := fs.String("build-agent-cmd", os.Getenv("FLOWBEE_BUILD_AGENT_CMD"), "override the build/resolver agent CLI (empty = per-role --model defaults)")
+	agentCmd := fs.String("agent-cmd", os.Getenv("FLOWBEE_AGENT_CMD"), "override the review/author agent CLI (empty = per-role defaults for --agent)")
+	buildCmd := fs.String("build-agent-cmd", os.Getenv("FLOWBEE_BUILD_AGENT_CMD"), "override the build/resolver agent CLI (empty = per-role defaults for --agent)")
+	agent := fs.String("agent", envOr("FLOWBEE_FLEET_AGENT", "claude"), "agent backend for the built-in role commands: claude|codex")
 	noSmoke := fs.Bool("no-smoke", false, "skip the agent smoke test at startup")
 	mirror := fs.String("mirror", envOr("FLOWBEE_MIRROR_PATH", filepath.Join(os.TempDir(), "flowbee-mirror.git")), "local bare mirror path")
 	selfMerge := fs.Bool("self-merge", envOr("FLOWBEE_ALLOW_SELF_MERGE", "") != "", "enable Branch B autonomous merge")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *agent != "claude" && *agent != "codex" {
+		return fmt.Errorf("flowbee up: --agent must be claude or codex, got %q", *agent)
 	}
 
 	cfg, _ := config.Load()
@@ -56,7 +60,7 @@ func runUp(args []string) error {
 	// models: the reviewer (Opus) differs from the builder (Sonnet, §5.5), so an unauthed
 	// review model passes the build smoke but fails every review. Mirrors `flowbee fleet`.
 	if !*noSmoke {
-		roles := upRoles(*agentCmd, *buildCmd)
+		roles := upRoles(*agent, *agentCmd, *buildCmd)
 		var bCmd, rCmd string
 		for _, r := range roles {
 			switch r.role {
@@ -132,7 +136,7 @@ func runUp(args []string) error {
 	// the cost-reporting JSON harness. Mirrors `flowbee fleet` so `up` is not a degraded
 	// shadow of it: conflict_resolver is included (a real merge conflict routes to a
 	// resolving_conflict job only it can claim — omit it and every conflict escalates).
-	for _, r := range upRoles(*agentCmd, *buildCmd) {
+	for _, r := range upRoles(*agent, *agentCmd, *buildCmd) {
 		spawn(r.role, "work", "--role", r.role, "--identity", r.identity, "--model-family", r.family, "--agent-cmd", r.cmd)
 	}
 
@@ -160,14 +164,14 @@ type upRole struct{ role, identity, family, cmd string }
 // differs from the builder/author family (sonnet) so anti-affinity (I-10) holds with
 // a REAL model difference, not just a label. agentOverride/buildOverride (the
 // --agent-cmd / --build-agent-cmd flags) replace the per-role defaults when set.
-func upRoles(agentOverride, buildOverride string) []upRole {
+func upRoles(agent, agentOverride, buildOverride string) []upRole {
 	const reviewFamily = "opus" // the review/resolve model; differs from the builder family
 	return []upRole{
-		{"spec_author", "spec-author", fleetBuilderFamily, roleAgentCmd(fleetBuilderFamily, false, agentOverride, buildOverride)},
-		{"spec_reviewer", "issue-reviewer", reviewFamily, roleAgentCmd(reviewFamily, false, agentOverride, buildOverride)},
-		{"eng_worker", "builder", fleetBuilderFamily, roleAgentCmd(fleetBuilderFamily, true, agentOverride, buildOverride)},
-		{"code_reviewer", "code-reviewer", reviewFamily, roleAgentCmd(reviewFamily, false, agentOverride, buildOverride)},
-		{"conflict_resolver", "conflict-resolver", reviewFamily, roleAgentCmd(reviewFamily, true, agentOverride, buildOverride)},
+		{"spec_author", "spec-author", fleetBuilderFamily, roleAgentCmd(agent, fleetBuilderFamily, false, agentOverride, buildOverride)},
+		{"spec_reviewer", "issue-reviewer", reviewFamily, roleAgentCmd(agent, reviewFamily, false, agentOverride, buildOverride)},
+		{"eng_worker", "builder", fleetBuilderFamily, roleAgentCmd(agent, fleetBuilderFamily, true, agentOverride, buildOverride)},
+		{"code_reviewer", "code-reviewer", reviewFamily, roleAgentCmd(agent, reviewFamily, false, agentOverride, buildOverride)},
+		{"conflict_resolver", "conflict-resolver", reviewFamily, roleAgentCmd(agent, reviewFamily, true, agentOverride, buildOverride)},
 	}
 }
 

@@ -10,7 +10,7 @@ import (
 // and the cost-reporting harness — the three things the old hand-rolled single
 // agent-cmd silently dropped.
 func TestUpRolesMatchFleetGuarantees(t *testing.T) {
-	roles := upRoles("", "") // per-role defaults (no operator override)
+	roles := upRoles("claude", "", "") // per-role defaults (no operator override)
 
 	by := map[string]upRole{}
 	for _, r := range roles {
@@ -69,7 +69,7 @@ func TestUpRolesMatchFleetGuarantees(t *testing.T) {
 // TestUpRolesHonorOverride: an operator override (--agent-cmd / --build-agent-cmd)
 // replaces the per-role defaults, same as fleet.
 func TestUpRolesHonorOverride(t *testing.T) {
-	roles := upRoles("REVIEW-OVERRIDE", "BUILD-OVERRIDE")
+	roles := upRoles("claude", "REVIEW-OVERRIDE", "BUILD-OVERRIDE")
 	for _, r := range roles {
 		switch r.role {
 		case "eng_worker", "conflict_resolver":
@@ -105,7 +105,7 @@ func TestUpSmokeTestCatchesBrokenAgent(t *testing.T) {
 	}
 	// up smokes BOTH the build and review roles (the review model differs from the
 	// builder, §5.5) — confirm it has distinct commands to smoke for each.
-	roles := upRoles("", "")
+	roles := upRoles("claude", "", "")
 	var b, r string
 	for _, x := range roles {
 		switch x.role {

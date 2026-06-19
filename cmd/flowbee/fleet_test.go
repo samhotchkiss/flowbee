@@ -28,11 +28,11 @@ func captureStdout(t *testing.T, f func()) string {
 // `--model <family>`, so build (Sonnet) and review (Opus) run GENUINELY different models
 // (§5.5 uncorrelated review). An override wins and forgoes per-role models.
 func TestRoleAgentCmdInjectsPerRoleModel(t *testing.T) {
-	build := roleAgentCmd("sonnet", true, "", "")
+	build := roleAgentCmd("claude", "sonnet", true, "", "")
 	if !strings.Contains(build, "--model sonnet") || !strings.Contains(build, "Create the file(s)") {
 		t.Errorf("build cmd missing --model sonnet or the file-writing prompt: %q", build)
 	}
-	review := roleAgentCmd("opus", false, "", "")
+	review := roleAgentCmd("claude", "opus", false, "", "")
 	if !strings.Contains(review, "--model opus") {
 		t.Errorf("review cmd missing --model opus: %q", review)
 	}
@@ -53,11 +53,48 @@ func TestRoleAgentCmdInjectsPerRoleModel(t *testing.T) {
 		t.Errorf("code_reviewer model %q == builder model %q — correlated review", reviewerFamily, fleetBuilderFamily)
 	}
 	// overrides win and disable per-role model injection.
-	if got := roleAgentCmd("opus", false, "MY_REVIEW_CMD", ""); got != "MY_REVIEW_CMD" {
+	if got := roleAgentCmd("claude", "opus", false, "MY_REVIEW_CMD", ""); got != "MY_REVIEW_CMD" {
 		t.Errorf("agent override not honored: %q", got)
 	}
-	if got := roleAgentCmd("sonnet", true, "", "MY_BUILD_CMD"); got != "MY_BUILD_CMD" {
+	if got := roleAgentCmd("claude", "sonnet", true, "", "MY_BUILD_CMD"); got != "MY_BUILD_CMD" {
 		t.Errorf("build override not honored: %q", got)
+	}
+}
+
+// TestRoleAgentCmdCodex: with --agent codex, every role runs `codex exec` (never claude),
+// reads stdin from /dev/null (codex exec blocks on an open stdin), bypasses the sandbox so
+// it can write the work-product / verdict file, and the BUILD prompt forbids git (Flowbee
+// owns the commit). The per-role difference is the task CONTEXT (build prompt vs verdict),
+// not the model — this is the operator's choice to spend Codex quota over the Claude limit.
+func TestRoleAgentCmdCodex(t *testing.T) {
+	build := roleAgentCmd("codex", "sonnet", true, "", "")
+	review := roleAgentCmd("codex", "opus", false, "", "")
+	for _, c := range []string{build, review} {
+		if !strings.HasPrefix(c, "codex exec ") {
+			t.Errorf("codex agent must run `codex exec`, got %q", c)
+		}
+		if strings.Contains(c, "claude") {
+			t.Errorf("codex agent must not invoke claude: %q", c)
+		}
+		if !strings.Contains(c, "< /dev/null") {
+			t.Errorf("codex exec must read stdin from /dev/null (else it blocks): %q", c)
+		}
+		if !strings.Contains(c, "--dangerously-bypass-approvals-and-sandbox") {
+			t.Errorf("codex must bypass approvals+sandbox to write files non-interactively: %q", c)
+		}
+	}
+	if !strings.Contains(build, "Create the file(s)") {
+		t.Errorf("codex build cmd missing the file-writing prompt: %q", build)
+	}
+	if !strings.Contains(build, "Do NOT run git") {
+		t.Errorf("codex build cmd must forbid git (Flowbee owns the commit): %q", build)
+	}
+	if strings.Contains(review, "Create the file(s)") {
+		t.Errorf("codex review cmd must not use the file-writing build prompt: %q", review)
+	}
+	// explicit --agent-cmd / --build-agent-cmd overrides still win over the codex default.
+	if got := roleAgentCmd("codex", "opus", false, "OVERRIDE", ""); got != "OVERRIDE" {
+		t.Errorf("override must win even under --agent codex: %q", got)
 	}
 }
 
@@ -102,7 +139,7 @@ func TestFleetSystemdTemplatesRequiredRepoURL(t *testing.T) {
 	t.Setenv("FLOWBEE_GITHUB_OWNER", "")
 	t.Setenv("FLOWBEE_GITHUB_REPO", "")
 	out := captureStdout(t, func() {
-		printFleetSystemd("http://cp:7070", 3, "claude -p x", "claude -p y")
+		printFleetSystemd("http://cp:7070", 3, "claude", "claude -p x", "claude -p y")
 	})
 	for _, want := range []string{
 		"FLOWBEE_REPO_URL=git@github.com:OWNER/REPO.git", // required-to-start var, placeholder
@@ -121,7 +158,7 @@ func TestFleetSystemdTemplatesRequiredRepoURL(t *testing.T) {
 func TestFleetSystemdEchoesResolvedRepoURL(t *testing.T) {
 	t.Setenv("FLOWBEE_REPO_URL", "git@github.com:samhotchkiss/flowbee.git")
 	out := captureStdout(t, func() {
-		printFleetSystemd("http://cp:7070", 2, "a", "b")
+		printFleetSystemd("http://cp:7070", 2, "claude", "a", "b")
 	})
 	if !strings.Contains(out, "FLOWBEE_REPO_URL=git@github.com:samhotchkiss/flowbee.git") {
 		t.Errorf("must echo the resolved repo url; got:\n%s", out)

@@ -84,6 +84,77 @@ func TestWorktreeDiffCommitPushPromote(t *testing.T) {
 	}
 }
 
+// TestSoftResetToNormalizesSelfCommittingAgent proves the fix for an agentic CLI (codex)
+// that runs `git commit` on its own. The harness owns the commit (§3.5), so a self-
+// committed worktree is CLEAN — HasChanges would read false and the build be wrongly
+// rejected as "no changes", and CommitAndPushEpoch would fail on the empty tree. After
+// SoftResetTo(base) the agent's change is pending again, so the normal collect path
+// (HasChanges → Diff → CommitAndPushEpoch) works exactly as for a non-committing agent.
+func TestSoftResetToNormalizesSelfCommittingAgent(t *testing.T) {
+	m, base := newFixture(t)
+
+	ws := WorktreeBase(t.TempDir(), "job-cx", 1)
+	wt, err := m.AddWorktree(ws, base)
+	if err != nil {
+		t.Fatalf("add worktree: %v", err)
+	}
+	defer wt.Destroy()
+
+	// the "agent" writes a file AND commits it itself (what codex does).
+	mustWrite(t, filepath.Join(ws, "feature.txt"), "built + self-committed by agent\n")
+	if _, err := wt.Run("git", "add", "-A"); err != nil {
+		t.Fatalf("agent add: %v", err)
+	}
+	if _, err := wt.Run("git", "-c", "user.email=a@b.c", "-c", "user.name=agent", "commit", "-m", "agent's own commit"); err != nil {
+		t.Fatalf("agent commit: %v", err)
+	}
+	// the worktree is now CLEAN — the pre-fix failure mode.
+	if changed, _ := wt.HasChanges(); changed {
+		t.Fatal("precondition: a self-committed worktree should be clean")
+	}
+
+	// normalize: undo the agent's commit, keep its change pending.
+	if err := wt.SoftResetTo(base); err != nil {
+		t.Fatalf("soft reset: %v", err)
+	}
+	changed, err := wt.HasChanges()
+	if err != nil || !changed {
+		t.Fatalf("after SoftResetTo HasChanges=%v err=%v want true", changed, err)
+	}
+	diff, err := wt.Diff()
+	if err != nil || !strings.Contains(diff, "feature.txt") || !strings.Contains(diff, "self-committed by agent") {
+		t.Fatalf("diff must capture the agent's change after reset; err=%v diff:\n%s", err, diff)
+	}
+	// the harness's own commit now succeeds (it would have failed on the clean tree).
+	sha, ref, err := wt.CommitAndPushEpoch("job-cx", 1, "harness commit")
+	if err != nil {
+		t.Fatalf("commit+push after reset: %v", err)
+	}
+	if got, ok := m.RefSHA(ref); !ok || got != sha {
+		t.Fatalf("epoch ref sha=%q ok=%v want %s", got, ok, sha)
+	}
+}
+
+// TestSoftResetToIsNoOpForNonCommittingAgent: a non-committing agent (claude) leaves HEAD
+// at base, so SoftResetTo(base) must be a harmless no-op that preserves pending changes.
+func TestSoftResetToIsNoOpForNonCommittingAgent(t *testing.T) {
+	m, base := newFixture(t)
+	ws := WorktreeBase(t.TempDir(), "job-cl", 1)
+	wt, err := m.AddWorktree(ws, base)
+	if err != nil {
+		t.Fatalf("add worktree: %v", err)
+	}
+	defer wt.Destroy()
+	mustWrite(t, filepath.Join(ws, "feature.txt"), "built, not committed\n")
+	if err := wt.SoftResetTo(base); err != nil {
+		t.Fatalf("soft reset (no-op): %v", err)
+	}
+	changed, err := wt.HasChanges()
+	if err != nil || !changed {
+		t.Fatalf("pending change must survive the no-op reset: HasChanges=%v err=%v", changed, err)
+	}
+}
+
 // TestDropRefOrphansEpochRef proves the M11 compensation primitive (§6.5.4, I-12):
 // dropping a dead epoch's ref orphans the zombie's work so it can never be promoted.
 // Dropping a missing ref is a no-op (idempotent compensation).
