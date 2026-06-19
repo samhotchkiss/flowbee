@@ -115,14 +115,14 @@ var ActiveLeaseStates = map[State]bool{
 // HasActiveLease reports whether s is a state that holds an active lease.
 func HasActiveLease(s State) bool { return ActiveLeaseStates[s] }
 
-// livenessEvaluableStates is ActiveLeaseStates MINUS merge_handoff, derived so it can
-// never drift from the source of truth. merge_handoff holds the one-active-lease
-// uniqueness slot (so it stays in ActiveLeaseStates + the migration index) but has NO
-// bound worker — it is parked awaiting a HUMAN merge.
+// livenessEvaluableStates is ActiveLeaseStates MINUS the two worker-LESS states
+// (merge_handoff, merging), derived so it can never drift from the source of truth.
+// Both hold the one-active-lease uniqueness slot (so they stay in ActiveLeaseStates +
+// the migration index) but neither has a bound worker to be "live."
 var livenessEvaluableStates = func() map[State]bool {
 	m := make(map[State]bool, len(ActiveLeaseStates))
 	for s := range ActiveLeaseStates {
-		if s != StateMergeHandoff {
+		if s != StateMergeHandoff && s != StateMerging {
 			m[s] = true
 		}
 	}
@@ -131,13 +131,22 @@ var livenessEvaluableStates = func() map[State]bool {
 
 // LivenessEvaluable reports whether the liveness ladder (the two-rung stall kill +
 // heartbeat-staleness reap) should evaluate a job in state s. It is HasActiveLease
-// EXCEPT merge_handoff: at the human merge gate a "stall" is the NORMAL, expected
-// condition (a human may take hours/days to merge), so evaluating it made the ladder
-// read the handoff's stale build-phase heartbeat as a dead worker and revoke/escalate
-// it — looping the build forever (the live #175/#177 handoff regression). A forgotten
-// handoff is surfaced by the board and resolved by reconcile (PR merged -> done, PR
-// closed -> pr_closed), never by the liveness ladder. Used by BOTH liveness entry
-// points (the Rung-2 poller sweep AND the lease/phase-deadline timer).
+// EXCEPT the two states with NO bound worker, which the reconcile-side supersedable()
+// excludes for the SAME reason — they must SETTLE, not be yanked back to build:
+//
+//   - merge_handoff: parked at the HUMAN merge gate, where a "stall" is the normal,
+//     expected condition (a human may take hours/days). Evaluating it made the ladder
+//     read the handoff's stale build-phase heartbeat as a dead worker and
+//     revoke/escalate it — looping the build forever (the live #175/#177 regression).
+//     Recovered by reconcile (PR merged -> done, PR closed -> pr_closed).
+//   - merging: a merge in flight, dispatched to the project-OUT outbox (NOT a worker),
+//     so it too has no heartbeat. Reaping it would yank the job back to build
+//     MID-DISPATCH while the merge outbox row is still pending — a double-action /
+//     inconsistency. Recovered by the outbox (retry / conflict -> resolver /
+//     dead-letter) + reconcile, never the liveness ladder.
+//
+// Used by BOTH liveness entry points (the Rung-2 poller sweep AND the
+// lease/phase-deadline timer).
 func LivenessEvaluable(s State) bool { return livenessEvaluableStates[s] }
 
 // CostExceeded is the pure §6.7 / I-15 ceiling predicate: a job is over budget

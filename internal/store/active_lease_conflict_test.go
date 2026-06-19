@@ -121,3 +121,48 @@ func TestFireLeaseDeadlineSkipsMergeHandoff(t *testing.T) {
 		t.Fatalf("merge_handoff job was disturbed by the timer: state=%s (want merge_handoff)", j.State)
 	}
 }
+
+// TestLivenessExcludesMerging: a `merging` job (a merge dispatched to the project-OUT
+// outbox — no bound worker) must be excluded from BOTH liveness entry points, exactly
+// like merge_handoff and exactly as the reconcile-side supersedable() already excludes
+// it. Reaping a merge in flight would yank the job back to build mid-dispatch while the
+// merge outbox row is still pending — a double-action. Recovery is the outbox +
+// reconcile, never the liveness ladder.
+func TestLivenessExcludesMerging(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "m", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: time.Unix(1000, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET state='merging', lease_epoch=2, last_heartbeat_at='2000-01-01T00:00:00Z',
+		    lease_id=NULL, bound_identity=NULL WHERE id='m'`); err != nil {
+		t.Fatal(err)
+	}
+
+	// (1) poller scope
+	ids, err := st.ActiveLeaseJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if id == "m" {
+			t.Fatal("a merging job must NOT be in ActiveLeaseJobs (the mid-dispatch yank)")
+		}
+	}
+	// (2) timer scope — a leftover deadline timer must not reap it
+	cfg := store.LivenessConfig{HeartbeatReapAfter: time.Second, AbsoluteCap: time.Second}
+	res, err := st.FireLeaseDeadline(ctx, store.DueTimer{ID: "tm", JobID: "m", ExpectedEpoch: 2, Kind: store.TimerPhaseDeadline}, time.Unix(100000, 0), cfg, false)
+	if err != nil {
+		t.Fatalf("FireLeaseDeadline: %v", err)
+	}
+	if res.Killed {
+		t.Fatal("a merging job must NOT be killed by a leftover deadline timer")
+	}
+	if j, _ := st.GetJob(ctx, "m"); j.State != job.StateMerging {
+		t.Fatalf("merging job disturbed: state=%s want merging", j.State)
+	}
+}
