@@ -179,7 +179,12 @@ building → review_pending → code_review → mergeable → merging → done**
   `GET /v1/merge-handoff` lists approved PRs awaiting a human merge (with `allow_self_merge`
   off, this is your whole merge queue); `GET /v1/needs-human` lists escalated jobs, each
   tagged with the trigger (attempts/bounces/reviewer_rejections/cost/stall/ci_stalled/project_out); `GET /v1/needs-input` lists design
-  forks awaiting an answer. Act with `flowbee requeue <job>` (re-arm) or the matching POST.
+  forks awaiting an answer. Inspect a job's full story first with **`flowbee card <job-id>`**
+  (its verdicts, lessons, and timeline, folded from the ledger), then act:
+  **`flowbee requeue <job-id>`** re-arms it for a fresh attempt, or **`flowbee cancel
+  <job-id>`** terminally dismisses a dead end so it leaves the triage view (both take
+  `--force` for an actively-leased job; the matching POST endpoints are
+  `/v1/jobs/{job}/requeue` and `/v1/jobs/{job}/cancel`).
 - **Metrics:** `GET /metrics` on the health listener (`:7001`, same unauthenticated port as
   `/healthz`) emits Prometheus text format — point a scrape at it. Series: `flowbee_jobs{repo,state}`
   (job counts; a missing state means zero — alert on `flowbee_jobs{state="needs_human"} > 0`),
@@ -332,12 +337,12 @@ Flowbee is built so nothing wedges permanently — but here is the operator's to
 | Symptom | What's happening | Action |
 |---|---|---|
 | `stranded: true` in fleet-health | jobs waiting, no live worker | start/restart `flowbee fleet` on a box |
-| A job sits in `needs_human` | a transient failure escalated, or a no-eligible-worker dead-end | fix the cause, then `flowbee requeue <job-id>` to re-arm it with a fresh budget |
+| A job sits in `needs_human` | a transient failure escalated, or a no-eligible-worker dead-end | `flowbee card <job-id>` to see its full story, then fix the cause and `flowbee requeue <job-id>` to re-arm — or `flowbee cancel <job-id>` to dismiss it if it's a dead end |
 | A job keeps failing CI | the rebuild bounced `max_bounces` times (total, across all reviewers) | it auto-escalates to `needs_human`; inspect the PR's CI logs, fix, requeue |
 | A job parks with trigger `reviewer_rejections` | ONE review node requested changes on the same task 6 times — a genuine standoff, not normal iteration | read that reviewer's findings on the PR; the disagreement needs a human call, then `flowbee requeue <job-id>` |
 | A job parks with trigger `ci_stalled` | its PR's CI never went green for the whole stall window — CI is wedged (runner down, no workflow triggered, or perpetually pending), not merely slow | fix CI (restart the runner / check the workflow triggers / re-run the run), then `flowbee requeue <job-id>` |
 | A job parks with trigger `project_out` | a GitHub write for it (open-PR / merge / create-issue) failed permanently — the branch/PR was deleted, a 422/404 — so the action was dead-lettered (the rest of the outbox keeps flowing) | fix the GitHub state (the branch/PR), then `flowbee requeue <job-id>` |
-| "which binary is running?" | a stale deploy | `flowbee version` prints the embedded git SHA |
+| "which binary is running?" | a stale deploy | `flowbee version` prints the embedded git SHA (`flowbee version --json` for tooling: `{"version":"…"}`); compare it to `/healthz`'s `version` |
 | Suspect a stuck `ready` job | a projection drifted from the ledger | the forward-progress watchdog resyncs it within 60s; it can't persist |
 
 The **forward-progress watchdog** (runs every 60s) is the safety net: it re-folds each
