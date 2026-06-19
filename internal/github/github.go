@@ -938,63 +938,80 @@ func (c *RealClient) PutFile(ctx context.Context, path string, content []byte, m
 // build a tree (inline content) on top of its base tree, create a commit, fast-forward the
 // ref. Reconcile-first like PutFile (no force-push). Idempotent: if the new tree equals the
 // tip's tree (all files unchanged), it makes no commit — a re-drain after a crash is a no-op.
+//
+// The whole read-build-fast-forward is RETRIED on a non-fast-forward (a concurrent write moved
+// the branch between the ref read and the ref update): a fast-forward update is fast-forward
+// ONLY, so the loser must re-read the new tip and rebuild on it. Without the retry a concurrent
+// merge/archive landing in the window 422'd this PERMANENTLY (a 4xx) and the archive was
+// abandoned — the regression vs PutFile this replaced.
 func (c *RealClient) PutFiles(ctx context.Context, files map[string][]byte, message, branch string) error {
 	if len(files) == 0 {
 		return nil
 	}
-	// 1) the branch tip commit.
-	var ref struct {
-		Object struct {
-			SHA string `json:"sha"`
-		} `json:"object"`
-	}
-	if err := c.rest(ctx, http.MethodGet, "/git/ref/heads/"+url.PathEscape(branch), nil, &ref); err != nil {
-		return fmt.Errorf("get ref %s: %w", branch, err)
-	}
-	parent := ref.Object.SHA
-	// 2) its base tree.
-	var commit struct {
-		Tree struct {
-			SHA string `json:"sha"`
-		} `json:"tree"`
-	}
-	if err := c.rest(ctx, http.MethodGet, "/git/commits/"+parent, nil, &commit); err != nil {
-		return fmt.Errorf("get commit %s: %w", parent, err)
-	}
-	// 3) a new tree stacking the files on the base tree (inline content; GitHub blobs them).
 	type treeEntry struct {
 		Path    string `json:"path"`
 		Mode    string `json:"mode"`
 		Type    string `json:"type"`
 		Content string `json:"content"`
 	}
-	entries := make([]treeEntry, 0, len(files))
+	entries := make([]treeEntry, 0, len(files)) // content is fixed; only the base tip moves
 	for path, content := range files {
 		entries = append(entries, treeEntry{Path: path, Mode: "100644", Type: "blob", Content: string(content)})
 	}
-	var tree struct {
-		SHA string `json:"sha"`
-	}
-	if err := c.rest(ctx, http.MethodPost, "/git/trees",
-		map[string]any{"base_tree": commit.Tree.SHA, "tree": entries}, &tree); err != nil {
-		return fmt.Errorf("create tree: %w", err)
-	}
-	if tree.SHA == "" || tree.SHA == commit.Tree.SHA {
-		return nil // unchanged tree: idempotent no-op (the content already matches the tip)
-	}
-	// 4) the commit + 5) fast-forward the ref.
-	var newCommit struct {
-		SHA string `json:"sha"`
-	}
-	if err := c.rest(ctx, http.MethodPost, "/git/commits",
-		map[string]any{"message": message, "tree": tree.SHA, "parents": []string{parent}}, &newCommit); err != nil {
-		return fmt.Errorf("create commit: %w", err)
-	}
-	if err := c.rest(ctx, http.MethodPatch, "/git/refs/heads/"+url.PathEscape(branch),
-		map[string]any{"sha": newCommit.SHA}, nil); err != nil {
+
+	const maxAttempts = 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// 1) the branch tip commit + 2) its base tree.
+		var ref struct {
+			Object struct {
+				SHA string `json:"sha"`
+			} `json:"object"`
+		}
+		if err := c.rest(ctx, http.MethodGet, "/git/ref/heads/"+url.PathEscape(branch), nil, &ref); err != nil {
+			return fmt.Errorf("get ref %s: %w", branch, err)
+		}
+		parent := ref.Object.SHA
+		var commit struct {
+			Tree struct {
+				SHA string `json:"sha"`
+			} `json:"tree"`
+		}
+		if err := c.rest(ctx, http.MethodGet, "/git/commits/"+parent, nil, &commit); err != nil {
+			return fmt.Errorf("get commit %s: %w", parent, err)
+		}
+		// 3) a new tree stacking the files on the CURRENT base tree (inline content).
+		var tree struct {
+			SHA string `json:"sha"`
+		}
+		if err := c.rest(ctx, http.MethodPost, "/git/trees",
+			map[string]any{"base_tree": commit.Tree.SHA, "tree": entries}, &tree); err != nil {
+			return fmt.Errorf("create tree: %w", err)
+		}
+		if tree.SHA == "" || tree.SHA == commit.Tree.SHA {
+			return nil // unchanged tree: idempotent no-op (the content already matches the tip)
+		}
+		// 4) the commit + 5) fast-forward the ref.
+		var newCommit struct {
+			SHA string `json:"sha"`
+		}
+		if err := c.rest(ctx, http.MethodPost, "/git/commits",
+			map[string]any{"message": message, "tree": tree.SHA, "parents": []string{parent}}, &newCommit); err != nil {
+			return fmt.Errorf("create commit: %w", err)
+		}
+		err := c.rest(ctx, http.MethodPatch, "/git/refs/heads/"+url.PathEscape(branch),
+			map[string]any{"sha": newCommit.SHA}, nil)
+		if err == nil {
+			return nil
+		}
+		// a non-fast-forward (the tip moved under us, 422) is retryable: re-read + rebuild.
+		// GitHub also reports the lost FF race as 422 Unprocessable. Any other error is real.
+		var ghErr *ErrGitHub
+		if attempt < maxAttempts-1 && errors.As(err, &ghErr) && ghErr.StatusCode == http.StatusUnprocessableEntity {
+			continue
+		}
 		return fmt.Errorf("update ref %s: %w", branch, err)
 	}
-	return nil
+	return fmt.Errorf("update ref %s: exhausted %d fast-forward attempts (branch kept moving)", branch, maxAttempts)
 }
 
 // prNodeQuery resolves a PR's GraphQL node ID (+ current draft state) from its
