@@ -70,6 +70,17 @@ func (w WriteSet) Overlaps(other WriteSet) bool {
 // builds whose write-sets overlap" rule, applied as a pure pre-filter before the
 // priority/aging ranking.
 //
+// KNOWN EDGE (no reservation-side anti-starvation): a filtered candidate is not ranked
+// that round, so aging cannot rescue it while it stays filtered. An explicitly WIDE
+// candidate (scope:wide refactor) overlaps every reservation, so a SUSTAINED stream of
+// overlapping in-flight builds could withhold it indefinitely. In practice in-flight
+// builds COMPLETE and their reservations clear (opening a window), and reservations
+// exist only for builds that DECLARED a write-set (uncommon), so indefinite starvation
+// needs a pathological continuous-overlap workload; the conflict_resolver is the
+// correctness backstop if an overlapping pair ever does co-dispatch. A horizon-based
+// admission (admit a candidate aged past a threshold despite reservations) would close
+// it fully but needs a clock here and trades conflict-avoidance for liveness.
+//
 // The write-set for each candidate is supplied by `writeSetOf` (folded from the
 // job's declared blast-radius). A candidate with NO declared write-set (an empty,
 // non-wide entry, or no entry) is NOT excluded by a SPECIFIC-path reservation — its

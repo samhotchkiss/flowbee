@@ -41,6 +41,12 @@ type Candidate struct {
 // EffectivePriority is the §6.6 aged priority: base priority plus one point per
 // AgingRate of wait since EnqueuedAt. Higher wins. Pure in (now, agingRate).
 func EffectivePriority(c Candidate, now time.Time, agingRate time.Duration) int {
+	if agingRate <= 0 {
+		// no aging configured: priority is the base only. Guards a divide-by-zero panic
+		// in the lease loop — PickWith is exported with a caller-supplied rate, so a 0
+		// (mis)configuration must degrade to un-aged ranking, not crash.
+		return c.Priority
+	}
 	wait := now.Sub(c.EnqueuedAt)
 	if wait < 0 {
 		wait = 0
