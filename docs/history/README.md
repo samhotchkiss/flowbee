@@ -101,6 +101,8 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVGB3PRY6MFGTK2CJWMXWR85`](./01KVGB3PRY6MFGTK2CJWMXWR85.md) | 01KVGB3PRY6MFGTK2CJWMXWR85 | done | #190 | — | 2026-06-19T16:25:04Z |
 | [`01KVGB3PRY6MFGTK2CJWMXWR85-build`](./01KVGB3PRY6MFGTK2CJWMXWR85-build.md) | # Spec: Log per-repo merge/archive policy at startup | done | — | #191 | 2026-06-19T16:34:29Z |
 | [`01KVGJK7APRQRQ25RH9HGB7EYQ`](./01KVGJK7APRQRQ25RH9HGB7EYQ.md) | Document the fleet `--agent codex\|claude` flag in docs/operating.md | done | — | #193 | 2026-06-19T18:41:50Z |
+| [`01KVGM7ZNFBX4T4544N7MJXF5X`](./01KVGM7ZNFBX4T4544N7MJXF5X.md) | 01KVGM7ZNFBX4T4544N7MJXF5X | done | #194 | — | 2026-06-19T19:04:05Z |
+| [`01KVGM7ZNFBX4T4544N7MJXF5X-build`](./01KVGM7ZNFBX4T4544N7MJXF5X-build.md) | # Spec: Document Per-Node Model Labels in History Cards | done | — | #195 | 2026-06-19T19:12:35Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
