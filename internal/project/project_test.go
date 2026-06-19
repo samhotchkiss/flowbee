@@ -1,8 +1,11 @@
 package project
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -202,6 +205,29 @@ func TestPoisonOutboxRowDeadLetteredNoHeadOfLineWedge(t *testing.T) {
 	// the poison row left NO audit entry (the action never took effect on GitHub).
 	if audit, _ := st.AuditLog(ctx, "poison"); len(audit) != 0 {
 		t.Fatalf("dead-lettered poison must not write an audit entry: %+v", audit)
+	}
+}
+
+// TestDeadLetterLogged: a dead-lettered GitHub write is recorded in the serve log (the
+// durable complement to the flowbee_outbox_abandoned metric + the SSE feed), naming the
+// action + the job, so silently-dropped work is greppable.
+func TestDeadLetterLogged(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+	var buf bytes.Buffer
+	sender.SetLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	seedReviewPending(t, st, "dl")
+	if _, err := st.EnqueuePROpen(ctx, "dl", "sha-dl", "main"); err != nil {
+		t.Fatal(err)
+	}
+	fake.FailNextWriteWith(&gh.ErrGitHub{StatusCode: 422, Method: "POST", Path: "/pulls", Body: "Reference does not exist"})
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "dead-lettered") || !strings.Contains(out, "job=dl") || !strings.Contains(out, "pulls.create") {
+		t.Errorf("dead-letter must be logged with action + job; got %q", out)
 	}
 }
 

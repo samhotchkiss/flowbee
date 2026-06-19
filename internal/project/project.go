@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -98,6 +99,12 @@ type Sender struct {
 	gh    gh.Writer
 	clock Clock
 	pub   Publisher
+	// logger records dead-lettered (abandoned) GitHub writes durably in the serve log —
+	// the durable complement to the flowbee_outbox_abandoned metric + the ephemeral SSE
+	// feed, and the ONLY surfacing for a CRITICAL action abandoned against an already-
+	// terminal job (a signed-off spec whose issue-create fails, which the needs_human
+	// escalation drops). Nil => no log (legacy single-repo callers).
+	logger *slog.Logger
 
 	// repo is the F9 repo-scope handle this sender drains for (a repos.id). Empty is
 	// the legacy single-repo scope (drains all rows). One control plane runs one
@@ -177,6 +184,10 @@ func New(st *store.Store, w gh.Writer, clk Clock, pub Publisher) *Sender {
 func NewForRepo(repo, baseBranch string, st *store.Store, w gh.Writer, clk Clock, pub Publisher) *Sender {
 	return &Sender{store: st, gh: w, clock: clk, pub: pub, repo: repo, baseBranch: baseBranch}
 }
+
+// SetLogger wires a logger so dead-lettered GitHub writes are recorded in the serve log
+// (the durable complement to the metric/SSE). Optional; nil leaves dead-letters unlogged.
+func (s *Sender) SetLogger(l *slog.Logger) { s.logger = l }
 
 // Repo returns the repo-scope handle this sender is bound to ("" = legacy).
 func (s *Sender) Repo() string { return s.repo }
@@ -293,6 +304,13 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 				if derr := s.store.DeadLetterOutbox(ctx, row.ID, row.JobID,
 					string(job.EscalationProjectOut), err.Error(), criticalAction(row.Action), s.clock.Now()); derr != nil {
 					return sent, derr
+				}
+				if s.logger != nil {
+					// durable record of dropped work — a critical action escalates to needs_human
+					// unless the job is already terminal (then this WARN is the only surfacing).
+					s.logger.Warn("dead-lettered GitHub write",
+						"action", row.Action, "job", row.JobID, "repo", s.repo,
+						"critical", criticalAction(row.Action), "permanent", permanent, "err", err.Error())
 				}
 				if s.pub != nil {
 					s.pub.PublishReconcile(row.JobID, "project_out:dead_letter")

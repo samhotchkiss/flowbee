@@ -22,6 +22,7 @@ package multirepo
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -85,6 +86,7 @@ type managerConfig struct {
 	history        HistoryFactory
 	allowOwnSource map[string]bool
 	archiveHistory map[string]bool
+	logger         *slog.Logger
 }
 
 // WithHistory wires the F11 history writer per repo so each repo's project-OUT
@@ -111,6 +113,12 @@ func WithArchiveHistory(repos map[string]bool) Option {
 	return func(c *managerConfig) { c.archiveHistory = repos }
 }
 
+// WithLogger wires a logger into each repo's project-OUT sender so dead-lettered GitHub
+// writes are recorded durably in the serve log (alongside the flowbee_outbox_abandoned metric).
+func WithLogger(l *slog.Logger) Option {
+	return func(c *managerConfig) { c.logger = l }
+}
+
 // New builds a Manager over every ACTIVE registered repo, constructing each repo's
 // scoped reconcile-IN + project-OUT loop via the factory. Parked (active=0) repos
 // are skipped — their loops do not run and their jobs are not dispatched.
@@ -135,6 +143,7 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 		// relax flowbee_source for a non-control-plane repo (mirrors store.AllowOwnSourceRepos).
 		sender.SetAllowOwnSource(cfg.allowOwnSource[r.ID])
 		sender.SetArchiveHistory(cfg.archiveHistory[r.ID])
+		sender.SetLogger(cfg.logger)
 		rec := reconcile.NewForRepo(r.ID, st, client, recClk, asReconcilePub(pub))
 		// F11 (build-list §F): wire the per-repo history writer so the merged->done
 		// post-merge archive commit lands on the repo's integration branch. The same

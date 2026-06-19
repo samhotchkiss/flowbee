@@ -802,6 +802,7 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 	var historyOpt []multirepo.Option
 	historyOpt = append(historyOpt, multirepo.WithAllowOwnSource(allowOwn))
 	historyOpt = append(historyOpt, multirepo.WithArchiveHistory(archiveHist))
+	historyOpt = append(historyOpt, multirepo.WithLogger(logger)) // durable dead-letter records
 	if os.Getenv("FLOWBEE_MIRROR_PATH") != "" {
 		// F9: each repo's history archive + base_sha resolution come off ITS OWN bare
 		// mirror (provisioned lazily), not one shared mirror — so a non-default repo
