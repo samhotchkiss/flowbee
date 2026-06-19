@@ -787,6 +787,16 @@ func (m *Mirror) CommitHistory(branch, message string, files []HistoryFile) (sha
 	}
 	head = strings.TrimSpace(head)
 	// advance the real branch ref to the new commit (Flowbee's dedicated commit).
+	//
+	// KNOWN LIMITATION (build-list §F, compounding memory — NOT yet production-durable):
+	// this advances ONLY the LOCAL mirror ref; it does NOT push to origin, and the next
+	// force-fetch of the branch (rebase-before-review / base refresh) overwrites it — so
+	// the docs/history archive never reaches GitHub and does not survive locally. The
+	// read side (the fleet grepping docs/history for prior dead ends) is also not wired
+	// yet. Making this durable should write the card+TOC via the GitHub Contents API
+	// directly onto the integration branch (atomic per file, no fast-forward race with
+	// concurrent merges) rather than pushing local main. Tracked as a feature gap; the
+	// rest of the pipeline (intake → review → merge) does not depend on it.
 	if _, err := run("", "git", "--git-dir", m.Path, "update-ref", ref, head); err != nil {
 		return "", false, fmt.Errorf("history advance %s: %w", ref, err)
 	}

@@ -22,6 +22,13 @@ type CostParams struct {
 	TokensInDelta  int64
 	TokensOutDelta int64
 	MicroUSDDelta  int64
+	// KNOWN GAP (not currently reachable): cost reports carry no idempotency key, so a
+	// RE-DELIVERED under-ceiling report would double-count the meter (results/specs dedupe
+	// via result_idempotency; cost does not). It is not reachable today — the worker sends
+	// cost fire-and-forget, once per heartbeat, with NO app-level retry — so only a
+	// transport-level redelivery could trigger it, and the $ ceiling is off by default.
+	// A correct fix needs a per-REPORT key from the worker (a server-derived per-epoch key
+	// is WRONG: a job legitimately sends multiple incremental reports within one epoch).
 }
 
 // CostResult reports what a RecordCost call did (for the API / tests).
