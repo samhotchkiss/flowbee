@@ -114,7 +114,7 @@ func TestCostEscalationFoldsOverBudgetAndReason(t *testing.T) {
 
 	// requeue re-arms the job (active again) -> live clears over_budget + reason; the
 	// fold must clear them too (this was the second half of the latent divergence).
-	if _, err := st.RequeueJob(ctx, "j", time.Unix(1002, 0)); err != nil {
+	if _, err := st.RequeueJob(ctx, "j", false, time.Unix(1002, 0)); err != nil {
 		t.Fatalf("requeue: %v", err)
 	}
 	if j, _ := st.GetJob(ctx, "j"); j.OverBudget || j.EscalationReason != "" {

@@ -41,7 +41,7 @@ func TestRequeueZeroesCountersInFold(t *testing.T) {
 		t.Fatalf("setup: want attempts=2, got %d", j.Attempts)
 	}
 
-	if _, err := st.RequeueJob(ctx, "p", now); err != nil {
+	if _, err := st.RequeueJob(ctx, "p", false, now); err != nil {
 		t.Fatalf("requeue: %v", err)
 	}
 	proj, _ := st.GetJob(ctx, "p")

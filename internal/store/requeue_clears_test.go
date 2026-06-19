@@ -27,7 +27,7 @@ func TestRequeueClearsOverBudgetAndEscalation(t *testing.T) {
 		`UPDATE jobs SET state='needs_human', over_budget=1, escalation_reason='cost' WHERE id='b'`); err != nil {
 		t.Fatal(err)
 	}
-	final, err := st.RequeueJob(ctx, "b", now.Add(time.Second))
+	final, err := st.RequeueJob(ctx, "b", false, now.Add(time.Second))
 	if err != nil {
 		t.Fatalf("requeue: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestRequeueSpecJobReArmsToSpecAuthoring(t *testing.T) {
 	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='needs_human' WHERE id='s'`); err != nil {
 		t.Fatal(err)
 	}
-	final, err := st.RequeueJob(ctx, "s", now.Add(time.Second))
+	final, err := st.RequeueJob(ctx, "s", false, now.Add(time.Second))
 	if err != nil {
 		t.Fatalf("requeue: %v", err)
 	}
