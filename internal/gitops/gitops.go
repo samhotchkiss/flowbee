@@ -111,7 +111,14 @@ func (m *Mirror) HeadSHA(ref string) (string, error) {
 // REALLY land on main, never a worker's say-so. Both commits must be present in the
 // mirror (FetchBranch the head ref first).
 func (m *Mirror) DiffBetween(base, head string) (string, error) {
-	out, err := run("", "git", "--git-dir", m.Path, "diff", base+".."+head)
+	// -c core.quotepath=false: emit literal UTF-8 pathnames, NOT git's default
+	// C-quoted form ("a/caf\303\251.pem"). The content-gate denylist classifies on
+	// path prefixes/suffixes; a C-quoted path (leading '"', octal-escaped bytes)
+	// defeats every classifier, so a filename with one non-ASCII byte would smuggle
+	// a workflow/secret/Dockerfile past the gate. The parser unquotes defensively
+	// too (a verdict-time diff isn't always from this command), but our own
+	// authoritative diff must not hand it a quoted path in the first place.
+	out, err := run("", "git", "-c", "core.quotepath=false", "--git-dir", m.Path, "diff", base+".."+head)
 	if err != nil {
 		return "", fmt.Errorf("diff %s..%s: %w", base, head, err)
 	}

@@ -551,9 +551,11 @@ func TouchedPaths(diff string) []string {
 				continue
 			}
 		case strings.HasPrefix(line, "rename to "):
-			add(strings.TrimSpace(line[len("rename to "):]))
+			// rename headers carry a bare path (no a/ b/), but git C-quotes them too,
+			// so unquote before classifying — else a renamed-in non-ASCII path bypasses.
+			add(unquoteGitPath(strings.TrimSpace(line[len("rename to "):])))
 		case strings.HasPrefix(line, "rename from "):
-			add(strings.TrimSpace(line[len("rename from "):]))
+			add(unquoteGitPath(strings.TrimSpace(line[len("rename from "):])))
 		}
 	}
 	// the +++/--- lines are the authority for deletes: re-scan for delete targets
@@ -592,12 +594,77 @@ func stripDiffPathPrefix(p string) string {
 		p = p[:i]
 	}
 	p = strings.TrimSpace(p)
+	// Decode git's C-quoting BEFORE any prefix logic. git wraps a path holding a
+	// byte >= 0x80 (the default core.quotepath=true) in double quotes with octal
+	// escapes; the leading '"' would defeat the a/ b/ strip and every denylist
+	// classifier, and normalizePath's backslash rewrite would further mangle the
+	// octal escapes. Unquoting restores the literal path bytes.
+	p = unquoteGitPath(p)
 	if p == "/dev/null" {
 		return p
 	}
 	p = strings.TrimPrefix(p, "a/")
 	p = strings.TrimPrefix(p, "b/")
 	return p
+}
+
+// unquoteGitPath decodes a git C-quoted pathname. git quotes any path containing
+// a byte >= 0x80 (with core.quotepath on, the default) or a control/special char:
+// it wraps the path in double quotes and backslash-escapes with \a \b \t \n \v \f
+// \r \" \\ plus octal \NNN for raw bytes. If p is not so quoted it is returned
+// unchanged. This is a security boundary: a non-ASCII byte in a filename was a
+// total content-gate bypass (a C-quoted ".github/workflows/é.yml" matched no
+// classifier and self-merged to main), so the parser must see the true bytes.
+func unquoteGitPath(p string) string {
+	if len(p) < 2 || p[0] != '"' || p[len(p)-1] != '"' {
+		return p
+	}
+	body := p[1 : len(p)-1]
+	var b strings.Builder
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		i++
+		if i >= len(body) {
+			b.WriteByte('\\')
+			break
+		}
+		switch e := body[i]; e {
+		case 'a':
+			b.WriteByte('\a')
+		case 'b':
+			b.WriteByte('\b')
+		case 't':
+			b.WriteByte('\t')
+		case 'n':
+			b.WriteByte('\n')
+		case 'v':
+			b.WriteByte('\v')
+		case 'f':
+			b.WriteByte('\f')
+		case 'r':
+			b.WriteByte('\r')
+		case '"':
+			b.WriteByte('"')
+		case '\\':
+			b.WriteByte('\\')
+		default:
+			if e >= '0' && e <= '7' { // octal \NNN, 1-3 digits
+				val := int(e - '0')
+				for k := 0; k < 2 && i+1 < len(body) && body[i+1] >= '0' && body[i+1] <= '7'; k++ {
+					i++
+					val = val*8 + int(body[i]-'0')
+				}
+				b.WriteByte(byte(val))
+			} else {
+				b.WriteByte(e) // unknown escape: keep the char literally
+			}
+		}
+	}
+	return b.String()
 }
 
 // addedLines returns the content of '+' lines (added/modified), excluding the
