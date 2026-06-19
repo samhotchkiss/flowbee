@@ -140,8 +140,8 @@ func (s *Store) EvaluateLiveness(ctx context.Context, jobID string, now time.Tim
 		if err != nil {
 			return err
 		}
-		if !job.HasActiveLease(j.State) {
-			return nil // nothing to evaluate (not an active lease)
+		if !job.LivenessEvaluable(j.State) {
+			return nil // not a worker-leased state (e.g. merge_handoff awaiting a human merge)
 		}
 		// read the liveness sub-state on the lease.
 		var health, rung1, rung2 string
@@ -346,8 +346,11 @@ func (s *Store) FireLeaseDeadline(ctx context.Context, t DueTimer, now time.Time
 	if err != nil {
 		return LivenessResult{}, err
 	}
-	if epoch != t.ExpectedEpoch || !job.HasActiveLease(job.State(state)) {
-		_ = s.markTimerFired(ctx, t.ID) // stale: the job was re-claimed / progressed
+	if epoch != t.ExpectedEpoch || !job.LivenessEvaluable(job.State(state)) {
+		// stale (re-claimed / progressed) OR a non-worker-leased state like merge_handoff
+		// (a deadline timer left over from the build phase must NOT reap a handoff that is
+		// now correctly parked awaiting a human merge — the #175/#177 loop).
+		_ = s.markTimerFired(ctx, t.ID)
 		return LivenessResult{JobID: t.JobID}, nil
 	}
 	res, err := s.EvaluateLiveness(ctx, t.JobID, now, cfg, breakerTripped)

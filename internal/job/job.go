@@ -115,6 +115,31 @@ var ActiveLeaseStates = map[State]bool{
 // HasActiveLease reports whether s is a state that holds an active lease.
 func HasActiveLease(s State) bool { return ActiveLeaseStates[s] }
 
+// livenessEvaluableStates is ActiveLeaseStates MINUS merge_handoff, derived so it can
+// never drift from the source of truth. merge_handoff holds the one-active-lease
+// uniqueness slot (so it stays in ActiveLeaseStates + the migration index) but has NO
+// bound worker — it is parked awaiting a HUMAN merge.
+var livenessEvaluableStates = func() map[State]bool {
+	m := make(map[State]bool, len(ActiveLeaseStates))
+	for s := range ActiveLeaseStates {
+		if s != StateMergeHandoff {
+			m[s] = true
+		}
+	}
+	return m
+}()
+
+// LivenessEvaluable reports whether the liveness ladder (the two-rung stall kill +
+// heartbeat-staleness reap) should evaluate a job in state s. It is HasActiveLease
+// EXCEPT merge_handoff: at the human merge gate a "stall" is the NORMAL, expected
+// condition (a human may take hours/days to merge), so evaluating it made the ladder
+// read the handoff's stale build-phase heartbeat as a dead worker and revoke/escalate
+// it — looping the build forever (the live #175/#177 handoff regression). A forgotten
+// handoff is surfaced by the board and resolved by reconcile (PR merged -> done, PR
+// closed -> pr_closed), never by the liveness ladder. Used by BOTH liveness entry
+// points (the Rung-2 poller sweep AND the lease/phase-deadline timer).
+func LivenessEvaluable(s State) bool { return livenessEvaluableStates[s] }
+
 // CostExceeded is the pure §6.7 / I-15 ceiling predicate: a job is over budget
 // iff it has a $ ceiling and its accumulated micro-USD meter reached it. With no
 // ceiling (nil) the meter only accumulates (for the rollup) and never escalates.

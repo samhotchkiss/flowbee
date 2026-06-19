@@ -81,3 +81,43 @@ func TestActiveLeaseJobsExcludesMergeHandoff(t *testing.T) {
 		}
 	}
 }
+
+// TestFireLeaseDeadlineSkipsMergeHandoff covers the TIMER path of the handoff loop
+// (the one the first fix missed): a lease/phase-deadline timer left over from the build
+// phase fires AFTER the job reached merge_handoff. The timer guard must skip it — a
+// merge_handoff job is parked for a human, not a dead worker — or the timer revokes the
+// handoff back to ready and the build loops forever (live #175/#177). Uses an aggressive
+// reap config to prove the guard short-circuits BEFORE any staleness evaluation.
+func TestFireLeaseDeadlineSkipsMergeHandoff(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(100000, 0)
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "h", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: time.Unix(1000, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// merge_handoff at epoch 3, with a stale build-phase heartbeat — exactly the input
+	// that looped the live handoffs.
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET state='merge_handoff', lease_epoch=3,
+		    last_heartbeat_at='2000-01-01T00:00:00Z', lease_id=NULL, bound_identity=NULL WHERE id='h'`); err != nil {
+		t.Fatal(err)
+	}
+
+	// a leftover deadline timer for the SAME epoch (so the epoch guard passes and we
+	// exercise the state guard). Aggressive reap/cap that WOULD kill a worker-leased job.
+	cfg := store.LivenessConfig{HeartbeatReapAfter: time.Second, AbsoluteCap: time.Second}
+	res, err := st.FireLeaseDeadline(ctx, store.DueTimer{ID: "t1", JobID: "h", ExpectedEpoch: 3, Kind: store.TimerPhaseDeadline}, now, cfg, false)
+	if err != nil {
+		t.Fatalf("FireLeaseDeadline: %v", err)
+	}
+	if res.Killed {
+		t.Fatal("a merge_handoff job must NOT be killed by a leftover deadline timer (the handoff loop)")
+	}
+	j, _ := st.GetJob(ctx, "h")
+	if j.State != job.StateMergeHandoff {
+		t.Fatalf("merge_handoff job was disturbed by the timer: state=%s (want merge_handoff)", j.State)
+	}
+}
