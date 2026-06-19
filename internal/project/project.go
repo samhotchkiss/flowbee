@@ -543,10 +543,14 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		}
 		branch := orDefault(s.baseBranch, "main") // the repo's integration branch
 		msg := fmt.Sprintf("flowbee: archive history for %s", row.JobID)
+		// land the card + the regenerated TOC in ONE commit (not one per file) so a merge
+		// adds a single archive commit. Idempotent on a re-drain (unchanged tree => no commit).
+		files := make(map[string][]byte, len(arts))
 		for _, a := range arts {
-			if err := s.gh.PutFile(ctx, a.Path, []byte(a.Content), msg, branch); err != nil {
-				return "", fmt.Errorf("archive %s: %w", a.Path, err)
-			}
+			files[a.Path] = []byte(a.Content)
+		}
+		if err := s.gh.PutFiles(ctx, files, msg, branch); err != nil {
+			return "", fmt.Errorf("archive history for %s: %w", row.JobID, err)
 		}
 		return fmt.Sprintf("history:archived files=%d", len(arts)), nil
 

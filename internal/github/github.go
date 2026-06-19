@@ -163,6 +163,12 @@ type Writer interface {
 	// the durable, reconcile-first way to land a Flowbee-authored doc on the integration
 	// branch. Idempotent: a re-PUT of byte-identical content is a no-op.
 	PutFile(ctx context.Context, path string, content []byte, message, branch string) error
+	// PutFiles creates-or-updates SEVERAL files in ONE commit on `branch` via the Git Data
+	// API (tree -> commit -> fast-forward ref). The §F archive lands a job's card AND the
+	// regenerated TOC together, so a merge adds a SINGLE archive commit, not one per file.
+	// Idempotent: when the resulting tree is byte-identical to the branch tip's, it makes no
+	// commit (a re-drain after a CP crash is a no-op).
+	PutFiles(ctx context.Context, files map[string][]byte, message, branch string) error
 }
 
 // BranchProtectionReader is the narrow read surface the I-8 startup assertion
@@ -926,6 +932,69 @@ func (c *RealClient) PutFile(ctx context.Context, path string, content []byte, m
 		body["sha"] = cur.SHA // update in place
 	}
 	return c.rest(ctx, http.MethodPut, "/contents/"+path, body, nil)
+}
+
+// PutFiles commits MULTIPLE files in one commit via the Git Data API: read the branch tip,
+// build a tree (inline content) on top of its base tree, create a commit, fast-forward the
+// ref. Reconcile-first like PutFile (no force-push). Idempotent: if the new tree equals the
+// tip's tree (all files unchanged), it makes no commit — a re-drain after a crash is a no-op.
+func (c *RealClient) PutFiles(ctx context.Context, files map[string][]byte, message, branch string) error {
+	if len(files) == 0 {
+		return nil
+	}
+	// 1) the branch tip commit.
+	var ref struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	if err := c.rest(ctx, http.MethodGet, "/git/ref/heads/"+url.PathEscape(branch), nil, &ref); err != nil {
+		return fmt.Errorf("get ref %s: %w", branch, err)
+	}
+	parent := ref.Object.SHA
+	// 2) its base tree.
+	var commit struct {
+		Tree struct {
+			SHA string `json:"sha"`
+		} `json:"tree"`
+	}
+	if err := c.rest(ctx, http.MethodGet, "/git/commits/"+parent, nil, &commit); err != nil {
+		return fmt.Errorf("get commit %s: %w", parent, err)
+	}
+	// 3) a new tree stacking the files on the base tree (inline content; GitHub blobs them).
+	type treeEntry struct {
+		Path    string `json:"path"`
+		Mode    string `json:"mode"`
+		Type    string `json:"type"`
+		Content string `json:"content"`
+	}
+	entries := make([]treeEntry, 0, len(files))
+	for path, content := range files {
+		entries = append(entries, treeEntry{Path: path, Mode: "100644", Type: "blob", Content: string(content)})
+	}
+	var tree struct {
+		SHA string `json:"sha"`
+	}
+	if err := c.rest(ctx, http.MethodPost, "/git/trees",
+		map[string]any{"base_tree": commit.Tree.SHA, "tree": entries}, &tree); err != nil {
+		return fmt.Errorf("create tree: %w", err)
+	}
+	if tree.SHA == "" || tree.SHA == commit.Tree.SHA {
+		return nil // unchanged tree: idempotent no-op (the content already matches the tip)
+	}
+	// 4) the commit + 5) fast-forward the ref.
+	var newCommit struct {
+		SHA string `json:"sha"`
+	}
+	if err := c.rest(ctx, http.MethodPost, "/git/commits",
+		map[string]any{"message": message, "tree": tree.SHA, "parents": []string{parent}}, &newCommit); err != nil {
+		return fmt.Errorf("create commit: %w", err)
+	}
+	if err := c.rest(ctx, http.MethodPatch, "/git/refs/heads/"+url.PathEscape(branch),
+		map[string]any{"sha": newCommit.SHA}, nil); err != nil {
+		return fmt.Errorf("update ref %s: %w", branch, err)
+	}
+	return nil
 }
 
 // prNodeQuery resolves a PR's GraphQL node ID (+ current draft state) from its

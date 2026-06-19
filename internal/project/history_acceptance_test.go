@@ -119,7 +119,7 @@ func TestF11HistoryArchiveOnMerge(t *testing.T) {
 	}
 
 	// ── PROVE the archive landed DURABLY via the Contents API: card + TOC on main.
-	puts := fake.PutFiles()
+	puts := fake.WrittenFiles()
 	cardPath := history.CardPath(id)
 	cardB, ok := puts[cardPath]
 	if !ok {

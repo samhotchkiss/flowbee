@@ -386,8 +386,9 @@ func (f *Fake) PutFile(ctx context.Context, path string, content []byte, message
 	return nil
 }
 
-// PutFiles returns the path->content map written via PutFile (a copy), for assertions.
-func (f *Fake) PutFiles() map[string][]byte {
+// WrittenFiles returns the path->content map written via PutFile/PutFiles (a copy), for
+// assertions.
+func (f *Fake) WrittenFiles() map[string][]byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make(map[string][]byte, len(f.putFiles))
@@ -395,6 +396,24 @@ func (f *Fake) PutFiles() map[string][]byte {
 		out[k] = append([]byte(nil), v...)
 	}
 	return out
+}
+
+// PutFiles records a multi-file commit (one fake call), applying every file — the Fake's
+// model of the Git Data API batched commit.
+func (f *Fake) PutFiles(ctx context.Context, files map[string][]byte, message, branch string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("PutFiles(%d@%s)", len(files), branch))
+	if err := f.retryGate(); err != nil {
+		return err
+	}
+	if f.putFiles == nil {
+		f.putFiles = map[string][]byte{}
+	}
+	for path, content := range files {
+		f.putFiles[path] = append([]byte(nil), content...)
+	}
+	return nil
 }
 
 // DeletedBranches returns the branches deleted (post-merge cleanup assertions).

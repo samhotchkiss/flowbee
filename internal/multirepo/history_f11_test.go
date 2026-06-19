@@ -89,7 +89,7 @@ func TestF11HistoryWiredPerRepo(t *testing.T) {
 	}
 	// the archive landed DURABLY via the Contents API: the card + the TOC, on the repo's
 	// integration branch ('trunk'), idempotent per file.
-	puts := fake.PutFiles()
+	puts := fake.WrittenFiles()
 	if len(puts) != 2 {
 		t.Fatalf("archive must put the card + the TOC, got %d files: %v", len(puts), keysOf(puts))
 	}
@@ -103,15 +103,16 @@ func TestF11HistoryWiredPerRepo(t *testing.T) {
 	if _, ok := puts["docs/history/README.md"]; !ok {
 		t.Fatalf("TOC not put at docs/history/README.md: %v", keysOf(puts))
 	}
-	// the put targeted the repo's integration branch, not a default.
+	// the archive landed in ONE commit (PutFiles, not one PutFile per artifact) targeting the
+	// repo's integration branch 'trunk', not a default.
 	var onTrunk bool
 	for _, c := range fake.Calls() {
-		if strings.Contains(c, "docs/history/"+id+".md@trunk") {
+		if strings.Contains(c, "PutFiles(") && strings.Contains(c, "@trunk") {
 			onTrunk = true
 		}
 	}
 	if !onTrunk {
-		t.Fatalf("archive did not target the repo integration branch 'trunk': %v", fake.Calls())
+		t.Fatalf("archive must land one PutFiles commit on 'trunk': %v", fake.Calls())
 	}
 }
 
