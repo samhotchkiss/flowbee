@@ -823,6 +823,37 @@ func runAgentHeartbeat(ctx context.Context, c *client.Client, jobID string, epoc
 // when the agent emitted its result (e.g. a spec) to stdout instead of writing the
 // expected $FLOWBEE_SPEC_FILE / $FLOWBEE_VERDICT_FILE. Build roles leave it false
 // (their agents write files, and their stdout can be large — don't buffer it).
+// agent output caps (untrusted black-box stdout/stderr). 16 MiB of stdout is far past any
+// legitimate agent result/diff text; 256 KiB of stderr is ample for an error tail.
+const (
+	maxAgentStdoutBytes = 16 << 20
+	maxAgentStderrBytes = 256 << 10
+)
+
+// boundedWriter accumulates up to max bytes then DISCARDS the rest while still reporting
+// full consumption, so the child process's stdout/stderr pipe never blocks (back-pressure
+// from a stalled reader would hang the agent). Bounds the worker's memory against a
+// runaway agent and bounds the artifact a review role submits from stdout.
+type boundedWriter struct {
+	b   strings.Builder
+	max int
+}
+
+func newBoundedWriter(max int) *boundedWriter { return &boundedWriter{max: max} }
+
+func (w *boundedWriter) Write(p []byte) (int, error) {
+	if rem := w.max - w.b.Len(); rem > 0 {
+		if len(p) <= rem {
+			w.b.Write(p)
+		} else {
+			w.b.Write(p[:rem])
+		}
+	}
+	return len(p), nil // claim full consumption so os/exec keeps draining the pipe
+}
+
+func (w *boundedWriter) String() string { return w.b.String() }
+
 func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, epoch, ttlS int, dir, agentCmd string, env []string, capture bool) (string, error) {
 	if agentCmd == "" {
 		return "", nil
@@ -853,10 +884,15 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, ep
 		return nil
 	}
 	cmd.WaitDelay = 10 * time.Second
-	var errb, outb strings.Builder
-	cmd.Stderr = &errb
-	cmd.Stdout = &outb // always capture: needed to parse the agent's reported cost/usage
-	_ = capture        // (capture is now always on; the param is kept for call-site clarity)
+	// BOUNDED capture: the agent CLI is an untrusted black box, so its stdout/stderr must
+	// NOT buffer without limit — a chatty or runaway agent (or one dumping a file to
+	// stdout) would OOM the worker, and for review/author roles the whole stdout is
+	// submitted as the artifact when the verdict/spec file is absent. Cap both; the writer
+	// keeps consuming past the cap so the child's pipe never blocks.
+	errb, outb := newBoundedWriter(maxAgentStderrBytes), newBoundedWriter(maxAgentStdoutBytes)
+	cmd.Stderr = errb
+	cmd.Stdout = outb // capture: needed to parse the agent's reported cost/usage
+	_ = capture       // (capture is now always on; the param is kept for call-site clarity)
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("agent start: %w", err)
 	}
