@@ -153,8 +153,14 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		// reconcile-driven transitions (§3.4). These move STATE only as a consequence
 		// of a GitHub-owned fact changing — never a stage/role/verdict edit.
 		switch {
-		case pr.Merged && j.State != job.StateDone:
+		case pr.Merged && pr.MergeCommit != "" && j.State != job.StateDone:
 			// the terminal Domain-B fact: the job is done. No counter or verdict edit.
+			// REQUIRE a resolved merge commit, not merely Merged=true: GitHub's GraphQL
+			// flips pullRequest.merged before mergeCommit.oid resolves, so a refetch can
+			// return Merged=true/MergeCommit="". Transitioning to done on that empty window
+			// would (a) refresh siblings to base_sha="" and (b) leave the I-3 terminal-SHA
+			// freeze (keyed on merge_commit) UNARMED — letting stale/replayed snapshots
+			// re-write a settled job's facts. Waiting one sweep for the commit closes both.
 			if err := reconcileTransitionTx(ctx, tx, &j, seq, job.StateDone,
 				ledger.KindJobCompleted, now,
 				ledger.Payload{MergeProvenance: pr.MergeCommit}); err != nil {
