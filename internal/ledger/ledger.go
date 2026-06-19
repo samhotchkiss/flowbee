@@ -253,6 +253,11 @@ func Fold(events []Event) (job.Job, error) {
 			j.BoundModelFamily = ""
 		case KindStateChanged:
 			j.State = e.ToState
+			// fold the recorded epoch: most state changes carry the current epoch (no
+			// change), but the operator requeue/cancel paths BUMP it (fence the worker) and
+			// record the bumped value here — without this, a rebuild-from-ledger kept the
+			// pre-requeue epoch (projection != Fold, a latent DR divergence).
+			j.LeaseEpoch = e.LeaseEpoch
 			if e.Payload.ResetCounters {
 				// operator requeue re-arms the job with a fresh budget (attempts/bounces
 				// zeroed); mirror the live UPDATE so projection == Fold(events) holds.
