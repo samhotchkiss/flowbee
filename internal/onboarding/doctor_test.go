@@ -389,3 +389,29 @@ func TestCheckWorkerAuth(t *testing.T) {
 		})
 	}
 }
+
+// TestDoctorHonorsConfigPath: ConfigPath (what serve uses via FLOWBEE_CONFIG) must win
+// over Root — doctor validates THAT file and resolves flows/ next to it, so it checks
+// the same config serve runs instead of a stray cwd/flowbee.yaml.
+func TestDoctorHonorsConfigPath(t *testing.T) {
+	scaffolded := initGitRepo(t)
+	if _, err := Init(scaffolded); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	emptyRoot := t.TempDir() // deliberately has NO flowbee.yaml
+
+	rep, err := Doctor(context.Background(), DoctorOptions{
+		Root:       emptyRoot, // would FAIL (config not found) if Root were used
+		ConfigPath: filepath.Join(scaffolded, "flowbee.yaml"),
+		SkipGitHub: true,
+	})
+	if err != nil {
+		t.Fatalf("Doctor: %v", err)
+	}
+	if statusOf(rep, "config") != StatusPass {
+		t.Fatalf("config must pass via ConfigPath (not the empty Root):\n%s", dump(rep))
+	}
+	if statusOf(rep, "flow") != StatusPass {
+		t.Fatalf("flow must resolve next to ConfigPath, got %s", statusOf(rep, "flow"))
+	}
+}

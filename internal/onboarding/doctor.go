@@ -71,7 +71,12 @@ type preflighter interface {
 // a RealClient from FLOWBEE_GITHUB_TOKEN, or warns if no token). SkipGitHub forces
 // the reachability check to a warn (the offline path: `flowbee doctor --offline`).
 type DoctorOptions struct {
-	Root       string
+	Root string
+	// ConfigPath is the EXACT config file to validate (what `serve` uses via
+	// FLOWBEE_CONFIG). When set it wins over Root — doctor reads this file and resolves
+	// flows/ next to it — so doctor validates the SAME config serve runs, not a stray
+	// cwd/flowbee.yaml. Empty => <Root>/flowbee.yaml (the scaffold/quickstart path).
+	ConfigPath string
 	Probe      GitHubProbe
 	SkipGitHub bool
 	// ProbeTimeout bounds a real reachability call. 0 => 10s.
@@ -86,8 +91,17 @@ func Doctor(ctx context.Context, opts DoctorOptions) (DoctorReport, error) {
 	var rep DoctorReport
 	root := opts.Root
 
+	// honor FLOWBEE_CONFIG (what serve uses): validate the EXACT config file serve runs
+	// and resolve flows/ next to it, instead of a possibly-stray <cwd>/flowbee.yaml.
+	configPath := opts.ConfigPath
+	if configPath == "" {
+		configPath = filepath.Join(root, "flowbee.yaml")
+	} else {
+		root = filepath.Dir(configPath)
+	}
+
 	// (1) config: present + parses + valid.
-	cfg, _ := checkConfig(root, &rep)
+	cfg, _ := checkConfig(configPath, &rep)
 
 	// (2) flows + identities: the flow files exist and every referenced identity
 	// resolves to an identity yaml with an existing lens file.
@@ -240,11 +254,10 @@ func recentSnapshot(dir string) (name, age string, ok bool) {
 	return filepath.Base(newestPath), since.Round(time.Minute).String(), true
 }
 
-func checkConfig(root string, rep *DoctorReport) (config.Config, bool) {
-	path := filepath.Join(root, "flowbee.yaml")
+func checkConfig(path string, rep *DoctorReport) (config.Config, bool) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		rep.add("config", StatusFail, fmt.Sprintf("flowbee.yaml not found (run `flowbee init`): %v", err))
+		rep.add("config", StatusFail, fmt.Sprintf("config not found at %s (run `flowbee init`, or set FLOWBEE_CONFIG): %v", path, err))
 		return config.Config{}, false
 	}
 	cfg := config.Default()

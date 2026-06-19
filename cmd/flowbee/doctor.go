@@ -21,8 +21,15 @@ func runDoctor(args []string) error {
 		return err
 	}
 
+	// honor FLOWBEE_CONFIG so `flowbee doctor` validates the SAME config `flowbee serve`
+	// runs — not a stray <cwd>/flowbee.yaml. An explicit --dir (non-default) still wins.
+	configPath := ""
+	if *dir == "." {
+		configPath = envOr("FLOWBEE_CONFIG", "")
+	}
 	rep, err := onboarding.Doctor(context.Background(), onboarding.DoctorOptions{
 		Root:       *dir,
+		ConfigPath: configPath,
 		SkipGitHub: *offline,
 	})
 	if err != nil {
