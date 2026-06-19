@@ -23,4 +23,12 @@ behavior* — a safety gate doing its job, not a fault to force past.
 
 **Fix:** Check the epic job state. Once the barrier review approves and the fan-out runs, the children start automatically — no manual intervention is needed.
 
+## Builds keep escalating to needs_human with "agent produced no changes".
+
+**Cause:** The worker's agent CLI ran but wrote no files. This is almost always an unauthenticated or expired agent session, a rate limit, or a model that is unavailable or misconfigured. Flowbee burns an attempt each time and escalates the job at `max_attempts`.
+
+**Diagnose:** Check the agent directly on a worker box: `codex login status` for `--agent codex`, or `claude --version` for Claude. Use `flowbee card <job-id>` to see which model ran each node and which attempts failed, and watch for `flowbee_jobs{state="needs_human"}` climbing.
+
+**Recover:** Re-authenticate the agent on each worker, for example with `codex login`, then restart the fleet with `sudo systemctl restart flowbee-fleet`. The fleet smoke-tests the build and review agents at startup and refuses to start if they are broken, so a clean restart verifies the fix and re-arms the workers. Requeue escalated jobs with `flowbee requeue <job-id>`.
+
 When filing a support request, run `flowbee version` to include the running build SHA in your report.
