@@ -52,6 +52,10 @@ type SeedParams struct {
 	// default. A seeded job is bound to exactly one repo so reconcile-IN/project-OUT
 	// can scope it; the scheduler still ranks across all repos.
 	Repo string
+	// IssueNumber stamps the originating GitHub issue at INSERT time (nil = none). Set
+	// it in the seed itself — NOT a follow-up UPDATE — so the (repo, issue_number) dedup
+	// that gates re-adoption is atomic with the insert under the seeding transaction.
+	IssueNumber *int
 }
 
 // SeedJob inserts a job and its job_created event in one transaction (append +
@@ -60,68 +64,81 @@ type SeedParams struct {
 func (s *Store) SeedJob(ctx context.Context, p SeedParams) (job.Job, error) {
 	var j job.Job
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		blocked, err := hasUnsatisfiedDeps(ctx, tx, p.BlockedBy)
-		if err != nil {
-			return err
-		}
-		state := job.StateReady
-		if blocked {
-			state = job.StateBlocked
-		}
-		blockedJSON := marshalStrings(p.BlockedBy)
-		reqJSON := marshalStrings(p.RequiredCapabilities)
-		flowID := p.FlowID
-		if flowID == "" {
-			flowID = p.ID // a standalone job is a flow of one (§12.6.5)
-		}
-		var ceiling any
-		if p.CostCeilingMicroUSD != nil {
-			ceiling = *p.CostCeilingMicroUSD
-		}
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO jobs (id, kind, flow, stage, state, role, base_sha, priority,
-			                  blocked_by, required_capabilities, enqueued_at,
-			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
-			                  cost_ceiling_micro_usd, flow_id,
-			                  task_text, spec_text, acceptance_criteria, repo)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 4, 0, ?, ?, ?, ?, ?, ?)`,
-			p.ID, string(p.Kind), p.Flow, p.Stage, string(state), string(p.Role), p.BaseSHA, p.Priority,
-			blockedJSON, reqJSON, p.Now.Format(rfc3339), ceiling, flowID,
-			p.TaskText, p.SpecText, p.AcceptanceCriteria, p.Repo)
-		if err != nil {
-			return fmt.Errorf("insert job: %w", err)
-		}
-		ev := ledger.Event{
-			JobID:     p.ID,
-			JobSeq:    1,
-			Kind:      ledger.KindJobCreated,
-			ToState:   state,
-			Actor:     "system",
-			CreatedAt: p.Now,
-			Payload: ledger.Payload{
-				Kind: p.Kind, Flow: p.Flow, Stage: p.Stage, Role: p.Role,
-				BaseSHA: p.BaseSHA, Priority: p.Priority,
-				BlockedBy: p.BlockedBy, RequiredCapabilities: p.RequiredCapabilities,
-				TaskText: p.TaskText, SpecText: p.SpecText, AcceptanceCriteria: p.AcceptanceCriteria,
-			},
-		}
-		if err := appendEvent(ctx, tx, ev); err != nil {
-			return err
-		}
-		if err := setJobSeq(ctx, tx, p.ID, 1); err != nil {
-			return err
-		}
-		if state == job.StateReady {
-			if err := s.armNoEligibleTimerTx(ctx, tx, p.ID, 0, p.Now); err != nil {
-				return fmt.Errorf("arm alarm: %w", err)
-			}
-		}
-		return nil
+		return s.seedJobTx(ctx, tx, p)
 	})
 	if err != nil {
 		return j, err
 	}
 	return s.GetJob(ctx, p.ID)
+}
+
+// seedJobTx is the transactional core of SeedJob: insert + job_created event +
+// projection, all on the caller's tx. Extracted so a caller that must seed
+// ATOMICALLY with a preceding read (e.g. AdoptIssueAsBuild's dedup check, which would
+// otherwise race two concurrent sweep goroutines between the check and the insert) can
+// run the whole check-then-seed inside ONE transaction.
+func (s *Store) seedJobTx(ctx context.Context, tx *sql.Tx, p SeedParams) error {
+	blocked, err := hasUnsatisfiedDeps(ctx, tx, p.BlockedBy)
+	if err != nil {
+		return err
+	}
+	state := job.StateReady
+	if blocked {
+		state = job.StateBlocked
+	}
+	blockedJSON := marshalStrings(p.BlockedBy)
+	reqJSON := marshalStrings(p.RequiredCapabilities)
+	flowID := p.FlowID
+	if flowID == "" {
+		flowID = p.ID // a standalone job is a flow of one (§12.6.5)
+	}
+	var ceiling any
+	if p.CostCeilingMicroUSD != nil {
+		ceiling = *p.CostCeilingMicroUSD
+	}
+	var issueNum any
+	if p.IssueNumber != nil {
+		issueNum = *p.IssueNumber
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO jobs (id, kind, flow, stage, state, role, base_sha, priority,
+		                  blocked_by, required_capabilities, enqueued_at,
+		                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
+		                  cost_ceiling_micro_usd, flow_id,
+		                  task_text, spec_text, acceptance_criteria, repo, issue_number)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 4, 0, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, string(p.Kind), p.Flow, p.Stage, string(state), string(p.Role), p.BaseSHA, p.Priority,
+		blockedJSON, reqJSON, p.Now.Format(rfc3339), ceiling, flowID,
+		p.TaskText, p.SpecText, p.AcceptanceCriteria, p.Repo, issueNum)
+	if err != nil {
+		return fmt.Errorf("insert job: %w", err)
+	}
+	ev := ledger.Event{
+		JobID:     p.ID,
+		JobSeq:    1,
+		Kind:      ledger.KindJobCreated,
+		ToState:   state,
+		Actor:     "system",
+		CreatedAt: p.Now,
+		Payload: ledger.Payload{
+			Kind: p.Kind, Flow: p.Flow, Stage: p.Stage, Role: p.Role,
+			BaseSHA: p.BaseSHA, Priority: p.Priority,
+			BlockedBy: p.BlockedBy, RequiredCapabilities: p.RequiredCapabilities,
+			TaskText: p.TaskText, SpecText: p.SpecText, AcceptanceCriteria: p.AcceptanceCriteria,
+		},
+	}
+	if err := appendEvent(ctx, tx, ev); err != nil {
+		return err
+	}
+	if err := setJobSeq(ctx, tx, p.ID, 1); err != nil {
+		return err
+	}
+	if state == job.StateReady {
+		if err := s.armNoEligibleTimerTx(ctx, tx, p.ID, 0, p.Now); err != nil {
+			return fmt.Errorf("arm alarm: %w", err)
+		}
+	}
+	return nil
 }
 
 // hasUnsatisfiedDeps reports whether any predecessor id is not in state `done`.
