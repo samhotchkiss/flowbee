@@ -177,6 +177,16 @@ func runServe(args []string) error {
 			"addr", cfg.PrivateAddr, "self_merge", cfg.AllowSelfMerge)
 	}
 
+	// F5 per-repo consensus panel: a repo's required_reviewers overrides the global default,
+	// so one repo can run an N-reviewer panel while others stay single-reviewer (keyed by the
+	// repo id, which is jobs.repo).
+	repoReviewers := map[string]int{}
+	for _, rc := range cfg.Repos {
+		if rc.RequiredReviewers > 0 {
+			repoReviewers[rc.ID] = rc.RequiredReviewers
+		}
+	}
+
 	srv := api.New(st, clock.Real{}, ulid.NewMinter(nil), api.Config{
 		LeaseTTL:           cfg.LeaseTTL(),
 		HeartbeatInterval:  cfg.HeartbeatInterval(),
@@ -195,7 +205,8 @@ func runServe(args []string) error {
 		Authenticator:      authn,
 		// THE ONE DECISION (§14, F2): Branch B (autonomous merge) when
 		// FLOWBEE_ALLOW_SELF_MERGE is set; default false = Branch A (handoff).
-		Policy: job.Policy{AllowSelfMerge: cfg.AllowSelfMerge, RequiredReviewers: cfg.RequiredReviewers},
+		Policy:        job.Policy{AllowSelfMerge: cfg.AllowSelfMerge, RequiredReviewers: cfg.RequiredReviewers},
+		RepoReviewers: repoReviewers,
 		// F2: the operator content-integrity posture (ceilings + extra denylist).
 		ContentPolicy: cfg.ContentPolicy(),
 		// build-list §7.3: the credential-bearing GitHub remote the control plane

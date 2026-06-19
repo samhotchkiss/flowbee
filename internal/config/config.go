@@ -145,6 +145,10 @@ type RepoConfig struct {
 	// false: it commits to the repo's main on every merge, so enable it only for a repo
 	// whose owner wants that. Set via `archive_history: true` in the repo's registry entry.
 	ArchiveHistory bool `yaml:"archive_history"`
+	// RequiredReviewers overrides the global RequiredReviewers (F5 consensus panel) for THIS
+	// repo: how many DISTINCT reviewers must approve before a verdict mints. 0 = inherit the
+	// global setting. Lets one repo run an N-reviewer panel while others stay single-reviewer.
+	RequiredReviewers int `yaml:"required_reviewers"`
 }
 
 // IsActive reports whether the repo is active (default true when unset).

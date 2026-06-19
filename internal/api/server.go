@@ -53,6 +53,10 @@ type Server struct {
 
 	facts  store.FactSource
 	policy job.Policy
+	// reviewersByRepo overrides policy.RequiredReviewers per repo (F5 consensus panel): a
+	// repo can run an N-reviewer panel while others stay single-reviewer. Empty => the global
+	// policy applies everywhere. Set via SetRequiredReviewers from the per-repo config.
+	reviewersByRepo map[string]int
 
 	leaseTTL     time.Duration
 	longPollWait time.Duration
@@ -99,6 +103,10 @@ type Config struct {
 	// Policy is THE ONE DECISION surface (§14): AllowSelfMerge default false =
 	// Branch A (every approval -> handoff -> human).
 	Policy job.Policy
+	// RepoReviewers overrides Policy.RequiredReviewers (F5 consensus panel) per repo: a repo
+	// can run an N-reviewer panel while others stay single-reviewer. Empty => Policy applies
+	// everywhere.
+	RepoReviewers map[string]int
 	// Facts is the reconciled-fact source the I-9 gate consumes. If nil it
 	// defaults to the DB-backed source (domain_b_facts), which reconcile-IN writes
 	// (M3 tests seed it directly via store.UpsertDomainBFacts).
@@ -173,6 +181,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 	srv := &Server{
 		store:              st,
 		clock:              clk,
+		reviewersByRepo:    cfg.RepoReviewers,
 		minter:             minter,
 		registry:           worker.NewRegistry(st, cfg.LeaseTTLS, cfg.HeartbeatIntervalS, allow),
 		broker:             NewBroker(),
@@ -973,6 +982,17 @@ type reviewRequest struct {
 // review runs the I-9 code-review gate for a fenced code_review result. The
 // worker's claim is recorded as untrusted; the gate mints (or refuses) the
 // tamper-evident verdict from reconciled facts. Stale epoch -> 409.
+// policyForRepo returns the global policy with RequiredReviewers overridden by the repo's
+// F5 panel size when one is configured — so a repo can run an N-reviewer consensus panel
+// while others stay single-reviewer. A 0/absent override inherits the global policy.
+func (s *Server) policyForRepo(repo string) job.Policy {
+	p := s.policy
+	if n, ok := s.reviewersByRepo[repo]; ok && n > 0 {
+		p.RequiredReviewers = n
+	}
+	return p
+}
+
 func (s *Server) review(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("job")
 	epoch, ok := epochFromHeader(r)
@@ -985,7 +1005,14 @@ func (s *Server) review(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	resp, err := s.store.ReviewResult(r.Context(), s.facts, s.policy, store.ReviewResultParams{
+	// resolve the F5 consensus size for THIS job's repo (no override => the global policy).
+	policy := s.policy
+	if len(s.reviewersByRepo) > 0 {
+		if j, e := s.store.GetJob(r.Context(), jobID); e == nil {
+			policy = s.policyForRepo(j.Repo)
+		}
+	}
+	resp, err := s.store.ReviewResult(r.Context(), s.facts, policy, store.ReviewResultParams{
 		JobID: jobID, Epoch: epoch,
 		Claim:          job.VerdictValue(req.Verdict),
 		Disposition:    job.Disposition(req.Disposition),
