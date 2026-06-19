@@ -269,6 +269,19 @@ flowbee backup --dir /mnt/ext/flowbee-backups --keep 30   # an external disk is 
 # 0 * * * *  flowbee backup --dir /mnt/ext/flowbee-backups
 ```
 
+To recover from a snapshot, **`flowbee restore`** does it safely — it verifies the
+snapshot first (integrity + ledger rows), safety-backs-up the current DB (so the restore
+is itself reversible), and replaces atomically:
+
+```bash
+flowbee serve   # ← STOP serve first (a restore under a running server is unsupported)
+flowbee restore --latest --force         # restore the newest snapshot in the backup dir
+flowbee restore ~/.flowbee/backups/flowbee-20260619-011338.402.db --force   # or an explicit one
+```
+
+`--force` is required (the confirmation gate). The restore is internally consistent
+because the jobs table is a pure fold of the append-only ledger.
+
 It's the equivalent of `sqlite3 .backup` but it knows the DB path, verifies the copy, and
 rotates — a backup you can't restore is no backup. **It is still a *floor*:** same-disk
 snapshots don't survive disk loss, so litestream's continuous WAL replication to object
@@ -331,6 +344,22 @@ The **forward-progress watchdog** (runs every 60s) is the safety net: it re-fold
 `ready` job's ledger and repairs any projection that has drifted (so a capability mismatch
 can never make a job unclaimable), and escalates a genuinely no-eligible-worker job to
 `needs_human` so a human always sees it. You should rarely need the table above.
+
+### Pausing the fleet (`flowbee pause` / `flowbee resume`)
+
+When something looks wrong and you want to hold new work *without* dropping what's in
+flight, pause gracefully instead of killing `serve`:
+
+```bash
+flowbee pause     # control plane stops issuing NEW leases; workers idle after their current job
+# ...in-flight jobs finish + submit normally; investigate...
+flowbee resume    # leasing resumes
+```
+
+`pause` only gates *new* claims — already-leased jobs keep heartbeating and submitting
+results, so no work is lost. `flowbee status` shows a clear `PAUSED` banner while it's on.
+(It's a marker file beside the DB; it takes effect live, no restart, and survives a
+`serve` restart — `resume` to clear it.)
 
 ---
 

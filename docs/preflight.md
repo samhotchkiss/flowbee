@@ -80,14 +80,16 @@ Run it first; the rest of this list is the human judgement `doctor` can't make.
         off-disk, point-in-time recovery). See [operating.md §6](./operating.md).
   - [ ] and/or **`flowbee backup`** scheduled (cron/launchd) — the on-disk floor.
 - [ ] `flowbee doctor`'s `durability` line is green (a backup is detected).
-- [ ] You've confirmed a restore works (`litestream restore`, or copy a snapshot
-      back) — a restore is internally consistent because the jobs table is a pure
-      fold of the append-only ledger.
+- [ ] You've confirmed a restore works — `litestream restore`, or **`flowbee restore
+      --latest --force`** (verifies the snapshot + safety-backs-up the current DB
+      first). A restore is internally consistent because the jobs table is a pure fold
+      of the append-only ledger.
 
 ## 7. Rollback and observability
 
-- [ ] You know how to pause the fleet quickly (stop `serve` / drain workers) if
-      something goes wrong.
+- [ ] You know how to pause the fleet quickly. Prefer graceful: **`flowbee pause`**
+      (stops new leases, lets in-flight jobs finish), **`flowbee resume`** to unpause —
+      not a blunt `serve` kill, which drops in-flight work.
 - [ ] Logs from the control plane and workers are being captured somewhere you
       can read them (and `flowbee status` gives a one-glance live summary).
 - [ ] You have a way to revert a bad merge (branch protection allows it, or a
