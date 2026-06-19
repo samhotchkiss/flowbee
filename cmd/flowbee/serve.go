@@ -740,6 +740,12 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 			logger.Error("register repo", "id", id, "err", err)
 			continue
 		}
+		logger.Info("repo policy",
+			"id", id,
+			"repo", rc.Owner+"/"+rc.Repo,
+			"allow_own_source_merge", rc.AllowOwnSourceMerge,
+			"archive_history", rc.ArchiveHistory,
+		)
 		tokenEnv[id] = rc.TokenEnv
 		if rc.AllowOwnSourceMerge {
 			allowOwn[id] = true
