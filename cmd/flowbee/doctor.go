@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 
@@ -17,6 +18,7 @@ func runDoctor(args []string) error {
 	dir := fs.String("dir", ".", "repo root to validate")
 	offline := fs.Bool("offline", false, "skip the GitHub reachability check")
 	quiet := fs.Bool("quiet", false, "suppress per-check lines; print only the summary")
+	jsonOut := fs.Bool("json", false, "emit check results as a JSON array (name/status/detail per check)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -34,6 +36,27 @@ func runDoctor(args []string) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	if *jsonOut {
+		type jsonCheck struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Detail string `json:"detail"`
+		}
+		out := make([]jsonCheck, len(rep.Checks))
+		for i, c := range rep.Checks {
+			out[i] = jsonCheck{Name: c.Name, Status: string(c.Status), Detail: c.Detail}
+		}
+		b, err := json.Marshal(out)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		if !rep.Green() {
+			return fmt.Errorf("doctor found failing checks")
+		}
+		return nil
 	}
 
 	if !*quiet {
