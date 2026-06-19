@@ -96,6 +96,27 @@ Default **false** = the fully-protected posture (no behavior change). It relaxes
 Dockerfiles, secrets) are **never** relaxed in any repo. Never set it for the repo
 that *is* Flowbee.
 
+### Per-repo: `archive_history`
+
+The §F **compounding memory**: when on, every merge lands a curated
+`docs/history/<id>.md` card (status, attempts, verdicts, linked PR, lessons) plus a
+regenerated `docs/history/README.md` TOC on the repo's integration branch — in-repo
+provenance of how each issue was built, reconstructable from the event ledger. The
+write is reconcile-first: each file is one atomic Contents-API commit onto the
+branch's current tip (no force-push, no race with concurrent merges), Flowbee the sole
+author, never entangled with the feature diff.
+
+```yaml
+repos:
+  - id: flowbee
+    owner: acme
+    repo: flowbee
+    archive_history: true   # populate docs/history/ on every merge
+```
+
+Default **false** because it commits to the repo's `main` on every merge — enable it
+only for a repo whose owner wants that in-repo archive.
+
 ## Cost circuit-breaker (§6.7)
 
 | key | env override | default | meaning |
