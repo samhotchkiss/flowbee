@@ -4,6 +4,7 @@
 *.exe
 *.test
 *.out
+/flowbee
 
 # Go
 /vendor/
