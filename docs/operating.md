@@ -244,7 +244,9 @@ building → review_pending → code_review → mergeable → merging → done**
   `job_events` is append-only, so this grows with throughput; see Durability below), and
   `flowbee_outbox_abandoned{action}` (dead-lettered GitHub writes that never took effect —
   critical ones also escalate to `needs_human`, but cosmetic ones are otherwise silent, so
-  alert on any growth). The pages that matter: a wedged `needs_human` job,
+  alert on any growth; each is also logged with a `dead-lettered GitHub write` WARN naming the
+  action + job, and **`flowbee retry-outbox <job-id>`** re-arms a job's abandoned actions once
+  you've fixed the cause). The pages that matter: a wedged `needs_human` job,
   `flowbee_fleet_workers{status="live"} == 0` with waiting jobs, `over_budget` climbing,
   `flowbee_outbox_abandoned` growing, or `flowbee_github_last_success_age_seconds` past a few
   minutes (all progress has silently stalled).

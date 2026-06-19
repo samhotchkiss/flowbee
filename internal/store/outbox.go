@@ -154,6 +154,22 @@ func (s *Store) BumpOutboxAttempts(ctx context.Context, id int64) error {
 	return err
 }
 
+// RetryAbandonedOutbox re-arms a job's dead-lettered (abandoned) outbox actions back to
+// `pending` (attempts reset) so the project-OUT drain re-attempts them — the operator recovery
+// after the underlying cause is fixed (a transient race like the §F archive, or a re-POSTed spec
+// after a malformed one's issue-create failed). Every drained action is idempotent (an abandoned
+// action took no effect, so a re-attempt can't double-apply), so this is safe to call. Returns
+// the number of actions re-armed.
+func (s *Store) RetryAbandonedOutbox(ctx context.Context, jobID string) (int, error) {
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE outbox SET status='pending', attempts=0 WHERE job_id=? AND status='abandoned'`, jobID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // OutboxAbandonedByAction counts abandoned (dead-lettered) outbox actions per action type —
 // GitHub writes that never took effect. Critical abandons (create-issue/merge) also escalate
 // the owning job to needs_human, but cosmetic ones (comments, the §F archive) are otherwise
