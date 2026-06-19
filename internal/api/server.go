@@ -720,6 +720,15 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		identity = bound
 	}
 	family := r.URL.Query().Get("model_family")
+	// CLAMP model_family to the credential-bound value when the operator declared one for
+	// this enrolled identity. The self-asserted param feeds the §5.5 anti-affinity
+	// exclusion (a same-family reviewer can't approve a build); without this clamp a
+	// worker could lie about its family to win the review of a same-family (or its own
+	// model's) build — defeating the uncorrelated-review guarantee (I-10). Identity is
+	// already unforgeable above; this grounds family in the same credential.
+	if bound, ok := auth.FamilyFrom(r); ok {
+		family = bound
+	}
 	roleFilter := job.Role(r.URL.Query().Get("role"))
 
 	// polling for work is proof of liveness: bump last_seen so an idle worker (no

@@ -56,17 +56,46 @@ type Authenticator interface {
 type BearerAuth struct {
 	secret         []byte
 	enrolled       map[string]struct{}
+	family         map[string]string // identity -> operator-declared model_family (optional)
 	loopbackBypass bool
 }
 
-// NewBearer builds a bearer authenticator with the given server secret and the
-// set of enrolled identities. loopbackBypass enables the same-box no-token path.
+// NewBearer builds a bearer authenticator with the given server secret and the set of
+// enrolled identities. An enrolled entry may optionally bind the identity's model
+// family as "identity:family" (e.g. "reviewer-bob:claude-opus"). When bound, the lease
+// handler CLAMPS the worker's self-asserted model_family to this operator-declared
+// value — so the §5.5 anti-affinity exclusion (a same-family reviewer can't rubber-stamp)
+// cannot be defeated by a worker simply declaring a different family at lease time.
+// loopbackBypass enables the same-box no-token path.
 func NewBearer(secret []byte, enrolled []string, loopbackBypass bool) *BearerAuth {
 	set := make(map[string]struct{}, len(enrolled))
-	for _, id := range enrolled {
+	fam := make(map[string]string)
+	for _, e := range enrolled {
+		id, f := parseEnrolledEntry(e)
 		set[id] = struct{}{}
+		if f != "" {
+			fam[id] = f
+		}
 	}
-	return &BearerAuth{secret: secret, enrolled: set, loopbackBypass: loopbackBypass}
+	return &BearerAuth{secret: secret, enrolled: set, family: fam, loopbackBypass: loopbackBypass}
+}
+
+// parseEnrolledEntry splits an "identity:family" enrolled entry into its parts.
+// Identities use dots (e.g. "studio.opus"), never colons, so ':' is an unambiguous
+// family delimiter. A bare "identity" yields an empty family (unconstrained — the
+// legacy behavior, no anti-affinity binding for that identity).
+func parseEnrolledEntry(e string) (id, family string) {
+	if i := strings.IndexByte(e, ':'); i >= 0 {
+		return e[:i], e[i+1:]
+	}
+	return e, ""
+}
+
+// FamilyFor returns the operator-declared model family bound to an enrolled identity,
+// if one was configured. Implements FamilyResolver.
+func (b *BearerAuth) FamilyFor(identity string) (string, bool) {
+	f, ok := b.family[identity]
+	return f, ok && f != ""
 }
 
 // Mint produces the signed token a worker presents in Authorization: Bearer.
@@ -137,11 +166,35 @@ func isLoopback(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// FamilyResolver is an OPTIONAL capability an Authenticator may implement: it maps an
+// authenticated identity to its operator-declared model family. When present, Middleware
+// stashes that family so the lease handler can clamp the self-asserted model_family —
+// grounding §5.5 anti-affinity in the credential, not the worker's word. An Authenticator
+// that doesn't implement it (e.g. mTLS) simply leaves model_family worker-asserted.
+type FamilyResolver interface {
+	FamilyFor(identity string) (string, bool)
+}
+
 // identityCtxKey carries the authenticated identity down to handlers.
 type identityCtxKey struct{}
 
+// identityFamilyCtxKey carries the credential-bound model family down to handlers.
+type identityFamilyCtxKey struct{}
+
 func withIdentity(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, identityCtxKey{}, id)
+}
+
+func withFamily(ctx context.Context, family string) context.Context {
+	return context.WithValue(ctx, identityFamilyCtxKey{}, family)
+}
+
+// FamilyFrom returns the credential-bound model family stashed by Middleware, if the
+// authenticator bound one for this identity. The lease handler clamps the self-asserted
+// model_family to it (anti-affinity trust root, I-10).
+func FamilyFrom(r *http.Request) (string, bool) {
+	f, ok := r.Context().Value(identityFamilyCtxKey{}).(string)
+	return f, ok && f != ""
 }
 
 // Middleware wraps an http.Handler, authenticating every request before it
@@ -167,6 +220,13 @@ func Middleware(a Authenticator, next http.Handler) http.Handler {
 			return
 		}
 		ctx := withIdentity(r.Context(), id)
+		// bind the operator-declared model family (if any) so the handler can clamp the
+		// self-asserted model_family — the anti-affinity trust root (I-10).
+		if fr, ok := a.(FamilyResolver); ok {
+			if fam, ok := fr.FamilyFor(id); ok {
+				ctx = withFamily(ctx, fam)
+			}
+		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

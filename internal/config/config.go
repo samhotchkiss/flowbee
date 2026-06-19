@@ -50,6 +50,11 @@ type Config struct {
 	WorkerAuthSecret string `yaml:"worker_auth_secret"`
 	// EnrolledIdentities is the allowlist of worker identities permitted to
 	// authenticate (§7.6). Set via FLOWBEE_ENROLLED_IDENTITIES (comma-separated).
+	// An entry MAY bind the identity's model family as "identity:family" (e.g.
+	// "reviewer-bob:claude-opus"). When bound, the control plane clamps that worker's
+	// self-asserted model_family to the declared value, grounding the §5.5 anti-affinity
+	// exclusion (a same-family reviewer can't rubber-stamp) in the credential instead of
+	// the worker's word. A bare "identity" leaves model_family worker-asserted (legacy).
 	EnrolledIdentities []string `yaml:"enrolled_identities"`
 	// AuthLoopbackBypass lets same-box (127.0.0.1) workers skip the token even when
 	// WorkerAuthSecret is set (§12.4 "bearer fallback on loopback"). Default true.
@@ -155,10 +160,10 @@ func (c Config) CostCeilingMicroUSD() int64 {
 
 func Default() Config {
 	return Config{
-		DatabaseURL:        defaultDBPath(),
-		PrivateAddr:        ":7070",
-		HealthAddr:         ":7001",
-		WebhookAddr:        ":8443",
+		DatabaseURL: defaultDBPath(),
+		PrivateAddr: ":7070",
+		HealthAddr:  ":7001",
+		WebhookAddr: ":8443",
 		// LeaseTTLS is also the absolute lease cap (Rung-3, un-gameable): a worker can
 		// hold a lease at most this long, even while heartbeating. It MUST exceed a real
 		// agent build's wall time, or a multi-minute build is revoked mid-run and its
