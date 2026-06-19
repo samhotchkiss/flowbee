@@ -22,7 +22,21 @@ var ErrJobNotFound = errors.New("job not found")
 // eng_worker. This is the operator's "retry" for a job that escalated to needs_human
 // from a now-fixed transient failure (e.g. a deployment bug) — without hand-editing
 // the jobs table. Returns the resulting state.
-func (s *Store) RequeueJob(ctx context.Context, jobID string, now time.Time) (job.State, error) {
+// ErrJobActivelyLeased is returned when a requeue targets a job that currently holds an
+// active lease (a worker is building/reviewing/merging it right now). Re-arming it bumps
+// the epoch, which FENCES the live worker — silently discarding its in-flight work. The
+// requeue is for STRANDED jobs (needs_human/failed), so this is rejected unless forced.
+var ErrJobActivelyLeased = errors.New("job is actively leased; requeue would discard the live worker's in-flight work (use force to override)")
+
+// RequeueJob re-arms an escalated / stranded job for a fresh attempt: it resets the
+// attempt + bounce budget, clears the lease + verdict, bumps the lease epoch (fencing
+// any zombie worker so its next call 409s), and routes the job back to `ready` as an
+// eng_worker. This is the operator's "retry" for a job that escalated to needs_human
+// from a now-fixed transient failure (e.g. a deployment bug) — without hand-editing
+// the jobs table. Returns the resulting state. When force is false (the default), a job
+// that holds an ACTIVE lease is rejected (ErrJobActivelyLeased) so a mistyped id or a
+// just-picked-up job doesn't have a live worker's build silently fenced + discarded.
+func (s *Store) RequeueJob(ctx context.Context, jobID string, force bool, now time.Time) (job.State, error) {
 	var final job.State
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		j, seq, err := loadJobTx(ctx, tx, jobID)
@@ -31,6 +45,9 @@ func (s *Store) RequeueJob(ctx context.Context, jobID string, now time.Time) (jo
 		}
 		if err != nil {
 			return err
+		}
+		if !force && job.HasActiveLease(j.State) {
+			return ErrJobActivelyLeased
 		}
 		// Re-arm to the job's OWN entry stage: a spec job restarts at spec_authoring (it
 		// has no build to rebuild), a build job at `ready`. Routing a spec escalation to a

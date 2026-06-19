@@ -294,18 +294,23 @@ func runLease(args []string) error {
 // it on the control-plane box (loopback) or with FLOWBEE_WORKER_TOKEN set.
 func runRequeue(args []string) error {
 	fs := flag.NewFlagSet("requeue", flag.ContinueOnError)
+	force := fs.Bool("force", false, "requeue even if the job is actively leased (fences the live worker, discarding its in-flight work)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: flowbee requeue <job-id>")
+		return fmt.Errorf("usage: flowbee requeue [--force] <job-id>")
 	}
 	jobID := fs.Arg(0)
 	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
 	c := client.NewWithToken(url, os.Getenv("FLOWBEE_WORKER_TOKEN"))
-	st, err := c.Requeue(context.Background(), jobID)
+	st, err := c.Requeue(context.Background(), jobID, *force)
 	if err != nil {
 		return err
+	}
+	if st == 409 {
+		return fmt.Errorf("job %s is actively leased — a worker is building/reviewing it now; "+
+			"re-run with --force to requeue anyway (this discards the live worker's work)", jobID)
 	}
 	if st != 200 {
 		return fmt.Errorf("requeue status %d", st)

@@ -31,7 +31,7 @@ func TestRequeueJob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	final, err := st.RequeueJob(ctx, "j", now)
+	final, err := st.RequeueJob(ctx, "j", false, now)
 	if err != nil {
 		t.Fatalf("RequeueJob: %v", err)
 	}
@@ -59,8 +59,47 @@ func TestRequeueJob(t *testing.T) {
 func TestRequeueNotFound(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
-	_, err := st.RequeueJob(ctx, "01KV9R0HWS-truncated", time.Unix(1000, 0))
+	_, err := st.RequeueJob(ctx, "01KV9R0HWS-truncated", false, time.Unix(1000, 0))
 	if !errors.Is(err, store.ErrJobNotFound) {
 		t.Fatalf("requeue of missing job: err=%v, want ErrJobNotFound", err)
+	}
+}
+
+// TestRequeueRejectsActivelyLeasedJob: requeue is for STRANDED jobs. Re-arming a job
+// that holds an ACTIVE lease bumps the epoch and fences the live worker — silently
+// discarding its in-flight build. Without force it must be rejected (a mistyped id or a
+// just-picked-up job); with force it proceeds (the operator's deliberate override).
+func TestRequeueRejectsActivelyLeasedJob(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "live", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+		RequiredCapabilities: []string{"role:eng_worker"}, Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// a worker claims it: now leased (an active lease).
+	if _, err := st.ClaimReadyJob(ctx, store.ClaimParams{
+		JobID: "live", LeaseID: "L", Identity: "w", ModelFamily: "claude",
+		Role: job.RoleEngWorker, Attested: []string{"role:eng_worker"}, TTL: time.Minute, Now: now,
+	}); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// unforced requeue must be rejected, leaving the live lease untouched.
+	if _, err := st.RequeueJob(ctx, "live", false, now); !errors.Is(err, store.ErrJobActivelyLeased) {
+		t.Fatalf("want ErrJobActivelyLeased, got %v", err)
+	}
+	if j, _ := st.GetJob(ctx, "live"); j.State != job.StateLeased || j.LeaseID != "L" {
+		t.Fatalf("rejected requeue mutated the live lease: state=%s lease=%s", j.State, j.LeaseID)
+	}
+
+	// forced requeue proceeds (deliberate override) — re-arms to ready, fencing the worker.
+	if _, err := st.RequeueJob(ctx, "live", true, now); err != nil {
+		t.Fatalf("forced requeue: %v", err)
+	}
+	if j, _ := st.GetJob(ctx, "live"); j.State != job.StateReady {
+		t.Fatalf("forced requeue state=%s want ready", j.State)
 	}
 }

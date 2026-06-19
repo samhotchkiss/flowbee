@@ -1450,9 +1450,14 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 // the control-plane box where the loopback bypass applies.)
 func (s *Server) requeue(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("job")
-	final, err := s.store.RequeueJob(r.Context(), jobID, s.clock.Now())
+	force := r.URL.Query().Get("force") == "true" || r.URL.Query().Get("force") == "1"
+	final, err := s.store.RequeueJob(r.Context(), jobID, force, s.clock.Now())
 	if errors.Is(err, store.ErrJobNotFound) {
 		http.Error(w, "requeue: no such job "+jobID+" (check the FULL job id, not a truncated one)", http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, store.ErrJobActivelyLeased) {
+		http.Error(w, "requeue: "+err.Error()+" — re-run with --force if you really mean to", http.StatusConflict)
 		return
 	}
 	if err != nil {

@@ -387,9 +387,13 @@ func (c *Client) Release(ctx context.Context, jobID string, epoch int) (status i
 
 // Requeue re-arms a stranded job (escalated to needs_human from a now-fixed
 // transient failure) for a fresh attempt: reset attempts/bounces, back to ready.
-func (c *Client) Requeue(ctx context.Context, jobID string) (status int, err error) {
+func (c *Client) Requeue(ctx context.Context, jobID string, force bool) (status int, err error) {
 	var out map[string]string
-	return c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/requeue", nil, nil, &out)
+	path := "/v1/jobs/" + jobID + "/requeue"
+	if force {
+		path += "?force=true"
+	}
+	return c.postJSONStatus(ctx, path, nil, nil, &out)
 }
 
 // ReleaseNoPenalty re-arms WITHOUT burning an attempt — for a non-failure abandon
