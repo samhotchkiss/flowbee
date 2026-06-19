@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +27,12 @@ func isPausedDB(dbURL string) bool {
 // job counts by state, the human-action queue (merge_handoff + needs_human),
 // and fleet worker liveness. Read-only, no network calls.
 func runStatus(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	jsonOut := fs.Bool("json", false, "emit status as a single JSON object")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -57,7 +65,11 @@ func runStatus(args []string) error {
 	}
 	abandoned, _ := st.OutboxAbandonedByAction(ctx) // dropped GitHub writes (best-effort)
 
-	printStatus(os.Stdout, jobs, health, abandoned, isPausedDB(cfg.DatabaseURL))
+	summary := summarizeStatus(jobs, health, abandoned, isPausedDB(cfg.DatabaseURL))
+	if *jsonOut {
+		return printStatusJSON(os.Stdout, summary)
+	}
+	printStatusSummary(os.Stdout, summary)
 	return nil
 }
 
@@ -88,31 +100,100 @@ func sortedCounts(m map[string]int) string {
 	return strings.Join(parts, ", ")
 }
 
-// printStatus writes the operator summary to w. Kept separate from runStatus
-// so it is unit-testable without a live database.
-func printStatus(w io.Writer, jobs []store.BoardJob, health store.FleetHealth, abandoned map[string]int, paused bool) {
-	// Single pass: tally per-repo state counts and human-action totals.
-	repoStates := make(map[string]map[string]int)
-	var mergeHandoff, needsHuman int
+type statusRepoSummary struct {
+	States map[string]int `json:"states"`
+}
+
+type statusAwaitingHumanSummary struct {
+	MergeHandoff int `json:"merge_handoff"`
+	NeedsHuman   int `json:"needs_human"`
+	Total        int `json:"total"`
+}
+
+type statusModelSummary struct {
+	LiveWorkers  int `json:"live_workers"`
+	StaleWorkers int `json:"stale_workers"`
+	TotalWorkers int `json:"total_workers"`
+}
+
+type statusFleetSummary struct {
+	LiveWorkers  int                           `json:"live_workers"`
+	StaleWorkers int                           `json:"stale_workers"`
+	ByModel      map[string]statusModelSummary `json:"by_model"`
+}
+
+type statusSummary struct {
+	Repos                  map[string]statusRepoSummary `json:"repos"`
+	AwaitingHuman          statusAwaitingHumanSummary   `json:"awaiting_human"`
+	Fleet                  statusFleetSummary           `json:"fleet"`
+	AbandonedGitHubWrites  map[string]int               `json:"abandoned_github_writes"`
+	Paused                 bool                         `json:"-"`
+	liveModelBreakdownOnly map[string]int
+}
+
+func summarizeStatus(jobs []store.BoardJob, health store.FleetHealth, abandoned map[string]int, paused bool) statusSummary {
+	summary := statusSummary{
+		Repos:                  map[string]statusRepoSummary{},
+		AbandonedGitHubWrites:  map[string]int{},
+		Paused:                 paused,
+		liveModelBreakdownOnly: health.ByModel,
+	}
+
 	for _, j := range jobs {
 		repo := j.Repo
 		if repo == "" {
 			repo = "-"
 		}
-		if repoStates[repo] == nil {
-			repoStates[repo] = make(map[string]int)
+		repoSummary := summary.Repos[repo]
+		if repoSummary.States == nil {
+			repoSummary.States = map[string]int{}
 		}
-		repoStates[repo][j.State]++
+		repoSummary.States[j.State]++
+		summary.Repos[repo] = repoSummary
 		switch j.State {
 		case "merge_handoff":
-			mergeHandoff++
+			summary.AwaitingHuman.MergeHandoff++
 		case "needs_human":
-			needsHuman++
+			summary.AwaitingHuman.NeedsHuman++
 		}
 	}
+	summary.AwaitingHuman.Total = summary.AwaitingHuman.MergeHandoff + summary.AwaitingHuman.NeedsHuman
 
-	repos := make([]string, 0, len(repoStates))
-	for r := range repoStates {
+	summary.Fleet.LiveWorkers = health.LiveWorkers
+	summary.Fleet.StaleWorkers = health.StaleWorkers
+	summary.Fleet.ByModel = map[string]statusModelSummary{}
+	for model, live := range health.ByModel {
+		entry := summary.Fleet.ByModel[model]
+		entry.LiveWorkers = live
+		entry.TotalWorkers = entry.LiveWorkers + entry.StaleWorkers
+		summary.Fleet.ByModel[model] = entry
+	}
+	for model, stale := range health.StaleByModel {
+		entry := summary.Fleet.ByModel[model]
+		entry.StaleWorkers = stale
+		entry.TotalWorkers = entry.LiveWorkers + entry.StaleWorkers
+		summary.Fleet.ByModel[model] = entry
+	}
+	for action, count := range abandoned {
+		summary.AbandonedGitHubWrites[action] = count
+	}
+	return summary
+}
+
+func printStatusJSON(w io.Writer, summary statusSummary) error {
+	enc := json.NewEncoder(w)
+	return enc.Encode(summary)
+}
+
+// printStatus writes the operator summary to w. Kept separate from runStatus
+// so it is unit-testable without a live database.
+func printStatus(w io.Writer, jobs []store.BoardJob, health store.FleetHealth, abandoned map[string]int, paused bool) {
+	printStatusSummary(w, summarizeStatus(jobs, health, abandoned, paused))
+}
+
+func printStatusSummary(w io.Writer, summary statusSummary) {
+	repos := make([]string, 0, len(summary.Repos))
+	for r := range summary.Repos {
 		repos = append(repos, r)
 	}
 	sort.Strings(repos)
@@ -122,7 +203,7 @@ func printStatus(w io.Writer, jobs []store.BoardJob, health store.FleetHealth, a
 		fmt.Fprintln(tw, "no jobs")
 	} else {
 		for _, repo := range repos {
-			states := repoStates[repo]
+			states := summary.Repos[repo].States
 			stateNames := make([]string, 0, len(states))
 			for s := range states {
 				stateNames = append(stateNames, s)
@@ -137,14 +218,14 @@ func printStatus(w io.Writer, jobs []store.BoardJob, health store.FleetHealth, a
 	}
 	tw.Flush() //nolint:errcheck
 
-	fmt.Fprintf(w, "\nawaiting human: %d merge_handoff, %d needs_human\n", mergeHandoff, needsHuman)
-	fmt.Fprintf(w, "fleet: %d live, %d stale workers%s\n", health.LiveWorkers, health.StaleWorkers, modelBreakdown(health.ByModel))
+	fmt.Fprintf(w, "\nawaiting human: %d merge_handoff, %d needs_human\n", summary.AwaitingHuman.MergeHandoff, summary.AwaitingHuman.NeedsHuman)
+	fmt.Fprintf(w, "fleet: %d live, %d stale workers%s\n", summary.Fleet.LiveWorkers, summary.Fleet.StaleWorkers, modelBreakdown(summary.liveModelBreakdownOnly))
 	// dropped GitHub writes (dead-lettered) — work that never took effect. Surface it in the
 	// human view too (not just the metric/log), pointing at the recovery command.
-	if len(abandoned) > 0 {
-		fmt.Fprintf(w, "⚠ abandoned GitHub writes: %s — fix the cause, then `flowbee retry-outbox <job-id>`\n", sortedCounts(abandoned))
+	if len(summary.AbandonedGitHubWrites) > 0 {
+		fmt.Fprintf(w, "⚠ abandoned GitHub writes: %s — fix the cause, then `flowbee retry-outbox <job-id>`\n", sortedCounts(summary.AbandonedGitHubWrites))
 	}
-	if paused {
+	if summary.Paused {
 		fmt.Fprintln(w, "\n*** PAUSED — no new leases are being issued (`flowbee resume` to unpause) ***")
 	}
 }

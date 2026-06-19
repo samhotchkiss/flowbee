@@ -46,6 +46,9 @@ type FleetHealth struct {
 	// worker registers — "codex", "sonnet", …), so the operator can see which model the
 	// fleet is running at a glance. Empty when no worker advertises one (older workers).
 	ByModel map[string]int
+	// StaleByModel counts STALE workers per advertised backend/model. The human status line
+	// intentionally keeps showing live models only; machine status uses this for totals.
+	StaleByModel map[string]int
 }
 
 // Stranded reports the silent-stall condition: work to do, but no live worker for it.
@@ -61,19 +64,29 @@ func (s *Store) FleetHealth(ctx context.Context, now time.Time, staleAfter time.
 		return h, err
 	}
 	for _, w := range roster {
+		model := ""
+		for _, cap := range w.Attested {
+			if m, ok := strings.CutPrefix(cap, "model:"); ok && m != "" {
+				model = m
+				break
+			}
+		}
 		if w.StaleHB {
 			h.StaleWorkers++
+			if model != "" {
+				if h.StaleByModel == nil {
+					h.StaleByModel = map[string]int{}
+				}
+				h.StaleByModel[model]++
+			}
 			continue
 		}
 		h.LiveWorkers++
-		for _, cap := range w.Attested {
-			if m, ok := strings.CutPrefix(cap, "model:"); ok && m != "" {
-				if h.ByModel == nil {
-					h.ByModel = map[string]int{}
-				}
-				h.ByModel[m]++
-				break
+		if model != "" {
+			if h.ByModel == nil {
+				h.ByModel = map[string]int{}
 			}
+			h.ByModel[model]++
 		}
 	}
 	if err := s.DB.QueryRowContext(ctx, `
