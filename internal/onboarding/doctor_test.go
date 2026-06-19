@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/config"
 	gh "github.com/samhotchkiss/flowbee/internal/github"
@@ -321,5 +322,35 @@ func TestDoctorCostCeilingArmed(t *testing.T) {
 	}
 	if !rep.Green() {
 		t.Fatalf("cost-ceiling armed must not break green:\n%s", dump(rep))
+	}
+}
+
+func TestRecentSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	// no snapshots -> not ok.
+	if _, _, ok := recentSnapshot(dir); ok {
+		t.Fatal("empty dir must yield ok=false")
+	}
+	// a fresh snapshot -> ok.
+	fresh := filepath.Join(dir, "flowbee-20260101-000001.000.db")
+	if err := os.WriteFile(fresh, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := recentSnapshot(dir); !ok {
+		t.Fatal("a just-written snapshot must be recent")
+	}
+	// an OLD snapshot (mtime > 25h ago) -> not ok.
+	old := filepath.Join(dir, "flowbee-20250101-000001.000.db")
+	if err := os.WriteFile(old, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-26 * time.Hour)
+	_ = os.Chtimes(old, stale, stale)
+	_ = os.Chtimes(fresh, stale, stale) // age BOTH out
+	if _, _, ok := recentSnapshot(dir); ok {
+		t.Fatal("all snapshots older than 25h must yield ok=false")
+	}
+	if _, _, ok := recentSnapshot(""); ok {
+		t.Fatal("empty dir path must yield ok=false")
 	}
 }

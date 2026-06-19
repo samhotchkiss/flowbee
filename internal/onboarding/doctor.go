@@ -96,7 +96,82 @@ func Doctor(ctx context.Context, opts DoctorOptions) (DoctorReport, error) {
 	// (3) GitHub reachability (skippable offline).
 	checkGitHub(ctx, opts, cfg, &rep)
 
+	// (4) durability: a single-file SQLite control plane with no backup loses ALL
+	// state on disk failure. Surface it at the readiness gate (WARN, not FAIL — it's a
+	// production recommendation, not a start-up blocker).
+	checkDurability(&rep)
+
 	return rep, nil
+}
+
+// checkDurability warns when no backup strategy is detected. It PASSES on either a
+// Litestream config (the off-disk production answer) or a recent `flowbee backup`
+// snapshot (the on-disk floor); otherwise it WARNs. WARN never breaks `green`.
+func checkDurability(rep *DoctorReport) {
+	for _, p := range []string{
+		"/etc/litestream.yml", "/etc/litestream.yaml",
+		filepath.Join(homeDir(), ".config", "litestream.yml"),
+		filepath.Join(homeDir(), "litestream.yml"),
+	} {
+		if p != "" && fileExists(p) {
+			rep.add("durability", StatusPass, "litestream config found ("+p+") — continuous off-disk replication")
+			return
+		}
+	}
+	dir := os.Getenv("FLOWBEE_BACKUP_DIR")
+	if dir == "" && homeDir() != "" {
+		dir = filepath.Join(homeDir(), ".flowbee", "backups")
+	}
+	if name, age, ok := recentSnapshot(dir); ok {
+		rep.add("durability", StatusPass, fmt.Sprintf("recent backup snapshot (%s, %s old) — on-disk floor; litestream is the off-disk answer", name, age))
+		return
+	}
+	rep.add("durability", StatusWarn, "no backup detected — a disk failure loses ALL state. Set up litestream "+
+		"(off-disk, docs/operating.md §6) or schedule `flowbee backup` (on-disk floor)")
+}
+
+func homeDir() string {
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return h
+}
+
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
+}
+
+// recentSnapshot returns the newest flowbee-*.db in dir and its rounded age, when one
+// exists within the last 25h (a daily backup cadence with slack). ok=false otherwise.
+func recentSnapshot(dir string) (name, age string, ok bool) {
+	if dir == "" {
+		return "", "", false
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "flowbee-*.db"))
+	if err != nil || len(matches) == 0 {
+		return "", "", false
+	}
+	var newest os.FileInfo
+	var newestPath string
+	for _, m := range matches {
+		fi, err := os.Stat(m)
+		if err != nil {
+			continue
+		}
+		if newest == nil || fi.ModTime().After(newest.ModTime()) {
+			newest, newestPath = fi, m
+		}
+	}
+	if newest == nil {
+		return "", "", false
+	}
+	since := time.Since(newest.ModTime())
+	if since > 25*time.Hour {
+		return "", "", false
+	}
+	return filepath.Base(newestPath), since.Round(time.Minute).String(), true
 }
 
 func checkConfig(root string, rep *DoctorReport) (config.Config, bool) {
