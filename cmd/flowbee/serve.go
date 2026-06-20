@@ -448,6 +448,23 @@ func runServe(args []string) error {
 		keep := cfg.BackupKeepN()
 		logger.Info("auto-backup enabled", "interval", d.String(), "keep", keep, "dir", backupDir)
 		go func() {
+			snap := func(why string) {
+				s, size, pruned, err := takeSnapshot(ctx, st.DB, backupDir, keep)
+				if err != nil {
+					logger.Error("auto-backup FAILED", "why", why, "err", err) // durability gap — alertable
+					return
+				}
+				logger.Info("💾 auto-backup", "why", why, "snapshot", s, "bytes", size, "pruned", pruned)
+			}
+			// startup catch-up: a plain ticker fires only AFTER `interval` elapses within ONE
+			// process lifetime, so a CP that restarts more often than the interval (crashes,
+			// deploys, dev redeploys) would NEVER snapshot. If the newest snapshot is already
+			// older than the interval (or none exists), take one now so the floor can't be
+			// skipped by churn — but skip it when a recent snapshot already covers the window,
+			// so frequent restarts don't spam redundant backups.
+			if age, ok := newestSnapshotAge(backupDir); !ok || age > d {
+				snap("startup")
+			}
 			t := time.NewTicker(d)
 			defer t.Stop()
 			for {
@@ -455,12 +472,7 @@ func runServe(args []string) error {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					snap, size, pruned, err := takeSnapshot(ctx, st.DB, backupDir, keep)
-					if err != nil {
-						logger.Error("auto-backup FAILED", "err", err) // durability gap — alertable
-						continue
-					}
-					logger.Info("💾 auto-backup", "snapshot", snap, "bytes", size, "pruned", pruned)
+					snap("interval")
 				}
 			}
 		}()

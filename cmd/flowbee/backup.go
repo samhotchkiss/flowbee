@@ -129,6 +129,23 @@ func pruneSnapshots(dir string, keep int) int {
 	return deleted
 }
 
+// newestSnapshotAge returns how long ago the most recent flowbee-*.db snapshot in dir was
+// written (by file mtime), and ok=false when the dir has no snapshot yet. The serve
+// auto-backup loop uses it to decide whether a startup catch-up is due, so a
+// frequently-restarted control plane still gets a floor within `interval`.
+func newestSnapshotAge(dir string) (time.Duration, bool) {
+	entries, err := filepath.Glob(filepath.Join(dir, "flowbee-*.db"))
+	if err != nil || len(entries) == 0 {
+		return 0, false
+	}
+	sort.Strings(entries) // lexical == chronological for the timestamped names
+	fi, err := os.Stat(entries[len(entries)-1])
+	if err != nil {
+		return 0, false
+	}
+	return time.Since(fi.ModTime()), true
+}
+
 // defaultBackupDir is a `backups/` sibling of the standard DB location.
 func defaultBackupDir() string {
 	if home, err := os.UserHomeDir(); err == nil && home != "" {

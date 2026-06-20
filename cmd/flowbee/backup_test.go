@@ -43,6 +43,28 @@ func TestPruneSnapshots(t *testing.T) {
 	}
 }
 
+// TestNewestSnapshotAge: false on an empty dir; on a populated dir it reports a small,
+// non-negative age for the most recent snapshot — the signal the serve loop uses to decide
+// a startup catch-up so a frequently-restarted CP still gets a floor within the interval.
+func TestNewestSnapshotAge(t *testing.T) {
+	dir := t.TempDir()
+	if _, ok := newestSnapshotAge(dir); ok {
+		t.Fatal("empty dir must report ok=false (no snapshot => catch-up is due)")
+	}
+	for _, ts := range []string{"20260101-000001.000", "20260620-120000.000"} {
+		if err := os.WriteFile(filepath.Join(dir, "flowbee-"+ts+".db"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	age, ok := newestSnapshotAge(dir)
+	if !ok {
+		t.Fatal("populated dir must report ok=true")
+	}
+	if age < 0 || age > time.Hour {
+		t.Fatalf("age of a just-written snapshot = %v, want a small non-negative duration", age)
+	}
+}
+
 func TestBackupRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "flowbee.db")
