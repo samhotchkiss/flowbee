@@ -65,6 +65,7 @@ func newF2Env(t *testing.T, cfg config.Config) *f2Env {
 	}, "f2")
 	fake := gh.NewFake()
 	sender := project.New(st, fake, clk, srv.Broker())
+	sender.WithHistory(fakeMergeHistory{}, "main") // self-merge requires a mirror to pin+re-verify
 	private := httptest.NewServer(srv.PrivateHandler())
 	t.Cleanup(private.Close)
 	return &f2Env{st: st, fake: fake, clk: clk, sender: sender, private: private}

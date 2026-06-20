@@ -267,13 +267,15 @@ func TestMergedJobDeletesItsIssueBranch(t *testing.T) {
 // case is covered by TestMergeConflictRoutesToResolverAfterFetch.)
 func TestTransientNotMergeableRetriedNotResolved(t *testing.T) {
 	st, fake, sender, clk := newSender(t)
+	// self-merge requires a mirror for the SHA-pin + content re-verify; wire a clean fake one.
+	sender.WithHistory(&fakeHistory{tip: "h", diffOut: diffAdding("docs/x.md", "clean")}, "main")
 	ctx := context.Background()
 	if _, err := st.SeedJob(ctx, store.SeedParams{
 		ID: "t", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: clk.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging' WHERE id='t'`); err != nil {
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging', base_sha='b', head_sha='h' WHERE id='t'`); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
@@ -317,5 +319,37 @@ func TestContentDenyReasonAllowOwnSource(t *testing.T) {
 	secret := "--- a/internal/app/.env\n+++ b/internal/app/.env\n@@ -0,0 +1 @@\n+KEY=v\n"
 	if contentDenyReason(secret, true) == "" {
 		t.Fatal("allowOwnSource must NOT relax the universal secret_material class")
+	}
+}
+
+// TestSelfMergeWithoutHistoryFailsClosed: an autonomous merge on a Sender with NO history
+// writer (no FLOWBEE_MIRROR_PATH => s.history == nil) cannot SHA-pin OR content-re-verify, so
+// it must FAIL CLOSED to the human merge gate instead of merging the live head unpinned +
+// unchecked. Regression for the bug where BOTH safeguards sat inside `if s.history != nil`,
+// silently downgrading the highest-stakes action to "merge whatever is live" with no mirror.
+func TestSelfMergeWithoutHistoryFailsClosed(t *testing.T) {
+	st, fake, sender, clk := newSender(t) // New() => s.history == nil
+	ctx := context.Background()
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "n", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: clk.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging', base_sha='b', head_sha='h' WHERE id='n'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
+		JobID: "n", Action: store.ActionEnqueueMerge, Payload: `{"pr_number":99}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if enq := fake.Enqueued(); len(enq) != 0 {
+		t.Fatalf("a self-merge with no mirror must NOT merge (it can't pin/verify); enqueued=%v", enq)
+	}
+	if j, _ := st.GetJob(ctx, "n"); j.State != job.StateMergeHandoff {
+		t.Fatalf("state=%s, want merge_handoff (unverifiable self-merge fails closed to the human gate)", j.State)
 	}
 }

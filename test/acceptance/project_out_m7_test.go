@@ -58,6 +58,7 @@ func newM7Env(t *testing.T, policy job.Policy) *m7Env {
 	}, "m7")
 	fake := gh.NewFake()
 	sender := project.New(st, fake, clk, srv.Broker())
+	sender.WithHistory(fakeMergeHistory{}, "main") // self-merge requires a mirror to pin+re-verify
 	rec := reconcile.New(st, fake, clk, srv.Broker())
 
 	private := httptest.NewServer(srv.PrivateHandler())

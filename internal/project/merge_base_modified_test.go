@@ -15,6 +15,8 @@ import (
 // merge case: every near-simultaneous merge's loser would otherwise strand at needs_human.
 func TestMergeBaseModifiedRetriesNotDeadLetters(t *testing.T) {
 	st, fake, sender, clk := newSender(t)
+	// self-merge requires a mirror for the SHA-pin + content re-verify; wire a clean fake one.
+	sender.WithHistory(&fakeHistory{tip: "h", diffOut: diffAdding("docs/x.md", "clean")}, "main")
 	ctx := context.Background()
 
 	if _, err := st.SeedJob(ctx, store.SeedParams{
@@ -22,7 +24,7 @@ func TestMergeBaseModifiedRetriesNotDeadLetters(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging' WHERE id='j'`); err != nil {
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging', base_sha='b', head_sha='h' WHERE id='j'`); err != nil {
 		t.Fatal(err)
 	}
 	fake.SetMergeBaseModified(91)

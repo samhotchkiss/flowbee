@@ -471,28 +471,44 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		// after the verdict was minted would otherwise merge unreviewed (the merge
 		// API merges the live head). Passing it as the merge `sha` makes GitHub 409
 		// if the head moved, routing to retry/handoff instead of a silent bad merge.
+		// An AUTONOMOUS merge MUST be SHA-pinned to the reviewed head AND content-re-verified
+		// against the REAL base..head diff — and BOTH require the local history/mirror writer.
+		// If it is absent (no FLOWBEE_MIRROR_PATH) or the job has no bound base/head, neither
+		// safeguard can run, so FAIL CLOSED to the human merge gate rather than merge the live
+		// head unpinned + unchecked. Otherwise an approve-then-push race (merging is
+		// non-supersedable) or an under-reported denylisted/secret diff would land on main. The
+		// guards used to sit INSIDE `if s.history != nil`, which silently downgraded the
+		// highest-stakes action to "merge whatever is live" when no mirror was configured.
+		// Self-merge therefore REQUIRES a mirror; without one, every autonomous merge handoffs.
+		if s.history == nil {
+			if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, "self_merge_unverifiable", s.clock.Now()); rerr != nil {
+				return "", fmt.Errorf("route unverifiable self-merge to handoff: %w", rerr)
+			}
+			if s.pub != nil {
+				s.pub.PublishReconcile(row.JobID, "project_out:self_merge_unverifiable")
+			}
+			return "autonomous merge UNVERIFIABLE (no mirror to SHA-pin/content re-verify) -> merge_handoff", nil
+		}
 		var expectedHead string
-		if s.history != nil {
-			j, jerr := s.store.GetJob(ctx, row.JobID)
-			if jerr == nil && j.BaseSHA != "" && j.HeadSHA != "" {
-				expectedHead = j.HeadSHA
-				br := store.IssueBranch(s.resolveIssueNum(ctx, j), row.JobID)
-				if ferr := s.history.FetchBranch(br); ferr != nil {
-					return "", fmt.Errorf("verify autonomous merge: fetch %s: %w", br, ferr)
+		j, jerr := s.store.GetJob(ctx, row.JobID)
+		if jerr == nil && j.BaseSHA != "" && j.HeadSHA != "" {
+			expectedHead = j.HeadSHA
+			br := store.IssueBranch(s.resolveIssueNum(ctx, j), row.JobID)
+			if ferr := s.history.FetchBranch(br); ferr != nil {
+				return "", fmt.Errorf("verify autonomous merge: fetch %s: %w", br, ferr)
+			}
+			actualDiff, derr := s.history.DiffBetween(j.BaseSHA, j.HeadSHA)
+			if derr != nil {
+				return "", fmt.Errorf("verify autonomous merge: diff %s..%s: %w", j.BaseSHA, j.HeadSHA, derr)
+			}
+			if reason := contentDenyReason(actualDiff, s.allowOwnSource); reason != "" {
+				if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
+					return "", fmt.Errorf("route self-merge to handoff: %w", rerr)
 				}
-				actualDiff, derr := s.history.DiffBetween(j.BaseSHA, j.HeadSHA)
-				if derr != nil {
-					return "", fmt.Errorf("verify autonomous merge: diff %s..%s: %w", j.BaseSHA, j.HeadSHA, derr)
+				if s.pub != nil {
+					s.pub.PublishReconcile(row.JobID, "project_out:self_merge_denied")
 				}
-				if reason := contentDenyReason(actualDiff, s.allowOwnSource); reason != "" {
-					if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
-						return "", fmt.Errorf("route self-merge to handoff: %w", rerr)
-					}
-					if s.pub != nil {
-						s.pub.PublishReconcile(row.JobID, "project_out:self_merge_denied")
-					}
-					return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
-				}
+				return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
 			}
 		}
 		if err := s.gh.EnqueueMergeQueue(ctx, number, expectedHead); err != nil {

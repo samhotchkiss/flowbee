@@ -72,6 +72,7 @@ func newM11Env(t *testing.T, policy job.Policy) *m11Env {
 	}, "m11")
 	fake := gh.NewFake()
 	sender := project.New(st, fake, clk, srv.Broker())
+	sender.WithHistory(fakeMergeHistory{}, "main") // self-merge requires a mirror to pin+re-verify
 	rec := reconcile.New(st, fake, clk, srv.Broker())
 	cfg := store.LivenessConfig{
 		PhaseBudget: 10 * time.Minute, AbsoluteCap: 60 * time.Minute,
