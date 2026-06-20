@@ -340,3 +340,37 @@ func statusFixtureJobs() []store.BoardJob {
 		{ID: "4", Repo: "octo/infra", State: "needs_human"},
 	}
 }
+
+// TestPrintStatusStarvationDetector: ready work + live workers + nothing actively building =
+// the starvation symptom (the merge_handoff reservation incident). It must surface loudly so a
+// future wedge is never silent. A fleet that IS building, or has no ready work, must NOT warn.
+func TestPrintStatusStarvationDetector(t *testing.T) {
+	starved := []store.BoardJob{
+		{ID: "1", Repo: "r", State: "ready"},
+		{ID: "2", Repo: "r", State: "ready"},
+		{ID: "3", Repo: "r", State: "merge_handoff"},
+	}
+	var buf bytes.Buffer
+	printStatus(&buf, starved, store.FleetHealth{LiveWorkers: 14}, nil, false)
+	if !strings.Contains(buf.String(), "STARVATION") {
+		t.Errorf("ready jobs + live workers + 0 active must warn STARVATION:\n%s", buf.String())
+	}
+
+	// a fleet actively building must NOT warn.
+	working := []store.BoardJob{
+		{ID: "1", Repo: "r", State: "ready"},
+		{ID: "2", Repo: "r", State: "building"},
+	}
+	var buf2 bytes.Buffer
+	printStatus(&buf2, working, store.FleetHealth{LiveWorkers: 14}, nil, false)
+	if strings.Contains(buf2.String(), "STARVATION") {
+		t.Errorf("a building fleet must NOT warn starvation:\n%s", buf2.String())
+	}
+
+	// no ready work => not starved (an idle fleet with nothing to do is fine).
+	var buf3 bytes.Buffer
+	printStatus(&buf3, []store.BoardJob{{ID: "1", Repo: "r", State: "done"}}, store.FleetHealth{LiveWorkers: 14}, nil, false)
+	if strings.Contains(buf3.String(), "STARVATION") {
+		t.Errorf("no ready work must NOT warn starvation:\n%s", buf3.String())
+	}
+}

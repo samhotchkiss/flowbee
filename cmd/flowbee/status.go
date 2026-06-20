@@ -123,12 +123,28 @@ type statusFleetSummary struct {
 }
 
 type statusSummary struct {
-	Repos                  map[string]statusRepoSummary `json:"repos"`
-	AwaitingHuman          statusAwaitingHumanSummary   `json:"awaiting_human"`
-	Fleet                  statusFleetSummary           `json:"fleet"`
-	AbandonedGitHubWrites  map[string]int               `json:"abandoned_github_writes"`
-	Paused                 bool                         `json:"-"`
+	Repos                 map[string]statusRepoSummary `json:"repos"`
+	AwaitingHuman         statusAwaitingHumanSummary   `json:"awaiting_human"`
+	Fleet                 statusFleetSummary           `json:"fleet"`
+	AbandonedGitHubWrites map[string]int               `json:"abandoned_github_writes"`
+	// ReadyJobs is work waiting to be claimed; ActiveJobs is work an agent is actively
+	// running (claimed + in progress). ReadyJobs>0 with live workers but ActiveJobs==0 is a
+	// starvation signal — the fleet is idle while work waits (e.g. a candidate-withholding
+	// reservation/capacity bug). Surfaced so a wedge is never silent (the merge_handoff
+	// reservation incident sat undetected for hours).
+	ReadyJobs              int  `json:"ready_jobs"`
+	ActiveJobs             int  `json:"active_jobs"`
+	Starved                bool `json:"starved"`
+	Paused                 bool `json:"-"`
 	liveModelBreakdownOnly map[string]int
+}
+
+// agentActiveStates are the states in which a worker is actively running an agent (so the
+// fleet is genuinely doing work). Deliberately EXCLUDES review_pending/mergeable/merge_handoff
+// (awaiting a claim or a human) — those are not "the fleet is busy".
+var agentActiveStates = map[string]bool{
+	"leased": true, "building": true, "code_review": true,
+	"resolving_conflict": true, "spec_authoring": true, "spec_review": true,
 }
 
 func summarizeStatus(jobs []store.BoardJob, health store.FleetHealth, abandoned map[string]int, paused bool) statusSummary {
@@ -155,9 +171,16 @@ func summarizeStatus(jobs []store.BoardJob, health store.FleetHealth, abandoned 
 			summary.AwaitingHuman.MergeHandoff++
 		case "needs_human":
 			summary.AwaitingHuman.NeedsHuman++
+		case "ready":
+			summary.ReadyJobs++
+		}
+		if agentActiveStates[j.State] {
+			summary.ActiveJobs++
 		}
 	}
 	summary.AwaitingHuman.Total = summary.AwaitingHuman.MergeHandoff + summary.AwaitingHuman.NeedsHuman
+	// starvation: work is ready and workers are alive, but nothing is being actively worked.
+	summary.Starved = summary.ReadyJobs > 0 && health.LiveWorkers > 0 && summary.ActiveJobs == 0
 
 	summary.Fleet.LiveWorkers = health.LiveWorkers
 	summary.Fleet.StaleWorkers = health.StaleWorkers
@@ -220,6 +243,13 @@ func printStatusSummary(w io.Writer, summary statusSummary) {
 
 	fmt.Fprintf(w, "\nawaiting human: %d merge_handoff, %d needs_human\n", summary.AwaitingHuman.MergeHandoff, summary.AwaitingHuman.NeedsHuman)
 	fmt.Fprintf(w, "fleet: %d live, %d stale workers%s\n", summary.Fleet.LiveWorkers, summary.Fleet.StaleWorkers, modelBreakdown(summary.liveModelBreakdownOnly))
+	// starvation detector — the fleet is idle while work waits. This is the symptom of ANY
+	// candidate-withholding bug (a reservation/capacity gate offering nothing), regardless of
+	// cause, so a future wedge surfaces immediately instead of sitting silent for hours.
+	if summary.Starved {
+		fmt.Fprintf(w, "⚠ possible fleet STARVATION: %d ready job(s) waiting + %d live worker(s) but 0 actively building/reviewing — the lease handler may be offering nothing (reservation/capacity withholding). Check `flowbee board` + the stuck jobs' declared_blast_radius vs in-flight reservations.\n",
+			summary.ReadyJobs, summary.Fleet.LiveWorkers)
+	}
 	// dropped GitHub writes (dead-lettered) — work that never took effect. Surface it in the
 	// human view too (not just the metric/log), pointing at the recovery command.
 	if len(summary.AbandonedGitHubWrites) > 0 {
