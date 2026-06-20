@@ -21,6 +21,43 @@ Some series are emitted only when the backing aggregate exists. For example, a j
 with no jobs has no `flowbee_jobs` series, and a repo with no pending merge has no
 `flowbee_oldest_pending_merge_age_seconds` series.
 
+## Alerting Rules
+
+The Prometheus alert definitions are maintained in
+[`deploy/prometheus-rules.yml`](../deploy/prometheus-rules.yml). This section explains how
+to interpret those deployed rules and how to tune their thresholds for different Flowbee
+installations.
+
+This revision does not include `deploy/prometheus-rules.yml`, so there are no checked-in
+alert names, expressions, `for` durations, labels, or annotations to enumerate here. When
+that file is present, treat it as the source of truth: document every `alert:` entry here by
+its exact name, translate its PromQL into operator-facing symptoms, and keep the metric
+details aligned with the metric reference below.
+
+### Tuning Guidance
+
+- **Repository size:** Larger repositories may naturally increase scan, indexing, merge,
+  rebase, and processing durations. Raise latency or duration thresholds only after checking
+  healthy-period p95 and p99 behavior for that repository, then leave margin for normal CI
+  variance. Keep error-rate alerts strict unless a larger repository is known to produce
+  harmless retries that are already understood and bounded.
+- **Merge volume:** Higher merge frequency can increase queue depth, branch contention,
+  conflict rates, and background reconcile or merge load. Tune backlog, queue, and
+  throughput thresholds against normal peak merge windows rather than quiet periods. Adjust
+  `for` durations to avoid paging on short expected bursts, but keep them short enough to
+  catch sustained overload before approved work ages past its SLO.
+- **Fleet size:** Larger fleets can increase aggregate counts while reducing per-instance
+  pressure, depending on the metric. Distinguish per-instance alerts from fleet-wide
+  aggregate alerts before changing thresholds, and scale thresholds in proportion to
+  worker or instance count only when the expression is an aggregate count. Keep
+  availability, scrape, and missing-target alerts sensitive enough to catch partial fleet
+  loss instead of only total outages.
+- **Concrete thresholds:** Change alert thresholds, rate windows, and `for` durations in
+  `deploy/prometheus-rules.yml` when operators need different sensitivity. Prefer changing
+  one dimension at a time: the threshold for what is abnormal, the PromQL lookback window
+  for how the signal is smoothed, or the `for` duration for how long the abnormal condition
+  must persist before firing.
+
 ## Metric Reference
 
 | Metric | Type | Labels | Meaning | Alert guidance |

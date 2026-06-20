@@ -265,7 +265,9 @@ building → review_pending → code_review → mergeable → merging → done**
 - **Metrics:** `GET /metrics` on the health listener (`:7001`, same unauthenticated port as
   `/healthz`) emits Prometheus text format — point a scrape at it. Use
   [`metrics.md`](metrics.md) as the detailed reference for metric names, labels, types, units,
-  and alert guidance. The pages that matter most in day-to-day operation are a wedged
+  and alert guidance. For deployed alert conditions and threshold tuning, see
+  [Alerting Rules](metrics.md#alerting-rules). The pages that matter most in day-to-day
+  operation are a wedged
   `needs_human` job, no live workers while jobs are waiting, abandoned GitHub outbox work, an
   approved merge aging past its SLO, red main CI, unexpected pause/park state, over-budget
   work, or GitHub last-success age growing past the normal reconcile cadence. `/healthz`
