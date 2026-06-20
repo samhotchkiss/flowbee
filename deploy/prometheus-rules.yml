@@ -23,7 +23,7 @@ groups:
 
       - alert: FlowbeeJobsWaitingWithNoLiveWorkers
         # Tune both the no-worker duration and waiting-job definition per deployment.
-        expr: (flowbee_fleet_workers{status="live"} == 0) and on() (flowbee_fleet_waiting_jobs > 0)
+        expr: (sum(flowbee_fleet_workers{status="live"}) == 0) and on() (flowbee_fleet_waiting_jobs > 0)
         for: 5m
         labels:
           severity: critical
