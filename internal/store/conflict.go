@@ -81,11 +81,19 @@ func hasDeclaration(declared string) bool {
 // (the §E "avoid first" rule). A build that declared a wide blast-radius single-
 // flights the whole tree. Folded from the persisted declared_blast_radius.
 func (s *Store) ActiveReservations(ctx context.Context) ([]scheduler.Reservation, error) {
+	// merge_handoff is DELIBERATELY excluded: a job parked at the human merge gate can sit
+	// there INDEFINITELY (allow_self_merge off), and holding its blast-radius reservation that
+	// long starves every overlapping ready build — the fleet wedges (a real live incident:
+	// merge_handoff jobs piled up on hot shared files and withheld all overlapping ready work).
+	// The reservation is only a conflict-avoidance OPTIMIZATION for IN-FLIGHT builds (the
+	// atomic claim is the correctness backstop); when a parked job finally merges, an
+	// overlapping build that proceeded meanwhile just rebases/resolves like any other — the
+	// resolver path handles it. Liveness wins over a speculative, resolver-handled conflict.
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT id, declared_blast_radius, reservation_paths, reservation_wide
 		  FROM jobs
 		 WHERE state IN ('leased','building','code_review','review_pending',
-		                 'resolving_conflict','mergeable','merging','merge_handoff')`)
+		                 'resolving_conflict','mergeable','merging')`)
 	if err != nil {
 		return nil, err
 	}
