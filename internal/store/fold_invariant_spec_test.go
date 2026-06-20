@@ -68,6 +68,34 @@ func TestFoldBacklogToSpecReview(t *testing.T) {
 	assertFoldMatchesProjection(t, st, "b")
 }
 
+// TestFoldResultAcceptedCarriesHead drives a real build RESULT (carrying the worker's pushed
+// head) through the projection==Fold invariant. The result UPDATE writes head_sha from
+// PushedSHA, so the appended result_accepted event must carry it — otherwise a ledger rebuild
+// blanks head_sha for a job sitting in review_pending (before a verdict mints the SHA), and
+// reconcile's flowbeePlaced guard then supersedes a good built+CI'd job back to ready. This
+// is the store-level lock for the missed KindResultAccepted head (sibling of rebase/resolve).
+func TestFoldResultAcceptedCarriesHead(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+
+	seedBuild(t, st, "j")
+	ls, err := claim(st, "j", "w1")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := st.Result(ctx, store.ResultParams{
+		JobID: "j", Epoch: ls.Epoch, PushedSHA: "builthead", Now: time.Unix(3200, 0),
+	}); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	j, _ := st.GetJob(ctx, "j")
+	if j.State != job.StateReviewPending || j.HeadSHA != "builthead" {
+		t.Fatalf("after result: state=%s head=%q, want review_pending/builthead", j.State, j.HeadSHA)
+	}
+	// the re-fold must reproduce head_sha=builthead, not blank it.
+	assertFoldMatchesProjection(t, st, "j")
+}
+
 // TestFoldPROpenAndRequeueClearsHead locks the head_sha fold across the PR-open + requeue
 // re-arm. KindPROpened now carries the head it stamped (read by reconcile's flowbeePlaced
 // classifier), and the operator requeue clears head_sha + verdict; both must fold, or a

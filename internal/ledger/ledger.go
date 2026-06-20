@@ -248,6 +248,13 @@ func Fold(events []Event) (job.Job, error) {
 			// projection-resync would strip the gate (the #2221/#2223 live regression).
 			j.State = e.ToState
 			j.RequiredCapabilities = []string{"role:code_reviewer"}
+			// mirror the projection's head_sha = COALESCE(NULLIF(PushedSHA,''), head_sha) so a
+			// fold-rebuild keeps the head reconcile's flowbeePlaced guard reads — else it
+			// blanks head_sha and supersedes a good build back to ready. Same conditional as
+			// KindConflictResolved (this was the missed sibling of that #2221/#2223-era fix).
+			if e.Payload.HeadSHA != "" {
+				j.HeadSHA = e.Payload.HeadSHA
+			}
 			// the lease is released on result: clear live lease columns, keep epoch.
 			j.LeaseID = ""
 			j.BoundIdentity = ""

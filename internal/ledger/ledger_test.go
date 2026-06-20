@@ -42,11 +42,11 @@ func TestFoldResetsBuildCapsOnReArmToReady(t *testing.T) {
 }
 
 // TestFoldCarriesHeadOnReArm locks the fix for a projection!=Fold divergence on head_sha:
-// the head-establishing re-arms (KindRebased, KindConflictResolved) set head_sha via a direct
-// store UPDATE, so the fold must reproduce it from the event payload — otherwise a
-// rebuild-from-ledger blanks (rebase) or strands (resolve) the head, and reconcile's
-// flowbeePlaced guard (which reads head_sha to tell our own integrated head from an external
-// push) misclassifies the next sweep and spuriously supersedes the review.
+// the head-establishing events (KindResultAccepted, KindRebased, KindConflictResolved) set
+// head_sha via a direct store UPDATE, so the fold must reproduce it from the event payload —
+// otherwise a rebuild-from-ledger blanks (result/rebase) or strands (resolve) the head, and
+// reconcile's flowbeePlaced guard (which reads head_sha to tell our own integrated head from
+// an external push) misclassifies the next sweep and spuriously supersedes the review.
 func TestFoldCarriesHeadOnReArm(t *testing.T) {
 	now := time.Unix(100, 0)
 	base := []Event{
@@ -87,6 +87,23 @@ func TestFoldCarriesHeadOnReArm(t *testing.T) {
 		t.Fatal(err)
 	} else if j.HeadSHA != "rebasedhead" {
 		t.Errorf("empty resolved head must keep the prior head; got %q want rebasedhead", j.HeadSHA)
+	}
+
+	// the BUILD RESULT itself carries the worker's pushed head -> the fold must reproduce it
+	// (the result UPDATE sets head_sha = COALESCE(NULLIF(PushedSHA,''), head_sha)). Without it
+	// a rebuild blanks head_sha for any job sitting in review_pending/code_review/mergeable
+	// before a verdict mints the SHA, and the next sweep supersedes a good built+CI'd job.
+	built := []Event{
+		{JobID: "H2", JobSeq: 1, Kind: KindJobCreated, ToState: job.StateReady, CreatedAt: now,
+			Payload: Payload{Kind: job.KindBuild, Role: job.RoleEngWorker, RequiredCapabilities: []string{"role:eng_worker"}}},
+		{JobID: "H2", JobSeq: 2, Kind: KindLeaseClaimed, ToState: job.StateLeased, LeaseEpoch: 1, CreatedAt: now},
+		{JobID: "H2", JobSeq: 3, Kind: KindResultAccepted, ToState: job.StateReviewPending, LeaseEpoch: 1, CreatedAt: now,
+			Payload: Payload{HeadSHA: "builthead"}},
+	}
+	if j, err := Fold(built); err != nil {
+		t.Fatal(err)
+	} else if j.HeadSHA != "builthead" {
+		t.Errorf("result-accepted fold head=%q want builthead (a blank head breaks the flowbeePlaced guard)", j.HeadSHA)
 	}
 }
 

@@ -481,6 +481,15 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 				FromState: t.From, ToState: t.To, LeaseEpoch: j.LeaseEpoch,
 				Actor: j.BoundIdentity, CreatedAt: p.Now,
 			}
+			if t.Kind == ledger.KindResultAccepted {
+				// Carry the pushed head on the event so Fold can reconstruct head_sha. The
+				// projection below writes head_sha = COALESCE(NULLIF(PushedSHA,''), head_sha);
+				// without this the event is payload-less and a DR re-fold blanks head_sha,
+				// after which reconcile's flowbeePlaced guard reads the unchanged PR head as a
+				// SHA move and supersedes a good, built+CI'd job back to `ready`. Mirrors the
+				// head-carrying KindRebased / KindConflictResolved payloads.
+				ev.Payload.HeadSHA = p.PushedSHA
+			}
 			if err := appendEvent(ctx, tx, ev); err != nil {
 				return err
 			}
