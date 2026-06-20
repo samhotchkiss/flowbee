@@ -243,10 +243,12 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 		if err != nil {
 			var ra *gh.ErrRetryAfter
 			if errors.As(err, &ra) {
-				// authoritative secondary limit: park the WHOLE outbox (§8.2.4) and
-				// leave the row pending for the next drain after the park expires.
+				// a rate-limit (primary 5000/hr, secondary/abuse, or GraphQL RATE_LIMITED):
+				// park the WHOLE outbox (§8.2.4) until the window resets and leave the row
+				// pending. Do NOT bump attempts — a rate-limit is a temporary outage, never
+				// progress toward the poison/dead-letter threshold, so a rate-limited
+				// issues.create/merge waits for the reset instead of being abandoned (russ #215).
 				s.parkedUntil = s.clock.Now().Add(ra.RetryAfter)
-				_ = s.store.BumpOutboxAttempts(ctx, row.ID)
 				return sent, nil
 			}
 			// a merge that conflicts (a sibling merged into the same area after the

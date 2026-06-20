@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -202,6 +203,46 @@ func (e *ErrRetryAfter) Error() string {
 	return fmt.Sprintf("retry after %s", e.RetryAfter)
 }
 
+// rateLimitBackoff detects a GitHub rate-limit from response headers and returns how long to
+// back off before retrying. GitHub signals it three ways, all covered here: a `Retry-After`
+// header (the secondary/abuse limit), or `X-RateLimit-Remaining: 0` + `X-RateLimit-Reset:
+// <unix>` (the primary 5000/hr limit) — the latter also present on a GraphQL 200 that
+// carries a RATE_LIMITED error. Returns ok=false when the response is not rate-limited.
+// Capped at 1h (a sane outage ceiling) and floored at 1s (never a busy-spin).
+func rateLimitBackoff(h http.Header) (time.Duration, bool) {
+	if ra := strings.TrimSpace(h.Get("Retry-After")); ra != "" {
+		if secs, err := strconv.Atoi(ra); err == nil && secs >= 0 {
+			return clampBackoff(time.Duration(secs) * time.Second), true
+		}
+	}
+	if h.Get("X-RateLimit-Remaining") == "0" {
+		if reset := strings.TrimSpace(h.Get("X-RateLimit-Reset")); reset != "" {
+			if unix, err := strconv.ParseInt(reset, 10, 64); err == nil {
+				return clampBackoff(time.Until(time.Unix(unix, 0))), true
+			}
+		}
+	}
+	return 0, false
+}
+
+func clampBackoff(d time.Duration) time.Duration {
+	if d < time.Second {
+		return time.Second
+	}
+	if d > time.Hour {
+		return time.Hour
+	}
+	return d
+}
+
+// isGraphQLRateLimited reports whether a GraphQL errors array signals the shared rate limit
+// — GitHub returns HTTP 200 with errors[].type == "RATE_LIMITED" (or a "rate limit" message),
+// so the status-code path never sees it. This is why issues.create / mergeQueue.enqueue
+// (both GraphQL mutations) were dead-lettered instead of backing off (russ #215).
+func isGraphQLRateLimited(typ, msg string) bool {
+	return strings.EqualFold(typ, "RATE_LIMITED") || strings.Contains(strings.ToLower(msg), "rate limit")
+}
+
 // ErrMergeConflict signals a PR that GitHub refuses to merge because it conflicts
 // with its base (a 405 "merge conflicts" / "not mergeable") — a sibling merged into
 // the same area after this change's verdict was minted. Distinct from a transient
@@ -367,6 +408,7 @@ func (c *RealClient) graphQL(ctx context.Context, query string, vars map[string]
 	var env struct {
 		Data   json.RawMessage `json:"data"`
 		Errors []struct {
+			Type    string `json:"type"`
 			Message string `json:"message"`
 		} `json:"errors"`
 	}
@@ -374,6 +416,16 @@ func (c *RealClient) graphQL(ctx context.Context, query string, vars map[string]
 		return fmt.Errorf("decode graphql: %w", err)
 	}
 	if len(env.Errors) > 0 {
+		// a GraphQL rate-limit is a 200 with errors[].type=RATE_LIMITED — back off until the
+		// window resets (the same outbox park as a REST 429) instead of returning a generic
+		// error that the drain retries blindly to the dead-letter backstop (russ #215).
+		if isGraphQLRateLimited(env.Errors[0].Type, env.Errors[0].Message) {
+			d, ok := rateLimitBackoff(resp.Header)
+			if !ok {
+				d = 60 * time.Second
+			}
+			return &ErrRetryAfter{RetryAfter: d}
+		}
 		return fmt.Errorf("graphql error: %s", env.Errors[0].Message)
 	}
 	return json.Unmarshal(env.Data, out)
@@ -707,11 +759,14 @@ func (c *RealClient) rest(ctx context.Context, method, path string, body any, ou
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
-		if ra := resp.Header.Get("Retry-After"); ra != "" {
-			if secs, perr := time.ParseDuration(ra + "s"); perr == nil {
-				return &ErrRetryAfter{RetryAfter: secs}
-			}
-			return &ErrRetryAfter{RetryAfter: 60 * time.Second}
+		// 403/429 with a rate-limit signal (Retry-After OR X-RateLimit-Remaining:0 + Reset)
+		// is a TEMPORARY outage, not a poison 4xx — back off until the window resets rather
+		// than letting a 403 dead-letter or a 429 hammer the limit every drain (russ #215).
+		if d, ok := rateLimitBackoff(resp.Header); ok {
+			return &ErrRetryAfter{RetryAfter: d}
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return &ErrRetryAfter{RetryAfter: 60 * time.Second} // 429 with no headers: default backoff
 		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
