@@ -436,6 +436,11 @@ func Fold(events []Event) (job.Job, error) {
 				j.SpecContentHash = e.Payload.SpecContentHash
 				j.SpecVersion = e.Payload.SpecVersion
 			}
+			// the amend UPDATE sets spec_text to the amended bytes (COALESCE-non-empty); mirror
+			// it so a fold-rebuild reproduces the amended spec the issue/build actually carry.
+			if e.Payload.SpecText != "" {
+				j.SpecText = e.Payload.SpecText
+			}
 			j.SpecSignoff = e.Payload.SpecSignoff
 			j.LeaseID = ""
 			j.BoundIdentity = ""

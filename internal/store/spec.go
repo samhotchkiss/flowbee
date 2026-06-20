@@ -497,7 +497,11 @@ type SpecReviewResultParams struct {
 	// sign-off bound to the AMENDED hash. The author is never bounced.
 	AmendedHash    string // resolved by the caller (api) via spec.ContentHash
 	AmendedVersion int
-	IdempotencyKey string
+	// AmendedMarkdown is the AMENDED spec bytes themselves — FLOWBEE persists these as the new
+	// spec_text so the materialized issue + the build carry the content the sign-off is bound to.
+	// Without it, an amend hashes+signs the amended bytes but ships the original (rejected) ones.
+	AmendedMarkdown string
+	IdempotencyKey  string
 	// Notes are the issue-reviewer's findings; on a changes-requested bounce they are
 	// carried onto the job (LastReviewNotes) so the spec-author rebuild surfaces them
 	// (§F compounding-memory read side — symmetric with the code-review path).
@@ -611,6 +615,7 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 			if t.Kind == ledger.KindSpecAmended {
 				pay.SpecContentHash = in.AmendedHash
 				pay.SpecVersion = in.AmendedVersion
+				pay.SpecText = in.AmendedMarkdown // ship the AMENDED bytes (folded below + projected)
 				amended = true
 			}
 			if t.Kind == ledger.KindSpecNeedsDesign {
@@ -655,12 +660,13 @@ func (s *Store) SpecReviewResult(ctx context.Context, in SpecReviewResultParams)
 				UPDATE jobs
 				   SET state = 'done', spec_signoff = ?, spec_signoff_hash = ?,
 				       spec_content_hash = ?, spec_version = ?,
+				       spec_text = COALESCE(NULLIF(?, ''), spec_text),
 				       bounces = bounces + ?,
 				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 				       lease_hb_due = NULL, updated_at = datetime('now')
 				 WHERE id = ?`,
 				string(blob), minted.SpecHash, minted.SpecHash, minted.SpecVersion,
-				bouncesDelta, in.JobID); err != nil {
+				in.AmendedMarkdown, bouncesDelta, in.JobID); err != nil {
 				return fmt.Errorf("apply spec signoff projection: %w", err)
 			}
 			if isEpic == 1 {

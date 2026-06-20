@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
@@ -134,6 +135,23 @@ func TestF4_IssueReviewAmendsInPlaceNoBounce(t *testing.T) {
 	}
 	if folded.SpecSignoff == nil || folded.SpecSignoff.IntegrityHash != j.SpecSignoff.IntegrityHash {
 		t.Fatalf("Fold != projection for the amended sign-off")
+	}
+
+	// the issue + build must carry the AMENDED content the sign-off attests to — NOT the original
+	// sub-standard bytes. Without persisting the amended spec, the amend hashes the good spec but
+	// ships the rejected one (the materialized issue + the build implement the wrong document).
+	if j.SpecText != amended {
+		t.Fatalf("spec_text must be the AMENDED bytes; got %q", j.SpecText)
+	}
+	if folded.SpecText != amended {
+		t.Fatalf("Fold must reproduce the amended spec_text; got %q", folded.SpecText)
+	}
+	var body string
+	for _, iss := range e.fake.Issues() {
+		body = iss.Body
+	}
+	if !strings.Contains(body, "Build X.") || strings.Contains(body, "vague one-liner") {
+		t.Fatalf("the materialized issue must carry the AMENDED spec, not the original:\n%s", body)
 	}
 }
 

@@ -1261,9 +1261,10 @@ func (s *Server) specReview(w http.ResponseWriter, r *http.Request) {
 	// F4 amend-in-place: Flowbee commits the reviewer's amended bytes (computes the
 	// BLAKE3 hash — the worker never self-addresses its artifact, §11.1). The new
 	// version defaults to one past the reviewed version if unspecified.
-	var amendedHash string
+	var amendedHash, amendedMarkdown string
 	if job.VerdictValue(req.Decision) == job.VerdictAmended && req.AmendedSpecMarkdown != "" {
 		amendedHash = spec.ContentHash([]byte(req.AmendedSpecMarkdown))
+		amendedMarkdown = req.AmendedSpecMarkdown // persisted as spec_text so the issue/build carry the amended content
 	}
 	resp, err := s.store.SpecReviewResult(r.Context(), store.SpecReviewResultParams{
 		JobID: jobID, Epoch: epoch,
@@ -1272,6 +1273,7 @@ func (s *Server) specReview(w http.ResponseWriter, r *http.Request) {
 		MeetsStyle:        req.MeetsStyle,
 		MeetsRequirements: req.MeetsRequirements,
 		AmendedHash:       amendedHash,
+		AmendedMarkdown:   amendedMarkdown,
 		AmendedVersion:    req.AmendedVersion,
 		IdempotencyKey:    r.Header.Get("Idempotency-Key"),
 		Notes:             req.Notes, // carried to the spec-author rebuild on a bounce (§F read)
