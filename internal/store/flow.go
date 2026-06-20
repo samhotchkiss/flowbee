@@ -390,6 +390,22 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			// F5 panel accumulate: carry the head the reviewer just advanced so the fold tracks
 			// it (the projection does too, below) — keeps the job's head current across rounds so
 			// reconcile doesn't read the reviewer's own empty commit as a SHA move and supersede.
+			//
+			// TRUST ASSUMPTION (defense-in-depth gap, tracked): ReviewerHead is reported by the
+			// worker and folded here WITHOUT server-side tree validation. It is safe because the
+			// honest path can only ever advance the head by a SAME-TREE empty commit:
+			// reviewerEmptyCommit (worker/review.go) builds the verdict commit in its OWN fresh
+			// temp worktree the review agent never touches, then `git commit --allow-empty` with
+			// nothing staged — structurally a no-content commit. A ROGUE worker that bypassed the
+			// harness (pushed a different-tree commit to the issue branch AND reported its SHA
+			// here) could launder that head into j.HeadSHA, defeating reconcile's flowbeePlaced
+			// supersede guard and binding an N>=2 panel mint to a tree no reviewer judged. Closing
+			// that fully needs reconcile to verify tree(head)==tree(parent) before treating a
+			// head move as flowbeePlaced (a GitHub tree compare) — a threat-model call (defend
+			// against a compromised authenticated fleet member?) deliberately left to the operator
+			// rather than rushed into the live merge path. Not reachable via the honest fleet; the
+			// panel is opt-in (RequiredReviewers default 1, where this head never persists across a
+			// sweep with a banked approval waiting).
 			if t.Kind == ledger.KindReviewApproved && in.ReviewerHead != "" {
 				pay.HeadSHA = in.ReviewerHead
 			}

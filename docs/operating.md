@@ -151,7 +151,18 @@ top-level `required_reviewers:` in `flowbee.yaml`, or per repo with `required_re
 in that repo's registry entry, which overrides the global value. The default is 1,
 preserving the single-reviewer gate. Under `--agent codex`, panel reviewers use the same
 model but distinct identities; anti-affinity is per identity, not per model family, so an
-N>1 panel is satisfiable on a single-backend fleet.
+N>1 panel is satisfiable on a single-backend fleet. A clean auto-rebase or conflict
+resolution mid-panel re-establishes the reviewed head and starts a fresh round, so every
+approval that mints is against the actually-merged code.
+
+> **Threat model note (N>1):** a panel reviewer advances the issue branch with a same-tree
+> empty findings commit, and Flowbee trusts the head it reports (to avoid superseding the
+> round on that commit). An honest fleet can only ever report a same-tree commit, but a
+> *rogue* worker that bypassed the harness — pushing a different-tree commit to the branch
+> and reporting its SHA — could bind a panel mint to a tree no reviewer judged. The panel
+> defends against an honest-but-wrong reviewer, not a compromised one; if your threat model
+> includes a hostile authenticated worker, treat that as an open hardening item (reconcile
+> would need to verify the reviewer commit is empty before trusting its head).
 
 Operators can override the model per role via the `--agent-cmd` flag (reviewer, conflict
 resolver, and spec-reviewer roles) and `--build-agent-cmd` flag (build and spec-author
