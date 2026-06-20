@@ -456,23 +456,32 @@ func runServe(args []string) error {
 				}
 				logger.Info("💾 auto-backup", "why", why, "snapshot", s, "bytes", size, "pruned", pruned)
 			}
-			// startup catch-up: a plain ticker fires only AFTER `interval` elapses within ONE
-			// process lifetime, so a CP that restarts more often than the interval (crashes,
-			// deploys, dev redeploys) would NEVER snapshot. If the newest snapshot is already
-			// older than the interval (or none exists), take one now so the floor can't be
-			// skipped by churn — but skip it when a recent snapshot already covers the window,
-			// so frequent restarts don't spam redundant backups.
-			if age, ok := newestSnapshotAge(backupDir); !ok || age > d {
-				snap("startup")
+			// POLL-and-check-DUE rather than a fixed-interval ticker from startup. A snapshot
+			// is taken whenever the newest one is older than the interval (or none exists), so:
+			// (a) a CP that restarts more often than the interval still snapshots (a plain
+			// ticker resets every restart → never fires); AND (b) staleness is bounded to
+			// ~interval REGARDLESS of restart timing — a fixed ticker would let a restart that
+			// lands mid-interval (snapshot e.g. 5h old, < interval so no catch-up) push the next
+			// backup to interval-after-startup, leaving the floor ~2×interval stale. A recent
+			// snapshot within the window is left alone, so frequent restarts don't spam backups.
+			due := func(why string) {
+				if age, ok := newestSnapshotAge(backupDir); !ok || age >= d {
+					snap(why)
+				}
 			}
-			t := time.NewTicker(d)
+			due("startup")
+			poll := d / 6
+			if poll < time.Minute {
+				poll = time.Minute
+			}
+			t := time.NewTicker(poll)
 			defer t.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					snap("interval")
+					due("interval")
 				}
 			}
 		}()
