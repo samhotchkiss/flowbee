@@ -85,8 +85,15 @@ func runUp(args []string) error {
 	// 1. ensure the local mirror (Flowbee pushes build branches here, then to GitHub).
 	if _, err := os.Stat(*mirror); err != nil {
 		fmt.Printf("flowbee up: cloning mirror %s/%s -> %s\n", owner, repo, *mirror)
-		clone := exec.Command("git", "clone", "--bare", "--quiet",
-			fmt.Sprintf("https://github.com/%s/%s.git", owner, repo), *mirror)
+		// Bake the token into the clone URL when present — otherwise a PRIVATE repo (the
+		// common case the README quickstart documents: `export FLOWBEE_GITHUB_TOKEN`) fails
+		// here at "clone mirror" before serve ever runs, since this clone is unauthenticated
+		// and there may be no git credential helper. Mirrors the serve path's githubPushURL.
+		cloneURL := fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
+		if tok := os.Getenv("FLOWBEE_GITHUB_TOKEN"); tok != "" {
+			cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git", tok, owner, repo)
+		}
+		clone := exec.Command("git", "clone", "--bare", "--quiet", cloneURL, *mirror)
 		clone.Stderr = os.Stderr
 		if err := clone.Run(); err != nil {
 			return fmt.Errorf("clone mirror: %w", err)

@@ -292,20 +292,23 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/needs-input", s.needsInputJSON)
 	mux.HandleFunc("GET /v1/backlog", s.backlogJSON)
 	mux.HandleFunc("GET /v1/fleet", s.fleetJSON)
-	// F7 board-lifecycle write edges (operator / user-agent loop). These are the
-	// deliberate human/agent decisions: answer a needs_design item (resume it),
-	// promote a backlog item into its flow, opt a quiescent adopted item in.
-	mux.HandleFunc("POST /v1/jobs/{job}/design", s.resolveDesign)
-	mux.HandleFunc("POST /v1/jobs/{job}/promote", s.promoteBacklog)
-	mux.HandleFunc("POST /v1/jobs/{job}/adopt", s.adoptOptIn)
-	// operator retry: re-arm a job stranded in needs_human (escalated from a now-fixed
-	// transient failure) back to ready. Same operator surface as promote/adopt.
-	mux.HandleFunc("POST /v1/jobs/{job}/requeue", s.requeue)
-	mux.HandleFunc("POST /v1/jobs/{job}/cancel", s.cancel)
-	// the planner front-door (ingest): seed a spec-authoring job from a submitted
-	// work item so the spec flow (author -> issue-review -> materialize) can run.
-	mux.HandleFunc("POST /v1/specs", s.specCreate)
-	mux.HandleFunc("POST /v1/epics", s.epicCreate)
+	// F7 board-lifecycle WRITE / intake edges (operator / user-agent / planner loop):
+	// answer a needs_design item, promote a backlog item, opt a quiescent item in, retry
+	// a needs_human job, cancel, or inject work via the spec/epic front door. These MUTATE
+	// state / inject work, so they carry the SAME auth posture as the worker protocol —
+	// loopback-bypass when enabled, a valid token required off-loopback — so a non-loopback
+	// caller can't cancel/requeue a job or inject specs without a credential under the
+	// secure posture. (They previously sat on the bare mux, unauthenticated even with
+	// worker_auth_secret set; the read-only dashboard endpoints above stay open by design.)
+	// auth.Middleware(nil, h) == h, so this is a no-op in the loopback-only dev default.
+	op := func(h http.HandlerFunc) http.Handler { return auth.Middleware(s.authn, h) }
+	mux.Handle("POST /v1/jobs/{job}/design", op(s.resolveDesign))
+	mux.Handle("POST /v1/jobs/{job}/promote", op(s.promoteBacklog))
+	mux.Handle("POST /v1/jobs/{job}/adopt", op(s.adoptOptIn))
+	mux.Handle("POST /v1/jobs/{job}/requeue", op(s.requeue))
+	mux.Handle("POST /v1/jobs/{job}/cancel", op(s.cancel))
+	mux.Handle("POST /v1/specs", op(s.specCreate))
+	mux.Handle("POST /v1/epics", op(s.epicCreate))
 	// the board's machine-readable snapshot (HTML clients hit the web UI's "/"; a
 	// JSON client uses this stable endpoint instead of content-negotiating "/").
 	mux.HandleFunc("GET /v1/board", s.boardJSON)
