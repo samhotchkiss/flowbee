@@ -123,6 +123,8 @@ only for a repo whose owner wants that in-repo archive.
 |-----|--------------|---------|---------|
 | `cost_ceiling_usd` | `FLOWBEE_COST_CEILING_USD` | `0` (off) | per-job spend cap in dollars. When `> 0`, the first worker cost report whose accumulated total reaches it revokes the lease and escalates the job to `needs_human` (`over_budget`). `0` = no cap — cost is still metered for the rollup, but a runaway job is bounded only by attempts/bounces. A per-job ceiling seeded at creation (e.g. a costly epic) takes precedence over this fleet default. |
 
+> **The ceiling depends on the agent self-reporting its cost — by design there is no server-side price table** (Flowbee takes `total_cost_usd` directly from the agent, so a model/price change never desyncs the meter). The cost report is emitted only when the agent runs with `claude --output-format json` (the default fleet cmds and `flowbee up` all do this; `parseAgentUsage` reads `total_cost_usd` + `usage`). **A custom agent command that does NOT emit that JSON reports nothing, so the meter stays at $0, the rollup shows $0, and the ceiling can never fire** — the job is then bounded only by the hard caps (`max_attempts`, `max_bounces`, and the absolute `lease_ttl_s` wall-clock cap), not by dollars. If you set a ceiling, run an agent that emits `--output-format json`; a `$0.00` cost in `GET /v1/cost` for a job that clearly ran is the tell that your agent isn't reporting.
+
 ## Worker authentication
 
 Empty `worker_auth_secret` = loopback-only dev (the listener must stay on
