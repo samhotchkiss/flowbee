@@ -253,7 +253,10 @@ func (s *Store) RebaseOnto(ctx context.Context, mirror *gitops.Mirror, p RebaseO
 				JobID: p.JobID, JobSeq: nextSeq, Kind: ledger.KindRebased,
 				FromState: j.State, ToState: job.StateReviewPending, LeaseEpoch: j.LeaseEpoch + 1,
 				Actor: "system", CreatedAt: p.Now,
-				Payload: ledger.Payload{BaseSHA: p.NewBaseSHA},
+				// carry the integrated head so Fold reproduces the projection's head_sha
+				// (the UPDATE below sets head_sha = newSHA). reconcile's flowbeePlaced guard
+				// reads head_sha, so a fold-rebuild must not blank it.
+				Payload: ledger.Payload{BaseSHA: p.NewBaseSHA, HeadSHA: newSHA},
 			}
 			if err := appendEvent(ctx, tx, ev); err != nil {
 				return err
@@ -484,7 +487,9 @@ func (s *Store) ResolveConflictResult(ctx context.Context, p ResolveConflictPara
 			JobID: p.JobID, JobSeq: nextSeq, Kind: ledger.KindConflictResolved,
 			FromState: j.State, ToState: job.StateReviewPending, LeaseEpoch: j.LeaseEpoch,
 			Actor: j.BoundIdentity, CreatedAt: p.Now,
-			Payload: ledger.Payload{BaseSHA: j.BaseSHA},
+			// carry the resolved head so Fold reproduces head_sha (the UPDATE below sets it
+			// to PushedSHA when non-empty, else keeps the prior head — mirror that in Fold).
+			Payload: ledger.Payload{BaseSHA: j.BaseSHA, HeadSHA: p.PushedSHA},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err

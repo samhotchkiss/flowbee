@@ -77,6 +77,14 @@ func assertFoldMatchesProjection(t *testing.T, st *store.Store, id string) {
 	if folded.LeaseEpoch != proj.LeaseEpoch {
 		t.Fatalf("fold lease_epoch=%d != projection %d (epoch bumps must fold)", folded.LeaseEpoch, proj.LeaseEpoch)
 	}
+	// head_sha is read by reconcile's flowbeePlaced guard (an external-push-vs-our-own
+	// classification that gates supersession). Head-establishing re-arms (rebased,
+	// conflict_resolved, the panel accumulate) set it via a direct UPDATE, so the fold must
+	// carry the head on those events or a rebuild-from-ledger would blank/stale it and
+	// reconcile would misclassify the next sweep.
+	if folded.HeadSHA != proj.HeadSHA {
+		t.Fatalf("fold head_sha=%q != projection %q (head-establishing re-arms must fold the head)", folded.HeadSHA, proj.HeadSHA)
+	}
 	// role + required_capabilities decide WHO can lease the job. Several re-arm-to-ready
 	// paths (operator requeue, stall revoke, fast-cancel) set them via a direct UPDATE, NOT
 	// a folded field, so a rebuild-from-ledger could keep STALE review caps on a re-armed

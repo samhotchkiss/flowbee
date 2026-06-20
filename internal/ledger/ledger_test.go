@@ -41,6 +41,55 @@ func TestFoldResetsBuildCapsOnReArmToReady(t *testing.T) {
 	}
 }
 
+// TestFoldCarriesHeadOnReArm locks the fix for a projection!=Fold divergence on head_sha:
+// the head-establishing re-arms (KindRebased, KindConflictResolved) set head_sha via a direct
+// store UPDATE, so the fold must reproduce it from the event payload — otherwise a
+// rebuild-from-ledger blanks (rebase) or strands (resolve) the head, and reconcile's
+// flowbeePlaced guard (which reads head_sha to tell our own integrated head from an external
+// push) misclassifies the next sweep and spuriously supersedes the review.
+func TestFoldCarriesHeadOnReArm(t *testing.T) {
+	now := time.Unix(100, 0)
+	base := []Event{
+		{JobID: "H1", JobSeq: 1, Kind: KindJobCreated, ToState: job.StateReady, CreatedAt: now,
+			Payload: Payload{Kind: job.KindBuild, Role: job.RoleEngWorker, RequiredCapabilities: []string{"role:eng_worker"}}},
+		{JobID: "H1", JobSeq: 2, Kind: KindLeaseClaimed, ToState: job.StateLeased, LeaseEpoch: 1, CreatedAt: now},
+		{JobID: "H1", JobSeq: 3, Kind: KindResultAccepted, ToState: job.StateReviewPending, LeaseEpoch: 1, CreatedAt: now},
+	}
+
+	// a clean rebase re-arms review at the integrated head -> the fold must carry it (the
+	// rebase UPDATE sets head_sha = newSHA; the fold previously blanked it to "").
+	reb := append(append([]Event{}, base...),
+		Event{JobID: "H1", JobSeq: 4, Kind: KindRebased, ToState: job.StateReviewPending, LeaseEpoch: 2, CreatedAt: now,
+			Payload: Payload{BaseSHA: "newbase", HeadSHA: "rebasedhead"}})
+	if j, err := Fold(reb); err != nil {
+		t.Fatal(err)
+	} else if j.HeadSHA != "rebasedhead" {
+		t.Errorf("rebase fold head=%q want rebasedhead (a blank head breaks the flowbeePlaced guard)", j.HeadSHA)
+	}
+
+	// a conflict resolution re-arms at the resolver's pushed head -> the fold must carry it
+	// (the resolve UPDATE sets head_sha = PushedSHA; the fold previously left it stale).
+	res := append(append([]Event{}, base...),
+		Event{JobID: "H1", JobSeq: 4, Kind: KindConflictResolved, ToState: job.StateReviewPending, LeaseEpoch: 1, CreatedAt: now,
+			Payload: Payload{BaseSHA: "newbase", HeadSHA: "resolvedhead"}})
+	if j, err := Fold(res); err != nil {
+		t.Fatal(err)
+	} else if j.HeadSHA != "resolvedhead" {
+		t.Errorf("resolve fold head=%q want resolvedhead", j.HeadSHA)
+	}
+
+	// an empty resolved head keeps the prior head — mirrors the store's
+	// COALESCE(NULLIF(PushedSHA,''), head_sha).
+	keep := append(append([]Event{}, reb...),
+		Event{JobID: "H1", JobSeq: 5, Kind: KindConflictResolved, ToState: job.StateReviewPending, LeaseEpoch: 2, CreatedAt: now,
+			Payload: Payload{HeadSHA: ""}})
+	if j, err := Fold(keep); err != nil {
+		t.Fatal(err)
+	} else if j.HeadSHA != "rebasedhead" {
+		t.Errorf("empty resolved head must keep the prior head; got %q want rebasedhead", j.HeadSHA)
+	}
+}
+
 func TestFoldHappyPath(t *testing.T) {
 	now := time.Unix(100, 0)
 	events := []Event{

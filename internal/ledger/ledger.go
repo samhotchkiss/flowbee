@@ -598,7 +598,9 @@ func Fold(events []Event) (job.Job, error) {
 			j.RequiredCapabilities = []string{"role:code_reviewer"}
 			j.LeaseEpoch = e.LeaseEpoch
 			j.Verdict = nil
-			j.HeadSHA = ""
+			// the rebase UPDATE sets head_sha = newSHA (the integrated head); mirror it so a
+			// fold-rebuild keeps the head reconcile's flowbeePlaced guard reads.
+			j.HeadSHA = e.Payload.HeadSHA
 			if e.Payload.BaseSHA != "" {
 				j.BaseSHA = e.Payload.BaseSHA
 			}
@@ -632,6 +634,12 @@ func Fold(events []Event) (job.Job, error) {
 			j.Stage = "build"
 			j.RequiredCapabilities = []string{"role:code_reviewer"}
 			j.Verdict = nil
+			// the resolve UPDATE sets head_sha = COALESCE(NULLIF(PushedSHA,''), head_sha) —
+			// the resolved head when the resolver force-pushed one, else the prior head.
+			// Mirror that conditional so a fold-rebuild keeps head_sha == the projection.
+			if e.Payload.HeadSHA != "" {
+				j.HeadSHA = e.Payload.HeadSHA
+			}
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""
