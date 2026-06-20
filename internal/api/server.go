@@ -739,6 +739,16 @@ func (s *Server) setPause(w http.ResponseWriter, r *http.Request, pause bool) {
 		err = s.store.SetRepoActive(r.Context(), repo, !pause) // pause => active=false
 	} else {
 		err = s.store.SetDispatchPaused(r.Context(), pause)
+		if err == nil {
+			// Keep the CP-local marker file in lock-step with the DB flag so the two
+			// sources of truth can't disagree. Both the lease gate (isPaused) and
+			// `flowbee status` read `marker OR db-flag`; if `resume` cleared only the
+			// DB flag, a marker left by any source (an old binary, a manual touch)
+			// would wedge the fleet with no documented recovery (#216). This file op
+			// is safe here because the API runs ON the control-plane box, so a REMOTE
+			// client's resume still reaches the marker.
+			err = s.syncPauseMarker(pause)
+		}
 	}
 	if err != nil {
 		http.Error(w, "control: "+err.Error(), http.StatusBadRequest)
@@ -855,6 +865,28 @@ type LeaseContext struct {
 	// change. The brief tells the agent to re-apply that intent on the current code,
 	// reconciling it with the sibling change — not to re-run the original task.
 	Conflict bool `json:"conflict,omitempty"`
+}
+
+// syncPauseMarker mirrors the global pause flag onto the on-disk marker that the
+// lease gate (isPaused) and `flowbee status` read. pause => ensure the marker
+// exists; resume => ensure it's gone. A no-op when no marker path is configured.
+// This is what makes `flowbee resume` a reliable recovery: it clears the marker,
+// not just the DB flag (#216).
+func (s *Server) syncPauseMarker(pause bool) error {
+	if s.pauseMarkerPath == "" {
+		return nil
+	}
+	if pause {
+		f, err := os.OpenFile(s.pauseMarkerPath, os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		return f.Close()
+	}
+	if err := os.Remove(s.pauseMarkerPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // isPaused reports whether the fleet is currently paused. It checks for the
