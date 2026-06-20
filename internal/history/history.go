@@ -31,6 +31,7 @@ type Card struct {
 	JobID   string
 	Kind    job.Kind
 	Flow    string
+	Role    job.Role
 	Title   string // the human intent (task text first line), for the TOC + header
 	Status  job.State
 	Created time.Time // the job_created event's recorded time
@@ -96,6 +97,7 @@ func Fold(events []ledger.Event) (Card, error) {
 		JobID:            j.ID,
 		Kind:             j.Kind,
 		Flow:             j.Flow,
+		Role:             j.Role,
 		Status:           j.State,
 		IssueNum:         j.IssueNum,
 		PRNumber:         j.PRNumber,
