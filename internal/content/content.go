@@ -416,9 +416,22 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),                                                            // AWS access key id
 	regexp.MustCompile(`(?i)aws_secret_access_key\s*[=:]\s*[A-Za-z0-9/+]{20,}`),                       // AWS secret
 	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),                                          // PEM private key
-	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{30,}`),                                                  // GitHub token
+	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{30,}`),                                                  // GitHub token (classic/oauth/server)
+	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{30,}`),                                                // GitHub fine-grained PAT (current default; gh[pousr]_ misses it)
 	regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`),                                                // Slack token
-	regexp.MustCompile(`(?i)(api[_-]?key|secret|token|password)\s*[=:]\s*["']?[A-Za-z0-9/+_\-]{24,}`), // generic
+	regexp.MustCompile(`sk-ant-[A-Za-z0-9_\-]{20,}`),                                                  // Anthropic API key
+	regexp.MustCompile(`\bsk-(proj-)?[A-Za-z0-9]{20,}`),                                               // OpenAI API key (incl. project keys)
+	regexp.MustCompile(`\b[rs]k_live_[A-Za-z0-9]{20,}`),                                               // Stripe live secret / restricted key
+	regexp.MustCompile(`AIza[0-9A-Za-z_\-]{35}`),                                                      // Google API key (context-free)
+	regexp.MustCompile(`SG\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}`),                                // SendGrid API key
+	regexp.MustCompile(`ya29\.[A-Za-z0-9_\-]{20,}`),                                                   // Google OAuth access token
+	// NOTE: these are CONTEXT-FREE prefix shapes (no left-hand-side keyword needed), closing the
+	// "secret assigned to an innocuously-named variable" evasion FOR THESE PROVIDERS. The generic
+	// entropy/keyword check below is still LHS-anchored; a prefix-LESS high-entropy secret on a
+	// non-secret-ish var (e.g. `config = "<base64>"`) is NOT caught deterministically — a
+	// context-free entropy scan was considered but rejected (false-positives on legitimate
+	// base64/hash literals). That residual relies on the human merge gate + the LLM reviewer.
+	regexp.MustCompile(`(?i)(api[_-]?key|secret|token|password)\s*[=:]\s*["']?[A-Za-z0-9/+_\-]{24,}`), // generic keyword-anchored
 }
 
 // staticChecks runs the deterministic non-LLM checks (§9.2(c)) and returns the

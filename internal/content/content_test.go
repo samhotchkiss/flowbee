@@ -311,3 +311,44 @@ func TestModeChangeOnSpaceNamedWorkflowIsDenylisted(t *testing.T) {
 		t.Fatalf("a mode-change on a space-named workflow must hit the CI denylist class; it cleared (hits=%v)", r.DenylistHits)
 	}
 }
+
+// TestSecretScanCatchesCommonProvidersOnInnocuousVar: high-risk provider key formats must be
+// caught even when assigned to a NON-secret-ish variable (the context-free prefix patterns) —
+// the LHS-anchored keyword/entropy check alone misses `data = "<key>"`. Each would otherwise be
+// self-merge-eligible in an ordinary (non-denylisted) source file.
+func TestSecretScanCatchesCommonProvidersOnInnocuousVar(t *testing.T) {
+	cases := map[string]string{
+		"anthropic":      "sk-ant-api03-" + strings.Repeat("aB3", 12),
+		"github_fine":    "github_pat_11ABCDEFG0" + strings.Repeat("aB3", 10),
+		"openai_proj":    "sk-proj-" + strings.Repeat("aB3", 12),
+		"openai_classic": "sk-" + strings.Repeat("aB3", 16),
+		"stripe":         "sk_live_" + strings.Repeat("aB3", 12),
+		"google_apikey":  "AIza" + strings.Repeat("aB3c5", 7),
+		"sendgrid":       "SG." + strings.Repeat("aB3", 8) + "." + strings.Repeat("xY9", 8),
+		"google_oauth":   "ya29." + strings.Repeat("aB3", 12),
+	}
+	for name, secret := range cases {
+		d := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1 +1,2 @@\n package config\n+const data = \"" + secret + "\"\n"
+		r := Check(Patch{Diff: d, Declared: BlastRadius{Paths: []string{"config.go"}}}, Limits{})
+		if r.StaticChecksPass {
+			t.Errorf("%s key on an innocuous var must trip the secret-scan: %q", name, secret)
+		}
+	}
+}
+
+// TestSecretScanNoFalsePositiveOnOrdinaryStrings: ordinary identifiers/paths/URLs must NOT trip
+// the new prefix patterns, so legitimate code isn't needlessly forced to the human gate.
+func TestSecretScanNoFalsePositiveOnOrdinaryStrings(t *testing.T) {
+	for _, ok := range []string{
+		"this-is-a-normal-kebab-case-identifier-string",
+		"https://example.com/path/to/resource?q=value",
+		"github.com/samhotchkiss/flowbee/internal/content",
+		"a/very/long/file/path/that/is/not/a/secret.go",
+	} {
+		d := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1 +1,2 @@\n package config\n+const note = \"" + ok + "\"\n"
+		r := Check(Patch{Diff: d, Declared: BlastRadius{Paths: []string{"config.go"}}}, Limits{})
+		if !r.StaticChecksPass {
+			t.Errorf("ordinary string %q must NOT trip the secret-scan; failures=%v", ok, r.StaticFailures)
+		}
+	}
+}
