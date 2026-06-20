@@ -13,10 +13,11 @@ import (
 // assert the merge-conflict router fetches the post-merge main BEFORE resolving the
 // resolver's base.
 type fakeHistory struct {
-	fetched []string
-	tip     string
-	diffOut string // scripted DiffBetween result (the actual base..head unified diff)
-	diffErr error
+	fetched    []string
+	tip        string
+	diffOut    string            // scripted DiffBetween result (the actual base..head unified diff)
+	diffByHead map[string]string // per-head DiffBetween override (head -> diff); falls back to diffOut
+	diffErr    error
 }
 
 func (f *fakeHistory) CommitHistory(branch, message string, files []gitops.HistoryFile) (string, bool, error) {
@@ -28,6 +29,9 @@ func (f *fakeHistory) FetchBranch(branch string) error {
 	return nil
 }
 func (f *fakeHistory) DiffBetween(base, head string) (string, error) {
+	if d, ok := f.diffByHead[head]; ok {
+		return d, f.diffErr
+	}
 	return f.diffOut, f.diffErr
 }
 

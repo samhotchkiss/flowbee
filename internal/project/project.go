@@ -515,10 +515,22 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		}
 		if err := s.gh.EnqueueMergeQueue(ctx, number, expectedHead); err != nil {
 			if errors.Is(err, gh.ErrMergeHeadModified) {
-				// The feature branch moved after the gate reviewed it: a commit landed
-				// post-approval, so the head that would merge is unreviewed. `merging` is
-				// non-supersedable, so route to the HUMAN merge gate rather than retry the
-				// moved head or dead-letter — a human re-reviews the new head.
+				// The feature branch moved after the gate reviewed it. Before deferring to a
+				// human, check whether the move was COSMETIC — a reviewer's empty --allow-empty
+				// findings-commit (or any push leaving the base..head diff byte-identical to what
+				// was reviewed) changes the SHA but NOT the content. If so the live head IS the
+				// reviewed change: re-verify the denylist + merge the live head (russ #214 —
+				// reviewed-and-green PRs rotting 15–19h on a cosmetic head move). Safe by
+				// construction — it merges ONLY content identical to the review; a real content
+				// change (or a rebase, where the base context shifts) falls through to the human
+				// gate exactly as before.
+				if jerr == nil {
+					if detail, ok := s.mergeIfContentUnchanged(ctx, j, number); ok {
+						return detail, nil
+					}
+				}
+				// the head that would merge is unreviewed (real change). `merging` is
+				// non-supersedable, so route to the HUMAN merge gate — a human re-reviews it.
 				if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, "head_modified_after_review", s.clock.Now()); rerr != nil {
 					return "", fmt.Errorf("route head-modified to handoff: %w", rerr)
 				}
@@ -662,6 +674,49 @@ func (s *Sender) resolveIssueNum(ctx context.Context, j job.Job) int {
 // job (the signed_off_issue -> build link). The build carries the spec prose as
 // its task and binds to the current main tip as base_sha. Idempotent: a build
 // with the derived id already present is a no-op, so a re-drain never dupes.
+// mergeIfContentUnchanged is the head_modified recovery (russ #214): the PR head moved
+// after the verdict bound to j.HeadSHA, but if the move was COSMETIC — a reviewer's empty
+// --allow-empty findings-commit, or any push leaving the base..head diff byte-identical to
+// what was reviewed — then the LIVE head IS the reviewed change and is safe to merge. It
+// re-verifies the denylist against the live diff, then merges the live head. Returns
+// ok=false (so the caller hands off to a human) when: the content actually changed; the
+// diffs can't be computed (e.g. the verdict head was force-pushed away — a rebase, which
+// genuinely shifts the integration context and SHOULD re-review); or the re-merge still
+// fails. Safe by construction — it merges ONLY content byte-identical to the review, so a
+// bug here can at worst hand off (no worse than before), never merge unreviewed content.
+func (s *Sender) mergeIfContentUnchanged(ctx context.Context, j job.Job, number int) (string, bool) {
+	if s.history == nil || j.BaseSHA == "" || j.HeadSHA == "" {
+		return "", false
+	}
+	br := store.IssueBranch(s.resolveIssueNum(ctx, j), j.ID)
+	if err := s.history.FetchBranch(br); err != nil {
+		return "", false
+	}
+	liveHead, err := s.history.HeadSHA("refs/heads/" + br)
+	if err != nil || liveHead == "" || liveHead == j.HeadSHA {
+		return "", false
+	}
+	reviewed, err := s.history.DiffBetween(j.BaseSHA, j.HeadSHA)
+	if err != nil {
+		return "", false // verdict head gone (force-pushed/rebased) -> re-review via handoff
+	}
+	live, err := s.history.DiffBetween(j.BaseSHA, liveHead)
+	if err != nil || live != reviewed {
+		return "", false // real content change -> handoff
+	}
+	if reason := contentDenyReason(live, s.allowOwnSource); reason != "" {
+		return "", false // the live diff now trips the denylist -> handoff
+	}
+	if err := s.gh.EnqueueMergeQueue(ctx, number, liveHead); err != nil {
+		return "", false // still can't merge -> handoff
+	}
+	if s.logger != nil {
+		s.logger.Info("merged content-verified live head after a cosmetic head move",
+			"job", j.ID, "pr", number, "reviewed_head", j.HeadSHA, "live_head", liveHead)
+	}
+	return fmt.Sprintf("merge_enqueue pr=%d (content-verified live head; cosmetic head move)", number), true
+}
+
 func (s *Sender) seedBuildFromSpec(ctx context.Context, spec job.Job, now time.Time) (string, error) {
 	buildID := spec.ID + "-build"
 	if _, err := s.store.GetJob(ctx, buildID); err == nil {
