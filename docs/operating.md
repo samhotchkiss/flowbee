@@ -275,8 +275,13 @@ building → review_pending → code_review → mergeable → merging → done**
   `flowbee_outbox_abandoned{action}` (dead-lettered GitHub writes that never took effect —
   critical ones also escalate to `needs_human`, but cosmetic ones are otherwise silent, so
   alert on any growth; each is also logged with a `dead-lettered GitHub write` WARN naming the
-  action + job, and **`flowbee retry-outbox <job-id>`** re-arms a job's abandoned actions once
-  you've fixed the cause), and `flowbee_oldest_pending_merge_age_seconds{repo}` (age of the
+  action + job; **`flowbee outbox`** lists each abandoned write with its owning job + state so
+  you can triage it, and **`flowbee retry-outbox <job-id>`** re-arms a job's abandoned actions
+  once you've fixed the cause). The gauge counts only **actionable** abandons — an abandon whose
+  owning job has since reached `done`/`cancelled` is benign (a stale-SHA void or a superseded
+  merge attempt for a PR that merged anyway) and is excluded, so the series isn't a permanent
+  false alarm; `flowbee outbox --all` still lists those benign rows. Also
+  `flowbee_oldest_pending_merge_age_seconds{repo}` (age of the
   oldest job parked awaiting merge — `merge_handoff`: Flowbee approved the change but a
   human/policy must merge it; or `merging`: a wedged in-flight merge). A *count* of handoffs is
   normal, so `flowbee_jobs{state="merge_handoff"}` is noisy; the **age** is the page — a change

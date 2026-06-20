@@ -170,14 +170,26 @@ func (s *Store) RetryAbandonedOutbox(ctx context.Context, jobID string) (int, er
 	return int(n), nil
 }
 
-// OutboxAbandonedByAction counts abandoned (dead-lettered) outbox actions per action type —
-// GitHub writes that never took effect. Critical abandons (create-issue/merge) also escalate
-// the owning job to needs_human, but cosmetic ones (comments, the §F archive) are otherwise
-// silent, so this is the one alertable signal for "work was dropped". A growing count is the
-// page (e.g. an expired token, a persistent 4xx).
+// OutboxAbandonedByAction counts ACTIONABLE abandoned (dead-lettered) outbox actions per
+// action type — GitHub writes that never took effect AND whose owning job is still live (or
+// parked at needs_human). Critical abandons (create-issue/merge) escalate the owning job to
+// needs_human, but cosmetic ones (comments, the §F archive) are otherwise silent, so this is
+// the one alertable signal for "work was dropped". A growing count is the page (e.g. an
+// expired token, a persistent 4xx).
+//
+// It EXCLUDES abandons whose owning job has since reached `done` or `cancelled`: those are
+// benign by construction — a stale-SHA void (AbandonOutboxForJobSHA), a superseded merge
+// attempt for a PR that merged anyway, or a side-effect on a cancelled job. Counting them
+// produced a permanent false "work dropped" warning that never drained (it shouldn't —
+// the job already completed), drowning the real signal (russ #215).
 func (s *Store) OutboxAbandonedByAction(ctx context.Context) (map[string]int, error) {
-	rows, err := s.DB.QueryContext(ctx,
-		`SELECT action, COUNT(*) FROM outbox WHERE status='abandoned' GROUP BY action`)
+	// LEFT JOIN so an orphaned abandon (job row gone) still surfaces — only a job that
+	// DEFINITIVELY reached done/cancelled is excluded as benign.
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT o.action, COUNT(*)
+		  FROM outbox o LEFT JOIN jobs j ON j.id = o.job_id
+		 WHERE o.status='abandoned' AND COALESCE(j.state,'') NOT IN ('done','cancelled')
+		 GROUP BY o.action`)
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +202,46 @@ func (s *Store) OutboxAbandonedByAction(ctx context.Context) (map[string]int, er
 			return nil, err
 		}
 		out[action] = n
+	}
+	return out, rows.Err()
+}
+
+// AbandonedOutboxRow is one dead-lettered outbox action with the context an operator needs to
+// triage it: which job + repo produced it, that job's CURRENT state, and whether the abandon
+// is Actionable (the job is still live / parked at needs_human and genuinely missing this
+// side-effect) or benign (the job reached done/cancelled anyway).
+type AbandonedOutboxRow struct {
+	ID         int64
+	JobID      string
+	Repo       string
+	Action     string
+	JobState   string
+	Attempts   int
+	AgeHours   int
+	Actionable bool
+}
+
+// AbandonedOutbox lists every abandoned outbox row with its owning job's state, newest first,
+// so `flowbee outbox` can show WHY each write was dropped and whether it still needs attention.
+func (s *Store) AbandonedOutbox(ctx context.Context) ([]AbandonedOutboxRow, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT o.id, o.job_id, COALESCE(j.repo,''), o.action, COALESCE(j.state,'(no job)'), o.attempts,
+		       CAST((julianday('now')-julianday(o.enqueued_at))*24 AS INT)
+		  FROM outbox o LEFT JOIN jobs j ON j.id = o.job_id
+		 WHERE o.status='abandoned'
+		 ORDER BY o.id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AbandonedOutboxRow
+	for rows.Next() {
+		var r AbandonedOutboxRow
+		if err := rows.Scan(&r.ID, &r.JobID, &r.Repo, &r.Action, &r.JobState, &r.Attempts, &r.AgeHours); err != nil {
+			return nil, err
+		}
+		r.Actionable = r.JobState != string(job.StateDone) && r.JobState != string(job.StateCancelled)
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }

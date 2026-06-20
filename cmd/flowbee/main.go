@@ -106,6 +106,8 @@ func main() {
 		err = runCard(args)
 	case "retry-outbox":
 		err = runRetryOutbox(args)
+	case "outbox":
+		err = runOutbox(args)
 	case "backup":
 		err = runBackup(args)
 	case "restore":
