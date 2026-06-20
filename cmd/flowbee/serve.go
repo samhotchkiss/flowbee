@@ -562,11 +562,14 @@ func runServe(args []string) error {
 							logger.Error("merge_handoff un-stick", "err", err)
 							continue
 						}
+						total := 0
 						for repo, n := range counts {
 							if n > 0 {
 								logger.Info("🔀 un-stuck behind PRs (update-branch)", "repo", repo, "count", n)
+								total += n
 							}
 						}
+						srv.AddUnstick(total) // feeds flowbee_unstick_total
 					}
 				}
 			}()

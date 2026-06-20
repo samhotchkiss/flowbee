@@ -51,6 +51,12 @@ type Server struct {
 	ghLastSuccess atomic.Int64
 	ghLastErr     atomic.Pointer[string]
 
+	// unstickTotal counts merge_handoff PRs the #214 un-stick sweep has fast-forwarded
+	// (update-branch) since startup — the observable signal that the systemic merge-rot fix
+	// is doing work (a behind PR was found + brought up to date). Surfaced as the
+	// flowbee_unstick_total counter; the conditional 🔀 log line is the per-event detail.
+	unstickTotal atomic.Int64
+
 	facts  store.FactSource
 	policy job.Policy
 	// reviewersByRepo overrides policy.RequiredReviewers per repo (F5 consensus panel): a
@@ -224,6 +230,14 @@ func (s *Server) RecordGitHubSweep(err error) {
 	}
 	e := err.Error()
 	s.ghLastErr.Store(&e)
+}
+
+// AddUnstick records that the #214 un-stick sweep fast-forwarded n behind merge_handoff PRs
+// this pass (feeds flowbee_unstick_total). The runtime calls it after each UnstickAll.
+func (s *Server) AddUnstick(n int) {
+	if n > 0 {
+		s.unstickTotal.Add(int64(n))
+	}
 }
 
 // Broker exposes the SSE broker so the runtime can publish lifecycle events.
@@ -586,6 +600,13 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	// #214 un-stick: how many behind merge_handoff PRs the sweep has fast-forwarded since
+	// startup. A rising count means the systemic merge-rot fix is doing work (PRs were
+	// falling behind a moving base and got brought up to date); flat-at-0 is the steady state.
+	fmt.Fprintf(&b, "# HELP flowbee_unstick_total merge_handoff PRs fast-forwarded (update-branch) by the #214 un-stick sweep since startup.\n")
+	fmt.Fprintf(&b, "# TYPE flowbee_unstick_total counter\n")
+	fmt.Fprintf(&b, "flowbee_unstick_total %d\n", s.unstickTotal.Load())
 
 	// Dispatch pause state: a paused dispatcher (global) or a parked repo (per-repo) hands
 	// out NO work — make it OBSERVABLE so a pause is never silently forgotten ("why has russ
