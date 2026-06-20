@@ -131,6 +131,26 @@ func TestDenylistCaseFolding(t *testing.T) {
 	}
 }
 
+// TestDenylistPathTraversal locks the defensive `..`-folding: a protected path can't hide
+// behind a traversal segment. Not reachable at the merge gate today (git rejects `..` in
+// tree paths) but the gate is the last line of defense, so canonicalize. Ordinary paths
+// are unaffected.
+func TestDenylistPathTraversal(t *testing.T) {
+	for _, p := range []string{
+		"pkg/../.github/workflows/ci.yml",
+		"a/b/../../go.mod",
+		"./x/./../internal/engine/x.go",
+	} {
+		if !IsDenylisted(p) {
+			t.Errorf("traversal-hidden protected path %q must be denylisted after folding", p)
+		}
+	}
+	// a traversal that lands on an ordinary path stays clear, and folding doesn't corrupt it.
+	if IsDenylisted("a/b/../foo.go") {
+		t.Error("a/b/../foo.go folds to a/foo.go (ordinary) and must stay clear")
+	}
+}
+
 func TestCheckCleanDiffIsEligible(t *testing.T) {
 	r := Check(Patch{
 		Diff:     cleanDiff,

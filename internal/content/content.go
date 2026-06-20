@@ -27,6 +27,7 @@ package content
 
 import (
 	"math"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -792,6 +793,21 @@ func normalizePath(p string) string {
 	p = strings.ReplaceAll(p, "\\", "/")
 	p = strings.TrimPrefix(p, "./")
 	p = strings.TrimPrefix(p, "/")
+	if p == "" {
+		return ""
+	}
+	// Collapse `.`/`..` segments so a denylisted path can't hide behind traversal
+	// (`pkg/../.github/workflows/ci.yml` → `.github/workflows/ci.yml`). git rejects `..`
+	// in tree paths, so this isn't reachable at the merge gate today — but the content
+	// gate is the LAST line of defense, so canonicalize defensively. path.Clean is
+	// deterministic, so a declared and an actual path fold identically and the
+	// blast-radius comparison stays consistent. A result of "." (the whole path
+	// collapsed away) is treated as empty, same as the pre-clean guard above.
+	if cleaned := path.Clean(p); cleaned != "." {
+		p = cleaned
+	} else {
+		p = ""
+	}
 	return p
 }
 
