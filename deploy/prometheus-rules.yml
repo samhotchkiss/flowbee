@@ -1,0 +1,50 @@
+groups:
+  - name: flowbee.rules
+    rules:
+      - alert: FlowbeeGitHubReconcileFailing
+        # Tune this threshold per deployment based on the expected GitHub reconcile cadence.
+        expr: flowbee_github_last_success_age_seconds > 900
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Flowbee GitHub reconcile has not succeeded recently
+          description: Flowbee has not reported a successful GitHub reconcile for more than 15 minutes.
+
+      - alert: FlowbeeApprovedPRAwaitingMerge
+        # Tune this threshold per deployment based on merge policy, queue size, and expected automation latency.
+        expr: flowbee_oldest_pending_merge_age_seconds > 1800
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Flowbee approved PR is stuck awaiting merge
+          description: The oldest approved or in-flight merge has been pending for more than 30 minutes.
+
+      - alert: FlowbeeJobsWaitingWithNoLiveWorkers
+        # Tune both the no-worker duration and waiting-job definition per deployment.
+        expr: (flowbee_fleet_workers{status="live"} == 0) and on() (flowbee_fleet_waiting_jobs > 0)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Flowbee jobs are waiting with no live workers
+          description: Flowbee has ready jobs waiting while the live worker count has been zero for more than 5 minutes.
+
+      - alert: FlowbeeDroppedGitHubWrites
+        # Tune this gauge threshold and tolerance per deployment; any abandoned write is usually actionable.
+        expr: flowbee_outbox_abandoned > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Flowbee GitHub writes have been abandoned
+          description: Flowbee has one or more abandoned, dead-lettered GitHub write operations for an outbox action.
+
+      - alert: FlowbeeJobsOverBudget
+        # Tune this gauge threshold and tolerance per deployment based on job budgets and expected workload.
+        expr: flowbee_jobs_over_budget > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Flowbee jobs exceeded budget
+          description: Flowbee has one or more jobs whose recorded cost breached the configured budget.
