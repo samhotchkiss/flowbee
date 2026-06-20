@@ -324,18 +324,24 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 		}
 
 		// F5 multi-reviewer consensus: count the DISTINCT reviewers who have already approved
-		// in the CURRENT round (since the last result_accepted — a bounce/supersede re-enters
-		// review only via a fresh result_accepted, so this scopes to the current reviewed
-		// head). With RequiredReviewers=N, the gate mints only on the Nth distinct approval;
-		// below N it accumulates (re-arms review_pending for the next reviewer). The panel
-		// anti-affinity at claim time guarantees these approvers are distinct identities.
+		// in the CURRENT round — i.e. since the head the panel is reviewing was last
+		// (re)established. A round boundary is ANY event that puts a NEW reviewed head into
+		// review_pending: a fresh build result (result_accepted), a clean auto-rebase onto a
+		// moved base (rebased), or a conflict resolution (conflict_resolved). It is NOT
+		// review_approved — that is the intra-round accumulate (the reviewer's own empty
+		// findings commit), which must PRESERVE the count. Scoping only to result_accepted
+		// would leak a prior-head approval into a post-rebase/post-resolve round, minting an
+		// N-reviewer panel with fewer than N distinct reviewers of the actual merged code.
+		// With RequiredReviewers=N, the gate mints only on the Nth distinct approval; below N
+		// it accumulates (re-arms review_pending for the next reviewer). The panel anti-affinity
+		// at claim time guarantees these approvers are distinct identities.
 		var priorApprovals int
 		if err := tx.QueryRowContext(ctx, `
 			SELECT COUNT(DISTINCT actor) FROM job_events
 			 WHERE job_id = ? AND kind = 'verdict_claim'
 			   AND json_extract(payload, '$.VerdictClaim') = 'approved'
 			   AND job_seq > (SELECT COALESCE(MAX(job_seq),0) FROM job_events
-			                   WHERE job_id = ? AND kind = 'result_accepted')`,
+			                   WHERE job_id = ? AND kind IN ('result_accepted','rebased','conflict_resolved'))`,
 			in.JobID, in.JobID).Scan(&priorApprovals); err != nil {
 			return fmt.Errorf("count round approvals: %w", err)
 		}

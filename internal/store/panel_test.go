@@ -157,6 +157,88 @@ func TestPanelAccumulateTracksReviewerHead(t *testing.T) {
 	assertFoldMatchesProjection(t, st, "ht")
 }
 
+// TestPanelHeadMoveResetsRound: a head-establishing re-arm BETWEEN two panel approvals
+// (a clean auto-rebase onto a moved base, or a conflict resolution) starts a FRESH round —
+// the pre-move approval must NOT count toward the new head's quorum. Otherwise an N=2 panel
+// could mint with a single distinct reviewer of the actual merged code: reviewer-1 approves
+// head A, the base moves and the build is rebased to head B, reviewer-2 approves B, and the
+// stale A-approval is miscounted as the 2nd vote on B. The round boundary is keyed on ALL
+// head-establishing kinds (result_accepted, rebased, conflict_resolved), not result_accepted
+// alone.
+func TestPanelHeadMoveResetsRound(t *testing.T) {
+	for _, kind := range []string{"rebased", "conflict_resolved"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			st := testutil.NewStore(t)
+			src := store.DBFactSource{DB: st.DB}
+			panel := job.Policy{RequiredReviewers: 2}
+			now := time.Unix(3000, 0)
+
+			driveToCodeReview(t, st, "mv", "h0", "b0")
+			mustGreen(t, st, "mv", "h0", "b0")
+
+			// reviewer 1 approves head A -> below N=2 -> accumulate (review_pending).
+			if _, err := st.ReviewResult(ctx, src, panel, store.ReviewResultParams{
+				JobID: "mv", Epoch: epochOf(t, st, "mv"), Claim: job.VerdictApproved, Now: now,
+			}); err != nil {
+				t.Fatalf("approve 1: %v", err)
+			}
+
+			// the reviewed head is re-established (rebase onto a moved base / conflict
+			// resolution). Append that head-establishing event between the two approvals —
+			// it re-arms review_pending at a NEW reviewed head, starting a fresh round.
+			appendRawEvent(t, st, "mv", kind, "review_pending")
+
+			// a DISTINCT reviewer approves the NEW head. With the round reset, this is only
+			// the 1st distinct approval of head B -> must accumulate, NOT mint.
+			if _, err := st.ClaimReviewJob(ctx, store.ClaimReviewParams{
+				JobID: "mv", LeaseID: "rl2", Identity: "reviewer2-mv", ModelFamily: "opus",
+				Attested: []string{"role:code_reviewer", "model_family:opus"}, TTL: time.Minute, Now: now,
+			}); err != nil {
+				t.Fatalf("2nd reviewer claim: %v", err)
+			}
+			if _, err := st.ReviewResult(ctx, src, panel, store.ReviewResultParams{
+				JobID: "mv", Epoch: epochOf(t, st, "mv"), Claim: job.VerdictApproved, Now: now,
+			}); err != nil {
+				t.Fatalf("approve 2 (post-%s): %v", kind, err)
+			}
+			j, _ := st.GetJob(ctx, "mv")
+			if j.State == job.StateMergeable || j.Verdict != nil {
+				t.Fatalf("a stale pre-%s approval must NOT count toward the new head's quorum; "+
+					"state=%s verdict=%v (minted with one distinct reviewer of the moved head)", kind, j.State, j.Verdict)
+			}
+			if j.State != job.StateReviewPending {
+				t.Fatalf("post-%s 1st distinct approval must accumulate; state=%s want review_pending", kind, j.State)
+			}
+		})
+	}
+}
+
+// appendRawEvent appends a bare event of the given kind at the job's next ordinal — used to
+// inject a head-establishing re-arm (rebased / conflict_resolved) into a panel round without
+// driving the full GitHub-backed rebase machinery.
+func appendRawEvent(t *testing.T, st *store.Store, jobID, kind, toState string) {
+	t.Helper()
+	ctx := context.Background()
+	// the per-job ordinal tracker lives on the jobs row (loadJobTx reads jobs.job_seq); bump
+	// both it and job_events in lockstep so the next real appendEvent lands at the right seq.
+	var seq, epoch int
+	if err := st.DB.QueryRowContext(ctx,
+		`SELECT job_seq, lease_epoch FROM jobs WHERE id=?`, jobID).Scan(&seq, &epoch); err != nil {
+		t.Fatalf("read job_seq for %s: %v", jobID, err)
+	}
+	if _, err := st.DB.ExecContext(ctx,
+		`INSERT INTO job_events (job_id, job_seq, kind, from_state, to_state, lease_epoch, actor, payload)
+		 VALUES (?,?,?,?,?,?, 'reconcile', '{}')`,
+		jobID, seq+1, kind, "review_pending", toState, epoch); err != nil {
+		t.Fatalf("append %s event: %v", kind, err)
+	}
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET job_seq=? WHERE id=?`, seq+1, jobID); err != nil {
+		t.Fatalf("bump job_seq for %s: %v", jobID, err)
+	}
+}
+
 func mustGreen(t *testing.T, st *store.Store, id, head, base string) {
 	t.Helper()
 	if err := st.SetReconciledFacts(context.Background(), id, store.ReconciledPR{
