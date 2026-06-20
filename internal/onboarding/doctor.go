@@ -207,8 +207,10 @@ func checkDurability(rep *DoctorReport) {
 		rep.add("durability", StatusPass, fmt.Sprintf("recent backup snapshot (%s, %s old) — on-disk floor; litestream is the off-disk answer", name, age))
 		return
 	}
-	rep.add("durability", StatusWarn, "no backup detected — a disk failure loses ALL state. Set up litestream "+
-		"(off-disk, docs/operating.md §6) or schedule `flowbee backup` (on-disk floor)")
+	rep.add("durability", StatusWarn, "no recent backup snapshot — a disk failure loses ALL state. "+
+		"`flowbee serve` auto-backs-up every 6h by default, so this means serve isn't running here yet, "+
+		"`backup_interval_s` is negative (disabled), or no cycle has completed — run `flowbee backup` for an "+
+		"immediate floor, and set up litestream for off-disk durability (docs/operating.md §6)")
 }
 
 func homeDir() string {
