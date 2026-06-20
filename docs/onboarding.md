@@ -71,8 +71,14 @@ Needs `gh` authenticated to the repo:
   ## Acceptance Criteria
   - <testable done-when bullet>
   ```
+  **Priority (optional):** any issue defaults to priority **5**. To rank it, add a
+  `flowbee:p<N>` label — `flowbee:p1` = drop-everything urgent … `flowbee:p10` = nice-to-have
+  whenever there's time (**lower = more urgent**). The scheduler runs lower numbers first, and
+  aging keeps anything from starving. (When `main` is red, file the *fix* as `flowbee:p1` so it
+  jumps ahead of feature work.)
 - **CLI:** `flowbee spec "add rate limiting to /login" --repo <short-name>` runs the full
-  spec-author → issue-review → build flow.
+  spec-author → issue-review → build flow. `POST /v1/specs` and `/v1/epics` take a `priority`
+  field (1–10, default 5) the same way.
 
 ## 4. Watch + recover
 

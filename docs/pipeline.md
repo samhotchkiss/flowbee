@@ -10,7 +10,9 @@ Work enters Flowbee in one of two ways: label a GitHub issue `flowbee:build`, or
 
 - **Labeled GitHub issue → build.** An issue carrying the `flowbee:build` label already
   contains its own spec (the body is parsed into task / spec / acceptance), so intake
-  adopts it directly at the `ready` (build) stage. No spec authoring is needed.
+  adopts it directly at the `ready` (build) stage. No spec authoring is needed. An optional
+  `flowbee:p<N>` label sets its priority (1 = most urgent … 10 = nice-to-have, default 5;
+  lower runs first).
 - **An idea → the spec flow.** Ingested via `POST /v1/specs`, an idea enters at
   `spec_authoring` so an agent drafts the spec before any code is written.
 

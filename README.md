@@ -85,6 +85,7 @@ remote instead — same binary, no creds on the workers.)*
 ```bash
 # 1. From GitHub: open an issue and label it `flowbee:build`.
 #    Flowbee adopts it → builds → reviews → merges → closes the issue. That's it.
+#    (Optional: add `flowbee:p1`..`flowbee:p10` to prioritize — lower = more urgent, default 5.)
 
 # 2. From your planner agent: POST a work item to the front door.
 curl -X POST localhost:7070/v1/specs -H 'content-type: application/json' \
