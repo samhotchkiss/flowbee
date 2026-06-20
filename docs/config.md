@@ -156,6 +156,20 @@ repos:
 When `repos:` is present it takes precedence over the single-repo
 `github_owner`/`github_repo` keys.
 
+Rather than hand-edit this block, use **`flowbee repo add`** — it validates and appends an
+entry (preserving the file's comments and formatting), refuses a duplicate `id` or
+`owner/repo`, and re-checks that the result still loads before writing:
+
+```sh
+flowbee repo add acme/web --id web --allow-own-source-merge --reviewers 1
+```
+
+`--allow-own-source-merge` sets the merge posture for a managed repo that is **not** the
+Flowbee control plane (so its own `internal/`/`cmd/` changes can self-merge); omit it to keep
+every merge at the human gate. The control plane reads config at startup, so **restart it** to
+pick up the new repo. Then create the `flowbee:build` label + a `pull_request` CI workflow on
+the repo, and queue work (`flowbee spec "…" --repo web`, or label an issue `flowbee:build`).
+
 ## Credential-less remote workers (bundle mode, F3)
 
 By default a remote worker keeps its own local mirror and pushes the issue branch

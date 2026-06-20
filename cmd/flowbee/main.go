@@ -76,6 +76,8 @@ func main() {
 		err = runStatus(args)
 	case "spec":
 		err = runSpec(args)
+	case "repo":
+		err = runRepo(args)
 	case "serve":
 		err = runServe(args)
 	case "up":
@@ -124,5 +126,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|status|spec|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|retry-outbox|backup|restore|pause|resume|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|retry-outbox|backup|restore|pause|resume|seed|version>")
 }
