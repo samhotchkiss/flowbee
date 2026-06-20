@@ -274,6 +274,9 @@ func runServe(args []string) error {
 		CircuitBreakerAbstainFraction: 0.8,
 		HeartbeatReapAfter:            4 * hbInterval, // crash recovery in minutes, not ~20m
 	}
+	// the API arms these same deadlines on every claim (the soft phase budget is otherwise
+	// never set, so the §10.2 soft-deadline rung stays inert); the poller evaluates them.
+	srv.SetLiveness(livenessCfg)
 	poller := alarm.New(st, clock.Real{}, time.Second, srv.Broker()).
 		WithLiveness(livenessCfg, store.DBFactSource{DB: st.DB}, srv.Broker())
 	go poller.Run(ctx)

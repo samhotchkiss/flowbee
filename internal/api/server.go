@@ -61,6 +61,11 @@ type Server struct {
 	leaseTTL     time.Duration
 	longPollWait time.Duration
 	pollInterval time.Duration
+	// liveness is the Rung-3 deadline config (soft phase budget + absolute cap). Armed
+	// on every successful claim so the §10.2 soft-deadline ladder + the durable deadline
+	// timers actually run in production. Zero-value (AbsoluteCap==0) = liveness off, so a
+	// test server that never calls SetLiveness is unaffected (no premature soft deadline).
+	liveness store.LivenessConfig
 
 	// mirrorPath is the shared bare-repo mirror path handed to same-box workers
 	// for `worktree` provisioning (§7.4). Empty when no local mirror is configured
@@ -223,6 +228,11 @@ func (s *Server) RecordGitHubSweep(err error) {
 
 // Broker exposes the SSE broker so the runtime can publish lifecycle events.
 func (s *Server) Broker() *Broker { return s.broker }
+
+// SetLiveness wires the Rung-3 deadline config so each successful claim arms the soft
+// phase-budget + absolute-cap deadlines (the §10.2 ladder + durable timers). Called once
+// at serve startup with the same config the alarm poller evaluates against.
+func (s *Server) SetLiveness(cfg store.LivenessConfig) { s.liveness = cfg }
 
 // HealthHandler serves the health listener.
 func (s *Server) HealthHandler() http.Handler {
@@ -846,6 +856,16 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 			if err == nil {
+				// Arm the Rung-3 deadlines (soft phase budget + absolute cap) for this lease
+				// so the §10.2 ladder + durable deadline timers run in production — the claim
+				// itself only sets lease_deadline, never phase_deadline_at, so without this the
+				// soft-deadline early-escalation rung is silently inert. Best-effort + fenced
+				// to ls.Epoch: a failure here only skips soft early-escalation for this one
+				// lease (the absolute cap is already on the row). Guarded so a liveness-less
+				// test server (AbsoluteCap==0) never arms a now-due soft deadline.
+				if s.liveness.AbsoluteCap > 0 {
+					_ = s.store.ArmLeaseLivenessTimers(r.Context(), cand.JobID, ls.Epoch, s.clock.Now(), s.liveness)
+				}
 				j, _ := s.store.GetJob(r.Context(), cand.JobID)
 				s.broker.Publish(LifeEvent{JobID: cand.JobID, State: string(j.State), Event: "lease_claimed", Epoch: ls.Epoch})
 				grant := LeaseGrant{

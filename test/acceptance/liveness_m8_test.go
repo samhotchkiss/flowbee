@@ -15,6 +15,7 @@ package acceptance
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -92,6 +93,70 @@ func (e *m8Env) leaseBuild(t *testing.T, ctx context.Context, jobID, identity, f
 		t.Fatalf("arm liveness timers: %v", err)
 	}
 	return c, g
+}
+
+// TestM8_ClaimArmsSoftDeadlineViaServer proves the PRODUCTION wiring: a lease claimed
+// through the API server (with SetLiveness configured, exactly as serve.go does at
+// startup) arms the soft phase-deadline + the durable deadline timers ITSELF — no manual
+// ArmLeaseLivenessTimers. The bug this guards: the claim set only lease_deadline, never
+// phase_deadline_at, so SoftCrossed never fired and the §10.2 soft-deadline early-
+// escalation rung was silently inert in production (the unit tests passed only because
+// the harness armed the timers by hand). Note: this test does NOT call leaseBuild — it
+// claims raw, so the ONLY thing that can arm the soft deadline is the server.
+func TestM8_ClaimArmsSoftDeadlineViaServer(t *testing.T) {
+	e := newM8Env(t)
+	e.srv.SetLiveness(e.cfg) // what serve.go does once at startup
+	ctx := context.Background()
+	jobID := "armed-by-claim"
+
+	if _, err := e.st.SeedJob(ctx, store.SeedParams{
+		ID: jobID, Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, BaseSHA: "base-sha-0",
+		RequiredCapabilities: []string{"role:eng_worker"}, Now: e.clk.Now(),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	c := client.New(e.private.URL)
+	if _, err := c.Register(ctx, client.Registration{
+		WorkerID: "wk-zoe", Identity: "zoe", Host: "t",
+		Capabilities: []string{"role:eng_worker", "model_family:codex"},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	g, ok, err := c.Lease(ctx, "zoe", "codex", "")
+	if err != nil || !ok || g.JobID != jobID {
+		t.Fatalf("lease ok=%v err=%v", ok, err)
+	}
+
+	// the claim itself must have armed the soft deadline (not just the absolute cap) —
+	// the inert-rung bug was phase_deadline_at staying NULL after a real claim.
+	var phaseAt sql.NullString
+	if err := e.st.DB.QueryRowContext(ctx,
+		`SELECT phase_deadline_at FROM jobs WHERE id = ?`, jobID).Scan(&phaseAt); err != nil {
+		t.Fatalf("read phase_deadline_at: %v", err)
+	}
+	if !phaseAt.Valid || phaseAt.String == "" {
+		t.Fatal("claim through the API server must arm phase_deadline_at (the §10.2 soft deadline); it was NULL — the soft rung would be inert")
+	}
+
+	// and the full ladder now fires from that production-armed deadline: a worker
+	// reporting a Rung-1 `spinning` suspicion PAST the soft deadline is killed (soft
+	// deadline + Rung-1 suspicion, §10.3) — driven by the durable phase_deadline timer
+	// the claim armed, with nobody arming it by hand.
+	if _, st, herr := c.HeartbeatWith(ctx, jobID, g.LeaseEpoch, client.HeartbeatObs{
+		AgentHealth: "ok", Rung1Class: "spinning",
+	}); herr != nil || st != http.StatusOK {
+		t.Fatalf("heartbeat st=%d err=%v", st, herr)
+	}
+	e.clk.Advance(11 * time.Minute) // past the 10-min soft deadline, before the 60-min cap
+	e.poller.Tick(ctx)              // the durable phase_deadline timer fires -> FireLeaseDeadline -> EvaluateLiveness
+	j, _ := e.st.GetJob(ctx, jobID)
+	if j.State != job.StateReady {
+		t.Fatalf("soft deadline + Rung-1 suspicion must kill via the production-armed timer (revoke -> ready); state=%s", j.State)
+	}
+	if j.LeaseEpoch != g.LeaseEpoch+1 {
+		t.Fatalf("a kill must bump the epoch; %d -> %d", g.LeaseEpoch, j.LeaseEpoch)
+	}
 }
 
 // ── TestM8_NoNetDiffKilledOnlyWhenTwoRungsAgree ───────────────────────────────
