@@ -286,7 +286,12 @@ building → review_pending → code_review → mergeable → merging → done**
   human/policy must merge it; or `merging`: a wedged in-flight merge). A *count* of handoffs is
   normal, so `flowbee_jobs{state="merge_handoff"}` is noisy; the **age** is the page — a change
   Flowbee approved that NOBODY merged. **Alert on `flowbee_oldest_pending_merge_age_seconds > ~2h`**
-  so an approved PR can't sit unmerged for 15h+ silently (the count never tells you that). The
+  so an approved PR can't sit unmerged for 15h+ silently (the count never tells you that).
+  *(The control plane already keeps these PRs from rotting BEHIND a moving base: a 5-min
+  un-stick sweep runs `update-branch` on any `merge_handoff` PR GitHub reports as `behind`
+  — only repos that require up-to-date branches ever hit that — so a reviewed, green PR stays
+  current for its human/self-merge instead of falling further behind every sibling merge. It
+  never merges. Tune `FLOWBEE_UNSTICK_INTERVAL_S`; a negative value disables it.)* The
   pages that matter: a wedged `needs_human` job,
   `flowbee_fleet_workers{status="live"} == 0` with waiting jobs, `over_budget` climbing,
   `flowbee_outbox_abandoned` growing, `flowbee_oldest_pending_merge_age_seconds` past a couple
