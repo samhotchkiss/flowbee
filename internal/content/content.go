@@ -208,14 +208,17 @@ var denyMatchers = []struct {
 	// lockfiles + lifecycle scripts — arbitrary code execution at install time.
 	{"lockfile_or_lifecycle", func(p string) bool {
 		base := baseName(p)
+		// literals are ALL lower-case: denylistHitsWith passes a lower-cased path (case-fold
+		// defense), so a capitalised literal here would silently stop matching (e.g.
+		// `Gemfile`/`Cargo.toml` would no longer be protected at all).
 		switch base {
 		case "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json",
-			"Gemfile.lock", "poetry.lock", "Pipfile.lock", "go.sum", "Cargo.lock",
+			"gemfile.lock", "poetry.lock", "pipfile.lock", "go.sum", "cargo.lock",
 			"composer.lock",
 			// go.mod is the dependency MANIFEST: a `replace` directive (redirect a dep to
 			// a malicious fork) or a version bump to a compromised release is a supply-chain
 			// escalation that go.sum alone does not always catch — protect both.
-			"go.mod", "Cargo.toml", "package.json", "pyproject.toml", "Gemfile":
+			"go.mod", "cargo.toml", "package.json", "pyproject.toml", "gemfile":
 			return true
 		}
 		if strings.HasSuffix(base, ".lock") {
@@ -232,7 +235,9 @@ var denyMatchers = []struct {
 	// Dockerfiles / base-image refs / devcontainer — supply-chain substitution.
 	{"dockerfile_or_devcontainer", func(p string) bool {
 		base := baseName(p)
-		if base == "Dockerfile" || strings.HasPrefix(base, "Dockerfile.") ||
+		// literals are lower-case because denylistHitsWith passes a lower-cased path
+		// (case-fold defense, see there); base is therefore already lower-cased.
+		if base == "dockerfile" || strings.HasPrefix(base, "dockerfile.") ||
 			strings.HasSuffix(base, ".dockerfile") || base == ".dockerignore" {
 			return true
 		}
@@ -306,15 +311,24 @@ func denylistHitsWith(touched, extraPrefixes []string) []string {
 		if np == "" {
 			continue
 		}
+		// Case-fold for MATCHING. Every protected literal below is lower-case, but the
+		// path consumers resolve case-INsensitively: GitHub's Actions backend resolves the
+		// `.github` directory case-insensitively, and a macOS control plane / runner has a
+		// case-insensitive filesystem. So `.GitHub/workflows/evil.yml` committed on a
+		// case-sensitive Linux fleet box is denylist-CLEAR to a case-sensitive matcher yet
+		// lands in the REAL protected location and executes — a CRITICAL autonomous-merge
+		// bypass of every protected class. Match on the lower-cased copy; report the
+		// original-case path in the hit (for the audit trail).
+		lp := strings.ToLower(np)
 		for _, m := range denyMatchers {
-			if m.match(np) {
+			if m.match(lp) {
 				if !seen[np+"|"+m.name] {
 					seen[np+"|"+m.name] = true
 					out = append(out, m.name+":"+np)
 				}
 			}
 		}
-		if matchesAnyPrefix(np, extraPrefixes) {
+		if matchesAnyPrefix(lp, extraPrefixes) {
 			if !seen[np+"|configured"] {
 				seen[np+"|configured"] = true
 				out = append(out, "configured:"+np)
@@ -330,7 +344,9 @@ func denylistHitsWith(touched, extraPrefixes []string) []string {
 // accidental "deny everything").
 func matchesAnyPrefix(path string, prefixes []string) bool {
 	for _, raw := range prefixes {
-		np := normalizePath(raw)
+		// lower-case the prefix to match the lower-cased path callers pass (case-fold
+		// defense): an operator-configured `Secret/` prefix must still catch `secret/`.
+		np := strings.ToLower(normalizePath(raw))
 		if np == "" {
 			continue
 		}
@@ -355,8 +371,12 @@ func IsDenylisted(path string) bool {
 	if np == "" {
 		return false
 	}
+	// case-fold for matching, same as denylistHitsWith: the protected literals are
+	// lower-case and the path consumers (GitHub's .github resolution, a macOS FS) are
+	// case-insensitive, so a case-variant must still hit. (CRITICAL bypass fix.)
+	lp := strings.ToLower(np)
 	for _, m := range denyMatchers {
-		if m.match(np) {
+		if m.match(lp) {
 			return true
 		}
 	}

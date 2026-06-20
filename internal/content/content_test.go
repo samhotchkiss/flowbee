@@ -100,6 +100,37 @@ func TestDenylistClasses(t *testing.T) {
 	}
 }
 
+// TestDenylistCaseFolding locks the case-fold bypass fix: a worker on a case-sensitive Linux
+// box can commit a protected file under a case-VARIANT path, which a case-sensitive matcher
+// cleared while the file still lands in the real protected location on GitHub's
+// case-insensitive `.github` resolution / a macOS runner — a CRITICAL autonomous-merge
+// bypass of every protected class. Every class must match case-insensitively; both the
+// IsDenylisted and the DenylistHits dispatch paths are checked.
+func TestDenylistCaseFolding(t *testing.T) {
+	blocked := []string{
+		".GitHub/workflows/evil.yml", ".github/Workflows/evil.yml", ".GITHUB/actions/x/action.yml",
+		"DOCKERFILE", "docker/Dockerfile.PROD",
+		"Go.sum", "GO.MOD", "Package-Lock.json", "Cargo.TOML", "Gemfile", "GEMFILE",
+		".ENV", ".Env.production", "deploy/key.PEM", "id_RSA", ".NPMRC",
+		"Internal/engine/x.go", "CMD/flowbee/x.go", "Flows/build.yaml", "Flowbee.yaml", "Tools/x/main.go",
+		"secrets/TOKEN.txt", "SECRETS/token.txt",
+	}
+	for _, p := range blocked {
+		if !IsDenylisted(p) {
+			t.Errorf("IsDenylisted(%q): case-variant protected path must be denylisted (case-fold bypass)", p)
+		}
+		if hits := DenylistHits([]string{p}); len(hits) == 0 {
+			t.Errorf("DenylistHits(%q): case-variant protected path must be hit", p)
+		}
+	}
+	// ordinary paths stay clear regardless of case.
+	for _, p := range []string{"pkg/Foo.go", "README.MD", "src/App/Main.ts"} {
+		if IsDenylisted(p) {
+			t.Errorf("ordinary path %q must stay clear", p)
+		}
+	}
+}
+
 func TestCheckCleanDiffIsEligible(t *testing.T) {
 	r := Check(Patch{
 		Diff:     cleanDiff,
