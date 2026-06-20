@@ -357,15 +357,24 @@ sudo systemctl enable --now litestream
 litestream restore -o /home/sam/.flowbee/flowbee.db s3://my-bucket/flowbee-db
 ```
 
-No object store handy? **`flowbee backup`** is the turnkey on-disk floor: it takes a
-consistent snapshot (safe to run while `serve` is live — WAL), **integrity-checks it**,
-and prunes to the most recent N:
+No object store handy? **The control plane already backs itself up.** `flowbee serve`
+runs a built-in auto-backup loop — a consistent, integrity-checked, pruned `VACUUM INTO`
+snapshot every **6h by default** into `~/.flowbee/backups/` — so the on-disk floor needs
+**zero extra services** (no cron, no litestream). Each run logs `💾 auto-backup`; a failure
+logs `auto-backup FAILED` (alert on it — it means the durability floor is gone). Tune or
+opt out:
+
+```yaml
+backup_interval_s: 21600   # default 6h; FLOWBEE_BACKUP_INTERVAL_S. NEGATIVE = disable (run your own)
+backup_keep: 7             # snapshots retained (older pruned); FLOWBEE_BACKUP_KEEP
+```
+
+**`flowbee backup`** is the same operation on demand (and the way to target an external
+disk — better than snapshotting onto the same one the DB is on):
 
 ```bash
 flowbee backup                 # snapshot -> ~/.flowbee/backups/, keep last 7
 flowbee backup --dir /mnt/ext/flowbee-backups --keep 30   # an external disk is better than the same one
-# schedule it (cron/launchd) for an ongoing floor:
-# 0 * * * *  flowbee backup --dir /mnt/ext/flowbee-backups
 ```
 
 To recover from a snapshot, **`flowbee restore`** does it safely — it verifies the

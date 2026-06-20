@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestDefaultDBPathIsStandardLocation: the default database path must resolve to the
@@ -198,5 +199,32 @@ func TestRepoAllowOwnSourceMergeParses(t *testing.T) {
 	}
 	if by["cp"].AllowOwnSourceMerge {
 		t.Fatal("cp (the control plane) must default to false — fully protected")
+	}
+}
+
+// TestBackupIntervalResolution: 0 => 6h default, negative => disabled, a positive value is
+// honored with a 60s floor so a typo can't busy-loop the snapshot.
+func TestBackupIntervalResolution(t *testing.T) {
+	cases := []struct {
+		s       int
+		wantDur time.Duration
+		wantOn  bool
+	}{
+		{0, 6 * time.Hour, true},     // unset => default
+		{-1, 0, false},               // explicitly disabled
+		{30, 60 * time.Second, true}, // below floor => 60s
+		{3600, time.Hour, true},      // honored
+	}
+	for _, c := range cases {
+		d, on := Config{BackupIntervalS: c.s}.BackupInterval()
+		if on != c.wantOn || d != c.wantDur {
+			t.Errorf("BackupIntervalS=%d => (%v,%v), want (%v,%v)", c.s, d, on, c.wantDur, c.wantOn)
+		}
+	}
+	if got := (Config{BackupKeep: 0}).BackupKeepN(); got != 7 {
+		t.Errorf("BackupKeepN default = %d, want 7", got)
+	}
+	if got := (Config{BackupKeep: 3}).BackupKeepN(); got != 3 {
+		t.Errorf("BackupKeepN(3) = %d, want 3", got)
 	}
 }

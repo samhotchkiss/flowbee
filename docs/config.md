@@ -50,6 +50,17 @@ single-repo keys are ignored.
 
 `flowbee doctor` fails the `config` check if `lease_ttl_s < 3 * heartbeat_interval_s`.
 
+## Durability (auto-backup)
+
+| key | env override | default | meaning |
+|-----|--------------|---------|---------|
+| `backup_interval_s` | `FLOWBEE_BACKUP_INTERVAL_S` | `21600` (6h) | cadence of `serve`'s built-in self-backup loop (verified, pruned `VACUUM INTO` snapshot into the backup dir). **Negative = disable** (run your own cron/litestream). Positive values floor at 60s. |
+| `backup_keep` | `FLOWBEE_BACKUP_KEEP` | `7` | snapshots retained in the backup dir (older pruned) |
+| _(dir)_ | `FLOWBEE_BACKUP_DIR` | `~/.flowbee/backups` | where snapshots are written (use an external disk for real safety) |
+
+The on-disk floor needs no extra services. Litestream to object storage is still the
+off-disk production answer — see [operating.md §6](operating.md).
+
 ## Autonomous merge (§14)
 
 | key | env override | default | meaning |

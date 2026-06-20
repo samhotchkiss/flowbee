@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"os"
@@ -44,31 +45,46 @@ func runBackup(args []string) error {
 	}
 	defer st.Close()
 
-	// millisecond precision so two runs in the same second don't collide (VACUUM INTO
-	// errors if the target exists); lexical order still == chronological for pruning.
-	ts := time.Now().Format("20060102-150405.000")
-	snap := filepath.Join(*dir, "flowbee-"+ts+".db")
-	// VACUUM INTO writes a consistent, defragmented copy from a read snapshot — safe
-	// against a live writer under WAL. (No -wal/-shm sidecars: the copy is checkpointed.)
-	if _, err := st.DB.ExecContext(ctx, "VACUUM INTO ?", snap); err != nil {
-		return fmt.Errorf("snapshot: %w", err)
+	snap, size, pruned, err := takeSnapshot(ctx, st.DB, *dir, *keep)
+	if err != nil {
+		return err
 	}
-
-	// a backup you cannot restore is not a backup: verify the snapshot independently.
-	if err := verifySnapshot(ctx, snap); err != nil {
-		return fmt.Errorf("snapshot wrote but FAILED verification (%s): %w", snap, err)
-	}
-
-	fi, _ := os.Stat(snap)
-	fmt.Printf("✓ snapshot: %s (%d bytes, integrity ok)\n", snap, fi.Size())
-
-	if *keep > 0 {
-		if pruned := pruneSnapshots(*dir, *keep); pruned > 0 {
-			fmt.Printf("  pruned %d old snapshot(s), keeping the most recent %d\n", pruned, *keep)
-		}
+	fmt.Printf("✓ snapshot: %s (%d bytes, integrity ok)\n", snap, size)
+	if pruned > 0 {
+		fmt.Printf("  pruned %d old snapshot(s), keeping the most recent %d\n", pruned, *keep)
 	}
 	fmt.Println("  (this is the on-disk FLOOR — run Litestream to object storage for real durability; see docs/operating.md §6)")
 	return nil
+}
+
+// takeSnapshot writes one verified, pruned snapshot of db into dir and returns its path,
+// byte size, and the number of older snapshots pruned. It is the shared core behind both
+// the `flowbee backup` command and the control plane's built-in auto-backup loop (serve),
+// so a manual and an automatic backup are byte-for-byte the same operation. Safe against a
+// live writer: VACUUM INTO copies a consistent, checkpointed snapshot under WAL, and the
+// jobs table is a pure fold of the append-only ledger, so any restore is self-consistent.
+func takeSnapshot(ctx context.Context, db *sql.DB, dir string, keep int) (path string, size int64, pruned int, err error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", 0, 0, fmt.Errorf("create backup dir %q: %w", dir, err)
+	}
+	// millisecond precision so two runs in the same second don't collide (VACUUM INTO
+	// errors if the target exists); lexical order still == chronological for pruning.
+	ts := time.Now().Format("20060102-150405.000")
+	snap := filepath.Join(dir, "flowbee-"+ts+".db")
+	// VACUUM INTO writes a consistent, defragmented copy from a read snapshot — safe
+	// against a live writer under WAL. (No -wal/-shm sidecars: the copy is checkpointed.)
+	if _, err := db.ExecContext(ctx, "VACUUM INTO ?", snap); err != nil {
+		return "", 0, 0, fmt.Errorf("snapshot: %w", err)
+	}
+	// a backup you cannot restore is not a backup: verify the snapshot independently.
+	if err := verifySnapshot(ctx, snap); err != nil {
+		return "", 0, 0, fmt.Errorf("snapshot wrote but FAILED verification (%s): %w", snap, err)
+	}
+	fi, _ := os.Stat(snap)
+	if keep > 0 {
+		pruned = pruneSnapshots(dir, keep)
+	}
+	return snap, fi.Size(), pruned, nil
 }
 
 // verifySnapshot opens the freshly-written snapshot read-only and runs an integrity

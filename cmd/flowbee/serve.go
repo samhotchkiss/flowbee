@@ -436,6 +436,38 @@ func runServe(args []string) error {
 		}
 	}()
 
+	// built-in auto-backup (durability floor): the control plane snapshots its own DB on
+	// a timer so an operator gets the on-disk restore floor with ZERO extra services — no
+	// cron, no litestream — matching Flowbee's one-binary promise. VACUUM INTO is safe
+	// against the live writer under WAL, and the jobs table folds from the append-only
+	// ledger, so every snapshot restores self-consistently. A NEGATIVE backup_interval_s
+	// opts out (operator runs their own). Litestream to object storage is still the
+	// off-disk production answer (operating.md §6); this is the floor that was missing.
+	if d, on := cfg.BackupInterval(); on {
+		backupDir := envOr("FLOWBEE_BACKUP_DIR", defaultBackupDir())
+		keep := cfg.BackupKeepN()
+		logger.Info("auto-backup enabled", "interval", d.String(), "keep", keep, "dir", backupDir)
+		go func() {
+			t := time.NewTicker(d)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					snap, size, pruned, err := takeSnapshot(ctx, st.DB, backupDir, keep)
+					if err != nil {
+						logger.Error("auto-backup FAILED", "err", err) // durability gap — alertable
+						continue
+					}
+					logger.Info("💾 auto-backup", "snapshot", snap, "bytes", size, "pruned", pruned)
+				}
+			}
+		}()
+	} else {
+		logger.Warn("auto-backup DISABLED (backup_interval_s<0) — ensure an external backup (cron `flowbee backup` / litestream) covers durability")
+	}
+
 	// reconcile-IN + project-OUT (M6/M7, §8.1/§8.2): Flowbee is the SINGLE GitHub
 	// caller (R4). F9 multi-repo: ONE control plane runs a per-repo reconcile-IN +
 	// project-OUT loop over the repos registry, sharing a GLOBAL scheduler + fleet.

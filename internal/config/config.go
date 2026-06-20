@@ -97,6 +97,19 @@ type Config struct {
 	// FLOWBEE_COST_CEILING_USD.
 	CostCeilingUSD float64 `yaml:"cost_ceiling_usd"`
 
+	// BackupIntervalS controls the control plane's built-in auto-backup loop: `flowbee
+	// serve` takes a verified, pruned VACUUM-INTO snapshot of the DB every interval, so an
+	// operator gets the on-disk durability floor with ZERO extra services (no cron, no
+	// litestream) — the orchestrator backs itself up. 0 (unset) => default 6h. A NEGATIVE
+	// value DISABLES auto-backup (the operator runs their own cron/litestream). Set via
+	// FLOWBEE_BACKUP_INTERVAL_S. (Litestream to object storage is still the off-disk
+	// production answer; this is the floor — see docs/operating.md §6.)
+	BackupIntervalS int `yaml:"backup_interval_s"`
+	// BackupKeep is how many recent snapshots the auto-backup loop (and `flowbee backup`)
+	// retain in the backup dir, pruning older ones. 0 (unset) => 7. Set via
+	// FLOWBEE_BACKUP_KEEP.
+	BackupKeep int `yaml:"backup_keep"`
+
 	// GithubOwner / GithubRepo are the single-repo coordinates `flowbee init`
 	// prefills from the git remote (F13). They are the config-file form of the
 	// legacy FLOWBEE_GITHUB_OWNER/REPO env path: when Repos is empty, serve uses
@@ -290,6 +303,16 @@ func applyEnv(c *Config) {
 			c.CostCeilingUSD = f
 		}
 	}
+	// backup overrides parse the raw string (not envInt) so a NEGATIVE value can disable
+	// auto-backup — envInt's >0 convention can't express "explicitly off".
+	if v := os.Getenv("FLOWBEE_BACKUP_INTERVAL_S"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.BackupIntervalS = n
+		}
+	}
+	if v := envInt("FLOWBEE_BACKUP_KEEP"); v > 0 {
+		c.BackupKeep = v
+	}
 	if v := os.Getenv("FLOWBEE_GITHUB_OWNER"); v != "" {
 		c.GithubOwner = v
 	}
@@ -364,3 +387,31 @@ func (c Config) HeartbeatInterval() time.Duration {
 	return time.Duration(c.HeartbeatIntervalS) * time.Second
 }
 func (c Config) LongPollWait() time.Duration { return time.Duration(c.LongPollWaitS) * time.Second }
+
+// defaultBackupIntervalS is the auto-backup cadence when unset: every 6h.
+const defaultBackupIntervalS = 6 * 3600
+
+// BackupInterval resolves the effective auto-backup cadence and whether it's enabled. A
+// negative BackupIntervalS disables the loop (operator runs their own backups); 0 means the
+// 6h default; any positive value is honored with a 60s floor so a typo can't busy-loop.
+func (c Config) BackupInterval() (time.Duration, bool) {
+	if c.BackupIntervalS < 0 {
+		return 0, false
+	}
+	s := c.BackupIntervalS
+	if s == 0 {
+		s = defaultBackupIntervalS
+	}
+	if s < 60 {
+		s = 60
+	}
+	return time.Duration(s) * time.Second, true
+}
+
+// BackupKeepN is how many snapshots the auto-backup loop retains (0/unset => 7).
+func (c Config) BackupKeepN() int {
+	if c.BackupKeep <= 0 {
+		return 7
+	}
+	return c.BackupKeep
+}
