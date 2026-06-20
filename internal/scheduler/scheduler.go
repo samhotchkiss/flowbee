@@ -17,10 +17,10 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/job"
 )
 
-// AgingRate is how fast a waiting job's effective priority climbs: one priority
-// point per AgingRate of wait. With the default, a job that has waited an hour
-// out-ranks a fresh job priority+1 (3600s/600s = 6 points). Tuned by tests via
-// the explicit parameter on PickWith.
+// AgingRate is how fast a waiting job grows MORE urgent: it gains one urgency point
+// (its effective priority drops by one) per AgingRate of wait. With the default, a job
+// that has waited an hour out-urgents a fresh job one band less urgent (3600s/600s = 6
+// points). Tuned by tests via the explicit parameter on PickWith.
 const AgingRate = 600 * time.Second
 
 // Candidate is a leasable (`ready`) job as the scheduler sees it: enough to rank
@@ -38,20 +38,24 @@ type Candidate struct {
 	CIReady bool
 }
 
-// EffectivePriority is the §6.6 aged priority: base priority plus one point per
-// AgingRate of wait since EnqueuedAt. Higher wins. Pure in (now, agingRate).
+// EffectivePriority is the §6.6 aged priority. Priority is 1..10 where LOWER is MORE
+// urgent (1 = drop-everything, 10 = nice-to-have), so it is returned NEGATED: the ranking
+// throughout (Pick/Order) keeps "higher EffectivePriority wins", and -priority makes a
+// lower stored priority win. Aging then SUBTRACTS the wait, dropping a waiting job's stored
+// priority toward more-urgent (a higher effective value) so nothing starves. Pure in
+// (now, agingRate).
 func EffectivePriority(c Candidate, now time.Time, agingRate time.Duration) int {
 	if agingRate <= 0 {
-		// no aging configured: priority is the base only. Guards a divide-by-zero panic
-		// in the lease loop — PickWith is exported with a caller-supplied rate, so a 0
-		// (mis)configuration must degrade to un-aged ranking, not crash.
-		return c.Priority
+		// no aging configured: rank by the base only (still lower-is-more-urgent). Guards a
+		// divide-by-zero panic in the lease loop — PickWith is exported with a caller-
+		// supplied rate, so a 0 (mis)configuration must degrade to un-aged ranking, not crash.
+		return -c.Priority
 	}
 	wait := now.Sub(c.EnqueuedAt)
 	if wait < 0 {
 		wait = 0
 	}
-	return c.Priority + int(wait/agingRate)
+	return -c.Priority + int(wait/agingRate)
 }
 
 // Pick chooses the best candidate a worker with the given attested capabilities

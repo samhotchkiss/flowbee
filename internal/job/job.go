@@ -222,6 +222,34 @@ const (
 	DefaultMaxBounces  = 4
 )
 
+// Priority is a 1..10 urgency where LOWER = MORE urgent: 1 = drop-everything, 5 = the
+// default for any new issue, 10 = nice-to-have whenever there's time. The scheduler ranks
+// a lower number first (scheduler.EffectivePriority), and aging makes a waiting job
+// progressively MORE urgent so nothing starves. 0 is the "unset" sentinel (an omitted API
+// field / a bare INSERT) and normalizes to the default.
+const (
+	MostUrgentPriority  = 1
+	DefaultPriority     = 5
+	LeastUrgentPriority = 10
+)
+
+// NormalizePriority maps any raw priority to the valid 1..10 band: an unset 0 becomes the
+// default 5, and out-of-range values clamp (negative to most-urgent 1, >10 to least-urgent
+// 10). Apply it wherever a job is created from user input so the stored priority is always
+// a meaningful 1..10 (1 = most urgent).
+func NormalizePriority(p int) int {
+	switch {
+	case p == 0:
+		return DefaultPriority
+	case p < MostUrgentPriority:
+		return MostUrgentPriority
+	case p > LeastUrgentPriority:
+		return LeastUrgentPriority
+	default:
+		return p
+	}
+}
+
 // CapabilitiesSatisfy reports whether the attested capability set satisfies every
 // required capability tag. This is the pure §6.6 capability match (matching is on
 // the attested set; the loop wires it into the atomic claim). Required tags are

@@ -14,6 +14,8 @@ package reconcile
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"time"
 
 	gh "github.com/samhotchkiss/flowbee/internal/github"
@@ -116,7 +118,7 @@ func (r *Reconciler) Sweep(ctx context.Context) ([]store.ReconcileOutcome, error
 			if berr != nil || !hasLabel(iss.Labels, IntakeLabel) {
 				continue
 			}
-			id, aerr := r.store.AdoptIssueAsBuild(ctx, r.repo, iss.Number, iss.Title, iss.Body, base, now)
+			id, aerr := r.store.AdoptIssueAsBuild(ctx, r.repo, iss.Number, iss.Title, iss.Body, base, priorityFromLabels(iss.Labels), now)
 			if aerr == nil && id != "" && r.pub != nil {
 				r.pub.PublishReconcile(id, "issue_adopted")
 			}
@@ -132,6 +134,21 @@ func hasLabel(labels []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// priorityFromLabels reads an optional `flowbee:p<N>` label (N in 1..10, LOWER = more
+// urgent — `flowbee:p1` = drop-everything, `flowbee:p10` = nice-to-have) that a human can
+// add alongside the intake label to rank an issue. Returns 0 when absent — the store's
+// NormalizePriority maps that to the default 5, and clamps any out-of-band N into 1..10.
+func priorityFromLabels(labels []string) int {
+	for _, l := range labels {
+		if rest, ok := strings.CutPrefix(l, "flowbee:p"); ok {
+			if n, err := strconv.Atoi(rest); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
 }
 
 // Refetch handles a webhook HINT (§8.1.3): a TARGETED single-PR refetch through

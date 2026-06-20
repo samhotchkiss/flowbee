@@ -30,7 +30,7 @@ func TestAdoptIssueConcurrentDoubleAdopt(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start // line them up so they actually contend
-			ids[i], errs[i] = st.AdoptIssueAsBuild(ctx, "", 42, "title", "body", "base", now)
+			ids[i], errs[i] = st.AdoptIssueAsBuild(ctx, "", 42, "title", "body", "base", 0, now)
 		}(i)
 	}
 	close(start)

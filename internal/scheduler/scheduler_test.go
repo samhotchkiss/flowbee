@@ -9,32 +9,34 @@ func cand(id string, prio int, enqueued time.Time, req ...string) Candidate {
 	return Candidate{JobID: id, Priority: prio, EnqueuedAt: enqueued, RequiredCapabilities: req}
 }
 
-// TestAgedLowPriorityBeatsFreshHighPriority is the core §6.6 aging claim: a
-// low-priority job that has waited long enough out-ranks a high-priority newcomer.
-func TestAgedLowPriorityBeatsFreshHighPriority(t *testing.T) {
+// TestAgedNiceToHaveBeatsFreshUrgent is the core §6.6 aging claim under the 1..10
+// lower-is-more-urgent scale: a nice-to-have job (priority 8) that has waited long enough
+// out-ranks a fresh urgent newcomer (priority 2), so nothing starves.
+func TestAgedNiceToHaveBeatsFreshUrgent(t *testing.T) {
 	base := time.Unix(0, 0)
-	rate := time.Minute // 1 priority point per minute waited
-	// low-prio job waited 100 minutes -> effective prio = 0 + 100 = 100.
-	low := cand("low", 0, base)
-	// high-prio newcomer enqueued at now -> effective prio = 50 + 0 = 50.
+	rate := time.Minute // 1 urgency point per minute waited
+	// nice-to-have (8) waited 100 min -> effective = -8 + 100 = 92.
+	nice := cand("nice", 8, base)
+	// fresh urgent (2) enqueued now -> effective = -2 + 0 = -2.
 	now := base.Add(100 * time.Minute)
-	high := cand("high", 50, now)
+	urgent := cand("urgent", 2, now)
 
-	picked, ok := PickWith([]Candidate{high, low}, nil, now, rate)
+	picked, ok := PickWith([]Candidate{urgent, nice}, nil, now, rate)
 	if !ok {
 		t.Fatal("expected a pick")
 	}
-	if picked.JobID != "low" {
-		t.Fatalf("aged low-prio should win, got %s", picked.JobID)
+	if picked.JobID != "nice" {
+		t.Fatalf("aged nice-to-have should win (anti-starvation), got %s", picked.JobID)
 	}
 }
 
-// TestFreshHighPriorityBeatsFreshLow: with no aging gap, priority decides.
-func TestFreshHighPriorityBeatsFreshLow(t *testing.T) {
+// TestFreshUrgentBeatsFreshNice: with no aging gap, the LOWER priority number (more
+// urgent) decides — priority 1 beats priority 9.
+func TestFreshUrgentBeatsFreshNice(t *testing.T) {
 	now := time.Unix(1000, 0)
-	picked, ok := PickWith([]Candidate{cand("lo", 1, now), cand("hi", 9, now)}, nil, now, time.Minute)
-	if !ok || picked.JobID != "hi" {
-		t.Fatalf("fresh high-prio should win, got %+v ok=%v", picked, ok)
+	picked, ok := PickWith([]Candidate{cand("nice", 9, now), cand("urgent", 1, now)}, nil, now, time.Minute)
+	if !ok || picked.JobID != "urgent" {
+		t.Fatalf("fresh urgent (priority 1) should win, got %+v ok=%v", picked, ok)
 	}
 }
 
@@ -42,8 +44,8 @@ func TestFreshHighPriorityBeatsFreshLow(t *testing.T) {
 // is never offered the job, even if it is the highest-priority candidate.
 func TestCapabilityFilterExcludesIneligible(t *testing.T) {
 	now := time.Unix(0, 0)
-	needsCodex := cand("needs", 100, now, "role:eng_worker", "model_family:codex")
-	open := cand("open", 1, now)
+	needsCodex := cand("needs", 1, now, "role:eng_worker", "model_family:codex") // urgent
+	open := cand("open", 5, now)                                                 // default
 
 	// a worker without model_family:codex cannot win `needs`, only `open`.
 	picked, ok := Pick([]Candidate{needsCodex, open}, []string{"role:eng_worker", "model_family:opus"}, now)
@@ -51,7 +53,7 @@ func TestCapabilityFilterExcludesIneligible(t *testing.T) {
 		t.Fatalf("ineligible worker should fall to open job, got %+v ok=%v", picked, ok)
 	}
 
-	// a codex worker wins the higher-priority `needs`.
+	// a codex worker wins the more-urgent (priority 1) `needs`.
 	picked2, ok2 := Pick([]Candidate{needsCodex, open}, []string{"role:eng_worker", "model_family:codex"}, now)
 	if !ok2 || picked2.JobID != "needs" {
 		t.Fatalf("codex worker should win needs, got %+v ok=%v", picked2, ok2)

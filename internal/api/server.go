@@ -1205,7 +1205,7 @@ func (s *Server) epicCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.store.SeedEpic(r.Context(), store.SeedEpicParams{
 		EpicID: epicID, ChatRef: body.Title, AuthorLens: lens, Repo: repo,
-		Issues: issues, Priority: body.Priority, Now: s.clock.Now(),
+		Issues: issues, Priority: job.NormalizePriority(body.Priority), Now: s.clock.Now(),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
@@ -1265,7 +1265,7 @@ func (s *Server) specCreate(w http.ResponseWriter, r *http.Request) {
 		task = body.Title
 	}
 	j, err := s.store.SeedSpecJob(r.Context(), store.SeedSpecParams{
-		ID: id, ChatRef: body.Title, AuthorLens: lens, Priority: body.Priority, Repo: repo,
+		ID: id, ChatRef: body.Title, AuthorLens: lens, Priority: job.NormalizePriority(body.Priority), Repo: repo,
 		TaskText: task, AcceptanceCriteria: body.Acceptance, Now: s.clock.Now(),
 	})
 	if err != nil {

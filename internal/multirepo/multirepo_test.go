@@ -62,8 +62,8 @@ func TestMultiRepoControlPlane(t *testing.T) {
 	}
 
 	// ── a job from EACH repo ──
-	// web's job is higher priority => cross-repo prioritization must offer it first,
-	// even though it belongs to a different repo than core's job.
+	// core's job is MORE urgent (priority 1; lower = more urgent) => cross-repo
+	// prioritization must offer it first, even though web's job is a different repo.
 	seedReadyBuild(t, st, "jCore", "core", 1, now)
 	seedReadyBuild(t, st, "jWeb", "web", 9, now)
 
@@ -77,9 +77,9 @@ func TestMultiRepoControlPlane(t *testing.T) {
 	if len(order) != 2 {
 		t.Fatalf("global queue should hold BOTH repos' ready jobs, got %d", len(order))
 	}
-	// cross-repo prioritization: web (priority 9) outranks core (priority 1).
-	if order[0].JobID != "jWeb" || order[1].JobID != "jCore" {
-		t.Fatalf("cross-repo priority order = [%s %s], want [jWeb jCore]", order[0].JobID, order[1].JobID)
+	// cross-repo prioritization: core (priority 1, more urgent) outranks web (priority 9).
+	if order[0].JobID != "jCore" || order[1].JobID != "jWeb" {
+		t.Fatalf("cross-repo priority order = [%s %s], want [jCore jWeb]", order[0].JobID, order[1].JobID)
 	}
 
 	// the SAME shared worker pool claims both repos' jobs (repo-agnostic): one worker

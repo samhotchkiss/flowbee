@@ -15,7 +15,7 @@ import (
 // issue body IS the work request — no spec-authoring needed; the human wrote it).
 // Idempotent: if a job already tracks this (repo, issue_number) it is a no-op and
 // returns "". The resulting build flows to a PR that Closes the issue on merge.
-func (s *Store) AdoptIssueAsBuild(ctx context.Context, repo string, issueNumber int, title, body, baseSHA string, now time.Time) (string, error) {
+func (s *Store) AdoptIssueAsBuild(ctx context.Context, repo string, issueNumber int, title, body, baseSHA string, priority int, now time.Time) (string, error) {
 	id := ulid.New()
 	// Parse the issue body into task / spec / acceptance the SAME way the spec-flow adopt
 	// path does (adopt.go) — otherwise the whole body (acceptance criteria and all) collapses
@@ -56,7 +56,9 @@ func (s *Store) AdoptIssueAsBuild(ctx context.Context, repo string, issueNumber 
 		if err := s.seedJobTx(ctx, tx, SeedParams{
 			ID: id, Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
 			BaseSHA: baseSHA, Repo: repo, TaskText: task, SpecText: parsed.Spec,
-			AcceptanceCriteria: parsed.AcceptanceCriteria, IssueNumber: &issueNumber, Now: now,
+			AcceptanceCriteria: parsed.AcceptanceCriteria, IssueNumber: &issueNumber,
+			// 1..10, lower = more urgent; an unlabeled issue normalizes to the default 5.
+			Priority: job.NormalizePriority(priority), Now: now,
 		}); err != nil {
 			return err
 		}
