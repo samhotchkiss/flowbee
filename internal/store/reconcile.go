@@ -186,7 +186,7 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 			// stale base it was adopted at. Jobs with a PR re-base via supersede /
 			// rebase-before-review; this closes the gap for not-yet-built ready jobs.
 			if pr.MergeCommit != "" {
-				if err := refreshReadyBaseTx(ctx, tx, j.Repo, jobID, pr.MergeCommit, now); err != nil {
+				if _, err := refreshReadyBaseTx(ctx, tx, j.Repo, jobID, pr.MergeCommit, now); err != nil {
 					return err
 				}
 			}
@@ -447,14 +447,14 @@ func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr Reconc
 // projection equals a re-fold (base_sha is a folded field). Jobs already at newBase are
 // skipped (no churn / no spurious events). A ready job has no verdict or lease to
 // invalidate, so this is a pure base advance — not a supersession.
-func refreshReadyBaseTx(ctx context.Context, tx *sql.Tx, repo, mergedID, newBase string, now time.Time) error {
+func refreshReadyBaseTx(ctx context.Context, tx *sql.Tx, repo, mergedID, newBase string, now time.Time) (int, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, job_seq, lease_epoch FROM jobs
 		 WHERE state = 'ready' AND kind = 'build' AND COALESCE(repo,'') = ?
 		   AND id != ? AND COALESCE(base_sha,'') != ?`,
 		repo, mergedID, newBase)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	type row struct {
 		id         string
@@ -465,13 +465,13 @@ func refreshReadyBaseTx(ctx context.Context, tx *sql.Tx, repo, mergedID, newBase
 		var r row
 		if err := rows.Scan(&r.id, &r.seq, &r.epoch); err != nil {
 			rows.Close()
-			return err
+			return 0, err
 		}
 		rs = append(rs, r)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return 0, err
 	}
 	for _, r := range rs {
 		nextSeq := r.seq + 1
@@ -481,17 +481,41 @@ func refreshReadyBaseTx(ctx context.Context, tx *sql.Tx, repo, mergedID, newBase
 			Payload: ledger.Payload{BaseSHA: newBase},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
-			return err
+			return 0, err
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE jobs SET base_sha = ?, updated_at = datetime('now') WHERE id = ?`, newBase, r.id); err != nil {
-			return fmt.Errorf("refresh ready base %s: %w", r.id, err)
+			return 0, fmt.Errorf("refresh ready base %s: %w", r.id, err)
 		}
 		if err := setJobSeq(ctx, tx, r.id, nextSeq); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return len(rs), nil
+}
+
+// RefreshStaleReadyBuilds advances every `ready` build in repo whose base_sha lags the
+// current integration tip (mainTip) to that tip — the tick-driven complement to the
+// merge-time refreshReadyBaseTx. It closes the blocked->ready-after-merge gap: a build
+// still `blocked` when its sibling merged is skipped by the merge-time refresh (state
+// filter), and the dep-clear that later arms it to `ready` does NOT refresh the base — so
+// without this it would dispatch a wasted build cut from stale pre-merge code (recovered
+// only later at review_pending by the rebase pass). A `ready` build has no PR/lease/
+// verdict to invalidate, so aligning its base to the tip BEFORE dispatch is a pure,
+// always-correct advance (a build integrates against current main). Idempotent: jobs
+// already at mainTip are skipped (no churn, no spurious events). Each refresh emits
+// KindBaseRefreshed so the projection equals a re-fold. Returns the count advanced.
+func (s *Store) RefreshStaleReadyBuilds(ctx context.Context, repo, mainTip string, now time.Time) (int, error) {
+	if mainTip == "" {
+		return 0, nil // never blank a base on a missing tip (mirror not yet fetched)
+	}
+	var n int
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		var terr error
+		n, terr = refreshReadyBaseTx(ctx, tx, repo, "", mainTip, now)
+		return terr
+	})
+	return n, err
 }
 
 // JobIDForPR resolves the job bound to a GitHub PR number. ok=false if no job is

@@ -313,6 +313,18 @@ func runServe(args []string) error {
 							continue
 						}
 						rebaseStaleReviews(ctx, logger, st, r.ID, mp, url, branch)
+						// align not-yet-built `ready` builds to the live tip BEFORE dispatch:
+						// a build that was `blocked` when its sibling merged (skipped by the
+						// merge-time refresh) and later armed to `ready` keeps a stale base, and
+						// would otherwise waste a build cut from pre-merge code. A ready build has
+						// no PR/lease/verdict, so this is a pure pre-dispatch base advance.
+						if tip, terr := gitops.Open(mp).HeadSHA("refs/heads/" + branch); terr == nil {
+							if n, rerr := st.RefreshStaleReadyBuilds(ctx, r.ID, tip, time.Now()); rerr != nil {
+								logger.Warn("refresh stale ready bases", "repo", r.ID, "err", rerr)
+							} else if n > 0 {
+								logger.Info("advanced stale ready bases to tip", "repo", r.ID, "count", n)
+							}
+						}
 						// routine maintenance: the control mirror accumulates objects from
 						// every fetch over months; `git gc --auto` is a no-op below git's
 						// loose-object threshold and self-batches the occasional real repack,
