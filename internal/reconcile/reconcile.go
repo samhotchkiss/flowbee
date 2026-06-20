@@ -212,7 +212,11 @@ func toReconciled(pr gh.PullRequest) store.ReconciledPR {
 		HeadSHA:     pr.HeadRefOid,
 		BaseSHA:     pr.BaseRefOid,
 		MergeCommit: pr.MergeCommit,
-		CIGreen:     pr.CIRollup == gh.CISuccess,
+		// green requires BOTH the aggregate SUCCESS AND a real (non-skipped) passing check —
+		// GitHub rolls an ALL-SKIPPED head up to SUCCESS (no test ran), so the aggregate alone
+		// would let a paths-filtered or hostile-workflow PR pass the gate on tests that never
+		// executed. See gh.PullRequest.CIHasRealSuccess.
+		CIGreen: pr.CIRollup == gh.CISuccess && pr.CIHasRealSuccess,
 		// a DEFINITIVE failure (not merely pending/none): the build is broken.
 		CIFailed:       pr.CIRollup == gh.CIFailure || pr.CIRollup == gh.CIError,
 		ClosedUnmerged: pr.ClosedUnmerged,

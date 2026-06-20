@@ -69,6 +69,13 @@ func NewFake() *Fake {
 func (f *Fake) SetPR(pr PullRequest) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A scripted SUCCESS rollup means "CI really passed" in a test; default the real-success flag
+	// so existing green-CI tests need no change now the real client also requires a real (non-
+	// skipped) passing check. The all-skipped bypass is unit-tested against the real parser
+	// (TestBoardSweepRejectsAllSkippedCI); the reconcile gate ANDs this flag into CIGreen.
+	if pr.CIRollup == CISuccess {
+		pr.CIHasRealSuccess = true
+	}
 	f.prs[pr.Number] = pr
 }
 

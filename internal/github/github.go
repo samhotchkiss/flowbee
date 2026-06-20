@@ -59,7 +59,13 @@ type PullRequest struct {
 	// the job instead of waiting on a merge that will never come.
 	ClosedUnmerged bool
 	CIRollup       CIState
-	Labels         []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
+	// CIHasRealSuccess is true iff at least one NON-skipped check actually concluded SUCCESS on
+	// the head. GitHub's aggregate statusCheckRollup.state is SUCCESS even when EVERY check was
+	// SKIPPED (e.g. a paths: filter excluded the changed files, or a hostile workflow edit) —
+	// i.e. no test ran. The merge gate AND-s this with CIRollup==SUCCESS so an all-skipped PR is
+	// never read as green and cannot mint a verdict / self-merge on tests that never executed.
+	CIHasRealSuccess bool
+	Labels           []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
 }
 
 // Issue is the Domain-B snapshot of one open issue from a BoardSweep. Title/Body
@@ -312,7 +318,8 @@ fragment prFields on PullRequest {
   number updatedAt isDraft merged mergedAt
   headRefOid baseRefOid
   mergeCommit { oid }
-  commits(last:1) { nodes { commit { statusCheckRollup { state } } } }
+  commits(last:1) { nodes { commit { statusCheckRollup { state
+    contexts(first:100) { nodes { __typename ... on CheckRun { conclusion } ... on StatusContext { state } } } } } } }
   labels(first:20) { nodes { name } }
 }
 query BoardSweep($owner:String!, $repo:String!, $prCursor:String, $issueCursor:String, $includeMerged:Boolean!) {
@@ -395,7 +402,14 @@ type prNode struct {
 		Nodes []struct {
 			Commit struct {
 				StatusCheckRollup *struct {
-					State string `json:"state"`
+					State    string `json:"state"`
+					Contexts struct {
+						Nodes []struct {
+							Typename   string `json:"__typename"`
+							Conclusion string `json:"conclusion"` // CheckRun (Actions)
+							State      string `json:"state"`      // StatusContext (legacy)
+						} `json:"nodes"`
+					} `json:"contexts"`
 				} `json:"statusCheckRollup"`
 			} `json:"commit"`
 		} `json:"nodes"`
@@ -453,7 +467,17 @@ func prFromNode(n prNode) PullRequest {
 		pr.MergeCommit = n.MergeCommit.Oid
 	}
 	if len(n.Commits.Nodes) > 0 && n.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
-		pr.CIRollup = CIState(n.Commits.Nodes[0].Commit.StatusCheckRollup.State)
+		rollup := n.Commits.Nodes[0].Commit.StatusCheckRollup
+		pr.CIRollup = CIState(rollup.State)
+		// a REAL success = at least one NON-skipped check actually concluded SUCCESS (a CheckRun
+		// conclusion or a legacy StatusContext state). SKIPPED/NEUTRAL/missing don't count, so an
+		// all-skipped rollup (which GitHub aggregates to SUCCESS) is NOT a real success.
+		for _, c := range rollup.Contexts.Nodes {
+			if (c.Typename == "CheckRun" && c.Conclusion == "SUCCESS") || (c.Typename == "StatusContext" && c.State == "SUCCESS") {
+				pr.CIHasRealSuccess = true
+				break
+			}
+		}
 	}
 	for _, l := range n.Labels.Nodes {
 		pr.Labels = append(pr.Labels, l.Name)
@@ -562,7 +586,8 @@ query PR($owner:String!, $repo:String!, $number:Int!) {
       number updatedAt isDraft merged mergedAt
       headRefOid baseRefOid
       mergeCommit { oid }
-      commits(last:1) { nodes { commit { statusCheckRollup { state } } } }
+      commits(last:1) { nodes { commit { statusCheckRollup { state
+    contexts(first:100) { nodes { __typename ... on CheckRun { conclusion } ... on StatusContext { state } } } } } } }
       labels(first:20) { nodes { name } }
     }
   }
@@ -587,7 +612,14 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 					Nodes []struct {
 						Commit struct {
 							StatusCheckRollup *struct {
-								State string `json:"state"`
+								State    string `json:"state"`
+								Contexts struct {
+									Nodes []struct {
+										Typename   string `json:"__typename"`
+										Conclusion string `json:"conclusion"`
+										State      string `json:"state"`
+									} `json:"nodes"`
+								} `json:"contexts"`
 							} `json:"statusCheckRollup"`
 						} `json:"commit"`
 					} `json:"nodes"`
@@ -618,7 +650,17 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 		pr.MergeCommit = n.MergeCommit.Oid
 	}
 	if len(n.Commits.Nodes) > 0 && n.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
-		pr.CIRollup = CIState(n.Commits.Nodes[0].Commit.StatusCheckRollup.State)
+		rollup := n.Commits.Nodes[0].Commit.StatusCheckRollup
+		pr.CIRollup = CIState(rollup.State)
+		// a REAL success = at least one NON-skipped check actually concluded SUCCESS (a CheckRun
+		// conclusion or a legacy StatusContext state). SKIPPED/NEUTRAL/missing don't count, so an
+		// all-skipped rollup (which GitHub aggregates to SUCCESS) is NOT a real success.
+		for _, c := range rollup.Contexts.Nodes {
+			if (c.Typename == "CheckRun" && c.Conclusion == "SUCCESS") || (c.Typename == "StatusContext" && c.State == "SUCCESS") {
+				pr.CIHasRealSuccess = true
+				break
+			}
+		}
 	}
 	for _, l := range n.Labels.Nodes {
 		pr.Labels = append(pr.Labels, l.Name)
