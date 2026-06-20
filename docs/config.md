@@ -31,7 +31,7 @@ single-repo keys are ignored.
 
 | key | env override | default | meaning |
 |-----|--------------|---------|---------|
-| `database_url` | `FLOWBEE_DATABASE_URL` | `flowbee.db` | SQLite file (WAL). No database server. Gitignored + litestream'd. |
+| `database_url` | `FLOWBEE_DATABASE_URL` | `~/.flowbee/flowbee.db` | SQLite file (WAL). No database server. Gitignored + litestream'd. (The default is the absolute `~/.flowbee/flowbee.db`, not a cwd-relative path, so CLI queries find the live DB from any directory.) |
 | `private_addr` | `FLOWBEE_PRIVATE_ADDR` | `:7070` | the worker API — keep it on loopback / Tailscale |
 | `health_addr` | `FLOWBEE_HEALTH_ADDR` | `:7001` | `/healthz` |
 | `webhook_addr` | `FLOWBEE_WEBHOOK_ADDR` | `:8443` | GitHub webhooks |
@@ -41,12 +41,12 @@ single-repo keys are ignored.
 
 | key | env override | default | meaning |
 |-----|--------------|---------|---------|
-| `lease_ttl_s` | `FLOWBEE_LEASE_TTL_S` | `300` | lease lifetime; **must be ≥ 3 × `heartbeat_interval_s`** (DESIGN §6.3.3) |
+| `lease_ttl_s` | `FLOWBEE_LEASE_TTL_S` | `1200` | lease lifetime; **must be ≥ 3 × `heartbeat_interval_s`** (DESIGN §6.3.3). Set it ABOVE a real agent's wall time — too low revokes long builds mid-run and fences their results. |
 | `heartbeat_interval_s` | `FLOWBEE_HEARTBEAT_INTERVAL_S` | `30` | worker heartbeat cadence |
 | `long_poll_wait_s` | `FLOWBEE_LONG_POLL_WAIT_S` | `30` | worker long-poll hold |
 | `river_max_workers` | `FLOWBEE_RIVER_MAX_WORKERS` | `10` | internal job-runner concurrency |
 | `no_eligible_worker_s` | `FLOWBEE_NO_ELIGIBLE_WORKER_S` | `120` | how long a `ready` job may sit with no compliant worker before the alarm fires |
-| `reconcile_interval_s` | `FLOWBEE_RECONCILE_INTERVAL_S` | `45` | how often the reconciler probes GitHub for jobs that may have been missed by webhooks |
+| `reconcile_interval_s` | `FLOWBEE_RECONCILE_INTERVAL_S` _(env only)_ | `45` | how often the reconciler probes GitHub for jobs that may have been missed by webhooks. **Env-only — there is no `flowbee.yaml` key**; setting `reconcile_interval_s:` in the file is a silent no-op. |
 
 `flowbee doctor` fails the `config` check if `lease_ttl_s < 3 * heartbeat_interval_s`.
 
@@ -65,7 +65,7 @@ off-disk production answer — see [operating.md §6](operating.md).
 
 | key | env override | default | meaning |
 |-----|--------------|---------|---------|
-| `allow_self_merge` | `FLOWBEE_ALLOW_SELF_MERGE` | `true` | **`true`** = Flowbee merges an approved + content-clean + CI-green-at-head job itself, no human gate (the production posture). `false` = every approved job hands off to a human. |
+| `allow_self_merge` | `FLOWBEE_ALLOW_SELF_MERGE` | `true` _(scaffold)_ / `false` _(engine)_ | **`true`** = Flowbee merges an approved + content-clean + CI-green-at-head job itself, no human gate (the production posture). `false` = every approved job hands off to a human. The `flowbee init` scaffold opts **in** (`true`); the built-in engine default when no `flowbee.yaml` is present is the safe `false` (handoff). |
 
 The safety net for autonomous merge is entirely deterministic: a
 content-integrity gate, CI green at the *integrated* head, and a reconciled,

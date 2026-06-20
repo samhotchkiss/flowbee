@@ -39,7 +39,7 @@ Run it first; the rest of this list is the human judgement `doctor` can't make.
 ## 2. Fleet is up
 
 - [ ] The control plane (`flowbee serve`) is running and healthy — under systemd,
-      `systemctl status flowbee` should be `active (running)`.
+      `systemctl status flowbee-serve` should be `active (running)` (the unit `flowbee serve --systemd` emits is named **`flowbee-serve`**).
 - [ ] At least one worker is registered and idle, ready to pick up work.
 - [ ] The webhook endpoint is reachable from GitHub (or polling is enabled) so
       new issues and PR events are actually delivered.

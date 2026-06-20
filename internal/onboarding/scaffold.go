@@ -46,7 +46,11 @@ github_owner: %s
 github_repo: %s
 
 # ── Store / listeners ───────────────────────────────────────────────────────
-database_url: flowbee.db     # SQLite file (WAL); no database server required
+# database_url defaults to the ABSOLUTE ~/.flowbee/flowbee.db so flowbee status/board
+# find the live DB from any directory. Leave it commented to keep that default; uncomment
+# only to relocate the file (use an absolute path — a cwd-relative one makes CLI queries
+# run from elsewhere silently open an empty DB).
+# database_url: /var/lib/flowbee/flowbee.db
 private_addr: ":7070"        # worker API (loopback / Tailscale only)
 health_addr: ":7001"         # /healthz
 webhook_addr: ":8443"        # GitHub webhooks
