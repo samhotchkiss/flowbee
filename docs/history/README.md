@@ -119,6 +119,8 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVHHY5YJ6T90R62R9K0V9EY1`](./01KVHHY5YJ6T90R62R9K0V9EY1.md) | Project view: add a Documents tab (list + create documents within a project) | done | — | #2366 | 2026-06-20T06:23:08Z |
 | [`01KVJG8WMYQ78BP5D7362JJD49`](./01KVJG8WMYQ78BP5D7362JJD49.md) | iPad: copilot/agent rail floats over project content at tablet widths | done | — | #2372 | 2026-06-20T13:21:23Z |
 | [`01KVJYCRD8H0JTQZ9SC8WKS6GM`](./01KVJYCRD8H0JTQZ9SC8WKS6GM.md) | docs: document the `flowbee reservations` command in operating.md | done | — | #218 | 2026-06-20T16:44:14Z |
+| [`01KVK7WPGA275VGX3XJRRVN6SP`](./01KVK7WPGA275VGX3XJRRVN6SP.md) | # Spec: Add Prometheus Metrics Operator Reference | done | #219 | — | 2026-06-20T19:26:26Z |
+| [`01KVK7WPGA275VGX3XJRRVN6SP-build`](./01KVK7WPGA275VGX3XJRRVN6SP-build.md) | # Spec: Add Prometheus Metrics Operator Reference | done | — | #220 | 2026-06-20T19:34:01Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
