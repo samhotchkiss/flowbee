@@ -34,8 +34,8 @@ func TestFleetHealthByModel(t *testing.T) {
 	ins("c1", `["role:eng_worker","model:codex"]`, live)
 	ins("c2", `["role:code_reviewer","model:codex"]`, live)
 	ins("s1", `["role:eng_worker","model:sonnet"]`, live)
-	ins("stale", `["role:eng_worker","model:codex"]`, old)     // stale -> excluded
-	ins("nomodel", `["role:eng_worker"]`, live)                // no model: cap -> uncounted
+	ins("stale", `["role:eng_worker","model:codex"]`, old) // stale -> excluded
+	ins("nomodel", `["role:eng_worker"]`, live)            // no model: cap -> uncounted
 
 	h, err := st.FleetHealth(ctx, now, stale)
 	if err != nil {
@@ -49,6 +49,9 @@ func TestFleetHealthByModel(t *testing.T) {
 	}
 	if h.ByModel["sonnet"] != 1 {
 		t.Errorf("sonnet=%d want 1", h.ByModel["sonnet"])
+	}
+	if h.StaleByModel["codex"] != 1 {
+		t.Errorf("stale codex=%d want 1", h.StaleByModel["codex"])
 	}
 }
 
