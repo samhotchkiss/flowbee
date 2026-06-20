@@ -298,3 +298,16 @@ func TestCheckNoFalsePositiveOnMarkerLookalikes(t *testing.T) {
 		}
 	}
 }
+
+// TestModeChangeOnSpaceNamedWorkflowIsDenylisted: a chmod-only diff (no +++/---/rename header to
+// recover the path) on a denylisted file whose name contains a SPACE must STILL classify the
+// path. Git does not quote spaces, so the `diff --git a/<P> b/<P>` line is the sole path source
+// and must be parsed symmetrically — else the workflow change clears the gate and self-merges.
+func TestModeChangeOnSpaceNamedWorkflowIsDenylisted(t *testing.T) {
+	const wf = ".github/workflows/deploy v2.yml"
+	diff := "diff --git a/" + wf + " b/" + wf + "\nold mode 100644\nnew mode 100755\n"
+	r := Check(Patch{Diff: diff, Declared: BlastRadius{Paths: []string{wf}}}, Limits{})
+	if r.DenylistClear {
+		t.Fatalf("a mode-change on a space-named workflow must hit the CI denylist class; it cleared (hits=%v)", r.DenylistHits)
+	}
+}

@@ -617,14 +617,45 @@ func scanDeletes(diff string, add func(string)) {
 	}
 }
 
-// parseDiffGit extracts the a/ and b/ paths from a `diff --git a/x b/y` line.
+// parseDiffGit extracts the a/ and b/ paths from a `diff --git a/x b/y` line. Git does NOT
+// quote a SPACE in a pathname (even under core.quotepath=false), so a naive split on the first
+// space corrupts a space-containing path. That matters because a MODE-CHANGE-only hunk (chmod)
+// carries NO +++/---/rename header to recover the path from — the `diff --git` line is the sole
+// path source — so a corrupted classification would clear a space-named denylisted file (e.g.
+// ".github/workflows/deploy v2.yml") at the autonomous-merge gate. Git emits the two sides as
+// `a/<P> b/<P>` with an IDENTICAL <P> for every in-repo (non-rename) diff, so recover <P>
+// SYMMETRICALLY first; fall back to the first-space split only when that form doesn't hold (a
+// true rename, whose path is carried in the rename headers and parsed independently).
 func parseDiffGit(line string) (a, b string) {
 	rest := strings.TrimPrefix(line, "diff --git ")
+	if p := symmetricDiffGitPath(rest); p != "" {
+		return p, p
+	}
 	fields := strings.SplitN(rest, " ", 2)
 	if len(fields) != 2 {
 		return "", ""
 	}
 	return stripDiffPathPrefix(fields[0]), stripDiffPathPrefix(fields[1])
+}
+
+// symmetricDiffGitPath recovers <P> from `a/<P> b/<P>` (identical sides) — the form git emits
+// for every non-rename diff — making a space in <P> safe. Returns "" when the line is not
+// symmetric (a rename a/X b/Y with X≠Y, or a C-quoted path that doesn't start with a bare "a/"),
+// both of which the caller handles via the first-space split + rename/+++/--- headers.
+func symmetricDiffGitPath(rest string) string {
+	if !strings.HasPrefix(rest, "a/") {
+		return ""
+	}
+	// rest == "a/" + P + " b/" + P  ⇒  len(rest) == 5 + 2*len(P)  ("a/"=2, " b/"=3).
+	n := len(rest) - 5
+	if n < 2 || n%2 != 0 {
+		return ""
+	}
+	p := rest[2 : 2+n/2]
+	if p != "" && rest == "a/"+p+" b/"+p {
+		return p
+	}
+	return ""
 }
 
 // stripDiffPathPrefix removes a leading a/ or b/ and a trailing tab-annotation.
