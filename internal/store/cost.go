@@ -294,6 +294,11 @@ type MergeHandoffRow struct {
 	Repo        string `json:"repo"`
 	IssueNumber int    `json:"issue_number"`
 	PRNumber    int    `json:"pr_number"`
+	// Reason is WHY Flowbee handed off (from the routing event): head_modified_after_review
+	// (re-review needed), a denylist/source reason (a human merges it), self_merge_unverifiable
+	// (no mirror), etc. Empty for a bare M3-default handoff. Tells the operator what action to
+	// take — merge it, re-review, or fix a config — instead of guessing.
+	Reason string `json:"reason,omitempty"`
 }
 
 // MergeHandoffView lists every job parked in merge_handoff: Flowbee built, reviewed,
@@ -303,7 +308,12 @@ type MergeHandoffRow struct {
 // of the full board.
 func (s *Store) MergeHandoffView(ctx context.Context) ([]MergeHandoffRow, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT j.id, COALESCE(j.repo,''), j.issue_number, COALESCE(f.pr_number,0)
+		SELECT j.id, COALESCE(j.repo,''), COALESCE(j.issue_number,0), COALESCE(f.pr_number,0),
+		       COALESCE((SELECT json_extract(e.payload, '$.RevokeReason') FROM job_events e
+		                  WHERE e.job_id = j.id
+		                    AND json_extract(e.payload, '$.RevokeReason') IS NOT NULL
+		                    AND json_extract(e.payload, '$.RevokeReason') != ''
+		                  ORDER BY e.job_seq DESC LIMIT 1), '') AS reason
 		  FROM jobs j LEFT JOIN domain_b_facts f ON f.job_id = j.id
 		 WHERE j.state = 'merge_handoff'
 		 ORDER BY j.updated_at DESC, j.id ASC`)
@@ -314,7 +324,7 @@ func (s *Store) MergeHandoffView(ctx context.Context) ([]MergeHandoffRow, error)
 	out := []MergeHandoffRow{}
 	for rows.Next() {
 		var r MergeHandoffRow
-		if err := rows.Scan(&r.JobID, &r.Repo, &r.IssueNumber, &r.PRNumber); err != nil {
+		if err := rows.Scan(&r.JobID, &r.Repo, &r.IssueNumber, &r.PRNumber, &r.Reason); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

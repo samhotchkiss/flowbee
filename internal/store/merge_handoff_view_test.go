@@ -56,3 +56,34 @@ func TestMergeHandoffViewListsApprovedPRs(t *testing.T) {
 		t.Fatalf("row = %+v, want {h flowbee 42 77}", r)
 	}
 }
+
+// TestMergeHandoffViewSurfacesReason: the lane shows WHY each job handed off (the routing
+// event's reason), so an operator knows whether to re-review, merge it, or fix a config —
+// not guess.
+func TestMergeHandoffViewSurfacesReason(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "h", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+		Repo: "russ", Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// drive it to `merging`, then route to the human gate WITH a reason (the real path).
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging' WHERE id='h'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RouteSelfMergeToHandoff(ctx, "h", "head_modified_after_review", now); err != nil {
+		t.Fatalf("route to handoff: %v", err)
+	}
+
+	rows, err := st.MergeHandoffView(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Reason != "head_modified_after_review" {
+		t.Fatalf("lane must surface the handoff reason, got %+v", rows)
+	}
+}
