@@ -155,6 +155,51 @@ func TestSoftResetToIsNoOpForNonCommittingAgent(t *testing.T) {
 	}
 }
 
+// TestBundleSoftResetToNormalizesSelfCommittingAgent is the bundle-harness twin of the
+// self-commit fix: a codex agent on a --bundle worker may `git commit` its own work,
+// leaving a CLEAN clone that HasChanges reads false — so RunOnceHarnessBundle would drop a
+// good build as "agent produced no changes" and burn an attempt. SoftResetTo(base) re-exposes
+// the change as pending so the Diff path returns the agent's real work.
+func TestBundleSoftResetToNormalizesSelfCommittingAgent(t *testing.T) {
+	m, base := newFixture(t)
+	bundle, err := m.Bundle(base)
+	if err != nil {
+		t.Fatalf("bundle: %v", err)
+	}
+	wsDir := filepath.Join(t.TempDir(), "ws")
+	ws, err := CloneFromBundle(wsDir, bundle, base)
+	if err != nil {
+		t.Fatalf("clone from bundle: %v", err)
+	}
+	defer ws.Destroy()
+
+	// the "agent" writes a file AND commits it itself (what codex does).
+	mustWrite(t, filepath.Join(wsDir, "feature.go"), "package x // self-committed by bundle agent\n")
+	if _, err := ws.Run("git", "add", "-A"); err != nil {
+		t.Fatalf("agent add: %v", err)
+	}
+	if _, err := ws.Run("git", "-c", "user.email=a@b.c", "-c", "user.name=agent", "commit", "-m", "agent's own commit"); err != nil {
+		t.Fatalf("agent commit: %v", err)
+	}
+	// the clone is now CLEAN — the pre-fix failure mode (HasChanges=false -> dropped build).
+	if changed, _ := ws.HasChanges(); changed {
+		t.Fatal("precondition: a self-committed bundle clone should be clean")
+	}
+
+	// normalize: undo the agent's commit, keep its change pending.
+	if err := ws.SoftResetTo(base); err != nil {
+		t.Fatalf("soft reset: %v", err)
+	}
+	changed, err := ws.HasChanges()
+	if err != nil || !changed {
+		t.Fatalf("after SoftResetTo HasChanges=%v err=%v want true (else the build is dropped)", changed, err)
+	}
+	diff, err := ws.Diff()
+	if err != nil || !strings.Contains(diff, "feature.go") || !strings.Contains(diff, "self-committed by bundle agent") {
+		t.Fatalf("diff must capture the agent's change after reset; err=%v diff:\n%s", err, diff)
+	}
+}
+
 // TestDropRefOrphansEpochRef proves the M11 compensation primitive (§6.5.4, I-12):
 // dropping a dead epoch's ref orphans the zombie's work so it can never be promoted.
 // Dropping a missing ref is a no-op (idempotent compensation).

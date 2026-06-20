@@ -561,6 +561,15 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		return out, err
 	}
 
+	// Normalize a self-committing agent: an agentic CLI (codex) may `git commit` its own
+	// work, leaving a clean tree that HasChanges below would misread as "no changes" —
+	// dropping a good build and burning an attempt. Soft-reset any agent commits back to base
+	// so the changes are pending again (no-op for a non-committing agent like claude). This
+	// is the bundle-harness twin of the wt.SoftResetTo the other two build harnesses run.
+	if err := ws.SoftResetTo(grant.BaseSHA); err != nil {
+		return out, fmt.Errorf("normalize bundle workspace: %w", err)
+	}
+
 	// capture the node's own detailed commit message before stripping the scaffolding;
 	// the control plane commits the patch WITH it (the worker is credential-less).
 	commitMsg := nodeCommitMessage(wsDir, cfg.Identity, grant.Role, grant.JobID, grant.Context)

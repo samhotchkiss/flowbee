@@ -367,6 +367,18 @@ func (b *BundleWorkspace) HasChanges() (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// SoftResetTo undoes this run's agent commits while keeping the changes pending — the
+// bundle-workspace twin of Worktree.SoftResetTo (see its doc for the why). An agentic CLI
+// (codex) may `git commit` on its own, leaving a CLEAN tree that HasChanges reads as false
+// and the build is wrongly rejected as "agent produced no changes". The bundle clone is
+// detached at base, so ref is baseSHA; a no-op when the agent didn't commit (HEAD==base).
+func (b *BundleWorkspace) SoftResetTo(ref string) error {
+	if _, err := run(b.Dir, "git", "reset", "--soft", ref); err != nil {
+		return fmt.Errorf("soft reset to %s: %w", ref, err)
+	}
+	return nil
+}
+
 // Diff returns the unified diff of the workspace against base (the `patch`
 // work-product the worker returns, §7.3). It stages everything first so new files
 // are included. This is the ONLY thing the bundle worker hands back — no ref, no
