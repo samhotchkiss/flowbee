@@ -459,6 +459,14 @@ drop out of the lease queue (not just its reconcile loops). `flowbee status` sho
 `flowbee_repo_parked{repo} == 1` lasting longer than intended, so a pause is never silently
 forgotten. (A CP-local marker file beside the DB is still honored as an operator override.)
 
+**Red main (stop-the-line).** `flowbee_main_ci_red{repo}` is `1` when a repo's integration
+branch CI is itself red. While red, a feature PR's own CI failure can't be fairly attributed
+to the PR, so Flowbee **holds** those PRs in `review_pending` instead of bouncing good work to
+`needs_human`; `flowbee status` shows a `RED MAIN:` banner. **Alert on
+`flowbee_main_ci_red == 1`** — fix main first, and file the fix as `flowbee:p1` so it jumps the
+queue (Flowbee can't tell which PR fixes main on its own). Held PRs rebase + re-CI and proceed
+once main is green again.
+
 ---
 
 ## 8. Self-merge, briefly
