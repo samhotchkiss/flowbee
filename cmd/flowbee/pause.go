@@ -1,57 +1,72 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 
-	"github.com/samhotchkiss/flowbee/internal/config"
+	"github.com/samhotchkiss/flowbee/client"
 )
 
-// markerPath returns the pause marker file path that sits beside the live DB.
-// pause creates it; resume removes it; serve and status check it.
+// markerPath returns the pause marker file path that sits beside the live DB. It is the
+// CP-local operator override (serve + status check it); the `pause`/`resume` commands now
+// drive the DB-backed, client-triggerable control endpoint instead so a REMOTE client (the
+// russ worker) can pause the dispatcher too — not just a process on the control-plane box.
 func markerPath(dbURL string) string {
 	return filepath.Join(filepath.Dir(dbURL), "paused")
 }
 
-// runPause creates the pause marker so the lease endpoint stops issuing new
-// leases (workers go idle after their current job). In-flight leases, heartbeats,
-// and result submissions are unaffected. Idempotent.
-func runPause(args []string) error {
-	cfg, err := config.Load()
-	if err != nil {
+// runPause tells the dispatcher to stop issuing new leases. `flowbee pause` pauses
+// EVERYTHING; `flowbee pause --repo russ` parks just that repo (other repos keep flowing).
+// In-flight leases, heartbeats, and result submissions are unaffected. Hits the control
+// plane over FLOWBEE_URL (default loopback) so it works from any box, not just the CP.
+func runPause(args []string) error { return runControl(args, true) }
+
+// runResume is the inverse — resume global dispatch or a single repo.
+func runResume(args []string) error { return runControl(args, false) }
+
+func runControl(args []string, pause bool) error {
+	name := "resume"
+	if pause {
+		name = "pause"
+	}
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	repo := fs.String("repo", "", "scope to one repo id (default: everything)")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	p := markerPath(cfg.DatabaseURL)
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if os.IsExist(err) {
-		fmt.Println("fleet already paused")
-		return nil
+	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
+	c := client.NewWithToken(url, os.Getenv("FLOWBEE_WORKER_TOKEN"))
+	ctx := context.Background()
+
+	var err error
+	if pause {
+		err = c.Pause(ctx, *repo)
+	} else {
+		err = c.Resume(ctx, *repo)
 	}
 	if err != nil {
-		return fmt.Errorf("create pause marker: %w", err)
+		return fmt.Errorf("%s via %s: %w", name, url, err)
 	}
-	f.Close()
-	fmt.Printf("fleet PAUSED — no new leases will be issued (marker: %s)\n", p)
-	fmt.Println("  in-flight jobs continue; run `flowbee resume` when ready")
+
+	scope := "everything"
+	if *repo != "" {
+		scope = "repo " + *repo
+	}
+	if pause {
+		fmt.Printf("dispatch PAUSED (%s) — no new leases; in-flight jobs continue, heartbeats/results still flow\n", scope)
+		fmt.Printf("  run `flowbee resume%s` when ready\n", repoArg(*repo))
+	} else {
+		fmt.Printf("dispatch RESUMED (%s)\n", scope)
+	}
 	return nil
 }
 
-// runResume removes the pause marker so leasing resumes. Idempotent — no error
-// if the marker is absent.
-func runResume(args []string) error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+func repoArg(repo string) string {
+	if repo == "" {
+		return ""
 	}
-	p := markerPath(cfg.DatabaseURL)
-	if err := os.Remove(p); err != nil {
-		if os.IsNotExist(err) {
-			fmt.Println("fleet is not paused")
-			return nil
-		}
-		return fmt.Errorf("remove pause marker: %w", err)
-	}
-	fmt.Println("fleet RESUMED — lease endpoint is open again")
-	return nil
+	return " --repo " + repo
 }

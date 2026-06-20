@@ -466,6 +466,18 @@ func (c *Client) postJSON(ctx context.Context, path string, headers map[string]s
 	return err
 }
 
+// Pause tells the dispatcher to stop handing out new work. An empty repo pauses dispatch
+// GLOBALLY ("pause everything"); a repo id parks just that repo (other repos keep flowing).
+// Running jobs are never interrupted. Idempotent.
+func (c *Client) Pause(ctx context.Context, repo string) error {
+	return c.postJSON(ctx, "/v1/control/pause", nil, map[string]string{"repo": repo}, nil)
+}
+
+// Resume is the inverse of Pause (resume global dispatch or a single repo).
+func (c *Client) Resume(ctx context.Context, repo string) error {
+	return c.postJSON(ctx, "/v1/control/resume", nil, map[string]string{"repo": repo}, nil)
+}
+
 func (c *Client) postJSONStatus(ctx context.Context, path string, headers map[string]string, body, out any) (int, error) {
 	var buf io.Reader
 	if body != nil {

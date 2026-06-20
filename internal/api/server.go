@@ -253,6 +253,11 @@ func (s *Server) PrivateHandler() http.Handler {
 	worker := http.NewServeMux()
 	worker.HandleFunc("POST /v1/workers/register", s.register)
 	worker.HandleFunc("POST /v1/workers/usage", s.usage)
+	// dispatch control: a client (the russ worker, an operator) tells the dispatcher to
+	// pause — globally ("pause everything") or for one repo ({"repo":"russ"}).
+	worker.HandleFunc("POST /v1/control/pause", s.controlPause)
+	worker.HandleFunc("POST /v1/control/resume", s.controlResume)
+	worker.HandleFunc("GET /v1/control", s.controlStatus)
 	worker.HandleFunc("GET /v1/lease", s.lease)
 	worker.HandleFunc("POST /v1/jobs/{job}/heartbeat", s.heartbeat)
 	worker.HandleFunc("POST /v1/jobs/{job}/result", s.result)
@@ -271,6 +276,7 @@ func (s *Server) PrivateHandler() http.Handler {
 		"POST /v1/jobs/{job}/review", "POST /v1/jobs/{job}/spec",
 		"POST /v1/jobs/{job}/spec-review", "POST /v1/jobs/{job}/release",
 		"GET /v1/jobs/{job}/bundle",
+		"POST /v1/control/pause", "POST /v1/control/resume", "GET /v1/control",
 	} {
 		mux.Handle(p, authed)
 	}
@@ -674,6 +680,59 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "at_ceiling": atCeiling})
 }
 
+// controlPause (POST /v1/control/pause) lets a client tell the dispatcher to stop handing
+// out work. Body {"repo":"<id>"} parks just that repo — its jobs drop out of the lease
+// queue while every other repo keeps flowing; an empty body (no repo) pauses dispatch
+// GLOBALLY ("pause everything"). Running jobs are never interrupted — only NEW leasing
+// stops; heartbeats/results still flow. Idempotent + DB-backed (survives a CP redeploy).
+func (s *Server) controlPause(w http.ResponseWriter, r *http.Request) { s.setPause(w, r, true) }
+
+// controlResume (POST /v1/control/resume) is the inverse — resume global dispatch or a
+// single repo (same body shape).
+func (s *Server) controlResume(w http.ResponseWriter, r *http.Request) { s.setPause(w, r, false) }
+
+func (s *Server) setPause(w http.ResponseWriter, r *http.Request, pause bool) {
+	var body struct {
+		Repo string `json:"repo,omitempty"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body) // body optional: no repo => global
+	scope, err := "all", error(nil)
+	if repo := strings.TrimSpace(body.Repo); repo != "" {
+		scope = repo
+		err = s.store.SetRepoActive(r.Context(), repo, !pause) // pause => active=false
+	} else {
+		err = s.store.SetDispatchPaused(r.Context(), pause)
+	}
+	if err != nil {
+		http.Error(w, "control: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	verb := "resumed"
+	if pause {
+		verb = "paused"
+	}
+	s.broker.Publish(LifeEvent{State: "control", Event: "dispatch_" + verb + ":" + scope})
+	writeJSON(w, http.StatusOK, map[string]any{"paused": pause, "scope": scope})
+}
+
+// controlStatus (GET /v1/control) reports the current dispatch state: the global pause flag
+// + the list of parked repos, so a client can see whether (and where) work is flowing.
+func (s *Server) controlStatus(w http.ResponseWriter, r *http.Request) {
+	global, err := s.store.DispatchPaused(r.Context())
+	if err != nil {
+		http.Error(w, "control error", http.StatusInternalServerError)
+		return
+	}
+	repos, _ := s.store.ListRepos(r.Context(), false)
+	parked := []string{}
+	for _, rp := range repos {
+		if !rp.Active {
+			parked = append(parked, rp.ID)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"dispatch_paused": global, "parked_repos": parked})
+}
+
 // fleetJSON serves the §G fleet view source: per-account usage gauges with their
 // ceiling line + whether each account is currently gated out (the rollover state).
 func (s *Server) fleetJSON(w http.ResponseWriter, r *http.Request) {
@@ -826,8 +885,15 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	resolvingConflict := role == job.RoleConflictResolver
 
 	// Fleet pause: stop issuing new leases while letting in-flight jobs finish.
-	// Heartbeats and result submissions are NOT affected (separate handlers).
+	// Heartbeats and result submissions are NOT affected (separate handlers). Two
+	// sources: the operator's filesystem marker (isPaused) AND the client-triggerable,
+	// DB-backed global flag (a worker/operator POSTing /v1/control/pause — "pause
+	// everything"). Either pauses dispatch for the whole fleet.
 	if s.isPaused() {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if paused, perr := s.store.DispatchPaused(r.Context()); perr == nil && paused {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -857,6 +923,18 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			http.Error(w, "lease error", http.StatusInternalServerError)
 			return
+		}
+		// per-repo pause ("pause russ"): drop candidates whose repo is parked (active=0)
+		// so a paused repo's jobs stay put while every other repo keeps flowing. One batch
+		// lookup at this single chokepoint; a no-op fast path when no repo is parked.
+		if parked, perr := s.store.ParkedRepoJobIDs(r.Context()); perr == nil && len(parked) > 0 {
+			kept := cands[:0]
+			for _, c := range cands {
+				if _, isParked := parked[c.JobID]; !isParked {
+					kept = append(kept, c)
+				}
+			}
+			cands = kept
 		}
 		for _, cand := range scheduler.Order(cands, attested, s.clock.Now()) {
 			var ls *lease.Lease
