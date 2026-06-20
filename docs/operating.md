@@ -200,6 +200,9 @@ Sonnet builds and Opus reviews/resolves for cross-model review.
 
 ## 4. Feeding it work
 
+> Onboarding a brand-new repo (register it, labels, CI, `AGENTS.md`)? See the end-to-end
+> checklist in [`onboarding.md`](onboarding.md) — `flowbee repo add` is one command.
+
 There are two entry points, by design:
 
 **A labeled GitHub issue → straight to build.** The issue body already *is* the spec, so
