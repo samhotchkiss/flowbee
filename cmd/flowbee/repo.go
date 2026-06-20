@@ -5,8 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/samhotchkiss/flowbee/internal/config"
 	"gopkg.in/yaml.v3"
@@ -43,6 +46,7 @@ func runRepo(args []string) error {
 	archive := fs.Bool("archive", false, "land docs/history/<id>.md provenance on the repo's main on each merge")
 	tokenEnv := fs.String("token-env", "", "name of a per-repo PAT env var (empty = shared FLOWBEE_GITHUB_TOKEN)")
 	cfgPath := fs.String("config", "", "flowbee.yaml path (default: $FLOWBEE_CONFIG, else ~/.flowbee/flowbee.yaml)")
+	reload := fs.Bool("reload", false, "after writing, signal the running control plane to reload config in place (graceful re-exec) — no manual restart")
 	// Allow the <owner/repo> positional on EITHER side of the flags (Go's flag package stops
 	// at the first non-flag): re-parse the tail after extracting the single positional.
 	var positional string
@@ -84,11 +88,53 @@ func runRepo(args []string) error {
 	}
 
 	fmt.Printf("✓ registered repo %q (%s/%s) in %s\n", repoID, owner, repo, path)
-	fmt.Println("  Next, to make it live:")
-	fmt.Println("   1. restart the control plane — it reads config at startup (graceful kill -TERM the running `flowbee serve`, then relaunch).")
-	fmt.Printf("   2. on the repo: create the `flowbee:build` label + a CI workflow that runs on pull_request.\n")
-	fmt.Printf("  Then queue work: label an issue `flowbee:build`, or `flowbee spec \"<task>\" --repo %s`.\n", repoID)
+	if *reload {
+		if err := signalControlPlaneReload(); err != nil {
+			fmt.Printf("  ⚠ couldn't auto-reload (%v) — restart the control plane manually to pick it up.\n", err)
+		} else {
+			fmt.Println("  ✓ signalled the control plane to reload (graceful in-place re-exec) — the repo is going live now.")
+		}
+	} else {
+		fmt.Println("  Next: restart the control plane to pick it up (or re-run with --reload to do it for you).")
+	}
+	fmt.Printf("  On the repo: create the `flowbee:build` label + a pull_request CI workflow. Then queue work: label an issue `flowbee:build`, or `flowbee spec \"<task>\" --repo %s`.\n", repoID)
 	return nil
+}
+
+// signalControlPlaneReload finds the running control plane via its pidfile and sends SIGUSR1,
+// which triggers a graceful in-place re-exec (full config reload). Verifies the pid really is a
+// `flowbee serve` first, so a stale pidfile + reused pid never gets a stray signal.
+func signalControlPlaneReload() error {
+	pf := pidFilePath()
+	if pf == "" {
+		return fmt.Errorf("no home dir to locate the control-plane pidfile")
+	}
+	b, err := os.ReadFile(pf)
+	if err != nil {
+		return fmt.Errorf("no control-plane pidfile at %s (is `flowbee serve` running on this host?)", pf)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return fmt.Errorf("bad pid in %s", pf)
+	}
+	if !isFlowbeeServe(pid) {
+		return fmt.Errorf("pid %d is not a running `flowbee serve` (stale pidfile?)", pid)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return proc.Signal(syscall.SIGUSR1)
+}
+
+// isFlowbeeServe best-effort confirms pid is a flowbee serve process (ps works on macOS+Linux).
+func isFlowbeeServe(pid int) bool {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+	if err != nil {
+		return false
+	}
+	cmd := string(out)
+	return strings.Contains(cmd, "flowbee") && strings.Contains(cmd, "serve")
 }
 
 // resolveConfigPath mirrors config.Load's precedence for the WRITE target, but defaults to the

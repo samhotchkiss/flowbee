@@ -125,8 +125,27 @@ func runServe(args []string) error {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// SIGUSR1/SIGHUP = graceful RE-EXEC: an in-place restart that re-reads flowbee.yaml. It
+	// cancels ctx so every listener + loop shuts down cleanly — the SAME path as SIGTERM — then
+	// replaces the process image (reexecSelf). This is a full, clean config reload (the
+	// `flowbee repo add --reload` path) with NONE of the concurrent-mutation risk of live-
+	// rewiring the per-repo managers. SIGUSR1 because a nohup-launched CP ignores SIGHUP.
+	ctx, cancel := context.WithCancel(sigCtx)
+	defer cancel()
+	reexec := make(chan struct{}, 1)
+	go func() {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP, syscall.SIGUSR1)
+		defer signal.Stop(hup)
+		select {
+		case <-hup:
+			reexec <- struct{}{}
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	st, err := store.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -487,6 +506,14 @@ func runServe(args []string) error {
 	logger.Info("flowbee serve started",
 		"version", buildVersion(), "health", cfg.HealthAddr, "private", cfg.PrivateAddr)
 
+	// pidfile so `flowbee repo add --reload` can find the CP to signal. Survives a re-exec
+	// (same pid rewrites it); removed on a clean SIGTERM exit, not on re-exec (Exec replaces
+	// the image before the defer runs).
+	if pf := pidFilePath(); pf != "" {
+		_ = os.WriteFile(pf, []byte(strconv.Itoa(os.Getpid())), 0o644)
+		defer os.Remove(pf)
+	}
+
 	var bindErr error
 	select {
 	case <-ctx.Done():
@@ -497,11 +524,41 @@ func runServe(args []string) error {
 		logger.Error("fatal: a listener failed; shutting down", "err", bindErr)
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
 	_ = healthSrv.Shutdown(shutdownCtx)
 	_ = privateSrv.Shutdown(shutdownCtx)
+	select {
+	case <-reexec:
+		return reexecSelf(logger)
+	default:
+	}
 	return bindErr
+}
+
+// reexecSelf replaces the running process image with a fresh `flowbee serve` (same binary,
+// args, env, pid) — an in-place restart that re-reads the config. Behaviourally identical to a
+// graceful kill -TERM + relaunch, so it inherits that safety (SQLite WAL is durable across the
+// abrupt image swap; the loops + listeners were already shut down via the cancelled ctx).
+func reexecSelf(logger *slog.Logger) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("re-exec: resolve self: %w", err)
+	}
+	logger.Info("re-exec for config reload", "binary", exe)
+	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
+		return fmt.Errorf("re-exec %s: %w", exe, err)
+	}
+	return nil // unreachable on success: the image is replaced
+}
+
+// pidFilePath is the standard control-plane pidfile (~/.flowbee/flowbee.pid), written by serve
+// and read by `flowbee repo add --reload` to find the CP to signal. Empty if no home dir.
+func pidFilePath() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".flowbee", "flowbee.pid")
+	}
+	return ""
 }
 
 // wireMultiRepo seeds the F9 repos registry from config (or the legacy single-repo
