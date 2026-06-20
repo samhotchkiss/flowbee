@@ -114,6 +114,26 @@ type BranchCIReader interface {
 	BranchCIState(ctx context.Context, branch string) (CIState, error)
 }
 
+// MergeUnsticker is the OPTIONAL GitHub surface for the merge_handoff un-stick driver (#214):
+// read a PR's mergeable state and fast-forward a behind head so a reviewed, green PR stops
+// rotting behind a base that keeps moving (the "each other merge pushes the waiting PRs
+// further behind" cascade). SEPARATE + optional (the un-stick sweep type-asserts it, like
+// BranchCIReader) so clients/fakes that don't need it aren't forced to implement it; absence
+// simply disables the un-stick for that repo. It never MERGES — only fast-forwards — so it
+// cannot land unreviewed code; it expands no autonomous-merge trust.
+type MergeUnsticker interface {
+	// PullMergeableState returns the PR's REST mergeable_state ("behind","clean","dirty",
+	// "blocked","unstable","unknown",…). ok=false => no such PR. GitHub computes it
+	// ASYNCHRONOUSLY, so a freshly-changed PR can read "unknown" until a later poll — the
+	// caller acts ONLY on a definitive "behind".
+	PullMergeableState(ctx context.Context, number int) (state string, ok bool, err error)
+	// UpdateBranch fast-forwards the PR head with its base server-side (no local checkout):
+	// PUT /pulls/{n}/update-branch (202 Accepted). Re-triggers CI. A 422 (a real conflict the
+	// FF can't resolve, or already up to date) surfaces as an error the caller treats as
+	// "skip" — never a force.
+	UpdateBranch(ctx context.Context, number int) error
+}
+
 // OpenPRInput describes the draft PR Flowbee opens from a promoted epoch ref
 // (§8.2.1, the canonical §7.3 PR-open trigger). The worker NEVER supplies a PR
 // field — Flowbee opens the PR and stamps the returned number.
@@ -1028,6 +1048,30 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int, expected
 		return fmt.Errorf("%w: %v", ErrMergeBaseModified, err)
 	}
 	return err
+}
+
+// PullMergeableState implements MergeUnsticker: GET /pulls/{n} for the REST mergeable_state
+// (the only signal that distinguishes "behind base, blocked on up-to-date" from "clean"). A
+// 404 means the PR is gone (ok=false), not an error.
+func (c *RealClient) PullMergeableState(ctx context.Context, number int) (string, bool, error) {
+	var out struct {
+		MergeableState string `json:"mergeable_state"`
+	}
+	if err := c.rest(ctx, http.MethodGet, fmt.Sprintf("/pulls/%d", number), nil, &out); err != nil {
+		var ghErr *ErrGitHub
+		if errors.As(err, &ghErr) && ghErr.StatusCode == http.StatusNotFound {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return out.MergeableState, true, nil
+}
+
+// UpdateBranch implements MergeUnsticker: PUT /pulls/{n}/update-branch (server-side
+// fast-forward of base into head). 202 Accepted => nil; a 422 conflict / already-up-to-date
+// surfaces as ErrGitHub for the caller to skip.
+func (c *RealClient) UpdateBranch(ctx context.Context, number int) error {
+	return c.rest(ctx, http.MethodPut, fmt.Sprintf("/pulls/%d/update-branch", number), nil, nil)
 }
 
 // DeleteBranch deletes refs/heads/<branch>. A 404/422 (the ref is already gone, e.g.

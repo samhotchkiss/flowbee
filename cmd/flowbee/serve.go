@@ -529,6 +529,48 @@ func runServe(args []string) error {
 				}
 			}
 		}()
+		// #214 merge_handoff un-stick: periodically fast-forward any reviewed, green PR that is
+		// BEHIND its base, so it stops rotting (15-19h observed) AND stops pushing the other
+		// waiting PRs further behind — the cascade that never converges on its own. It NEVER
+		// merges (only update-branch, a server-side FF that re-triggers CI), acts ONLY on a
+		// definitive GitHub "behind" (reported only when the repo requires up-to-date branches,
+		// so it self-scopes), and a real conflict is left to a human. Slower cadence than
+		// reconcile (the rot is hours; one REST read per merge_handoff PR per pass). Tune via
+		// FLOWBEE_UNSTICK_INTERVAL_S; a negative value disables it.
+		unstickEvery := 5 * time.Minute
+		if v := os.Getenv("FLOWBEE_UNSTICK_INTERVAL_S"); v != "" {
+			if n, perr := strconv.Atoi(v); perr == nil {
+				if n < 0 {
+					unstickEvery = 0
+				} else if n > 0 {
+					unstickEvery = time.Duration(n) * time.Second
+				}
+			}
+		}
+		if unstickEvery > 0 {
+			logger.Info("merge_handoff un-stick enabled", "interval", unstickEvery.String())
+			go func() {
+				t := time.NewTicker(unstickEvery)
+				defer t.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-t.C:
+						counts, err := mgr.UnstickAll(ctx)
+						if err != nil {
+							logger.Error("merge_handoff un-stick", "err", err)
+							continue
+						}
+						for repo, n := range counts {
+							if n > 0 {
+								logger.Info("🔀 un-stuck behind PRs (update-branch)", "repo", repo, "count", n)
+							}
+						}
+					}
+				}
+			}()
+		}
 		refetcher := repoRefetcher{mgr: mgr, defaultRepo: firstRepo(mgr)}
 		// crash-replay: re-drive any webhook deliveries recorded 'pending' but interrupted
 		// before their refetch (a CP crash between RecordDelivery and MarkDeliveryProcessed).

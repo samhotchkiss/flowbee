@@ -41,6 +41,9 @@ type Fake struct {
 	putFiles        map[string][]byte // path -> last content written via PutFile (§F archive)
 	protection      map[string]Protection
 
+	mergeableStates map[int]string // scripted PR mergeable_state ("behind"/"clean"/…) for the #214 un-stick driver
+	updatedBranches []int          // PR numbers passed to UpdateBranch, for assertions
+
 	// retryAfter, when >0, makes the NEXT write return *ErrRetryAfter (§8.2.4),
 	// then resets — so a test can prove the sender parks the outbox and retries.
 	retryAfter time.Duration
@@ -61,7 +64,55 @@ func NewFake() *Fake {
 		comments:    map[int][]string{},
 		labels:      map[int][]string{},
 		protection:  map[string]Protection{},
+
+		mergeableStates: map[int]string{},
 	}
+}
+
+// SetMergeableState scripts a PR's REST mergeable_state ("behind"/"clean"/"unknown"/…) for
+// the #214 un-stick driver tests.
+func (f *Fake) SetMergeableState(number int, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mergeableStates[number] = state
+}
+
+// PullMergeableState implements MergeUnsticker: a scripted state wins; else a known PR reads
+// "clean"; else not found.
+func (f *Fake) PullMergeableState(ctx context.Context, number int) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("PullMergeableState(%d)", number))
+	if s, ok := f.mergeableStates[number]; ok {
+		return s, true, nil
+	}
+	if _, ok := f.prs[number]; ok {
+		return "clean", true, nil
+	}
+	return "", false, nil
+}
+
+// UpdateBranch implements MergeUnsticker: records the call, and (unless nextErr is set, e.g. a
+// scripted 422 conflict) marks the PR no-longer-behind, mirroring GitHub's server-side FF.
+func (f *Fake) UpdateBranch(ctx context.Context, number int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("UpdateBranch(%d)", number))
+	if f.nextErr != nil {
+		err := f.nextErr
+		f.nextErr = nil
+		return err
+	}
+	f.updatedBranches = append(f.updatedBranches, number)
+	f.mergeableStates[number] = "clean"
+	return nil
+}
+
+// UpdatedBranches returns the PR numbers UpdateBranch was called with, in order.
+func (f *Fake) UpdatedBranches() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.updatedBranches...)
 }
 
 // SetPR scripts (or replaces) one PR in the fake's board. A later call with the

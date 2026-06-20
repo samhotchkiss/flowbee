@@ -53,6 +53,11 @@ type repoLoop struct {
 	repo   store.Repo
 	rec    *reconcile.Reconciler
 	sender *project.Sender
+	// unsticker is the repo's client viewed as the optional #214 merge_handoff un-stick
+	// surface (fast-forward a behind, reviewed, green PR so it stops rotting). nil when the
+	// repo's client doesn't implement it (e.g. a minimal test fake) — the un-stick is then
+	// skipped for that repo.
+	unsticker gh.MergeUnsticker
 }
 
 // Manager owns the per-repo loops over one shared store. It is built from the
@@ -159,10 +164,12 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 				rec = rec.WithIntake(hw, branch)
 			}
 		}
+		unsticker, _ := client.(gh.MergeUnsticker) // nil if the client doesn't support it
 		m.loops[r.ID] = &repoLoop{
-			repo:   r,
-			rec:    rec,
-			sender: sender,
+			repo:      r,
+			rec:       rec,
+			sender:    sender,
+			unsticker: unsticker,
 		}
 		m.order = append(m.order, r.ID)
 	}
@@ -199,6 +206,47 @@ func (m *Manager) DrainAll(ctx context.Context) (map[string]int, error) {
 			return counts, fmt.Errorf("drain repo %q: %w", id, err)
 		}
 		counts[id] = n
+	}
+	return counts, nil
+}
+
+// UnstickAll fast-forwards every merge_handoff PR that is BEHIND its base, per repo, over the
+// repo's own client (#214). It NEVER merges — only brings the PR up to date (server-side FF,
+// re-triggering CI) — so a reviewed, green PR stops rotting behind a base that keeps moving
+// (the "each other merge pushes the waiting ones further behind, they never converge"
+// cascade); a human (or a later self-merge) then lands a CURRENT PR. It acts ONLY on a
+// definitive "behind" — GitHub reports that state only when the repo REQUIRES up-to-date
+// branches, so this self-scopes to exactly the repos that need it; "unknown" (async, not yet
+// computed), "clean", "dirty" (a real conflict — a human resolves) are left alone. A per-PR
+// error is skipped (best-effort), never fatal. Returns the per-repo count of branches updated.
+func (m *Manager) UnstickAll(ctx context.Context) (map[string]int, error) {
+	rows, err := m.store.MergeHandoffView(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byRepo := map[string][]store.MergeHandoffRow{}
+	for _, r := range rows {
+		byRepo[r.Repo] = append(byRepo[r.Repo], r)
+	}
+	counts := map[string]int{}
+	for _, id := range m.order {
+		loop := m.loops[id]
+		if loop.unsticker == nil {
+			continue
+		}
+		for _, row := range byRepo[id] {
+			if row.PRNumber == 0 {
+				continue
+			}
+			state, ok, serr := loop.unsticker.PullMergeableState(ctx, row.PRNumber)
+			if serr != nil || !ok || state != "behind" {
+				continue // act ONLY on a definitive behind
+			}
+			if uerr := loop.unsticker.UpdateBranch(ctx, row.PRNumber); uerr != nil {
+				continue // 422 conflict / transient — a human resolves a real conflict
+			}
+			counts[id]++
+		}
 	}
 	return counts, nil
 }
