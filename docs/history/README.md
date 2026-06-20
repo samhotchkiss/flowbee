@@ -111,6 +111,7 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVH0JWRXPBAHP9SQ6558Z21S`](./01KVH0JWRXPBAHP9SQ6558Z21S.md) | Add a troubleshooting entry for agent failures ('agent produced no changes' -> needs_human) | done | — | #207 | 2026-06-19T22:44:04Z |
 | [`01KVH3G1WJV0R568YSKH78BR58`](./01KVH3G1WJV0R568YSKH78BR58.md) | 01KVH3G1WJV0R568YSKH78BR58 | done | #208 | — | 2026-06-19T23:30:38Z |
 | [`01KVH3G1WJV0R568YSKH78BR58-build`](./01KVH3G1WJV0R568YSKH78BR58-build.md) | # Spec: `flowbee status --json` | done | — | #209 | 2026-06-20T01:25:18Z |
+| [`01KVH7JQABVJK1N1F01MP4QAQD`](./01KVH7JQABVJK1N1F01MP4QAQD.md) | Add a --json flag to flowbee card | done | — | #211 | 2026-06-20T01:26:03Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
