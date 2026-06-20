@@ -85,6 +85,13 @@ func assertFoldMatchesProjection(t *testing.T, st *store.Store, id string) {
 	if folded.HeadSHA != proj.HeadSHA {
 		t.Fatalf("fold head_sha=%q != projection %q (head-establishing re-arms must fold the head)", folded.HeadSHA, proj.HeadSHA)
 	}
+	// base_sha is the cut point a re-armed build builds against; several re-arm paths
+	// (supersede, rebase, resolve) set it via a direct UPDATE, and an empty incoming base
+	// must be COALESCEd to the prior — the fold guards must mirror that or a rebuild-from-
+	// ledger strands the build on a wrong/empty base.
+	if folded.BaseSHA != proj.BaseSHA {
+		t.Fatalf("fold base_sha=%q != projection %q (re-arm paths must fold the base)", folded.BaseSHA, proj.BaseSHA)
+	}
 	// role + required_capabilities decide WHO can lease the job. Several re-arm-to-ready
 	// paths (operator requeue, stall revoke, fast-cancel) set them via a direct UPDATE, NOT
 	// a folded field, so a rebuild-from-ledger could keep STALE review caps on a re-armed

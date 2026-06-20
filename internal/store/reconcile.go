@@ -421,7 +421,7 @@ func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr Reconc
 		UPDATE jobs
 		   SET state = 'ready', role = 'eng_worker', stage = 'build',
 		       required_capabilities = ?,
-		       base_sha = ?, head_sha = '',
+		       base_sha = COALESCE(NULLIF(?,''), base_sha), head_sha = '',
 		       verdict = NULL,
 		       lease_epoch = lease_epoch + 1,
 		       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,

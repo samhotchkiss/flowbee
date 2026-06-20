@@ -117,6 +117,54 @@ func TestUnrecordedResolvedHeadWouldSupersede(t *testing.T) {
 // (a rebuild or rebase-before-review) must NOT be superseded when reconcile observes
 // that head — even if the reconcile baseline (domain_b_facts) still lags at the old
 // head. An EXTERNAL head (not the job's) still supersedes.
+// TestSupersedePreservesBaseOnEmptyIncomingBase: a supersede triggered by a head-only move
+// must NOT blank base_sha when the sweep reports an empty base oid. The code explicitly
+// anticipates "a head but an empty base oid" (reconcile.go), and a re-armed build with
+// base_sha="" can't cut a worktree AND is skipped by the rebase sweep -> a needs_human dead
+// end. supersedeTx keeps the prior base when the incoming one is empty (COALESCE/NULLIF),
+// mirroring the KindSuperseded fold's existing `if BaseSHA != ""` guard (so projection==Fold).
+func TestSupersedePreservesBaseOnEmptyIncomingBase(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	now := time.Unix(1000, 0)
+
+	const ownHead, mainBase, externalHead = "ownbuildhead0", "mainbase0000", "externalhead0"
+
+	// seed WITH the base so the ledger carries it (fold-complete) — then the supersede's
+	// keep-prior-base is verifiable against the fold, not just the projection.
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "sb", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+		BaseSHA: mainBase, Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET state='review_pending', head_sha=? WHERE id='sb'`, ownHead); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertDomainBFacts(ctx, "sb", job.DomainBFacts{
+		PRExists: true, PRNumber: 9, HeadSHA: ownHead, BaseSHA: mainBase,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// an external head move with an EMPTY base oid -> supersede fires (real head move), but
+	// the base must be preserved, not blanked.
+	if _, err := st.ApplyReconciledPR(ctx, "sb", store.ReconciledPR{
+		Number: 9, HeadSHA: externalHead, BaseSHA: "",
+	}, now.Add(time.Second)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	j, _ := st.GetJob(ctx, "sb")
+	if j.State != job.StateReady {
+		t.Fatalf("external head move must supersede to ready, state=%s", j.State)
+	}
+	if j.BaseSHA != mainBase {
+		t.Fatalf("supersede with an empty incoming base must KEEP the prior base; base_sha=%q want %q (a build with base_sha=\"\" can't cut a worktree and the rebase sweep skips it -> needs_human)", j.BaseSHA, mainBase)
+	}
+	assertFoldMatchesProjection(t, st, "sb")
+}
+
 func TestFlowbeePlacedSuppressesRebuildSupersede(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.NewStore(t)
