@@ -447,6 +447,22 @@ func staticChecks(p Patch, touched []string, lim Limits) []string {
 		}
 	}
 
+	// parse markers (§9.2) — a diff that introduces leftover git conflict markers
+	// (<<<<<<< / >>>>>>> / the diff3 base |||||||) corrupts the file. This is reachable from
+	// a conflict_resolver that under-resolves a multi-hunk conflict (ordinary LLM fallibility,
+	// or a run cut short after the 3-way apply): CI does not catch a marker in a non-compiled
+	// file (markdown/json/yaml/fixtures/docs) and the code_reviewer is a non-deterministic LLM,
+	// so reject it deterministically — the check this package's doc comment promises. The
+	// ======= separator is intentionally NOT matched: it is ambiguous with legitimate content
+	// (markdown setext rules, ASCII dividers) and every real conflict is already caught by its
+	// surrounding angle-bracket markers.
+	for _, line := range addedLines(p.Diff) {
+		if isConflictMarker(line) {
+			fail = append(fail, "unresolved git conflict marker in the diff")
+			break
+		}
+	}
+
 	// binary-blob allowlist — a unified diff that introduces a binary file is denied
 	// (no binary outside an allowlist; the v1 allowlist is empty).
 	if introducesBinary(p.Diff) {
@@ -462,6 +478,29 @@ func staticChecks(p Patch, touched []string, lim Limits) []string {
 	}
 
 	return fail
+}
+
+// isConflictMarker reports whether a line is a leftover git conflict marker at column 0:
+// exactly seven '<', '>', or '|' (the diff3 base) followed by a space or end-of-line. Exactly
+// seven so ASCII art (8+ of the char) is not flagged; '=======' is deliberately excluded
+// (see the parse-markers note in staticChecks).
+func isConflictMarker(line string) bool {
+	for _, c := range []byte{'<', '>', '|'} {
+		if len(line) < 7 {
+			continue
+		}
+		seven := true
+		for i := 0; i < 7; i++ {
+			if line[i] != c {
+				seven = false
+				break
+			}
+		}
+		if seven && (len(line) == 7 || line[7] == ' ') {
+			return true
+		}
+	}
+	return false
 }
 
 func scanSecret(line string) string {

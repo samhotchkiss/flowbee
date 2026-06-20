@@ -264,3 +264,37 @@ func TestAllowOwnSourceRelaxesOnlyFlowbeeSource(t *testing.T) {
 		t.Fatal("default (control-plane) posture must STILL deny its own source")
 	}
 }
+
+// TestCheckRejectsConflictMarkers: a diff that introduces leftover git conflict markers
+// (<<<<<<< / >>>>>>> / the diff3 |||||||) fails the deterministic static gate, so it is not
+// self_merge-eligible and takes handoff. This is the §9.2 "parse markers" check; the primary
+// reachable source is a conflict_resolver that under-resolves a multi-hunk conflict.
+func TestCheckRejectsConflictMarkers(t *testing.T) {
+	mk := func(added string) string {
+		return "diff --git a/pkg/foo.go b/pkg/foo.go\n--- a/pkg/foo.go\n+++ b/pkg/foo.go\n@@ -1 +1,3 @@\n func x() {}\n+" + added + "\n"
+	}
+	for _, marker := range []string{"<<<<<<< HEAD", ">>>>>>> feature-branch", "<<<<<<<", "||||||| merged common ancestors"} {
+		r := Check(Patch{Diff: mk(marker), Declared: BlastRadius{Paths: []string{"pkg/foo.go"}}}, Limits{})
+		if r.StaticChecksPass {
+			t.Errorf("a leftover conflict marker %q must fail static checks; failures=%v", marker, r.StaticFailures)
+		}
+		if r.Eligible() {
+			t.Errorf("a diff with conflict marker %q must NOT be self_merge-eligible", marker)
+		}
+	}
+}
+
+// TestCheckNoFalsePositiveOnMarkerLookalikes: lines that merely resemble markers must NOT be
+// flagged — the ======= separator (markdown rule / ASCII divider), 8+ angle brackets (art),
+// short runs, and inline (non-column-0) occurrences are all legitimate content.
+func TestCheckNoFalsePositiveOnMarkerLookalikes(t *testing.T) {
+	mk := func(added string) string {
+		return "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,3 @@\n # Title\n+" + added + "\n"
+	}
+	for _, ok := range []string{"=======", "==============", "<<<", "<<<<<<<<", ">>>>>>>>>>", "look <<<<<<< inline"} {
+		r := Check(Patch{Diff: mk(ok), Declared: BlastRadius{Paths: []string{"README.md"}}}, Limits{})
+		if !r.StaticChecksPass {
+			t.Errorf("marker-lookalike %q must NOT trip the conflict-marker check; failures=%v", ok, r.StaticFailures)
+		}
+	}
+}
