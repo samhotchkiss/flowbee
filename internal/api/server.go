@@ -584,6 +584,31 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Dispatch pause state: a paused dispatcher (global) or a parked repo (per-repo) hands
+	// out NO work — make it OBSERVABLE so a pause is never silently forgotten ("why has russ
+	// been idle for days?"). Alert on flowbee_dispatch_paused == 1 or flowbee_repo_parked == 1
+	// lasting longer than intended.
+	if paused, perr := s.store.DispatchPaused(ctx); perr == nil {
+		v := 0
+		if paused {
+			v = 1
+		}
+		fmt.Fprintf(&b, "# HELP flowbee_dispatch_paused 1 when global dispatch is paused (no leases issued to any worker).\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_dispatch_paused gauge\n")
+		fmt.Fprintf(&b, "flowbee_dispatch_paused %d\n", v)
+	}
+	if repos, rerr := s.store.ListRepos(ctx, false); rerr == nil && len(repos) > 0 {
+		fmt.Fprintf(&b, "# HELP flowbee_repo_parked 1 when a repo is parked (its jobs are withheld from leasing).\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_repo_parked gauge\n")
+		for _, rp := range repos {
+			parked := 0
+			if !rp.Active {
+				parked = 1
+			}
+			fmt.Fprintf(&b, "flowbee_repo_parked{repo=%q} %d\n", rp.ID, parked)
+		}
+	}
+
 	// Fleet liveness + backlog: a fleet of zero live workers with waiting jobs is
 	// the "nothing is getting done" page.
 	if fh, err := s.store.FleetHealth(ctx, s.clock.Now(), s.staleHB); err == nil {

@@ -441,15 +441,23 @@ When something looks wrong and you want to hold new work *without* dropping what
 flight, pause gracefully instead of killing `serve`:
 
 ```bash
-flowbee pause     # control plane stops issuing NEW leases; workers idle after their current job
+flowbee pause              # stop issuing NEW leases to ANYONE ("pause everything")
+flowbee pause --repo russ  # park ONE repo — its jobs are withheld, every other repo keeps flowing
 # ...in-flight jobs finish + submit normally; investigate...
-flowbee resume    # leasing resumes
+flowbee resume             # resume everything
+flowbee resume --repo russ # un-park one repo
 ```
 
 `pause` only gates *new* claims — already-leased jobs keep heartbeating and submitting
-results, so no work is lost. `flowbee status` shows a clear `PAUSED` banner while it's on.
-(It's a marker file beside the DB; it takes effect live, no restart, and survives a
-`serve` restart — `resume` to clear it.)
+results, so no work is lost. Both forms hit the control plane over `FLOWBEE_URL` (default
+loopback), so a **remote client** (a worker on another box) can pause the dispatcher too —
+`POST /v1/control/pause` with `{"repo":"<id>"}` (per-repo) or an empty body (global), and
+`GET /v1/control` shows the current state. The global flag is **DB-backed** (survives a
+`serve` restart/redeploy), and `--repo` parks via `repos.active` so the repo's jobs truly
+drop out of the lease queue (not just its reconcile loops). `flowbee status` shows a
+`PAUSED` banner and a `PARKED REPOS:` line; alert on `flowbee_dispatch_paused == 1` or
+`flowbee_repo_parked{repo} == 1` lasting longer than intended, so a pause is never silently
+forgotten. (A CP-local marker file beside the DB is still honored as an operator override.)
 
 ---
 

@@ -65,7 +65,20 @@ func runStatus(args []string) error {
 	}
 	abandoned, _ := st.OutboxAbandonedByAction(ctx) // dropped GitHub writes (best-effort)
 
-	summary := summarizeStatus(jobs, health, abandoned, isPausedDB(cfg.DatabaseURL))
+	// global pause = the CP-local marker OR the DB-backed, client-triggerable flag.
+	globalPaused := isPausedDB(cfg.DatabaseURL)
+	if dp, derr := st.DispatchPaused(ctx); derr == nil && dp {
+		globalPaused = true
+	}
+	summary := summarizeStatus(jobs, health, abandoned, globalPaused)
+	// parked repos (per-repo pause): surfaced so a parked repo is never silently idle.
+	if repos, rerr := st.ListRepos(ctx, false); rerr == nil {
+		for _, rp := range repos {
+			if !rp.Active {
+				summary.ParkedRepos = append(summary.ParkedRepos, rp.ID)
+			}
+		}
+	}
 	if *jsonOut {
 		return printStatusJSON(os.Stdout, summary)
 	}
@@ -132,10 +145,11 @@ type statusSummary struct {
 	// starvation signal — the fleet is idle while work waits (e.g. a candidate-withholding
 	// reservation/capacity bug). Surfaced so a wedge is never silent (the merge_handoff
 	// reservation incident sat undetected for hours).
-	ReadyJobs              int  `json:"ready_jobs"`
-	ActiveJobs             int  `json:"active_jobs"`
-	Starved                bool `json:"starved"`
-	Paused                 bool `json:"-"`
+	ReadyJobs              int      `json:"ready_jobs"`
+	ActiveJobs             int      `json:"active_jobs"`
+	Starved                bool     `json:"starved"`
+	Paused                 bool     `json:"-"`
+	ParkedRepos            []string `json:"parked_repos,omitempty"`
 	liveModelBreakdownOnly map[string]int
 }
 
@@ -257,5 +271,9 @@ func printStatusSummary(w io.Writer, summary statusSummary) {
 	}
 	if summary.Paused {
 		fmt.Fprintln(w, "\n*** PAUSED — no new leases are being issued (`flowbee resume` to unpause) ***")
+	}
+	if len(summary.ParkedRepos) > 0 {
+		fmt.Fprintf(w, "\n*** PARKED REPOS: %s — their jobs are withheld from leasing (`flowbee resume --repo <id>` to un-park) ***\n",
+			strings.Join(summary.ParkedRepos, ", "))
 	}
 }
