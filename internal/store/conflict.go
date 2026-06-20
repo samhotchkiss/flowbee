@@ -151,6 +151,59 @@ func (s *Store) ReadyCandidatesReserved(ctx context.Context) ([]scheduler.Candid
 	return scheduler.ReservationFilter(cands, active, writeSets), nil
 }
 
+// ReservationHeld is one in-flight build's blast-radius reservation (the write-set it holds).
+type ReservationHeld struct {
+	JobID string
+	Wide  bool
+	Paths []string
+}
+
+// ReadyReservationView is a ready candidate and what (if anything) withholds it from leasing.
+type ReadyReservationView struct {
+	JobID     string
+	Wide      bool
+	Paths     []string
+	Blocked   bool
+	BlockedBy string // the in-flight reservation's job id that overlaps it (when Blocked)
+}
+
+// ReservationReport answers "why isn't this ready job being leased?" — the in-flight
+// reservations + every ready candidate with the reservation (if any) overlapping it. Backs
+// `flowbee reservations` + the starvation log so a withheld ready job is never a silent
+// mystery (russ #213: 8 ready / 14 idle / 0 building, debuggable in one glance).
+type ReservationReport struct {
+	Active []ReservationHeld
+	Ready  []ReadyReservationView
+}
+
+// ReservationReport builds the debuggability view (read-only).
+func (s *Store) ReservationReport(ctx context.Context) (ReservationReport, error) {
+	active, err := s.ActiveReservations(ctx)
+	if err != nil {
+		return ReservationReport{}, err
+	}
+	cands, err := s.ReadyCandidates(ctx)
+	if err != nil {
+		return ReservationReport{}, err
+	}
+	writeSets, err := s.readyWriteSets(ctx)
+	if err != nil {
+		return ReservationReport{}, err
+	}
+	rep := ReservationReport{}
+	for _, r := range active {
+		rep.Active = append(rep.Active, ReservationHeld{JobID: r.JobID, Wide: r.WriteSet.IsWide(), Paths: r.WriteSet.Paths})
+	}
+	for _, c := range cands {
+		ws := writeSets[c.JobID]
+		blocker, blocked := scheduler.BlockedBy(c.JobID, active, writeSets)
+		rep.Ready = append(rep.Ready, ReadyReservationView{
+			JobID: c.JobID, Wide: ws.IsWide(), Paths: ws.Paths, Blocked: blocked, BlockedBy: blocker,
+		})
+	}
+	return rep, nil
+}
+
 // readyWriteSets returns the declared write-set of every ready job (keyed by id).
 func (s *Store) readyWriteSets(ctx context.Context) (map[string]scheduler.WriteSet, error) {
 	rows, err := s.DB.QueryContext(ctx,

@@ -52,6 +52,49 @@ func TestMergeHandoffDoesNotHoldReservation(t *testing.T) {
 	}
 }
 
+// TestReservationReportExplainsWithholding: the debuggability behind `flowbee reservations`
+// (russ #213) — for each ready job it says whether it's withheld and by which in-flight
+// reservation, so a starvation ("8 ready / 0 building") is diagnosable in one glance.
+func TestReservationReportExplainsWithholding(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	now := time.Unix(1000, 0)
+	const onA = `{"paths":["pkg/a.go"],"scope":"worktree"}`
+
+	mk := func(id, state, blast string) {
+		if _, err := st.SeedJob(ctx, store.SeedParams{
+			ID: id, Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+			RequiredCapabilities: []string{"role:eng_worker"}, BaseSHA: "b", Now: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state=?, declared_blast_radius=? WHERE id=?`, state, blast, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("building", "building", onA)                                      // holds a reservation on pkg/a.go
+	mk("overlap", "ready", onA)                                          // ready, overlaps -> withheld
+	mk("disjoint", "ready", `{"paths":["pkg/z.go"],"scope":"worktree"}`) // ready, disjoint -> leasable
+
+	rep, err := st.ReservationReport(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Active) != 1 || rep.Active[0].JobID != "building" {
+		t.Fatalf("active reservations = %+v, want exactly [building]", rep.Active)
+	}
+	byID := map[string]store.ReadyReservationView{}
+	for _, c := range rep.Ready {
+		byID[c.JobID] = c
+	}
+	if v := byID["overlap"]; !v.Blocked || v.BlockedBy != "building" {
+		t.Fatalf("overlap = %+v, want withheld by building", v)
+	}
+	if v := byID["disjoint"]; v.Blocked {
+		t.Fatalf("disjoint must be leasable (paths don't overlap), got withheld by %s", v.BlockedBy)
+	}
+}
+
 // TestOnlyActiveBuildsHoldReservation pins the russ #213 fix: a reservation bites ONLY
 // while a build is actively producing a diff (leased/building/resolving_conflict). Every
 // POST-build state (review_pending/code_review/mergeable/merging/merge_handoff) has an open

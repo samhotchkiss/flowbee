@@ -74,6 +74,8 @@ func main() {
 		err = runBoard(args)
 	case "status":
 		err = runStatus(args)
+	case "reservations":
+		err = runReservations(args)
 	case "spec":
 		err = runSpec(args)
 	case "repo":

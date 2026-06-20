@@ -120,22 +120,38 @@ func candidateWriteSet(jobID string, writeSetOf map[string]WriteSet) (WriteSet, 
 // different job. An UNDECLARED candidate is withheld only by a WIDE active
 // reservation (a tree-wide single-flight). PURE.
 func reservationConflicts(jobID string, ws WriteSet, declared bool, active []Reservation) bool {
+	_, blocked := blockingReservation(jobID, ws, declared, active)
+	return blocked
+}
+
+// blockingReservation returns the id of the FIRST active reservation that withholds the
+// candidate (ok=true), or "" / false when it isn't blocked.
+func blockingReservation(jobID string, ws WriteSet, declared bool, active []Reservation) (string, bool) {
 	for _, r := range active {
 		if r.JobID == jobID {
 			continue // a job never reserves against itself
 		}
 		if declared {
 			if ws.Overlaps(r.WriteSet) {
-				return true
+				return r.JobID, true
 			}
 			continue
 		}
 		// undeclared candidate: only a wide reservation single-flights it out.
 		if r.WriteSet.IsWide() {
-			return true
+			return r.JobID, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// BlockedBy explains ReservationFilter for a single candidate: the id of the active
+// reservation withholding jobID (ok=true), using the candidate's write-set from writeSetOf,
+// or "" / false when it's leasable. The explainability behind a `flowbee reservations` view
+// + the starvation log, so a withheld ready job is never a silent mystery (russ #213).
+func BlockedBy(jobID string, active []Reservation, writeSetOf map[string]WriteSet) (string, bool) {
+	ws, declared := candidateWriteSet(jobID, writeSetOf)
+	return blockingReservation(jobID, ws, declared, active)
 }
 
 // pathsOverlap reports whether two normalized paths intersect: equal, or one is a
