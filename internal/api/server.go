@@ -544,6 +544,38 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		for k, n := range counts {
 			fmt.Fprintf(&b, "flowbee_jobs{repo=%q,state=%q} %d\n", k[0], k[1], n)
 		}
+
+		// Pending-merge STALL AGE: the oldest job parked awaiting merge (merge_handoff =
+		// Flowbee approved it but a human/policy must merge; merging = mid-merge). A COUNT
+		// of these is normal (handoffs happen); a large AGE is the page — a change Flowbee
+		// approved that NOBODY merged. This is the signal that was missing when a handoff sat
+		// 15h+ SILENTLY: the count gauge fires on any handoff (noisy), but only the age
+		// distinguishes a fresh handoff from a wedged one. updated_at is stable for a parked
+		// handoff (reconcile does not touch it), so now-updated_at is the true stall age.
+		// Alert on flowbee_oldest_pending_merge_age_seconds > a few hours.
+		oldestMerge := map[string]time.Time{}
+		for _, j := range jobs {
+			if j.State != string(job.StateMergeHandoff) && j.State != string(job.StateMerging) {
+				continue
+			}
+			if cur, ok := oldestMerge[j.Repo]; !ok || j.UpdatedAt.Before(cur) {
+				oldestMerge[j.Repo] = j.UpdatedAt
+			}
+		}
+		if len(oldestMerge) > 0 {
+			now := s.clock.Now()
+			fmt.Fprintf(&b, "# HELP flowbee_oldest_pending_merge_age_seconds Age of the oldest job parked awaiting merge (merge_handoff/merging), per repo.\n")
+			fmt.Fprintf(&b, "# TYPE flowbee_oldest_pending_merge_age_seconds gauge\n")
+			for repo, ts := range oldestMerge {
+				age := int64(0)
+				if !ts.IsZero() {
+					if d := now.Sub(ts); d > 0 {
+						age = int64(d.Seconds())
+					}
+				}
+				fmt.Fprintf(&b, "flowbee_oldest_pending_merge_age_seconds{repo=%q} %d\n", repo, age)
+			}
+		}
 	}
 
 	// Fleet liveness + backlog: a fleet of zero live workers with waiting jobs is

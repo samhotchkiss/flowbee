@@ -270,10 +270,17 @@ building → review_pending → code_review → mergeable → merging → done**
   critical ones also escalate to `needs_human`, but cosmetic ones are otherwise silent, so
   alert on any growth; each is also logged with a `dead-lettered GitHub write` WARN naming the
   action + job, and **`flowbee retry-outbox <job-id>`** re-arms a job's abandoned actions once
-  you've fixed the cause). The pages that matter: a wedged `needs_human` job,
+  you've fixed the cause), and `flowbee_oldest_pending_merge_age_seconds{repo}` (age of the
+  oldest job parked awaiting merge — `merge_handoff`: Flowbee approved the change but a
+  human/policy must merge it; or `merging`: a wedged in-flight merge). A *count* of handoffs is
+  normal, so `flowbee_jobs{state="merge_handoff"}` is noisy; the **age** is the page — a change
+  Flowbee approved that NOBODY merged. **Alert on `flowbee_oldest_pending_merge_age_seconds > ~2h`**
+  so an approved PR can't sit unmerged for 15h+ silently (the count never tells you that). The
+  pages that matter: a wedged `needs_human` job,
   `flowbee_fleet_workers{status="live"} == 0` with waiting jobs, `over_budget` climbing,
-  `flowbee_outbox_abandoned` growing, or `flowbee_github_last_success_age_seconds` past a few
-  minutes (all progress has silently stalled).
+  `flowbee_outbox_abandoned` growing, `flowbee_oldest_pending_merge_age_seconds` past a couple
+  hours (an approved change is stuck awaiting a human merge), or
+  `flowbee_github_last_success_age_seconds` past a few minutes (all progress has silently stalled).
   Example minimal `prometheus.yml` scrape config:
 
   ```yaml
