@@ -263,41 +263,16 @@ building → review_pending → code_review → mergeable → merging → done**
   `--force` for an actively-leased job; the matching POST endpoints are
   `/v1/jobs/{job}/requeue` and `/v1/jobs/{job}/cancel`).
 - **Metrics:** `GET /metrics` on the health listener (`:7001`, same unauthenticated port as
-  `/healthz`) emits Prometheus text format — point a scrape at it. Series: `flowbee_jobs{repo,state}`
-  (job counts; a missing state means zero — alert on `flowbee_jobs{state="needs_human"} > 0`),
-  `flowbee_fleet_workers{status="live"|"stale"}`, `flowbee_fleet_waiting_jobs`,
-  `flowbee_cost_micro_usd_total` (cumulative metered spend), `flowbee_jobs_over_budget`, and
-  `flowbee_github_last_success_age_seconds` (seconds since the last successful GitHub reconcile
-  sweep — grows without bound when the control plane can't reach GitHub: an **expired/revoked
-  token**, exhausted rate limit, or connectivity loss; `/healthz` carries the error in
-  `github_last_error`), `flowbee_db_size_bytes` (the SQLite file size — the ledger
-  `job_events` is append-only, so this grows with throughput; see Durability below), and
-  `flowbee_outbox_abandoned{action}` (dead-lettered GitHub writes that never took effect —
-  critical ones also escalate to `needs_human`, but cosmetic ones are otherwise silent, so
-  alert on any growth; each is also logged with a `dead-lettered GitHub write` WARN naming the
-  action + job; **`flowbee outbox`** lists each abandoned write with its owning job + state so
-  you can triage it, and **`flowbee retry-outbox <job-id>`** re-arms a job's abandoned actions
-  once you've fixed the cause). The gauge counts only **actionable** abandons — an abandon whose
-  owning job has since reached `done`/`cancelled` is benign (a stale-SHA void or a superseded
-  merge attempt for a PR that merged anyway) and is excluded, so the series isn't a permanent
-  false alarm; `flowbee outbox --all` still lists those benign rows. Also
-  `flowbee_oldest_pending_merge_age_seconds{repo}` (age of the
-  oldest job parked awaiting merge — `merge_handoff`: Flowbee approved the change but a
-  human/policy must merge it; or `merging`: a wedged in-flight merge). A *count* of handoffs is
-  normal, so `flowbee_jobs{state="merge_handoff"}` is noisy; the **age** is the page — a change
-  Flowbee approved that NOBODY merged. **Alert on `flowbee_oldest_pending_merge_age_seconds > ~2h`**
-  so an approved PR can't sit unmerged for 15h+ silently (the count never tells you that).
-  *(The control plane already keeps these PRs from rotting BEHIND a moving base: a 5-min
-  un-stick sweep runs `update-branch` on any `merge_handoff` PR GitHub reports as `behind`
-  — only repos that require up-to-date branches ever hit that — so a reviewed, green PR stays
-  current for its human/self-merge instead of falling further behind every sibling merge. It
-  never merges. Tune `FLOWBEE_UNSTICK_INTERVAL_S`; a negative value disables it.)* The
-  pages that matter: a wedged `needs_human` job,
-  `flowbee_fleet_workers{status="live"} == 0` with waiting jobs, `over_budget` climbing,
-  `flowbee_outbox_abandoned` growing, `flowbee_oldest_pending_merge_age_seconds` past a couple
-  hours (an approved change is stuck awaiting a human merge), or
-  `flowbee_github_last_success_age_seconds` past a few minutes (all progress has silently stalled).
-  Example minimal `prometheus.yml` scrape config:
+  `/healthz`) emits Prometheus text format — point a scrape at it. Use
+  [`metrics.md`](metrics.md) as the detailed reference for metric names, labels, types, units,
+  and alert guidance. The pages that matter most in day-to-day operation are a wedged
+  `needs_human` job, no live workers while jobs are waiting, abandoned GitHub outbox work, an
+  approved merge aging past its SLO, red main CI, unexpected pause/park state, over-budget
+  work, or GitHub last-success age growing past the normal reconcile cadence. `/healthz`
+  carries the latest GitHub error in `github_last_error`; **`flowbee outbox`** lists abandoned
+  writes with their owning job + state, and **`flowbee retry-outbox <job-id>`** re-arms a
+  job's abandoned actions once you've fixed the cause. Example minimal `prometheus.yml`
+  scrape config:
 
   ```yaml
   scrape_configs:
