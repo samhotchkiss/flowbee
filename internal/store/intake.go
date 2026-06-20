@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/intake"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/ulid"
 )
@@ -16,9 +17,18 @@ import (
 // returns "". The resulting build flows to a PR that Closes the issue on merge.
 func (s *Store) AdoptIssueAsBuild(ctx context.Context, repo string, issueNumber int, title, body, baseSHA string, now time.Time) (string, error) {
 	id := ulid.New()
+	// Parse the issue body into task / spec / acceptance the SAME way the spec-flow adopt
+	// path does (adopt.go) — otherwise the whole body (acceptance criteria and all) collapses
+	// into TaskText, the worker gets no $FLOWBEE_ACCEPTANCE, and the reviewer gate has no
+	// done-when to judge against. The issue title leads the task prose as human context.
+	parsed := intake.TaskFromIssueBody(body)
 	task := strings.TrimSpace(title)
-	if b := strings.TrimSpace(body); b != "" {
-		task = task + "\n\n" + b
+	if t := strings.TrimSpace(parsed.Text); t != "" {
+		if task != "" {
+			task = task + "\n\n" + t
+		} else {
+			task = t
+		}
 	}
 	adopted := ""
 	// The dedup check AND the seed run in ONE transaction. Two intake paths call this
@@ -45,7 +55,8 @@ func (s *Store) AdoptIssueAsBuild(ctx context.Context, repo string, issueNumber 
 		}
 		if err := s.seedJobTx(ctx, tx, SeedParams{
 			ID: id, Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
-			BaseSHA: baseSHA, Repo: repo, TaskText: task, IssueNumber: &issueNumber, Now: now,
+			BaseSHA: baseSHA, Repo: repo, TaskText: task, SpecText: parsed.Spec,
+			AcceptanceCriteria: parsed.AcceptanceCriteria, IssueNumber: &issueNumber, Now: now,
 		}); err != nil {
 			return err
 		}
