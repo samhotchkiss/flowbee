@@ -50,6 +50,7 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVBNRCR62R14H79X6FHFJBYM`](./01KVBNRCR62R14H79X6FHFJBYM.md) | docs: FAQ — what happens if a worker crashes mid-build | done | — | #145 | 2026-06-17T21:18:52Z |
 | [`01KVBR24Y7X4K53X30WP9BP49T`](./01KVBR24Y7X4K53X30WP9BP49T.md) | docs: glossary — define 'lease reaping' | done | — | #147 | 2026-06-17T21:42:40Z |
 | [`01KVDMC01B0AP4W94NBCPYWMFZ`](./01KVDMC01B0AP4W94NBCPYWMFZ.md) | specguard: pure deterministic deliverable-spec evaluator (Stage 1) | done | — | #2270 | 2026-06-18T22:31:09Z |
+| [`01KVDRMFKGK8ZFQ41EDCC6P0SF`](./01KVDRMFKGK8ZFQ41EDCC6P0SF.md) | ci: runner-liveness monitor false-alarms on retired mac-runner names; update to the Linux russ-ci fleet | done | — | #2277 | 2026-06-20T13:24:23Z |
 | [`01KVDVKXKMZQ8PM787JCSCPYZG`](./01KVDVKXKMZQ8PM787JCSCPYZG.md) | docs: add a 'Crash recovery' subsection to operating.md | done | — | #149 | 2026-06-18T17:21:01Z |
 | [`01KVDW480MNXJA2KNC0PDR3JHH`](./01KVDW480MNXJA2KNC0PDR3JHH.md) | 01KVDW480MNXJA2KNC0PDR3JHH | done | — | — | 2026-06-18T17:24:18Z |
 | [`01KVDWW9CYCB0GFYKV67ZX220S`](./01KVDWW9CYCB0GFYKV67ZX220S.md) | 01KVDWW9CYCB0GFYKV67ZX220S | done | #150 | — | 2026-06-18T17:37:16Z |
@@ -78,6 +79,7 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVEAEAZKD8PTHZHW6F3W659J`](./01KVEAEAZKD8PTHZHW6F3W659J.md) | ci: PR gate must be <5 min — 'Backend fast tests' runs 15min+ and times out (rule violation); speed it / keep heavy off the gate | done | — | #2281 | 2026-06-18T21:47:40Z |
 | [`01KVEDSJ94RJ4BT66MEHZBPQGW`](./01KVEDSJ94RJ4BT66MEHZBPQGW.md) | spec-flow Stage 2: machine-checks on pitch-source-of-truth + node stamp | done | — | #2282 | 2026-06-18T23:14:39Z |
 | [`01KVEG7TSWGE4C3ZFZ9ZCCGPE0`](./01KVEG7TSWGE4C3ZFZ9ZCCGPE0.md) | spec-flow Stage 3: fail-closed spec-conformance gate (review_prep->review) | done | — | #2283 | 2026-06-19T01:55:54Z |
+| [`01KVEMR2NENYYCZYVPBNG740FA`](./01KVEMR2NENYYCZYVPBNG740FA.md) | email: email.draft guard hardcodes reviewer 'sam.factcheck_2' + fails closed — broken for every non-Russell tenant | done | — | #2292 | 2026-06-20T13:22:54Z |
 | [`01KVEMR2NF550Y21SQAG82P703`](./01KVEMR2NF550Y21SQAG82P703.md) | flows: de-leak the global commission-comms template — stop shipping our investor-pitch prompts to every tenant | done | — | #2287 | 2026-06-19T01:49:54Z |
 | [`01KVEQ8ZMXRFE5K55ZWNKZAK1W`](./01KVEQ8ZMXRFE5K55ZWNKZAK1W.md) | doctor: report whether the per-job cost ceiling is armed | done | — | #175 | 2026-06-19T02:13:53Z |
 | [`01KVERG89T39WJ18AVGDT5HK92`](./01KVERG89T39WJ18AVGDT5HK92.md) | 01KVERG89T39WJ18AVGDT5HK92 | done | #176 | — | 2026-06-19T01:41:58Z |
@@ -100,6 +102,7 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVGA8081TEF65K9KCHRDATX9`](./01KVGA8081TEF65K9KCHRDATX9.md) | 01KVGA8081TEF65K9KCHRDATX9 | done | #188 | — | 2026-06-19T16:09:29Z |
 | [`01KVGB3PRY6MFGTK2CJWMXWR85`](./01KVGB3PRY6MFGTK2CJWMXWR85.md) | 01KVGB3PRY6MFGTK2CJWMXWR85 | done | #190 | — | 2026-06-19T16:25:04Z |
 | [`01KVGB3PRY6MFGTK2CJWMXWR85-build`](./01KVGB3PRY6MFGTK2CJWMXWR85-build.md) | # Spec: Log per-repo merge/archive policy at startup | done | — | #191 | 2026-06-19T16:34:29Z |
+| [`01KVGG94SPY131E5YMKCB3VD7W`](./01KVGG94SPY131E5YMKCB3VD7W.md) | Conflict escalation card: render the specific claim + two decision buttons | done | — | #2336 | 2026-06-20T03:54:48Z |
 | [`01KVGJK7APRQRQ25RH9HGB7EYQ`](./01KVGJK7APRQRQ25RH9HGB7EYQ.md) | Document the fleet `--agent codex\|claude` flag in docs/operating.md | done | — | #193 | 2026-06-19T18:41:50Z |
 | [`01KVGM7ZNFBX4T4544N7MJXF5X`](./01KVGM7ZNFBX4T4544N7MJXF5X.md) | 01KVGM7ZNFBX4T4544N7MJXF5X | done | #194 | — | 2026-06-19T19:04:05Z |
 | [`01KVGM7ZNFBX4T4544N7MJXF5X-build`](./01KVGM7ZNFBX4T4544N7MJXF5X-build.md) | # Spec: Document Per-Node Model Labels in History Cards | done | — | #195 | 2026-06-19T19:12:35Z |
@@ -112,6 +115,10 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVH3G1WJV0R568YSKH78BR58`](./01KVH3G1WJV0R568YSKH78BR58.md) | 01KVH3G1WJV0R568YSKH78BR58 | done | #208 | — | 2026-06-19T23:30:38Z |
 | [`01KVH3G1WJV0R568YSKH78BR58-build`](./01KVH3G1WJV0R568YSKH78BR58-build.md) | # Spec: `flowbee status --json` | done | — | #209 | 2026-06-20T01:25:18Z |
 | [`01KVH7JQABVJK1N1F01MP4QAQD`](./01KVH7JQABVJK1N1F01MP4QAQD.md) | Add a --json flag to flowbee card | done | — | #211 | 2026-06-20T01:26:03Z |
+| [`01KVHHY5YHEXN31H68TR75HWYF`](./01KVHHY5YHEXN31H68TR75HWYF.md) | Brief (iPad): open-loops counter squeezes content width — unreadable on tablet | done | — | #2365 | 2026-06-20T06:38:53Z |
+| [`01KVHHY5YJ6T90R62R9K0V9EY1`](./01KVHHY5YJ6T90R62R9K0V9EY1.md) | Project view: add a Documents tab (list + create documents within a project) | done | — | #2366 | 2026-06-20T06:23:08Z |
+| [`01KVJG8WMYQ78BP5D7362JJD49`](./01KVJG8WMYQ78BP5D7362JJD49.md) | iPad: copilot/agent rail floats over project content at tablet widths | done | — | #2372 | 2026-06-20T13:21:23Z |
+| [`01KVJYCRD8H0JTQZ9SC8WKS6GM`](./01KVJYCRD8H0JTQZ9SC8WKS6GM.md) | docs: document the `flowbee reservations` command in operating.md | done | — | #218 | 2026-06-20T16:44:14Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
