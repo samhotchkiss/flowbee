@@ -81,19 +81,22 @@ func hasDeclaration(declared string) bool {
 // (the §E "avoid first" rule). A build that declared a wide blast-radius single-
 // flights the whole tree. Folded from the persisted declared_blast_radius.
 func (s *Store) ActiveReservations(ctx context.Context) ([]scheduler.Reservation, error) {
-	// merge_handoff is DELIBERATELY excluded: a job parked at the human merge gate can sit
-	// there INDEFINITELY (allow_self_merge off), and holding its blast-radius reservation that
-	// long starves every overlapping ready build — the fleet wedges (a real live incident:
-	// merge_handoff jobs piled up on hot shared files and withheld all overlapping ready work).
-	// The reservation is only a conflict-avoidance OPTIMIZATION for IN-FLIGHT builds (the
-	// atomic claim is the correctness backstop); when a parked job finally merges, an
-	// overlapping build that proceeded meanwhile just rebases/resolves like any other — the
-	// resolver path handles it. Liveness wins over a speculative, resolver-handled conflict.
+	// A reservation bites ONLY while a build is ACTIVELY producing a diff — the genuine
+	// "two builds writing the same files at the same time" case. The moment the diff exists
+	// (review_pending onward: a PR is open, the build is DONE), the reservation must drop:
+	// a new overlapping build can proceed and, if the earlier PR merges first, just rebases/
+	// resolves like any other — the resolver path handles it. Holding reservations through
+	// the whole review→merge tail is what starved the fleet (russ #213: 8 ready / 14 idle /
+	// 0 building — five review_pending jobs declared huge blast radii on the hot shared files
+	// and withheld every overlapping ready build). This is the same principle that already
+	// excluded merge_handoff (a job can sit at the human merge gate indefinitely), now
+	// extended to ALL post-build states: liveness over a speculative, resolver-handled
+	// conflict. The atomic claim + the merge-time content gate remain the correctness
+	// backstops; this reservation is only a best-effort concurrent-build de-collision.
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT id, declared_blast_radius, reservation_paths, reservation_wide
 		  FROM jobs
-		 WHERE state IN ('leased','building','code_review','review_pending',
-		                 'resolving_conflict','mergeable','merging')`)
+		 WHERE state IN ('leased','building','resolving_conflict')`)
 	if err != nil {
 		return nil, err
 	}
