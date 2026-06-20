@@ -1788,10 +1788,13 @@ func (s *Server) release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// ?keep=1 re-arms without burning an attempt (a non-failure abandon, e.g. a
-	// worker-push fast-forward race lost to a branch move). Default burns (a real
-	// build abandon).
+	// worker-push fast-forward race lost to a branch move). ?fail=1 forces an attempt
+	// to burn even on a penalty-free GATE release (a reviewer that produced no parseable
+	// verdict), so a broken reviewer escalates after max_attempts instead of churning.
+	// Default burns only for a build abandon (-> ready).
 	noPenalty := r.URL.Query().Get("keep") == "1"
-	if err := s.store.Release(r.Context(), store.ReleaseParams{JobID: jobID, Epoch: epoch, Now: s.clock.Now(), NoPenalty: noPenalty}); err != nil {
+	failed := r.URL.Query().Get("fail") == "1"
+	if err := s.store.Release(r.Context(), store.ReleaseParams{JobID: jobID, Epoch: epoch, Now: s.clock.Now(), NoPenalty: noPenalty, Failed: failed}); err != nil {
 		s.writeFenceError(w, err)
 		return
 	}

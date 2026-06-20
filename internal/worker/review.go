@@ -179,6 +179,10 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	case "spec_reviewer":
 		v, e := readVerdict(verdictFile)
 		if e != nil {
+			// the agent produced no parseable verdict: release as a FAILED attempt (burns an
+			// attempt) so a persistently-broken reviewer escalates after max_attempts instead
+			// of churning claim↔TTL-expiry. Mirrors the build path's no-output abandon.
+			_, _ = c.ReleaseFailed(ctx, grant.JobID, grant.LeaseEpoch)
 			return out, fmt.Errorf("read verdict: %w", e)
 		}
 		switch v.Decision {
@@ -218,6 +222,10 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	case "code_reviewer":
 		v, e := readVerdict(verdictFile)
 		if e != nil {
+			// the agent produced no parseable verdict: release as a FAILED attempt (burns an
+			// attempt) so a persistently-broken reviewer escalates after max_attempts instead
+			// of churning claim↔TTL-expiry. Mirrors the build path's no-output abandon.
+			_, _ = c.ReleaseFailed(ctx, grant.JobID, grant.LeaseEpoch)
 			return out, fmt.Errorf("read verdict: %w", e)
 		}
 		verdict := "changes_requested"

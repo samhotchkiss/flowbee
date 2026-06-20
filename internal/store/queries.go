@@ -584,6 +584,13 @@ type ReleaseParams struct {
 	// churn as failures can exhaust max_attempts and escalate a GOOD change to
 	// needs_human; this keeps the attempt budget for genuine build failures.
 	NoPenalty bool
+	// Failed forces an attempt to be burned even for a GATE release (code_review ->
+	// review_pending, spec_review -> spec_authoring), which is otherwise penalty-free.
+	// It's for a genuine reviewer FAILURE — the agent produced no parseable verdict — so
+	// a persistently-broken reviewer escalates to needs_human after max_attempts instead
+	// of churning claim↔release indefinitely (the review-path analogue of the build's
+	// "no output -> burn attempt"; only the verdict-read-failure path sets it).
+	Failed bool
 }
 
 // Release applies engine.Decide for a fenced release: state -> ready, attempts++,
@@ -612,7 +619,7 @@ func (s *Store) Release(ctx context.Context, p ReleaseParams) error {
 		// burns an attempt, so a worker that keeps failing escalates after max_attempts
 		// instead of churning the claim forever. Gate releases that merely let go of good
 		// work (code_review -> review_pending, spec_review -> spec_authoring) do not.
-		if !p.NoPenalty && (toState == job.StateReady || toState == job.StateResolvingConflict) {
+		if p.Failed || (!p.NoPenalty && (toState == job.StateReady || toState == job.StateResolvingConflict)) {
 			attemptsDelta = 1
 		}
 		nextSeq := seq + 1

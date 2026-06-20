@@ -457,6 +457,15 @@ func (c *Client) ReleaseNoPenalty(ctx context.Context, jobID string, epoch int) 
 	return c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/release?keep=1", epochHeader(epoch), nil, &out)
 }
 
+// ReleaseFailed posts a release that BURNS an attempt even for a penalty-free gate state —
+// for a genuine reviewer failure (the agent produced no parseable verdict). It lets a
+// persistently-broken reviewer escalate to needs_human after max_attempts instead of
+// churning claim↔release, the review-path analogue of the build's no-output abandon.
+func (c *Client) ReleaseFailed(ctx context.Context, jobID string, epoch int) (status int, err error) {
+	var out map[string]bool
+	return c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/release?fail=1", epochHeader(epoch), nil, &out)
+}
+
 func epochHeader(epoch int) map[string]string {
 	return map[string]string{"X-Lease-Epoch": strconv.Itoa(epoch)}
 }
