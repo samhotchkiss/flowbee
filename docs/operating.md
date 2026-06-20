@@ -242,6 +242,12 @@ building → review_pending → code_review → mergeable → merging → done**
   the fleet line. The fleet line breaks down live workers by backend, for example
   `fleet: 14 live, 0 stale workers (codex:14)`, so you can confirm at a glance
   which model family a `--agent codex` fleet is running.
+- **Reservation picture:** `flowbee reservations` is a read-only local-DB view of
+  F8 blast-radius scheduling. It shows which ACTIVELY-building jobs currently hold
+  path reservations, then explains for each `ready` job whether it is withheld from
+  leasing and by which overlapping reservation. Reach for it when the fleet looks idle
+  even though ready jobs exist: disjoint write-sets run in parallel, while overlapping
+  write-sets serialize, and a reservation only bites while a build is producing a diff.
 - **Liveness:** `GET /v1/fleet-health` → `{live_workers, stale_workers, waiting_jobs,
   stranded}`. `stranded: true` (work waiting, no live worker) is the loud "is the fleet
   up?" signal.
