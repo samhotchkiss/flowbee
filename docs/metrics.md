@@ -21,6 +21,113 @@ Some series are emitted only when the backing aggregate exists. For example, a j
 with no jobs has no `flowbee_jobs` series, and a repo with no pending merge has no
 `flowbee_oldest_pending_merge_age_seconds` series.
 
+## Alerting Rules
+
+The Prometheus alert definitions are maintained in
+[`deploy/prometheus-rules.yml`](../deploy/prometheus-rules.yml). This section explains how
+to interpret those deployed rules and how to tune their thresholds for different Flowbee
+installations. The entries below document the alerts in the `flowbee.rules` group; keep
+this section aligned with that file whenever alert expressions, thresholds, or `for`
+durations change.
+
+### FlowbeeGitHubReconcileFailing
+
+- **Fires when:** `flowbee_github_last_success_age_seconds` stays above `900` seconds
+  for `10m`. In plain terms, Flowbee has gone more than 15 minutes since a successful
+  GitHub reconcile, and that stale condition persisted long enough to rule out a brief
+  scheduling delay.
+- **Why it matters:** GitHub reconcile is how Flowbee learns about issues, PRs, CI state,
+  and merge outcomes. If it is stale, the board can stop adopting work, miss CI or review
+  transitions, or delay merges even if workers are healthy.
+- **Tuning:** Tune the `900` second threshold around the expected reconcile cadence and
+  GitHub API reliability for the deployment. Keep the threshold several multiples above
+  `FLOWBEE_RECONCILE_INTERVAL_S`, and adjust the `for: 10m` duration if transient GitHub
+  or network blips are expected. Avoid making this too loose: stale reconcile means the
+  control plane is no longer reliably seeing GitHub truth.
+
+### FlowbeeApprovedPRAwaitingMerge
+
+- **Fires when:** `flowbee_oldest_pending_merge_age_seconds` stays above `1800` seconds
+  for `10m`. This means the oldest approved or currently merging PR has been waiting
+  more than 30 minutes, and the delay is sustained.
+- **Why it matters:** Approved work that cannot merge can indicate stuck CI, disabled
+  autonomous merge, merge contention, branch protection trouble, or a wedged merge loop.
+  The longer it waits, the more likely sibling work will rebase, conflict, or age out of
+  its intended review context.
+- **Tuning:** Set the `1800` second threshold from the repo's healthy merge latency SLO,
+  normal CI runtime, and expected queueing buffer. Larger repositories or slower CI may
+  need a higher threshold after checking healthy p95/p99 merge ages. Adjust `for: 10m`
+  to suppress short bursts during expected merge waves while still catching a sustained
+  stuck merge queue.
+
+### FlowbeeJobsWaitingWithNoLiveWorkers
+
+- **Fires when:** `flowbee_fleet_workers{status="live"} == 0` and
+  `flowbee_fleet_waiting_jobs > 0` are both true for `5m`. The alert requires ready work
+  to be waiting while the live worker count is zero, so an idle fleet with no queued jobs
+  does not fire.
+- **Why it matters:** Flowbee cannot make progress without live workers. Ready jobs will
+  sit unleased, issues will not move through build or review, and automation can appear
+  healthy at the control plane while the execution fleet is down.
+- **Tuning:** Tune the `for: 5m` duration to normal worker restart, deploy, and agent
+  startup time. Keep the zero-live-worker threshold strict for production fleets; if some
+  roles run on separate pools, add role-specific alerting in the rule file rather than
+  raising this aggregate threshold. For larger fleets, page on partial capacity loss with
+  an additional rule, but keep this all-workers-down alert sensitive.
+
+### FlowbeeDroppedGitHubWrites
+
+- **Fires when:** `flowbee_outbox_abandoned > 0`. The metric is grouped by `action`, so
+  the firing series identifies the kind of GitHub write that was abandoned or dead-lettered.
+  This rule has no `for` duration, so it fires as soon as Prometheus observes any abandoned
+  actionable write.
+- **Why it matters:** Abandoned GitHub writes mean Flowbee gave up on an operation such
+  as opening, updating, or merging through GitHub after retry policy was exhausted. The
+  affected job usually needs operator repair before it can continue cleanly.
+- **Tuning:** Any abandoned write is normally actionable, so keep the `> 0` threshold
+  strict. If a deployment has a known harmless abandoned action, prefer fixing or
+  suppressing that action label in Alertmanager rather than raising the rule globally.
+  Add a short `for` duration only if scrape timing causes duplicate noise after operators
+  have confirmed the gauge clears quickly during healthy recovery.
+
+### FlowbeeJobsOverBudget
+
+- **Fires when:** `flowbee_jobs_over_budget > 0`. The metric counts jobs whose recorded
+  agent cost has breached the configured budget. This rule has no `for` duration, so it
+  fires on the first scrape that sees one or more over-budget jobs.
+- **Why it matters:** Over-budget jobs can indicate an undersized job budget, unexpectedly
+  expensive work, repeated rebuild or review loops, model/tool failures, or a workload that
+  should be split before automation continues spending.
+- **Tuning:** Keep the `> 0` threshold for unattended autonomous deployments where cost
+  overruns require immediate inspection. If budgets are intentionally tight during tuning,
+  either adjust job budgets or add Alertmanager routing for known test repositories. Add a
+  `for` duration only when operators accept a short delay before investigating spend
+  overruns.
+
+### Tuning Guidance
+
+- **Repository size:** Larger repositories may naturally increase scan, indexing, merge,
+  rebase, and processing durations. Raise latency or duration thresholds only after checking
+  healthy-period p95 and p99 behavior for that repository, then leave margin for normal CI
+  variance. Keep error-rate alerts strict unless a larger repository is known to produce
+  harmless retries that are already understood and bounded.
+- **Merge volume:** Higher merge frequency can increase queue depth, branch contention,
+  conflict rates, and background reconcile or merge load. Tune backlog, queue, and
+  throughput thresholds against normal peak merge windows rather than quiet periods. Adjust
+  `for` durations to avoid paging on short expected bursts, but keep them short enough to
+  catch sustained overload before approved work ages past its SLO.
+- **Fleet size:** Larger fleets can increase aggregate counts while reducing per-instance
+  pressure, depending on the metric. Distinguish per-instance alerts from fleet-wide
+  aggregate alerts before changing thresholds, and scale thresholds in proportion to
+  worker or instance count only when the expression is an aggregate count. Keep
+  availability, scrape, and missing-target alerts sensitive enough to catch partial fleet
+  loss instead of only total outages.
+- **Concrete thresholds:** Change alert thresholds, rate windows, and `for` durations in
+  `deploy/prometheus-rules.yml` when operators need different sensitivity. Prefer changing
+  one dimension at a time: the threshold for what is abnormal, the PromQL lookback window
+  for how the signal is smoothed, or the `for` duration for how long the abnormal condition
+  must persist before firing.
+
 ## Metric Reference
 
 | Metric | Type | Labels | Meaning | Alert guidance |
