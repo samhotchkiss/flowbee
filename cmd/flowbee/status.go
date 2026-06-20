@@ -71,11 +71,15 @@ func runStatus(args []string) error {
 		globalPaused = true
 	}
 	summary := summarizeStatus(jobs, health, abandoned, globalPaused)
-	// parked repos (per-repo pause): surfaced so a parked repo is never silently idle.
+	// parked repos (per-repo pause) + red-main repos (green-main stop-the-line): surfaced so
+	// a parked repo is never silently idle and a red main never silently piles up PRs.
 	if repos, rerr := st.ListRepos(ctx, false); rerr == nil {
 		for _, rp := range repos {
 			if !rp.Active {
 				summary.ParkedRepos = append(summary.ParkedRepos, rp.ID)
+			}
+			if red, _ := st.RepoMainCIRed(ctx, rp.ID); red {
+				summary.RedMainRepos = append(summary.RedMainRepos, rp.ID)
 			}
 		}
 	}
@@ -150,6 +154,7 @@ type statusSummary struct {
 	Starved                bool     `json:"starved"`
 	Paused                 bool     `json:"-"`
 	ParkedRepos            []string `json:"parked_repos,omitempty"`
+	RedMainRepos           []string `json:"red_main_repos,omitempty"`
 	liveModelBreakdownOnly map[string]int
 }
 
@@ -275,5 +280,9 @@ func printStatusSummary(w io.Writer, summary statusSummary) {
 	if len(summary.ParkedRepos) > 0 {
 		fmt.Fprintf(w, "\n*** PARKED REPOS: %s — their jobs are withheld from leasing (`flowbee resume --repo <id>` to un-park) ***\n",
 			strings.Join(summary.ParkedRepos, ", "))
+	}
+	if len(summary.RedMainRepos) > 0 {
+		fmt.Fprintf(w, "\n*** RED MAIN: %s — the integration branch CI is failing. Feature PRs can't be fairly judged (they're held, not bounced). FIX MAIN FIRST — file the fix as `flowbee:p1` so it jumps the queue. ***\n",
+			strings.Join(summary.RedMainRepos, ", "))
 	}
 }

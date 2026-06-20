@@ -100,6 +100,7 @@ func (r *Reconciler) Sweep(ctx context.Context) ([]store.ReconcileOutcome, error
 		return nil, err
 	}
 	mainCIRed := r.mainCIRed(ctx)
+	_ = r.store.RecordMainCIRed(ctx, r.repo, mainCIRed) // surface a red main on /metrics + status
 	var outs []store.ReconcileOutcome
 	for _, pr := range snap.PullRequests {
 		out, applied, err := r.ingest(ctx, pr, now, mainCIRed)

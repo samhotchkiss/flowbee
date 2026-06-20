@@ -607,6 +607,18 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 			}
 			fmt.Fprintf(&b, "flowbee_repo_parked{repo=%q} %d\n", rp.ID, parked)
 		}
+		// Red main (green-main stop-the-line, russ #214): the integration branch's CI is
+		// definitively red — feature PRs can't be fairly judged and pile up un-mergeable.
+		// Alert on flowbee_main_ci_red == 1; the fix should be filed flowbee:p1 to jump the queue.
+		fmt.Fprintf(&b, "# HELP flowbee_main_ci_red 1 when a repo's integration branch CI is red (stop-the-line: fix main first).\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_main_ci_red gauge\n")
+		for _, rp := range repos {
+			red := 0
+			if r, _ := s.store.RepoMainCIRed(ctx, rp.ID); r {
+				red = 1
+			}
+			fmt.Fprintf(&b, "flowbee_main_ci_red{repo=%q} %d\n", rp.ID, red)
+		}
 	}
 
 	// Fleet liveness + backlog: a fleet of zero live workers with waiting jobs is

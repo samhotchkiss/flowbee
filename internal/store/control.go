@@ -40,6 +40,36 @@ func (s *Store) DispatchPaused(ctx context.Context) (bool, error) {
 	return v == "1", nil
 }
 
+// RecordMainCIRed persists the integration-branch CI state for a repo (the green-main
+// signal the reconcile sweep computes), so /metrics + `flowbee status` can surface a RED
+// MAIN — the stop-the-line alarm: fix main green before feature PRs pile up un-mergeable
+// over it (and file the fix as flowbee:p1 so it jumps the queue). The reconcile sweep
+// already holds CI-failing PRs over a red main; this makes the red main itself VISIBLE so a
+// human prioritizes the fix (Flowbee can't identify which PR fixes main on its own).
+func (s *Store) RecordMainCIRed(ctx context.Context, repo string, red bool) error {
+	v := "0"
+	if red {
+		v = "1"
+	}
+	_, err := s.DB.ExecContext(ctx,
+		`INSERT INTO flowbee_meta (key, value) VALUES (?, ?)
+		 ON CONFLICT (key) DO UPDATE SET value = excluded.value`, "main_ci_red:"+repo, v)
+	return err
+}
+
+// RepoMainCIRed reads the per-repo main-CI-red flag (false when unset/unknown).
+func (s *Store) RepoMainCIRed(ctx context.Context, repo string) (bool, error) {
+	var v string
+	err := s.DB.QueryRowContext(ctx, `SELECT value FROM flowbee_meta WHERE key = ?`, "main_ci_red:"+repo).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return v == "1", nil
+}
+
 // ParkedRepoJobIDs returns the set of leasable job ids belonging to a PARKED repo
 // (repos.active=0) — the per-repo "pause russ" enforcement applied once at the lease
 // chokepoint, so none of the six candidate queries needs a repos.active join. Fast path:

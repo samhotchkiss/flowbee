@@ -63,3 +63,41 @@ func TestMergeStallAgeMetric(t *testing.T) {
 		t.Fatalf("merge-stall age gauge missing/wrong (want 57600s): %s", m)
 	}
 }
+
+// TestRedMainMetric: a repo whose integration-branch CI is red surfaces on /metrics as
+// flowbee_main_ci_red{repo}=1 (green-main stop-the-line, russ #214), and flips to 0 when
+// main recovers.
+func TestRedMainMetric(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir()+"/flowbee.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
+		t.Fatal(err)
+	}
+	clk := clock.NewFake(time.Unix(1000, 0))
+	srv := api.New(st, clk, ulid.NewMinter(nil), api.Config{}, "v")
+	body := func() string {
+		rec := httptest.NewRecorder()
+		srv.HealthHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		return rec.Body.String()
+	}
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "russ", Owner: "o", Repo: "russ", DefaultBranch: "main", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.RecordMainCIRed(ctx, "russ", true); err != nil {
+		t.Fatal(err)
+	}
+	if m := body(); !strings.Contains(m, `flowbee_main_ci_red{repo="russ"} 1`) {
+		t.Fatalf("red main must surface as flowbee_main_ci_red=1: %s", m)
+	}
+	if err := st.RecordMainCIRed(ctx, "russ", false); err != nil {
+		t.Fatal(err)
+	}
+	if m := body(); !strings.Contains(m, `flowbee_main_ci_red{repo="russ"} 0`) {
+		t.Fatalf("recovered main must surface as flowbee_main_ci_red=0: %s", m)
+	}
+}
