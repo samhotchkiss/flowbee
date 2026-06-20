@@ -293,32 +293,6 @@ func runLease(args []string) error {
 // runRequeue re-arms a stranded job (one that escalated to needs_human from a
 // now-fixed transient failure) for a fresh attempt: `flowbee requeue <job-id>`. Run
 // it on the control-plane box (loopback) or with FLOWBEE_WORKER_TOKEN set.
-func runRequeue(args []string) error {
-	fs := flag.NewFlagSet("requeue", flag.ContinueOnError)
-	force := fs.Bool("force", false, "requeue even if the job is actively leased (fences the live worker, discarding its in-flight work)")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: flowbee requeue [--force] <job-id>")
-	}
-	jobID := fs.Arg(0)
-	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
-	c := client.NewWithToken(url, os.Getenv("FLOWBEE_WORKER_TOKEN"))
-	st, err := c.Requeue(context.Background(), jobID, *force)
-	if err != nil {
-		return err
-	}
-	if st == 409 {
-		return fmt.Errorf("job %s is actively leased — a worker is building/reviewing it now; "+
-			"re-run with --force to requeue anyway (this discards the live worker's work)", jobID)
-	}
-	if st != 200 {
-		return fmt.Errorf("requeue status %d", st)
-	}
-	fmt.Printf("requeued %s -> ready (fresh attempt budget)\n", jobID)
-	return nil
-}
 
 // runCancel terminally cancels a stranded job the operator has decided not to pursue
 // (the complement to requeue): `flowbee cancel <job-id>`. Clears it from the needs_human
