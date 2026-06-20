@@ -70,7 +70,7 @@ func runSeed(args []string) error {
 		Stage:              "build",
 		Role:               job.RoleEngWorker,
 		BaseSHA:            *baseSHA,
-		Priority:           *priority,
+		Priority:           job.NormalizePriority(*priority),
 		TaskText:           *taskText,
 		SpecText:           *specText,
 		AcceptanceCriteria: *acceptance,

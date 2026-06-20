@@ -684,7 +684,11 @@ func (s *Sender) seedBuildFromSpec(ctx context.Context, spec job.Job, now time.T
 		AcceptanceCriteria: spec.AcceptanceCriteria,
 		FlowID:             spec.ID,
 		Repo:               spec.Repo,
-		Now:                now,
+		// inherit the spec's urgency (1..10, lower = more urgent) so a build descends at the
+		// priority the issue was filed at — NOT the bare INSERT default 0, which now sorts as
+		// MORE urgent than 1 and would jump every spec-flow build to the front of the queue.
+		Priority: job.NormalizePriority(spec.Priority),
+		Now:      now,
 	}); err != nil {
 		return "", err
 	}
