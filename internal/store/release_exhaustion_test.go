@@ -104,10 +104,41 @@ func assertFoldMatchesProjection(t *testing.T, st *store.Store, id string) {
 	if folded.Role != proj.Role {
 		t.Fatalf("fold role=%q != projection %q (re-arm paths must fold the role)", folded.Role, proj.Role)
 	}
-	eng := []string{"role:eng_worker"}
-	if job.CapabilitiesSatisfy(eng, folded.RequiredCapabilities) != job.CapabilitiesSatisfy(eng, proj.RequiredCapabilities) {
-		t.Fatalf("fold caps=%v vs projection %v diverge on eng_worker leaseability (stale caps strand a re-armed build + churn the watchdogs)",
-			folded.RequiredCapabilities, proj.RequiredCapabilities)
+	// caps: assert the FUNCTIONAL invariant for the job's ACTUAL role (not just eng_worker) —
+	// an agent holding the projection's role can lease the folded job iff it can lease the
+	// projection. This generalization catches a spec_review job that folds stale code_reviewer
+	// caps (the ClaimSpecReview class) or a backlog/spec job that folds empty caps, while
+	// tolerating the benign empty-vs-[role:X] difference (both leaseable by an X-agent).
+	if proj.Role != "" {
+		roleCap := []string{"role:" + string(proj.Role)}
+		if job.CapabilitiesSatisfy(roleCap, folded.RequiredCapabilities) != job.CapabilitiesSatisfy(roleCap, proj.RequiredCapabilities) {
+			t.Fatalf("fold caps=%v vs projection %v diverge on %q leaseability (stale/empty caps strand the correct agent)",
+				folded.RequiredCapabilities, proj.RequiredCapabilities, proj.Role)
+		}
+	}
+	// kind/priority are set at creation/backlog and drive routing + scheduling order; a
+	// rebuild-from-ledger that dropped them (the KindBacklogged class) yields kind="" — an
+	// un-promotable, unschedulable stub.
+	if folded.Kind != proj.Kind {
+		t.Fatalf("fold kind=%q != projection %q (creation/backlog must fold the kind)", folded.Kind, proj.Kind)
+	}
+	if folded.Priority != proj.Priority {
+		t.Fatalf("fold priority=%d != projection %d", folded.Priority, proj.Priority)
+	}
+	// epic_reviewed is the drain gate for fanning out an epic's children; spec_text is the
+	// content the I-9 sign-off binds to + the build consumes. Both are set via direct UPDATEs
+	// on event paths (KindEpicReviewed, KindSpecAuthored/amend) the fold must reproduce.
+	if folded.EpicReviewed != proj.EpicReviewed {
+		t.Fatalf("fold epic_reviewed=%v != projection %v (a re-locked barrier strands every child)", folded.EpicReviewed, proj.EpicReviewed)
+	}
+	if folded.SpecText != proj.SpecText {
+		t.Fatalf("fold spec_text=%q != projection %q (spec authoring/amend must fold the materialized text)", folded.SpecText, proj.SpecText)
+	}
+	// verdict: at minimum its presence must agree — the requeue re-arm clears it (verdict=NULL)
+	// and the gate mints it; a fold that kept a stale verdict on a re-armed job (or dropped a
+	// minted one) diverges on the I-9 sign-off the merge gate reads.
+	if (folded.Verdict == nil) != (proj.Verdict == nil) {
+		t.Fatalf("fold verdict-present=%v != projection %v (requeue clears / mint sets the verdict)", folded.Verdict != nil, proj.Verdict != nil)
 	}
 }
 

@@ -68,6 +68,9 @@ func TestEpicBarrierGatesFanOut(t *testing.T) {
 	if r, _ := st.EpicReviewed(ctx, epic); !r {
 		t.Fatal("epic must be reviewed after the gate passes")
 	}
+	// the epic_reviewed flag is the drain gate for fan-out; it must survive a
+	// rebuild-from-ledger (KindEpicReviewed folds it) or the children strand forever.
+	assertFoldMatchesProjection(t, st, epic)
 	// the barrier records an epic_reviewed event and materializes NO single issue.
 	evs, _ := st.LoadEvents(ctx, epic)
 	sawEpic, sawIssue := false, false

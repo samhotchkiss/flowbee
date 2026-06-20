@@ -267,9 +267,19 @@ func Fold(events []Event) (job.Job, error) {
 			j.LeaseEpoch = e.LeaseEpoch
 			if e.Payload.ResetCounters {
 				// operator requeue re-arms the job with a fresh budget (attempts/bounces
-				// zeroed); mirror the live UPDATE so projection == Fold(events) holds.
+				// zeroed) and a clean slate: head_sha + verdict cleared, stage reset to the
+				// job's own entry stage (role/caps come from the ready/spec post-step).
+				// Mirror the live UPDATE exactly so projection == Fold(events) holds — else a
+				// rebuild-from-ledger keeps a stale head (reconcile misclassifies) + verdict.
 				j.Attempts = 0
 				j.Bounces = 0
+				j.HeadSHA = ""
+				j.Verdict = nil
+				if e.ToState == job.StateSpecAuthoring {
+					j.Stage = "spec"
+				} else {
+					j.Stage = "build"
+				}
 			}
 		case KindBaseRefreshed:
 			// a sibling PR merged; this still-`ready` job's base advances to the new main
@@ -387,11 +397,16 @@ func Fold(events []Event) (job.Job, error) {
 
 		case KindSpecAuthored:
 			// Flowbee committed spec.md and opened the spec_review gate: record the
-			// content hash + version it bound to. The lease is released (the author
-			// stage handed off the draft).
+			// content hash + version it bound to, plus the materialized spec_text and
+			// stage the projection wrote (role/caps come from the spec_review post-step).
+			// The lease is released (the author stage handed off the draft).
 			j.State = e.ToState
+			j.Stage = "review"
 			j.SpecContentHash = e.Payload.SpecContentHash
 			j.SpecVersion = e.Payload.SpecVersion
+			if e.Payload.SpecText != "" {
+				j.SpecText = e.Payload.SpecText
+			}
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""
@@ -463,15 +478,23 @@ func Fold(events []Event) (job.Job, error) {
 				j.SpecVersion = e.Payload.SpecVersion
 			}
 		case KindEpicReviewed:
-			// F4: the epic-level issue-review barrier passed. Recorded on the epic job;
-			// the runtime fans out the epic's issues (no per-job projection change here).
+			// F4: the epic-level issue-review barrier passed. The projection sets
+			// epic_reviewed=1 (the drain gate for fanning out the epic's children), so the
+			// fold must too or a rebuild-from-ledger re-locks a passed barrier and strands
+			// every child.
+			j.EpicReviewed = true
 		case KindIssueMaterialized:
 			// project-OUT created the GitHub issue; Flowbee stamped the number.
 			j.IssueNum = e.Payload.IssueNumber
 		case KindPROpened:
 			// Flowbee opened the PR and stamped the number (§7.3). The worker never
-			// supplies a PR field; Domain B owns existence.
+			// supplies a PR field; Domain B owns existence. Mirror the projection's
+			// COALESCE(NULLIF(head,''), head_sha): a non-empty head establishes the row's
+			// head (read by reconcile's flowbeePlaced classifier), an empty one preserves it.
 			j.PRNumber = e.Payload.PRNumber
+			if e.Payload.HeadSHA != "" {
+				j.HeadSHA = e.Payload.HeadSHA
+			}
 		case KindLeaseRevoked:
 			// M8 (§10.7): a two-rung kill or absolute-cap revoke. The epoch was bumped
 			// (the zombie's fence rides the event), the live lease cleared, the
@@ -567,7 +590,19 @@ func Fold(events []Event) (job.Job, error) {
 		case KindBacklogged:
 			// F7: a job seeded into `backlog` — tracked + visible but NOT scheduled.
 			// It carries the human intent so a later promotion ships a real spec/task.
+			// Mirror the SeedBacklog INSERT exactly (kind/flow/stage/role/caps/priority +
+			// default counters), not just the text: `backlog` is not covered by the role/caps
+			// post-step, so a rebuild-from-ledger that dropped these would re-fold an
+			// un-promotable spec stub (kind="", role="", anyone-can-lease caps).
 			j.State = e.ToState
+			j.Kind = e.Payload.Kind
+			j.Flow = e.Payload.Flow
+			j.Stage = e.Payload.Stage
+			j.Role = e.Payload.Role
+			j.RequiredCapabilities = []string{"role:" + string(e.Payload.Role)}
+			j.Priority = e.Payload.Priority
+			j.MaxAttempts = job.DefaultMaxAttempts
+			j.MaxBounces = job.DefaultMaxBounces
 			j.TaskText = e.Payload.TaskText
 			j.SpecText = e.Payload.SpecText
 			j.AcceptanceCriteria = e.Payload.AcceptanceCriteria
@@ -693,9 +728,25 @@ func Fold(events []Event) (job.Job, error) {
 		// OPPOSITE directions every cycle (resync-to-Fold vs normalize-to-eng_worker), churning
 		// forever until the job happens to dispatch. Mirror the projection's invariant here so
 		// the Fold is already correct: the watchdogs agree, and a DR rebuild is leasable.
-		if j.State == job.StateReady && j.Kind == job.KindBuild {
+		// role + caps for a state are DERIVED, not generally folded: only the build re-arm
+		// cases + this post-step set them, so every spec-flow / fan-out / requeue transition that
+		// changes role/caps via a direct UPDATE (KindReviewClaimed hardcodes code_reviewer,
+		// KindDepsCleared/KindStateChanged carry neither, etc.) would otherwise fold a STALE/WRONG
+		// role — unleaseable by the correct agent after a DR rebuild. Derive them from the state,
+		// the same way the ready-build case already does (a gate state has exactly one role/caps).
+		switch {
+		case j.State == job.StateReady && j.Kind == job.KindBuild:
 			j.Role = job.RoleEngWorker
 			j.RequiredCapabilities = []string{"role:eng_worker"}
+		case j.State == job.StateSpecAuthoring:
+			j.Role = job.RoleSpecAuthor
+			j.RequiredCapabilities = []string{"role:spec_author"}
+		case j.State == job.StateSpecReview:
+			j.Role = job.RoleSpecReviewer
+			j.RequiredCapabilities = []string{"role:spec_reviewer"}
+		case j.State == job.StateResolvingConflict:
+			j.Role = job.RoleConflictResolver
+			j.RequiredCapabilities = []string{"role:conflict_resolver"}
 		}
 		j.JobSeq = e.JobSeq
 	}

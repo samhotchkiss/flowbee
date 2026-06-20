@@ -235,7 +235,7 @@ func (s *Store) MaterializeSpec(ctx context.Context, p MaterializeSpecParams) er
 			JobID: p.JobID, JobSeq: nextSeq, Kind: ledger.KindSpecAuthored,
 			FromState: job.StateSpecAuthoring, ToState: job.StateSpecReview,
 			LeaseEpoch: j.LeaseEpoch, Actor: j.BoundIdentity, CreatedAt: p.Now,
-			Payload: ledger.Payload{SpecContentHash: p.ContentHash, SpecVersion: p.Version},
+			Payload: ledger.Payload{SpecContentHash: p.ContentHash, SpecVersion: p.Version, SpecText: p.Markdown},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err

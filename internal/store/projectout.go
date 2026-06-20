@@ -118,7 +118,7 @@ func (s *Store) StampPRNumber(ctx context.Context, jobID string, prNumber int, h
 			JobID: jobID, JobSeq: nextSeq, Kind: ledger.KindPROpened,
 			FromState: j.State, ToState: j.State, LeaseEpoch: j.LeaseEpoch,
 			Actor: "project-out", CreatedAt: now,
-			Payload: ledger.Payload{PRNumber: prNumber},
+			Payload: ledger.Payload{PRNumber: prNumber, HeadSHA: headSHA},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err
