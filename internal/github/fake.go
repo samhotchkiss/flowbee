@@ -19,6 +19,7 @@ type Fake struct {
 	prs         map[int]PullRequest
 	boardIssues map[int]Issue // open issues the BoardSweep returns (F7 direct-to-GitHub issues)
 	rate        RateLimit
+	branchCI    CIState  // scripted integration-branch CI rollup (green-main signal); "" => SUCCESS
 	calls       []string // "BoardSweep" / "PullRequest(N)" / "OpenPR" / ... in order, for assertions
 
 	// project-OUT write state (§8.2).
@@ -103,6 +104,24 @@ func (f *Fake) Calls() []string {
 }
 
 // BoardSweep returns the scripted snapshot and records the call.
+// BranchCIState returns the scripted integration-branch CI rollup (defaults to SUCCESS so
+// existing tests see a green main and bounce as before).
+func (f *Fake) BranchCIState(ctx context.Context, branch string) (CIState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.branchCI == "" {
+		return CISuccess, nil
+	}
+	return f.branchCI, nil
+}
+
+// SetBranchCI scripts the integration-branch CI rollup for the green-main tests.
+func (f *Fake) SetBranchCI(s CIState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.branchCI = s
+}
+
 func (f *Fake) BoardSweep(ctx context.Context) (BoardSnapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

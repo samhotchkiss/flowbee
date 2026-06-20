@@ -53,6 +53,12 @@ type ReconciledPR struct {
 	// never come (and instead of the slow, misleading stall the watchdog would otherwise
 	// raise ~4×lease_ttl later).
 	ClosedUnmerged bool
+	// MainCIRed is the green-main invariant signal (russ #214): the INTEGRATION BRANCH'S CI
+	// is itself definitively red. When true, a review_pending PR's own CI failure is NOT
+	// bounced — the affected-test gate can't tell "this PR broke main" from "main was already
+	// broken", so bouncing penalizes a good PR for an inherited failure. The PR is HELD; when
+	// main goes green it rebases + re-CIs and proceeds. Same value for every PR in a sweep.
+	MainCIRed bool
 }
 
 // ReconcileOutcome reports what an ingest did, for the runtime to publish / assert.
@@ -222,9 +228,18 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 				return err
 			}
 			out.Superseded = true
+		case pr.CIFailed && j.State == job.StateReviewPending && pr.MainCIRed:
+			// green-main invariant (russ #214): main itself is red, so this PR's CI failure
+			// can't be fairly attributed to the PR — the affected-test gate can't distinguish
+			// "this PR broke main" from "main was already broken". HOLD the PR in review_pending
+			// instead of bouncing a good change to needs_human over an inherited failure; when
+			// main goes green the PR rebases + re-CIs and proceeds. A no-op transition keeps the
+			// facts recorded above without penalizing the job. (Only a CONFIRMED-red main holds;
+			// unknown/green falls to the bounce below — safe degradation.)
+			out.Applied = true
 		case pr.CIFailed && j.State == job.StateReviewPending:
-			// the build's CI is DEFINITIVELY red while it awaits review: the change is
-			// broken, so bounce it back to build (rebuild), escalating to needs_human
+			// the build's CI is DEFINITIVELY red while it awaits review (and main is green, so
+			// it's THIS change): bounce it back to build (rebuild), escalating to needs_human
 			// at max_bounces. Gated to review_pending so a single failure bounces once
 			// (the rebuild moves the head; the next sweep sees fresh/pending CI).
 			if err := ciFailBounceTx(ctx, tx, &j, seq, now); err != nil {

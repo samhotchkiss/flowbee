@@ -15,6 +15,47 @@ import (
 // TestCIFailBouncesThenEscalates pins the CI-red handling: a review_pending build
 // whose CI is definitively red bounces back to build (rebuild), and after
 // max_bounces escalates to needs_human — never silently parks.
+// TestGreenMainHoldsCIFailBounce: the green-main invariant (russ #214). A review_pending PR
+// whose CI is red is NOT bounced when MAIN itself is red — the failure is inherited, not the
+// PR's fault, so it's HELD in review_pending instead of being penalized to needs_human. When
+// main is green, the same red CI bounces (it IS this change that broke).
+func TestGreenMainHoldsCIFailBounce(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+
+	seedReview := func(id string) {
+		if _, err := st.SeedJob(ctx, store.SeedParams{
+			ID: id, Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='review_pending' WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// main RED: a red-CI PR is HELD (stays review_pending), not bounced.
+	seedReview("held")
+	if _, err := st.ApplyReconciledPR(ctx, "held",
+		store.ReconciledPR{Number: 1, HeadSHA: "h", BaseSHA: "b", CIFailed: true, MainCIRed: true}, now); err != nil {
+		t.Fatal(err)
+	}
+	if j, _ := st.GetJob(ctx, "held"); j.State != job.StateReviewPending || j.Bounces != 0 {
+		t.Fatalf("red main: state=%s bounces=%d, want review_pending/0 (held, not bounced over a red main)", j.State, j.Bounces)
+	}
+
+	// main GREEN: the same red-CI PR IS bounced (this change is genuinely broken).
+	seedReview("bounced")
+	if _, err := st.ApplyReconciledPR(ctx, "bounced",
+		store.ReconciledPR{Number: 2, HeadSHA: "h2", BaseSHA: "b2", CIFailed: true, MainCIRed: false}, now); err != nil {
+		t.Fatal(err)
+	}
+	if j, _ := st.GetJob(ctx, "bounced"); j.State != job.StateReady || j.Bounces != 1 {
+		t.Fatalf("green main: state=%s bounces=%d, want ready/1 (bounced to rebuild)", j.State, j.Bounces)
+	}
+}
+
 func TestCIFailBouncesThenEscalates(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()

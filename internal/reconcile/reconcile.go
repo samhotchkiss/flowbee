@@ -99,9 +99,10 @@ func (r *Reconciler) Sweep(ctx context.Context) ([]store.ReconcileOutcome, error
 	if err := r.store.RecordRateLimit(ctx, snap.RateLimit, now); err != nil {
 		return nil, err
 	}
+	mainCIRed := r.mainCIRed(ctx)
 	var outs []store.ReconcileOutcome
 	for _, pr := range snap.PullRequests {
-		out, applied, err := r.ingest(ctx, pr, now)
+		out, applied, err := r.ingest(ctx, pr, now, mainCIRed)
 		if err != nil {
 			return outs, err
 		}
@@ -165,7 +166,7 @@ func (r *Reconciler) Refetch(ctx context.Context, prNumber int) (store.Reconcile
 	if !ok {
 		return store.ReconcileOutcome{}, false, nil // no such PR: nothing to reconcile
 	}
-	return r.ingest(ctx, pr, now)
+	return r.ingest(ctx, pr, now, r.mainCIRed(ctx))
 }
 
 // RefetchHint adapts Refetch to the webhook.Refetcher interface: a targeted
@@ -191,7 +192,7 @@ func (r *Reconciler) IntakeSweep(ctx context.Context) bool {
 
 // ingest maps one PR's Domain-B facts to its bound job and applies them under the
 // I-3 guards. An un-bound PR (no job for that number) is a no-op (applied=false).
-func (r *Reconciler) ingest(ctx context.Context, pr gh.PullRequest, now time.Time) (store.ReconcileOutcome, bool, error) {
+func (r *Reconciler) ingest(ctx context.Context, pr gh.PullRequest, now time.Time, mainCIRed bool) (store.ReconcileOutcome, bool, error) {
 	jobID, ok, err := r.store.JobIDForPRInRepo(ctx, r.repo, pr.Number)
 	if err != nil {
 		return store.ReconcileOutcome{}, false, err
@@ -199,7 +200,7 @@ func (r *Reconciler) ingest(ctx context.Context, pr gh.PullRequest, now time.Tim
 	if !ok {
 		return store.ReconcileOutcome{}, false, nil
 	}
-	out, err := r.store.ApplyReconciledPR(ctx, jobID, toReconciled(pr), now)
+	out, err := r.store.ApplyReconciledPR(ctx, jobID, toReconciled(pr, mainCIRed), now)
 	if err != nil {
 		return store.ReconcileOutcome{}, false, err
 	}
@@ -220,7 +221,27 @@ func (r *Reconciler) ingest(ctx context.Context, pr gh.PullRequest, now time.Tim
 
 // toReconciled maps a github.PullRequest to the store's Domain-B fact-set. CI is
 // "green" iff the rollup is SUCCESS (a pure mapping; gate logic consumes the bool).
-func toReconciled(pr gh.PullRequest) store.ReconciledPR {
+// mainCIRed reports whether the integration branch's CI is DEFINITIVELY red — the green-main
+// signal threaded onto every reconciled PR this sweep so a review_pending CI failure inherited
+// from a broken main does not bounce a good PR. A client that can't read branch CI, or any
+// read error, degrades to false (bounce as before) — a missing signal never WITHHOLDS a bounce.
+func (r *Reconciler) mainCIRed(ctx context.Context) bool {
+	br, ok := r.gh.(gh.BranchCIReader)
+	if !ok {
+		return false
+	}
+	branch := r.branch
+	if branch == "" {
+		branch = "main"
+	}
+	st, err := br.BranchCIState(ctx, branch)
+	if err != nil {
+		return false
+	}
+	return st == gh.CIFailure || st == gh.CIError
+}
+
+func toReconciled(pr gh.PullRequest, mainCIRed bool) store.ReconciledPR {
 	return store.ReconciledPR{
 		Number:      pr.Number,
 		UpdatedAt:   pr.UpdatedAt,
@@ -229,6 +250,7 @@ func toReconciled(pr gh.PullRequest) store.ReconciledPR {
 		HeadSHA:     pr.HeadRefOid,
 		BaseSHA:     pr.BaseRefOid,
 		MergeCommit: pr.MergeCommit,
+		MainCIRed:   mainCIRed,
 		// green requires BOTH the aggregate SUCCESS AND a real (non-skipped) passing check —
 		// GitHub rolls an ALL-SKIPPED head up to SUCCESS (no test ran), so the aggregate alone
 		// would let a paths-filtered or hostile-workflow PR pass the gate on tests that never

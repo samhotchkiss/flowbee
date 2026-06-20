@@ -105,6 +105,15 @@ type Client interface {
 	PullRequest(ctx context.Context, number int) (PullRequest, bool, error)
 }
 
+// BranchCIReader resolves the CI rollup at a branch HEAD — the integration branch's
+// green/red state, for the green-main invariant (don't bounce a PR for a CI failure it
+// merely inherited from a red main). A SEPARATE optional interface (reconcile type-asserts
+// it) so test fakes that don't need it aren't forced to implement it; absence degrades to
+// "main not red" (bounce as before).
+type BranchCIReader interface {
+	BranchCIState(ctx context.Context, branch string) (CIState, error)
+}
+
 // OpenPRInput describes the draft PR Flowbee opens from a promoted epoch ref
 // (§8.2.1, the canonical §7.3 PR-open trigger). The worker NEVER supplies a PR
 // field — Flowbee opens the PR and stamps the returned number.
@@ -626,6 +635,36 @@ func (c *RealClient) BoardSweep(ctx context.Context) (BoardSnapshot, error) {
 			sweepMaxPages, prMore, issueMore, c.Owner, c.Repo)
 	}
 	return snap, nil
+}
+
+// BranchCIState resolves the statusCheckRollup at a branch HEAD (the integration branch's
+// green/red state) — the green-main signal. Returns "" (treated as not-red) when the branch
+// has no rollup (no checks configured / unresolved), so a missing signal never WITHHOLDS a
+// bounce (safe degradation to today's behavior).
+func (c *RealClient) BranchCIState(ctx context.Context, branch string) (CIState, error) {
+	const q = `query($owner:String!,$repo:String!,$ref:String!){
+	  repository(owner:$owner,name:$repo){
+	    ref(qualifiedName:$ref){ target{ ... on Commit{ statusCheckRollup{ state } } } }
+	  }
+	}`
+	var out struct {
+		Repository struct {
+			Ref *struct {
+				Target struct {
+					StatusCheckRollup *struct {
+						State string `json:"state"`
+					} `json:"statusCheckRollup"`
+				} `json:"target"`
+			} `json:"ref"`
+		} `json:"repository"`
+	}
+	if err := c.graphQL(ctx, q, map[string]any{"owner": c.Owner, "repo": c.Repo, "ref": "refs/heads/" + branch}, &out); err != nil {
+		return "", err
+	}
+	if out.Repository.Ref == nil || out.Repository.Ref.Target.StatusCheckRollup == nil {
+		return "", nil
+	}
+	return CIState(out.Repository.Ref.Target.StatusCheckRollup.State), nil
 }
 
 // PullRequest fetches one PR's Domain-B facts (the targeted refetch, §8.1.3). It
