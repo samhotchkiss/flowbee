@@ -464,16 +464,24 @@ func runServe(args []string) error {
 			// lands mid-interval (snapshot e.g. 5h old, < interval so no catch-up) push the next
 			// backup to interval-after-startup, leaving the floor ~2×interval stale. A recent
 			// snapshot within the window is left alone, so frequent restarts don't spam backups.
-			due := func(why string) {
-				if age, ok := newestSnapshotAge(backupDir); !ok || age >= d {
-					snap(why)
-				}
-			}
-			due("startup")
 			poll := d / 6
 			if poll < time.Minute {
 				poll = time.Minute
 			}
+			// Fire when within HALF A POLL of the interval boundary, not strictly at/after it.
+			// The snapshot is WRITTEN by the poll, so its mtime lands slightly AFTER the poll
+			// tick; exactly `interval` later (with poll evenly dividing interval) the boundary
+			// poll computes age as a few ms UNDER `interval` and skips, deferring the backup a
+			// full poll — making the effective cadence interval+poll, not interval. A half-poll
+			// tolerance lets the boundary poll fire (cadence ~interval ± poll/2) while the prior
+			// poll, a half-interval-fraction earlier, still doesn't (no early spam).
+			threshold := d - poll/2
+			due := func(why string) {
+				if age, ok := newestSnapshotAge(backupDir); !ok || age >= threshold {
+					snap(why)
+				}
+			}
+			due("startup")
 			t := time.NewTicker(poll)
 			defer t.Stop()
 			for {
