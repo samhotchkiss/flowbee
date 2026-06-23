@@ -170,6 +170,36 @@ func (s *Store) RetryAbandonedOutbox(ctx context.Context, jobID string) (int, er
 	return int(n), nil
 }
 
+// RetryAbandonedOutboxForRepo re-arms every abandoned outbox action whose owning job
+// belongs to repo. This is the bulk recovery path after fixing a repo-scoped GitHub
+// problem (expired token, branch protection drift, deleted refs) without looping over
+// individual job ids.
+func (s *Store) RetryAbandonedOutboxForRepo(ctx context.Context, repo string) (int, error) {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE outbox
+		   SET status='pending', attempts=0
+		 WHERE status='abandoned'
+		   AND job_id IN (SELECT id FROM jobs WHERE repo = ?)`, repo)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// RetryAllAbandonedOutbox re-arms every abandoned outbox action across every repo.
+// Use only after the global cause is fixed; project-OUT actions are idempotent, so
+// retrying an abandoned action does not double-apply a GitHub write.
+func (s *Store) RetryAllAbandonedOutbox(ctx context.Context) (int, error) {
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE outbox SET status='pending', attempts=0 WHERE status='abandoned'`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // OutboxAbandonedByAction counts ACTIONABLE abandoned (dead-lettered) outbox actions per
 // action type — GitHub writes that never took effect AND whose owning job is still live (or
 // parked at needs_human). Critical abandons (create-issue/merge) escalate the owning job to

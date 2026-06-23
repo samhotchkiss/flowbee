@@ -1,0 +1,16 @@
+[Unit]
+Description=Flowbee worker fleet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=FLOWBEE_FLEET_ENV=%h/.flowbee/fleet.env
+Environment=FLOWBEE_BIN=/usr/local/bin/flowbee
+ExecStart=/usr/local/share/flowbee/launch/flowbee-fleet.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+

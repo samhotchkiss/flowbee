@@ -30,6 +30,11 @@ Run `flowbee doctor` before starting `flowbee serve` to validate your configurat
 - **Repo coordinates** — verifies the owner/repo reference resolves on GitHub.
 - **Flow file identities** — checks that every identity referenced in the flow file exists.
 - **Lens coverage** — ensures each identity has a lens configured.
+- **Running config** — when a control plane is reachable at `FLOWBEE_URL` (default
+  `http://127.0.0.1:7070`), prints the running process's redacted effective config:
+  version, pid, config path, DB, private bind, self-merge, mirror, git remote, token-present
+  bits, auth posture, log path, and managed repos. This is the source of truth for reproducing
+  the live launch; it does not print secret values.
 
 Pass `--offline` to skip the GitHub reachability check when running in an air-gapped or offline environment.
 
@@ -70,6 +75,33 @@ flowbee serve --systemd > /tmp/flowbee-serve.unit   # prints an env file + syste
 # install the printed ~/.flowbee/serve.env (fill in FLOWBEE_GITHUB_TOKEN) + the unit, then:
 sudo systemctl daemon-reload && sudo systemctl enable --now flowbee-serve
 journalctl -u flowbee-serve -f   # the startup line shows the build SHA
+```
+
+The versioned canonical launch assets live under `deploy/`:
+
+- `deploy/serve.env.example` -> copy to `~/.flowbee/serve.env` and fill secrets.
+- `deploy/launch/flowbee-serve.sh` -> single command launcher used by services.
+- `deploy/systemd/flowbee-serve.service` -> Linux user service.
+- `deploy/launchd/com.flowbee.serve.plist` -> macOS launchd service for this box.
+
+Install the committed launcher once, then restarts are single commands:
+
+```sh
+install -d /usr/local/share/flowbee/launch
+install -m 755 deploy/launch/flowbee-serve.sh /usr/local/share/flowbee/launch/
+cp deploy/serve.env.example ~/.flowbee/serve.env
+chmod 600 ~/.flowbee/serve.env
+
+# macOS:
+cp deploy/launchd/com.flowbee.serve.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.flowbee.serve.plist
+launchctl kickstart -k gui/$(id -u)/com.flowbee.serve
+
+# Linux:
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/flowbee-serve.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now flowbee-serve
 ```
 
 `flowbee.yaml` lists the repos one board serves (see [`deploy/multi-repo.md`](deploy/multi-repo.md)):
@@ -131,6 +163,33 @@ Run it as a service so it survives reboots:
 ```sh
 flowbee fleet --url http://<host>:7070 --builders 3 --systemd > flowbee-fleet.service
 # install the printed unit + env file, then: systemctl --user enable --now flowbee-fleet
+```
+
+The committed fleet launcher is the canonical restart path:
+
+- `deploy/fleet.env.example` -> copy to `~/.flowbee/fleet.env` on each worker box.
+- `deploy/launch/flowbee-fleet.sh` -> sources the env file and runs `flowbee fleet`.
+- `deploy/systemd/flowbee-fleet.service` -> Linux worker service.
+- `deploy/launchd/com.flowbee.fleet.plist` -> macOS worker service for this box.
+
+Install once:
+
+```sh
+install -d /usr/local/share/flowbee/launch
+install -m 755 deploy/launch/flowbee-fleet.sh /usr/local/share/flowbee/launch/
+cp deploy/fleet.env.example ~/.flowbee/fleet.env
+chmod 600 ~/.flowbee/fleet.env
+
+# macOS:
+cp deploy/launchd/com.flowbee.fleet.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.flowbee.fleet.plist
+launchctl kickstart -k gui/$(id -u)/com.flowbee.fleet
+
+# Linux:
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/flowbee-fleet.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now flowbee-fleet
 ```
 
 ### Review-model independence
@@ -272,8 +331,9 @@ building → review_pending → code_review → mergeable → merging → done**
   approved merge aging past its SLO, red main CI, unexpected pause/park state, over-budget
   work, or GitHub last-success age growing past the normal reconcile cadence. `/healthz`
   carries the latest GitHub error in `github_last_error`; **`flowbee outbox`** lists abandoned
-  writes with their owning job + state, and **`flowbee retry-outbox <job-id>`** re-arms a
-  job's abandoned actions once you've fixed the cause. Example minimal `prometheus.yml`
+  writes with their owning job + state, and **`flowbee retry-outbox <job-id>`**,
+  **`flowbee retry-outbox --repo <repo-id>`**, or **`flowbee retry-outbox --all`** re-arms
+  abandoned actions once you've fixed the cause. Example minimal `prometheus.yml`
   scrape config:
 
   ```yaml
@@ -420,6 +480,75 @@ The four automatic recovery mechanisms, in summary:
 ## 7. Recovering from trouble
 
 Flowbee is built so nothing wedges permanently — but here is the operator's toolkit:
+
+### Deploy a new serve binary
+
+Use a managed launcher, not a tmux/manual shell reconstruction:
+
+```bash
+go build -o bin/flowbee ./cmd/flowbee
+flowbee version
+install -m 755 bin/flowbee /usr/local/bin/flowbee
+
+# macOS launchd:
+launchctl kickstart -k gui/$(id -u)/com.flowbee.serve
+
+# Linux systemd:
+systemctl --user restart flowbee-serve
+```
+
+`flowbee serve` also handles `SIGHUP` / `SIGUSR1` as a graceful re-exec: listeners and
+loops shut down cleanly, the same binary re-execs with the same env, and config is re-read.
+That is useful for config reloads; replacing the binary plus restarting the service is the
+canonical deploy path.
+
+Verify the running process, not your invoking shell:
+
+```bash
+flowbee doctor
+curl -s http://127.0.0.1:7070/v1/config
+curl -s http://127.0.0.1:7001/healthz
+```
+
+### Restart or recover the fleet
+
+With the committed service installed, restart is one command:
+
+```bash
+# macOS launchd:
+launchctl kickstart -k gui/$(id -u)/com.flowbee.fleet
+
+# Linux systemd:
+systemctl --user restart flowbee-fleet
+```
+
+Workers refresh registration on their normal heartbeat while an agent is running, so a
+control-plane restart should not leave the fleet stale for more than about one heartbeat.
+If you still see `fleet: 0 live, N stale workers`, restart the fleet service; in-flight jobs
+are fenced by lease epoch and will either submit cleanly or be reaped/requeued by liveness.
+
+### Recover stranded jobs and outbox writes
+
+Use the broadest safe scope after fixing the cause:
+
+```bash
+flowbee status
+flowbee outbox
+flowbee retry-outbox <job-id>        # one job
+flowbee retry-outbox --repo flowbee  # all abandoned writes for one repo
+flowbee retry-outbox --all           # every abandoned write
+
+flowbee requeue <job-id>             # re-arm a needs_human job
+flowbee requeue --state needs_human  # bulk requeue by state
+```
+
+Then verify the queue is draining:
+
+```bash
+flowbee status
+curl -s http://127.0.0.1:7070/v1/fleet-health
+flowbee board
+```
 
 | Symptom | What's happening | Action |
 |---|---|---|

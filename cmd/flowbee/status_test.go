@@ -134,7 +134,7 @@ func TestStatusDefaultTextOutputByteExact(t *testing.T) {
 		"\n" +
 		"awaiting human: 2 merge_handoff, 1 needs_human\n" +
 		"fleet: 2 live, 3 stale workers (codex:1, sonnet:1)\n" +
-		"⚠ abandoned GitHub writes: issues.create:2, pulls.create:1 — fix the cause, then `flowbee retry-outbox <job-id>`\n"
+		"⚠ abandoned GitHub writes: issues.create:2, pulls.create:1 — fix the cause, then `flowbee retry-outbox <job-id>` / `--repo <id>` / `--all`\n"
 	if got := buf.String(); got != want {
 		t.Fatalf("status text changed\nwant:\n%q\ngot:\n%q", want, got)
 	}

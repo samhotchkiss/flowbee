@@ -2,8 +2,10 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,7 +32,7 @@ func TestHungAgentKilledOnContextEnd(t *testing.T) {
 		// a hung agent that FORKS a child holding the stdout pipe (`| cat`) — the real
 		// case: killing only the direct child leaves the orphan pinning cmd.Wait(). The
 		// fix kills the whole process group, so Wait returns when the GROUP dies.
-		_, err := runAgentHeartbeatIO(ctx, c, "j", 1, 3600, t.TempDir(), "sleep 30 | cat", nil, true)
+		_, err := runAgentHeartbeatIO(ctx, c, nil, "j", 1, 3600, t.TempDir(), "sleep 30 | cat", nil, true)
 		done <- err
 	}()
 
@@ -46,5 +48,42 @@ func TestHungAgentKilledOnContextEnd(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("runAgentHeartbeatIO blocked after the context ended — a hung agent would wedge the worker forever")
+	}
+}
+
+func TestAgentHeartbeatRefreshesRegistration(t *testing.T) {
+	oldMin, oldMax := agentHeartbeatMinS, agentHeartbeatMaxS
+	agentHeartbeatMinS, agentHeartbeatMaxS = 1, 1
+	t.Cleanup(func() {
+		agentHeartbeatMinS, agentHeartbeatMaxS = oldMin, oldMax
+	})
+
+	var registers atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/workers/register":
+			registers.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(client.RegisterResponse{WorkerID: "wid"})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/jobs/j/heartbeat":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"directive":"continue"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	reg := client.Registration{Identity: "builder-1", Capabilities: []string{"role:eng_worker"}}
+	_, err := runAgentHeartbeatIO(context.Background(), client.New(srv.URL), &reg, "j", 1, 300,
+		t.TempDir(), "sleep 2", nil, true)
+	if err != nil {
+		t.Fatalf("runAgentHeartbeatIO: %v", err)
+	}
+	if got := registers.Load(); got == 0 {
+		t.Fatal("expected heartbeat loop to refresh worker registration while the agent was running")
+	}
+	if reg.WorkerID != "wid" {
+		t.Fatalf("registration refresh should carry returned worker_id forward, got %q", reg.WorkerID)
 	}
 }

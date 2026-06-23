@@ -56,11 +56,14 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	c.Model = cfg.ModelLabel
-	if _, err := c.Register(ctx, client.Registration{
+	reg := client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
-	}); err != nil {
+	}
+	if resp, err := c.Register(ctx, reg); err != nil {
 		return HarnessOutcome{}, fmt.Errorf("register: %w", err)
+	} else {
+		reg.WorkerID = resp.WorkerID
 	}
 
 	grant, ok, err := c.Lease(ctx, cfg.Identity, cfg.ModelFamily, cfg.Role)
@@ -134,7 +137,7 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		"FLOWBEE_VERDICT_FILE="+verdictFile,
 		"FLOWBEE_SPEC_FILE="+specFile,
 	)
-	agentOut, err := runAgentHeartbeatIO(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, dir, cfg.AgentCmd, agentEnv, true)
+	agentOut, err := runAgentHeartbeatIO(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, dir, cfg.AgentCmd, agentEnv, true)
 	if err != nil {
 		return out, err
 	}

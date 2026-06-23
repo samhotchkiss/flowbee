@@ -102,6 +102,51 @@ type Server struct {
 	// ui is the F12 web UI (internal/web): the productionized Fleet/Board/Dashboard
 	// panes served off the same live store read-models, embedded via go:embed.
 	ui *web.UI
+	// runningConfig is a redacted snapshot of the effective serve launch/config,
+	// exposed read-only for operators who need to reproduce or audit the running
+	// process without `ps eww` archaeology.
+	runningConfig RunningConfig
+}
+
+// RunningConfig is the control plane's redacted effective runtime snapshot. It is
+// deliberately limited to non-secret values and boolean "present" bits for secrets.
+type RunningConfig struct {
+	Version              string              `json:"version"`
+	PID                  int                 `json:"pid"`
+	ConfigPath           string              `json:"config_path,omitempty"`
+	DatabaseURL          string              `json:"database_url"`
+	PrivateAddr          string              `json:"private_addr"`
+	HealthAddr           string              `json:"health_addr"`
+	WebhookAddr          string              `json:"webhook_addr"`
+	AllowSelfMerge       bool                `json:"allow_self_merge"`
+	RequiredReviewers    int                 `json:"required_reviewers"`
+	MirrorPath           string              `json:"mirror_path,omitempty"`
+	GitRemote            string              `json:"git_remote,omitempty"`
+	WorkerGitSSH         bool                `json:"worker_git_ssh"`
+	BundleProvisioning   bool                `json:"bundle_provisioning"`
+	GitHubTokenPresent   bool                `json:"github_token_present"`
+	WebhookSecretPresent bool                `json:"webhook_secret_present"`
+	WorkerAuthConfigured bool                `json:"worker_auth_configured"`
+	InsecureWorkerAPI    bool                `json:"insecure_worker_api"`
+	AuthLoopbackBypass   bool                `json:"auth_loopback_bypass"`
+	Repos                []RunningConfigRepo `json:"repos,omitempty"`
+	LogPath              string              `json:"log_path,omitempty"`
+	BackupDir            string              `json:"backup_dir,omitempty"`
+	ReconcileIntervalEnv string              `json:"reconcile_interval_s,omitempty"`
+	UnstickIntervalEnv   string              `json:"unstick_interval_s,omitempty"`
+	FlowbeeURL           string              `json:"flowbee_url,omitempty"`
+}
+
+type RunningConfigRepo struct {
+	ID                string `json:"id"`
+	Owner             string `json:"owner"`
+	Repo              string `json:"repo"`
+	DefaultBranch     string `json:"default_branch,omitempty"`
+	Active            bool   `json:"active"`
+	TokenEnv          string `json:"token_env,omitempty"`
+	TokenPresent      bool   `json:"token_present"`
+	ArchiveHistory    bool   `json:"archive_history"`
+	RequiredReviewers int    `json:"required_reviewers,omitempty"`
 }
 
 // Config carries the timing knobs the worker API needs.
@@ -162,6 +207,7 @@ type Config struct {
 	// `flowbee pause` creates it; `flowbee resume` removes it. Empty disables
 	// the check (dev/test with no DB-backed file path).
 	PauseMarkerPath string
+	RunningConfig   RunningConfig
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -189,6 +235,11 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 	// (ReviewResult / DispatchMerge) runs the configured ceilings + extra denylist.
 	st.ContentPolicy = cfg.ContentPolicy
 	ui := web.New(st, clk, web.Config{StaleHB: staleHB})
+	runningConfig := cfg.RunningConfig
+	runningConfig.Version = version
+	if runningConfig.PID == 0 {
+		runningConfig.PID = os.Getpid()
+	}
 	srv := &Server{
 		store:              st,
 		clock:              clk,
@@ -210,6 +261,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		authn:              cfg.Authenticator,
 		ui:                 ui,
 		pauseMarkerPath:    cfg.PauseMarkerPath,
+		runningConfig:      runningConfig,
 	}
 	// seed GitHub health to "just succeeded" so the age metric starts ~0, not at the
 	// unix epoch, before the first sweep runs.
@@ -306,6 +358,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/needs-input", s.needsInputJSON)
 	mux.HandleFunc("GET /v1/backlog", s.backlogJSON)
 	mux.HandleFunc("GET /v1/fleet", s.fleetJSON)
+	mux.HandleFunc("GET /v1/config", s.configJSON)
 	// F7 board-lifecycle WRITE / intake edges (operator / user-agent / planner loop):
 	// answer a needs_design item, promote a backlog item, opt a quiescent item in, retry
 	// a needs_human job, cancel, or inject work via the spec/epic front door. These MUTATE
@@ -332,6 +385,12 @@ func (s *Server) PrivateHandler() http.Handler {
 	// "/roster", and "/assets/". The read-only views bind to loopback/Tailscale.
 	s.ui.Mount(mux)
 	return mux
+}
+
+// configJSON exposes the RUNNING control plane's effective, redacted config. It is
+// read-only and contains no secret material; token/secret fields are booleans only.
+func (s *Server) configJSON(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.runningConfig)
 }
 
 // boardJSON serves the live board snapshot as JSON (the machine-readable board the

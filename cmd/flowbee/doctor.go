@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
+	"strings"
+	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/api"
 	"github.com/samhotchkiss/flowbee/internal/onboarding"
 )
 
@@ -37,6 +41,7 @@ func runDoctor(args []string) error {
 	if err != nil {
 		return err
 	}
+	rep.Checks = append(rep.Checks, runningConfigCheck(context.Background()))
 
 	if *jsonOut {
 		type jsonCheck struct {
@@ -80,4 +85,50 @@ func runDoctor(args []string) error {
 		return fmt.Errorf("flowbee doctor: FAIL")
 	}
 	return fmt.Errorf("doctor found failing checks (see above)")
+}
+
+func runningConfigCheck(ctx context.Context) onboarding.Check {
+	base := strings.TrimRight(envOr("FLOWBEE_URL", "http://127.0.0.1:7070"), "/")
+	reqCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, base+"/v1/config", nil)
+	if err != nil {
+		return onboarding.Check{Name: "running-config", Status: onboarding.StatusWarn, Detail: err.Error()}
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return onboarding.Check{Name: "running-config", Status: onboarding.StatusWarn,
+			Detail: "no running control plane reached at " + base + " (local config checks only)"}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return onboarding.Check{Name: "running-config", Status: onboarding.StatusWarn,
+			Detail: fmt.Sprintf("running control plane at %s returned status %d", base, resp.StatusCode)}
+	}
+	var cfg api.RunningConfig
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		return onboarding.Check{Name: "running-config", Status: onboarding.StatusWarn, Detail: "decode /v1/config: " + err.Error()}
+	}
+	repos := make([]string, 0, len(cfg.Repos))
+	for _, r := range cfg.Repos {
+		label := r.ID
+		if label == "" {
+			label = r.Owner + "/" + r.Repo
+		}
+		if r.TokenPresent {
+			label += ":token"
+		} else {
+			label += ":no-token"
+		}
+		repos = append(repos, label)
+	}
+	if len(repos) == 0 {
+		repos = append(repos, "none")
+	}
+	return onboarding.Check{Name: "running-config", Status: onboarding.StatusPass,
+		Detail: fmt.Sprintf("version=%s pid=%d config=%s db=%s private=%s self_merge=%v mirror=%s git_remote=%s token_present=%v webhook_secret=%v worker_auth=%v insecure=%v log_path=%s repos=%s",
+			cfg.Version, cfg.PID, orDash(cfg.ConfigPath), cfg.DatabaseURL, cfg.PrivateAddr,
+			cfg.AllowSelfMerge, orDash(cfg.MirrorPath), orDash(cfg.GitRemote), cfg.GitHubTokenPresent,
+			cfg.WebhookSecretPresent, cfg.WorkerAuthConfigured, cfg.InsecureWorkerAPI,
+			orDash(cfg.LogPath), strings.Join(repos, ","))}
 }

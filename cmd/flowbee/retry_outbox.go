@@ -20,13 +20,17 @@ import (
 // the running control plane picks the re-armed rows up on its next drain tick.
 func runRetryOutbox(args []string) error {
 	fs := flag.NewFlagSet("retry-outbox", flag.ContinueOnError)
+	repo := fs.String("repo", "", "re-arm abandoned outbox actions for every job in this repo")
+	all := fs.Bool("all", false, "re-arm every abandoned outbox action across all repos")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: flowbee retry-outbox <job-id>")
+	if (*repo != "" && *all) || (fs.NArg() > 0 && (*repo != "" || *all)) || fs.NArg() > 1 {
+		return fmt.Errorf("usage: flowbee retry-outbox <job-id> | --repo <repo-id> | --all")
 	}
-	jobID := fs.Arg(0)
+	if fs.NArg() == 0 && *repo == "" && !*all {
+		return fmt.Errorf("usage: flowbee retry-outbox <job-id> | --repo <repo-id> | --all")
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -39,7 +43,20 @@ func runRetryOutbox(args []string) error {
 	}
 	defer st.Close()
 
-	n, err := st.RetryAbandonedOutbox(ctx, jobID)
+	scope := ""
+	var n int
+	switch {
+	case *all:
+		scope = "all repos"
+		n, err = st.RetryAllAbandonedOutbox(ctx)
+	case *repo != "":
+		scope = "repo " + *repo
+		n, err = st.RetryAbandonedOutboxForRepo(ctx, *repo)
+	default:
+		jobID := fs.Arg(0)
+		scope = "job " + jobID
+		n, err = st.RetryAbandonedOutbox(ctx, jobID)
+	}
 	if err != nil {
 		if strings.Contains(err.Error(), "no such table") {
 			return fmt.Errorf("no initialized flowbee database at %q — point FLOWBEE_CONFIG / database_url at the live DB (standard location: ~/.flowbee/flowbee.db)", cfg.DatabaseURL)
@@ -47,9 +64,9 @@ func runRetryOutbox(args []string) error {
 		return err
 	}
 	if n == 0 {
-		fmt.Printf("no abandoned outbox actions for job %q (nothing to retry)\n", jobID)
+		fmt.Printf("no abandoned outbox actions for %s (nothing to retry)\n", scope)
 		return nil
 	}
-	fmt.Printf("re-armed %d abandoned outbox action(s) for job %q — the control plane will re-attempt them on its next drain\n", n, jobID)
+	fmt.Printf("re-armed %d abandoned outbox action(s) for %s — the control plane will re-attempt them on its next drain\n", n, scope)
 	return nil
 }
