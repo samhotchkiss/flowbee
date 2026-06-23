@@ -68,13 +68,16 @@ func (s *Store) RequeueJob(ctx context.Context, jobID string, force bool, now ti
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err
 		}
-		// clear over_budget + escalation_reason too: a requeued job is active again, not
-		// escalated, so it must drop out of the over-budget metric / needs-human triage.
+		// Clear build-attempt artifacts too. A requeued job is a fresh build candidate;
+		// carrying a previous attempt's diff/blast-radius makes reservation filtering treat
+		// the stale write-set as current and can withhold the entire ready queue.
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs
 			   SET state = ?, role = ?, stage = ?,
 			       required_capabilities = ?,
 			       head_sha = '', verdict = NULL,
+			       patch_diff = '', declared_blast_radius = '',
+			       reservation_paths = '', reservation_wide = 0,
 			       attempts = 0, bounces = 0, over_budget = 0, escalation_reason = '',
 			       lease_epoch = lease_epoch + 1,
 			       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
