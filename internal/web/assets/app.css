@@ -126,6 +126,7 @@ h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.9px;color:var(--fai
 .card .meta .chip.ci.green{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,var(--line))}
 .card .meta .chip.ci.running{color:var(--test);border-color:color-mix(in srgb,var(--test) 40%,var(--line))}
 .card .meta .chip.ci.waiting{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%,var(--line))}
+.card .meta .chip.ci.failed{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 40%,var(--line))}
 .card .meta .chip.ci.merged{color:var(--merge);border-color:color-mix(in srgb,var(--merge) 40%,var(--line))}
 .card .timer{
   margin-left:auto;font-family:var(--mono);font-size:.68rem;color:var(--faint);

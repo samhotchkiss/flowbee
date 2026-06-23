@@ -136,3 +136,71 @@ func TestBoardCardsExposeCIState(t *testing.T) {
 		t.Fatalf("ci chip = %q/%q, want CI green/green", cards[0].CILabel, cards[0].CIClass)
 	}
 }
+
+func TestBoardCardsShowCIForReadyPRs(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 16, 9, 0, 0, 0, time.UTC)
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "ready-pr", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, TaskText: "ready with a PR", Now: now,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET pr_number=43 WHERE id='ready-pr'`); err != nil {
+		t.Fatalf("set pr: %v", err)
+	}
+	if err := st.UpsertDomainBFacts(ctx, "ready-pr", job.DomainBFacts{
+		PRExists: true, PRNumber: 43, HeadSHA: "head", BaseSHA: "base",
+	}); err != nil {
+		t.Fatalf("facts: %v", err)
+	}
+
+	cards, err := st.BoardCards(ctx, now)
+	if err != nil {
+		t.Fatalf("board cards: %v", err)
+	}
+	if len(cards) != 1 {
+		t.Fatalf("want 1 card, got %d", len(cards))
+	}
+	if cards[0].CILabel != "CI not green" || cards[0].CIClass != "waiting" {
+		t.Fatalf("ci chip = %q/%q, want CI not green/waiting", cards[0].CILabel, cards[0].CIClass)
+	}
+}
+
+func TestBoardCardsExposeEpochCIFailure(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 16, 9, 0, 0, 0, time.UTC)
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "failed-ci", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, TaskText: "failed CI", Now: now,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `
+		UPDATE jobs SET state='review_pending', stage='review', pr_number=44, build_epoch=7 WHERE id='failed-ci'`); err != nil {
+		t.Fatalf("move to review_pending: %v", err)
+	}
+	if err := st.UpsertDomainBFacts(ctx, "failed-ci", job.DomainBFacts{
+		PRExists: true, PRNumber: 44, HeadSHA: "head", BaseSHA: "base",
+	}); err != nil {
+		t.Fatalf("facts: %v", err)
+	}
+	if err := st.RecordEpochCI(ctx, "failed-ci", 7, "head", store.EpochCIFailure, now); err != nil {
+		t.Fatalf("epoch ci: %v", err)
+	}
+
+	cards, err := st.BoardCards(ctx, now)
+	if err != nil {
+		t.Fatalf("board cards: %v", err)
+	}
+	if len(cards) != 1 {
+		t.Fatalf("want 1 card, got %d", len(cards))
+	}
+	if cards[0].CILabel != "CI failed" || cards[0].CIClass != "failed" {
+		t.Fatalf("ci chip = %q/%q, want CI failed/failed", cards[0].CILabel, cards[0].CIClass)
+	}
+}
