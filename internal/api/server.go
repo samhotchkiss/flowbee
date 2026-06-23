@@ -907,6 +907,7 @@ type LeaseGrant struct {
 	LeaseEpoch int    `json:"lease_epoch"`
 	LeaseTTLS  int    `json:"lease_ttl_s"`
 	Deadline   string `json:"lease_deadline"`
+	DryRun     bool   `json:"dry_run,omitempty"`
 	// Repo provisioning (§7.4). For same-box `worktree`, MirrorPath is the shared
 	// bare mirror the worker adds a per-lease worktree off; PushTarget is the
 	// epoch-namespaced ref the worker pushes its build to (Flowbee promotes it).
@@ -1036,6 +1037,7 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	// Self-asserted is fine: it's display-only, never a gate (unlike identity/family).
 	model := r.URL.Query().Get("model")
 	roleFilter := job.Role(r.URL.Query().Get("role"))
+	dryRun := truthyQuery(r.URL.Query().Get("dry_run")) || truthyQuery(r.URL.Query().Get("dry-run"))
 
 	// polling for work is proof of liveness: bump last_seen so an idle worker (no
 	// active lease to heartbeat) isn't badged stale on the roster / by the watchdog.
@@ -1112,6 +1114,17 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 			cands = kept
 		}
 		for _, cand := range scheduler.Order(cands, attested, s.clock.Now()) {
+			if dryRun {
+				j, gerr := s.store.GetJob(r.Context(), cand.JobID)
+				if gerr != nil {
+					http.Error(w, "lease error", http.StatusInternalServerError)
+					return
+				}
+				grant := s.leaseGrantForJob(r.Context(), cand.JobID, j, identity, family, lens, role, reviewing, resolvingConflict,
+					"dry-run", j.LeaseEpoch+1, s.clock.Now().Add(s.leaseTTL), true)
+				writeJSON(w, http.StatusOK, grant)
+				return
+			}
 			var ls *lease.Lease
 			switch {
 			case reviewing:
@@ -1153,90 +1166,8 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 				}
 				j, _ := s.store.GetJob(r.Context(), cand.JobID)
 				s.broker.Publish(LifeEvent{JobID: cand.JobID, State: string(j.State), Event: "lease_claimed", Epoch: ls.Epoch})
-				grant := LeaseGrant{
-					JobID: cand.JobID, Kind: string(j.Kind), Role: string(j.Role),
-					BaseSHA: j.BaseSHA, LeaseID: ls.LeaseID, LeaseEpoch: ls.Epoch,
-					LeaseTTLS: int(s.leaseTTL / time.Second), Deadline: ls.Deadline.Format(time.RFC3339Nano),
-					SpecContentHash: j.SpecContentHash, SpecVersion: j.SpecVersion,
-				}
-				// F1: ship the self-contained context block (§B). Identity/lens are the
-				// CREDENTIAL-BOUND resolved values (the fence): the worker acts AS this
-				// identity and cannot choose another. The bound_lens persisted at claim
-				// time wins over the self-asserted query param when present.
-				ctxLens := lens
-				if j.BoundLens != "" {
-					ctxLens = j.BoundLens
-				}
-				grant.Context = &LeaseContext{
-					Identity: identity, ModelFamily: family, Lens: ctxLens, Role: string(j.Role),
-					BaseSHA:             j.BaseSHA,
-					Task:                j.TaskText,
-					Spec:                j.SpecText,
-					AcceptanceCriteria:  j.AcceptanceCriteria,
-					PriorVerdict:        j.Verdict,
-					PriorReviewFindings: j.LastReviewNotes,
-				}
-				// the per-issue branch the node commits to (worker-push): builds + reviews
-				// both target it. Resolved from the job's bound issue (adopted) or its spec
-				// ancestor's materialized issue. Empty until an issue is bound.
-				if reviewing || role == job.RoleEngWorker || resolvingConflict {
-					grant.Context.IssueBranch = store.IssueBranch(s.store.ResolveIssueNum(r.Context(), cand.JobID), cand.JobID)
-					// a build that has bounced is a re-attempt after a CI failure / changes
-					// requested — tell the agent to fix what broke, not re-submit.
-					if role == job.RoleEngWorker && j.Bounces > 0 {
-						grant.Context.Rebuild = true
-					}
-					// F9: tell the (fungible) worker which repo this job belongs to so
-					// worker-push targets the right remote. Resolve the job's repo scope to
-					// its clone/push URL from the registry; the worker auths with its own
-					// git credential. Empty repo => single-repo deployment (worker uses its
-					// configured --repo-url).
-					if j.Repo != "" {
-						if rp, rerr := s.store.GetRepo(r.Context(), j.Repo); rerr == nil {
-							grant.Context.RepoURL = workerRepoURL(rp.Owner, rp.Repo, s.workerGitSSH)
-						}
-					}
-				}
-				// a code_reviewer judges the actual change: ship the build patch so its
-				// agent reads the diff (the review harness writes .flowbee/diff.patch),
-				// and ship CIReady so the harness skips until reconciled CI is green
-				// (an approval before then can't mint — it would bounce + rebuild-thrash).
-				// a conflict_resolver re-applies the job's ORIGINAL change on the CURRENT
-				// main (a sibling merged into the same area). Ship that original build patch
-				// as the Diff and flag Conflict so the resolver brief tells the agent to
-				// reconcile its intent with the current code — NOT to re-run the original
-				// task, whose target may no longer exist (which is the conflict).
-				if resolvingConflict {
-					if d, derr := s.store.JobPatchDiff(r.Context(), cand.JobID); derr == nil {
-						grant.Context.Diff = d
-					}
-					grant.Context.Conflict = true
-				}
-				if reviewing {
-					if d, derr := s.store.JobPatchDiff(r.Context(), cand.JobID); derr == nil {
-						grant.Context.Diff = d
-					}
-					if f, _, ferr := s.facts.Facts(r.Context(), cand.JobID); ferr == nil {
-						grant.Context.CIReady = f.PRExists && f.CIGreen && !f.Merged
-					}
-				}
-				// Repo provisioning hints (§7.4): only for build jobs that carry a
-				// base_sha and only when a local mirror is configured.
-				if s.mirrorPath != "" && j.BaseSHA != "" {
-					if s.bundleProvisioning {
-						// F3 cross-box `bundle`: the worker gets NO mirror path and NO push
-						// target — it fetches a read-only bundle from /v1/bundle, returns a
-						// diff, and Flowbee applies the patch + pushes the epoch ref itself.
-						// The worker holds no GitHub credential and never touches git writes.
-						grant.Provisioning = "bundle"
-					} else {
-						// same-box `worktree`: the worker adds a per-lease worktree off the
-						// shared mirror and pushes the epoch ref locally (no creds either).
-						grant.Provisioning = "worktree"
-						grant.MirrorPath = s.mirrorPath
-						grant.PushTarget = gitops.EpochRef(cand.JobID, ls.Epoch)
-					}
-				}
+				grant := s.leaseGrantForJob(r.Context(), cand.JobID, j, identity, family, lens, role, reviewing, resolvingConflict,
+					ls.LeaseID, ls.Epoch, ls.Deadline, false)
 				writeJSON(w, http.StatusOK, grant)
 				return
 			}
@@ -1256,6 +1187,103 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(s.pollInterval):
 		}
 	}
+}
+
+func truthyQuery(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "t", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, identity, family, lens string, role job.Role, reviewing, resolvingConflict bool, leaseID string, leaseEpoch int, leaseDeadline time.Time, dryRun bool) LeaseGrant {
+	grant := LeaseGrant{
+		JobID: jobID, Kind: string(j.Kind), Role: string(j.Role),
+		BaseSHA: j.BaseSHA, LeaseID: leaseID, LeaseEpoch: leaseEpoch,
+		LeaseTTLS: int(s.leaseTTL / time.Second), Deadline: leaseDeadline.Format(time.RFC3339Nano),
+		DryRun: dryRun, SpecContentHash: j.SpecContentHash, SpecVersion: j.SpecVersion,
+	}
+	// F1: ship the self-contained context block (§B). Identity/lens are the
+	// CREDENTIAL-BOUND resolved values (the fence): the worker acts AS this
+	// identity and cannot choose another. The bound_lens persisted at claim
+	// time wins over the self-asserted query param when present.
+	ctxLens := lens
+	if j.BoundLens != "" {
+		ctxLens = j.BoundLens
+	}
+	grant.Context = &LeaseContext{
+		Identity: identity, ModelFamily: family, Lens: ctxLens, Role: string(j.Role),
+		BaseSHA:             j.BaseSHA,
+		Task:                j.TaskText,
+		Spec:                j.SpecText,
+		AcceptanceCriteria:  j.AcceptanceCriteria,
+		PriorVerdict:        j.Verdict,
+		PriorReviewFindings: j.LastReviewNotes,
+	}
+	// the per-issue branch the node commits to (worker-push): builds + reviews
+	// both target it. Resolved from the job's bound issue (adopted) or its spec
+	// ancestor's materialized issue. Empty until an issue is bound.
+	if reviewing || role == job.RoleEngWorker || resolvingConflict {
+		grant.Context.IssueBranch = store.IssueBranch(s.store.ResolveIssueNum(ctx, jobID), jobID)
+		// a build that has bounced is a re-attempt after a CI failure / changes
+		// requested — tell the agent to fix what broke, not re-submit.
+		if role == job.RoleEngWorker && j.Bounces > 0 {
+			grant.Context.Rebuild = true
+		}
+		// F9: tell the (fungible) worker which repo this job belongs to so
+		// worker-push targets the right remote. Resolve the job's repo scope to
+		// its clone/push URL from the registry; the worker auths with its own
+		// git credential. Empty repo => single-repo deployment (worker uses its
+		// configured --repo-url).
+		if j.Repo != "" {
+			if rp, rerr := s.store.GetRepo(ctx, j.Repo); rerr == nil {
+				grant.Context.RepoURL = workerRepoURL(rp.Owner, rp.Repo, s.workerGitSSH)
+			}
+		}
+	}
+	// a code_reviewer judges the actual change: ship the build patch so its
+	// agent reads the diff (the review harness writes .flowbee/diff.patch),
+	// and ship CIReady so the harness skips until reconciled CI is green
+	// (an approval before then can't mint — it would bounce + rebuild-thrash).
+	// a conflict_resolver re-applies the job's ORIGINAL change on the CURRENT
+	// main (a sibling merged into the same area). Ship that original build patch
+	// as the Diff and flag Conflict so the resolver brief tells the agent to
+	// reconcile its intent with the current code — NOT to re-run the original
+	// task, whose target may no longer exist (which is the conflict).
+	if resolvingConflict {
+		if d, derr := s.store.JobPatchDiff(ctx, jobID); derr == nil {
+			grant.Context.Diff = d
+		}
+		grant.Context.Conflict = true
+	}
+	if reviewing {
+		if d, derr := s.store.JobPatchDiff(ctx, jobID); derr == nil {
+			grant.Context.Diff = d
+		}
+		if f, _, ferr := s.facts.Facts(ctx, jobID); ferr == nil {
+			grant.Context.CIReady = f.PRExists && f.CIGreen && !f.Merged
+		}
+	}
+	// Repo provisioning hints (§7.4): only for build jobs that carry a
+	// base_sha and only when a local mirror is configured.
+	if s.mirrorPath != "" && j.BaseSHA != "" {
+		if s.bundleProvisioning {
+			// F3 cross-box `bundle`: the worker gets NO mirror path and NO push
+			// target — it fetches a read-only bundle from /v1/bundle, returns a
+			// diff, and Flowbee applies the patch + pushes the epoch ref itself.
+			// The worker holds no GitHub credential and never touches git writes.
+			grant.Provisioning = "bundle"
+		} else {
+			// same-box `worktree`: the worker adds a per-lease worktree off the
+			// shared mirror and pushes the epoch ref locally (no creds either).
+			grant.Provisioning = "worktree"
+			grant.MirrorPath = s.mirrorPath
+			grant.PushTarget = gitops.EpochRef(jobID, leaseEpoch)
+		}
+	}
+	return grant
 }
 
 // workerRepoURL builds the per-job clone/push URL the lease ships to a worker. SSH

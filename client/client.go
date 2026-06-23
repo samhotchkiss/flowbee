@@ -115,6 +115,7 @@ type LeaseGrant struct {
 	LeaseEpoch   int    `json:"lease_epoch"`
 	LeaseTTLS    int    `json:"lease_ttl_s"`
 	Deadline     string `json:"lease_deadline"`
+	DryRun       bool   `json:"dry_run,omitempty"`
 	Provisioning string `json:"provisioning"`
 	MirrorPath   string `json:"mirror_path"`
 	PushTarget   string `json:"push_target"`
@@ -188,6 +189,15 @@ func (c *Client) Lease(ctx context.Context, identity, family, role string) (Leas
 // LeaseWithLens long-polls carrying the worker's lens (the §5.5 distinct-lens
 // anti-affinity input for spec_review). ok=false means a 204.
 func (c *Client) LeaseWithLens(ctx context.Context, identity, family, role, lens string) (LeaseGrant, bool, error) {
+	return c.leaseWithLens(ctx, identity, family, role, lens, false)
+}
+
+// LeaseDryRun returns the grant that would be offered without claiming the job.
+func (c *Client) LeaseDryRun(ctx context.Context, identity, family, role string) (LeaseGrant, bool, error) {
+	return c.leaseWithLens(ctx, identity, family, role, "", true)
+}
+
+func (c *Client) leaseWithLens(ctx context.Context, identity, family, role, lens string, dryRun bool) (LeaseGrant, bool, error) {
 	q := url.Values{}
 	q.Set("identity", identity)
 	q.Set("model_family", family)
@@ -199,6 +209,9 @@ func (c *Client) LeaseWithLens(ctx context.Context, identity, family, role, lens
 	}
 	if lens != "" {
 		q.Set("lens", lens)
+	}
+	if dryRun {
+		q.Set("dry_run", "1")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/v1/lease?"+q.Encode(), nil)
 	if err != nil {

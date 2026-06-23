@@ -66,6 +66,34 @@ func TestControlGlobalPause(t *testing.T) {
 	}
 }
 
+func TestLeaseDryRunDoesNotClaim(t *testing.T) {
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t)
+	seedReady(t, st, "j", "", clk.Now())
+
+	grant, ok, err := c.LeaseDryRun(ctx, "w", "codex", "")
+	if err != nil || !ok {
+		t.Fatalf("dry-run lease: ok=%v err=%v", ok, err)
+	}
+	if grant.JobID != "j" || !grant.DryRun {
+		t.Fatalf("dry-run grant = job %q dry=%v, want j/true", grant.JobID, grant.DryRun)
+	}
+	if grant.LeaseID != "dry-run" || grant.LeaseEpoch != 1 {
+		t.Fatalf("dry-run lease fields id=%q epoch=%d, want dry-run/1", grant.LeaseID, grant.LeaseEpoch)
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateReady || j.LeaseEpoch != 0 || j.LeaseID != "" {
+		t.Fatalf("dry-run mutated job: state=%s epoch=%d lease=%q", j.State, j.LeaseEpoch, j.LeaseID)
+	}
+
+	realGrant, ok, err := c.Lease(ctx, "w", "codex", "")
+	if err != nil || !ok || realGrant.JobID != "j" || realGrant.DryRun {
+		t.Fatalf("real lease after dry-run: ok=%v job=%q dry=%v err=%v", ok, realGrant.JobID, realGrant.DryRun, err)
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateLeased || j.LeaseEpoch != 1 || j.LeaseID == "" {
+		t.Fatalf("real lease did not claim job: state=%s epoch=%d lease=%q", j.State, j.LeaseEpoch, j.LeaseID)
+	}
+}
+
 // TestControlPerRepoPause: parking ONE repo drops its jobs from the lease queue while every
 // other repo keeps flowing — the "pause all russ jobs" case, leaving flowbee untouched.
 func TestControlPerRepoPause(t *testing.T) {

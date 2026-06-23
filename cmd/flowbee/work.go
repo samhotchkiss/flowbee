@@ -272,12 +272,22 @@ func runLease(args []string) error {
 	identity := fs.String("identity", envOr("FLOWBEE_IDENTITY", "modeb"), "worker identity")
 	family := fs.String("model-family", envOr("FLOWBEE_MODEL_TAG", "stub"), "model family tag")
 	role := fs.String("role", "", "role filter")
+	dryRun := fs.Bool("dry-run", false, "preview the lease grant without claiming the task")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
 	c := client.NewWithToken(url, os.Getenv("FLOWBEE_WORKER_TOKEN"))
-	grant, ok, err := c.Lease(context.Background(), *identity, *family, *role)
+	var (
+		grant client.LeaseGrant
+		ok    bool
+		err   error
+	)
+	if *dryRun {
+		grant, ok, err = c.LeaseDryRun(context.Background(), *identity, *family, *role)
+	} else {
+		grant, ok, err = c.Lease(context.Background(), *identity, *family, *role)
+	}
 	if err != nil {
 		return err
 	}
