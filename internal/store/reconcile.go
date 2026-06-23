@@ -559,7 +559,14 @@ func (s *Store) RefreshStaleReadyBuilds(ctx context.Context, repo, mainTip strin
 func (s *Store) JobIDForPR(ctx context.Context, prNumber int) (string, bool, error) {
 	var id string
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT id FROM jobs WHERE pr_number = ? LIMIT 1`, prNumber).Scan(&id)
+		`SELECT id FROM jobs
+		  WHERE pr_number = ?
+		  ORDER BY CASE
+		    WHEN state IN ('ready','leased','building','review_pending','code_review',
+		                   'mergeable','merging','merge_handoff','resolving_conflict') THEN 0
+		    ELSE 1
+		  END, updated_at DESC, id DESC
+		  LIMIT 1`, prNumber).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}

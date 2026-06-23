@@ -367,6 +367,43 @@ func TestUnboundPRNoOp(t *testing.T) {
 	}
 }
 
+func TestJobIDForPRPrefersActiveBinding(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "old-cancelled", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, BaseSHA: "old", Now: now,
+	}); err != nil {
+		t.Fatalf("seed old: %v", err)
+	}
+	if err := st.BindPRNumber(ctx, "old-cancelled", 3000); err != nil {
+		t.Fatalf("bind old: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='cancelled', updated_at=? WHERE id='old-cancelled'`, now.Add(time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("cancel old: %v", err)
+	}
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "active-review", Kind: job.KindBuild, Flow: "build", Stage: "review",
+		Role: job.RoleCodeReviewer, BaseSHA: "new", Now: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("seed active: %v", err)
+	}
+	if err := st.BindPRNumber(ctx, "active-review", 3000); err != nil {
+		t.Fatalf("bind active: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='review_pending', updated_at=? WHERE id='active-review'`, now.Add(2*time.Minute).Format(time.RFC3339)); err != nil {
+		t.Fatalf("activate review: %v", err)
+	}
+
+	id, ok, err := st.JobIDForPR(ctx, 3000)
+	if err != nil || !ok || id != "active-review" {
+		t.Fatalf("PR 3000 -> %q ok=%v err=%v (want active-review)", id, ok, err)
+	}
+}
+
 func mustJSON(t *testing.T, v any) string {
 	t.Helper()
 	b, err := json.Marshal(v)

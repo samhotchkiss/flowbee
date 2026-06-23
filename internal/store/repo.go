@@ -122,12 +122,19 @@ func (s *Store) SetRepoActive(ctx context.Context, id string, active bool) error
 // (F9): PR numbers are repo-scoped, so the per-repo reconcile sweep must bind its
 // swept PRs only to its own repo's jobs — #1000 in repo A never binds to #1000 in
 // repo B. ok=false if no job in that repo is bound to the PR. An empty repo scopes
-// to the legacy single-repo (repo='') jobs, so the pre-F9 JobIDForPR path is the
+// to the legacy single-repo (repo=”) jobs, so the pre-F9 JobIDForPR path is the
 // degenerate single-repo case of this one.
 func (s *Store) JobIDForPRInRepo(ctx context.Context, repo string, prNumber int) (string, bool, error) {
 	var id string
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT id FROM jobs WHERE repo = ? AND pr_number = ? LIMIT 1`, repo, prNumber).Scan(&id)
+		`SELECT id FROM jobs
+		  WHERE repo = ? AND pr_number = ?
+		  ORDER BY CASE
+		    WHEN state IN ('ready','leased','building','review_pending','code_review',
+		                   'mergeable','merging','merge_handoff','resolving_conflict') THEN 0
+		    ELSE 1
+		  END, updated_at DESC, id DESC
+		  LIMIT 1`, repo, prNumber).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
