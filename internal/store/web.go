@@ -20,11 +20,11 @@ import (
 // timer reads UpdatedAt (when the card last entered its current stage projection)
 // against `now` at render time (gray -> amber -> red).
 type BoardCard struct {
-	JobID         string    `json:"job_id"`
-	Kind          string    `json:"kind"`
-	Stage         string    `json:"stage"`
-	State         string    `json:"state"`
-	Role          string    `json:"role"`
+	JobID string `json:"job_id"`
+	Kind  string `json:"kind"`
+	Stage string `json:"stage"`
+	State string `json:"state"`
+	Role  string `json:"role"`
 	// Repo is the F9 repo-scope handle (the repos.id this card's job belongs to).
 	// Empty is the legacy single-repo default. The board's repo filter chips are the
 	// distinct non-empty values, and ?repo=<id> keeps only the matching cards.
@@ -42,6 +42,10 @@ type BoardCard struct {
 	// StageEntered). The UI maps it to the gray->amber->red per-card timer; surfaced
 	// here too so a non-JS client still sees the age.
 	StageAgeS int `json:"stage_age_s"`
+	// CILabel/CIClass summarize the reconciled CI fact Flowbee already has for a
+	// PR-backed card. The board renders it as a compact chip without calling GitHub.
+	CILabel string `json:"ci_label,omitempty"`
+	CIClass string `json:"ci_class,omitempty"`
 }
 
 // BoardCards returns every tracked job as a rich board card (F12 board view).
@@ -61,9 +65,13 @@ func (s *Store) BoardCards(ctx context.Context, now time.Time) ([]BoardCard, err
 		       COALESCE(j.task_text,''), COALESCE(j.spec_text,''),
 		       j.priority, COALESCE(j.needs_full_spec,0), j.lease_epoch,
 		       COALESCE(j.repo,''),
+		       COALESCE(j.ci_running,0),
+		       COALESCE(f.pr_exists,0), COALESCE(f.ci_green,0), COALESCE(f.merged,0),
+		       COALESCE(f.is_draft,0),
 		       COALESCE((SELECT MAX(e.created_at) FROM job_events e
 		                  WHERE e.job_id = j.id AND e.to_state = j.state), j.updated_at)
 		  FROM jobs j
+		  LEFT JOIN domain_b_facts f ON f.job_id = j.id
 		 WHERE j.state NOT IN ('quiescent','cancelled')
 		 ORDER BY j.updated_at DESC, j.id ASC`)
 	if err != nil {
@@ -74,15 +82,18 @@ func (s *Store) BoardCards(ctx context.Context, now time.Time) ([]BoardCard, err
 	for rows.Next() {
 		var c BoardCard
 		var isEpic, needs int
+		var ciRunning, prExists, ciGreen, merged, isDraft int
 		var task, spec, entered string
 		if err := rows.Scan(&c.JobID, &c.Kind, &c.Stage, &c.State, &c.Role, &c.Identity,
 			&c.IssueNumber, &c.EpicID, &isEpic, &task, &spec,
-			&c.Priority, &needs, &c.LeaseEpoch, &c.Repo, &entered); err != nil {
+			&c.Priority, &needs, &c.LeaseEpoch, &c.Repo,
+			&ciRunning, &prExists, &ciGreen, &merged, &isDraft, &entered); err != nil {
 			return nil, err
 		}
 		c.IsEpic = isEpic != 0
 		c.NeedsFullSpec = needs != 0
 		c.Title = cardTitle(task, spec, c.JobID)
+		c.CILabel, c.CIClass = boardCIChip(c.State, prExists, ciGreen, merged, ciRunning, isDraft)
 		if ts, perr := time.Parse(rfc3339, entered); perr == nil {
 			c.StageEntered = ts
 			age := now.Sub(ts)
@@ -94,6 +105,40 @@ func (s *Store) BoardCards(ctx context.Context, now time.Time) ([]BoardCard, err
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func boardCIChip(state string, prExists, ciGreen, merged, ciRunning, isDraft int) (string, string) {
+	if !showBoardCI(state) || prExists == 0 {
+		return "", ""
+	}
+	if merged != 0 {
+		return "CI merged", "merged"
+	}
+	if isDraft != 0 {
+		return "CI draft", "waiting"
+	}
+	if ciGreen != 0 {
+		return "CI green", "green"
+	}
+	if ciRunning != 0 {
+		return "CI running", "running"
+	}
+	return "CI not green", "waiting"
+}
+
+func showBoardCI(state string) bool {
+	switch state {
+	case string(job.StateReviewPending),
+		string(job.StateCodeReview),
+		string(job.StateMergeable),
+		string(job.StateMerging),
+		string(job.StateMergeHandoff),
+		string(job.StateResolvingConflict),
+		string(job.StateDone):
+		return true
+	default:
+		return false
+	}
 }
 
 // cardTitle derives a short human title for a card: first non-empty line of the

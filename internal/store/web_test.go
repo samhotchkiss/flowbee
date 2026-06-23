@@ -103,3 +103,36 @@ func TestBoardCardsStageTimerDeterministic(t *testing.T) {
 		t.Fatalf("stage age = %ds, want 2400 (40m folded from the ready event)", c.StageAgeS)
 	}
 }
+
+func TestBoardCardsExposeCIState(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 16, 9, 0, 0, 0, time.UTC)
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "review-1", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, TaskText: "review me", Now: now,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `
+		UPDATE jobs SET state='review_pending', stage='review', pr_number=42 WHERE id='review-1'`); err != nil {
+		t.Fatalf("move to review_pending: %v", err)
+	}
+	if err := st.UpsertDomainBFacts(ctx, "review-1", job.DomainBFacts{
+		PRExists: true, PRNumber: 42, HeadSHA: "head", BaseSHA: "base", CIGreen: true,
+	}); err != nil {
+		t.Fatalf("facts: %v", err)
+	}
+
+	cards, err := st.BoardCards(ctx, now)
+	if err != nil {
+		t.Fatalf("board cards: %v", err)
+	}
+	if len(cards) != 1 {
+		t.Fatalf("want 1 card, got %d", len(cards))
+	}
+	if cards[0].CILabel != "CI green" || cards[0].CIClass != "green" {
+		t.Fatalf("ci chip = %q/%q, want CI green/green", cards[0].CILabel, cards[0].CIClass)
+	}
+}

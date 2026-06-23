@@ -52,6 +52,7 @@
     {{if .IssueNumber}}<span class="chip">#{{.IssueNumber}}</span>{{end}}
     {{if .Identity}}<span class="chip ident">{{.Identity}}</span>{{end}}
     {{if .NeedsFullSpec}}<span class="chip">needs-spec</span>{{end}}
+    {{if .CILabel}}<span class="chip ci {{.CIClass}}">{{.CILabel}}</span>{{end}}
     <span class="timer {{.TimerClass}}">{{hms .StageAgeS}}</span>
   </div>
 </article>

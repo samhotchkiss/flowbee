@@ -84,6 +84,26 @@ func TestF12DashboardsRenderOffRealStore(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed backlog: %v", err)
 	}
+	// a PR-backed review card with CI still running, so the board exposes the
+	// reconciled CI state inline instead of making the operator open GitHub.
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "review-1", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, TaskText: "Review the widget branch", Now: now,
+	}); err != nil {
+		t.Fatalf("seed review job: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `
+		UPDATE jobs SET state='review_pending', stage='review', pr_number=123 WHERE id='review-1'`); err != nil {
+		t.Fatalf("move review job: %v", err)
+	}
+	if err := st.UpsertDomainBFacts(ctx, "review-1", job.DomainBFacts{
+		PRExists: true, PRNumber: 123, HeadSHA: "head", BaseSHA: "base",
+	}); err != nil {
+		t.Fatalf("seed review facts: %v", err)
+	}
+	if err := st.MarkCIRunning(ctx, "review-1", true, now); err != nil {
+		t.Fatalf("mark ci running: %v", err)
+	}
 
 	// register a worker box (the Fleet view) with per-model slots + named accounts,
 	// then report usage that pushes one account over its ceiling (the rollover state).
@@ -114,18 +134,20 @@ func TestF12DashboardsRenderOffRealStore(t *testing.T) {
 		t.Fatalf("/board status = %d", code)
 	}
 	for _, want := range []string{
-		"Board",                  // pane title
-		"⚠ Needs-you",            // the needs-you bucket
+		"Board",                            // pane title
+		"⚠ Needs-you",                      // the needs-you bucket
 		"Spec", "Build", "Review", "Merge", // the five top-level buckets (always rendered)
-		"class=\"bucket",         // the bucket containers
-		"data-job=\"build-1\"",   // a real card from the store (under the Build bucket)
-		"🐝",                      // the per-project marker (bee = flowbee/default)
-		"class=\"timer red\"",    // the per-card stage timer (45m in stage => red)
-		"box-a",                  // the bound identity chip
-		"/assets/board.js",       // the live SSE hook script (EventSource) is wired
-		"class=\"live\"",         // the live-connection indicator in the nav
-		"id=\"fb-drawer\"",       // the detail drawer shell (does not dim the board)
-		"href=\"/fleet\"",        // shared nav
+		"class=\"bucket",       // the bucket containers
+		"data-job=\"build-1\"", // a real card from the store (under the Build bucket)
+		"🐝",                    // the per-project marker (bee = flowbee/default)
+		"class=\"timer red\"",  // the per-card stage timer (45m in stage => red)
+		"box-a",                // the bound identity chip
+		"CI running",           // PR-backed cards expose reconciled CI state
+		"chip ci running",
+		"/assets/board.js", // the live SSE hook script (EventSource) is wired
+		"class=\"live\"",   // the live-connection indicator in the nav
+		"id=\"fb-drawer\"", // the detail drawer shell (does not dim the board)
+		"href=\"/fleet\"",  // shared nav
 		"href=\"/dashboard\"",
 	} {
 		if !strings.Contains(body, want) {
@@ -144,13 +166,13 @@ func TestF12DashboardsRenderOffRealStore(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Fleet",
-		"mac-studio",                 // the box host
-		"claude",                     // the model family
-		"class=\"pip busy\"",         // a busy slot pip (the live build)
+		"mac-studio",                      // the box host
+		"claude",                          // the model family
+		"class=\"pip busy\"",              // a busy slot pip (the live build)
 		"data-account=\"claude-primary\"", // the account usage gauge
-		"class=\"ceiling\"",          // the ceiling line on the gauge
-		"rollover",                   // the over-ceiling rollover badge
-		"build-1",                    // the live concurrent job on the box
+		"class=\"ceiling\"",               // the ceiling line on the gauge
+		"rollover",                        // the over-ceiling rollover badge
+		"build-1",                         // the live concurrent job on the box
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("/fleet missing %q\n---\n%s", want, body)
@@ -175,11 +197,11 @@ func TestF12DashboardsRenderOffRealStore(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Stages",        // the per-stage section
-		"ENTERED",        // absolute enter time label
-		"LEFT",           // absolute leave time label
-		"Build history",  // the build-history timeline
-		"Lease claimed",  // a real timeline note folded from the ledger
-		"2026-06-16",     // an absolute timestamp from the seeded events
+		"ENTERED",       // absolute enter time label
+		"LEFT",          // absolute leave time label
+		"Build history", // the build-history timeline
+		"Lease claimed", // a real timeline note folded from the ledger
+		"2026-06-16",    // an absolute timestamp from the seeded events
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("/board/detail missing %q\n---\n%s", want, body)
@@ -227,8 +249,8 @@ func TestBoardRepoFilter(t *testing.T) {
 	}
 	for _, want := range []string{
 		"data-job=\"alpha-1\"", "data-job=\"beta-1\"",
-		"class=\"repo-chip active\"",        // the "All" chip is active by default
-		"href=\"/board?repo=alpha\"",        // a chip link per repo
+		"class=\"repo-chip active\"", // the "All" chip is active by default
+		"href=\"/board?repo=alpha\"", // a chip link per repo
 		"href=\"/board?repo=beta\"",
 	} {
 		if !strings.Contains(body, want) {
