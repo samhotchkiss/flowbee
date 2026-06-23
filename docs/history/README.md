@@ -11,6 +11,7 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KV9SE2XPW8ABF9HRHDN4DXXP-build`](./01KV9SE2XPW8ABF9HRHDN4DXXP-build.md) | # Spec: `flowbee board` CLI subcommand | done | — | #42 | 2026-06-17T04:18:19Z |
 | [`01KV9XGCFH3ZQZ2S7PCV49NY28`](./01KV9XGCFH3ZQZ2S7PCV49NY28.md) | 01KV9XGCFH3ZQZ2S7PCV49NY28 | done | #44 | — | 2026-06-17T04:45:11Z |
 | [`01KV9XGCFH3ZQZ2S7PCV49NY28-build`](./01KV9XGCFH3ZQZ2S7PCV49NY28-build.md) | # Spec: Operator troubleshooting quick-reference | done | — | #45 | 2026-06-17T04:49:56Z |
+| [`01KV9ZKF8PB5304JG5Q3BX1CMW`](./01KV9ZKF8PB5304JG5Q3BX1CMW.md) | openrouter-runtime: retry + error classification in Client.Chat | done | — | #2233 | 2026-06-23T03:20:06Z |
 | [`01KV9ZQESQQPB7KA778RSS8KM1`](./01KV9ZQESQQPB7KA778RSS8KM1.md) | # Epic decomposition | done | — | — | 2026-06-17T05:09:56Z |
 | [`01KV9ZQESQQPB7KA778VSAMBM9`](./01KV9ZQESQQPB7KA778VSAMBM9.md) | Add docs/architecture-overview.md — a one-page map of Flowbee: control plane vs workers, the two domains (reconcile-in / project-out), the lease/epoch fencing, and the gate. DOCS-ONLY: create only docs/architecture-overview.md, link from README docs list. No Go code. | done | #50 | — | 2026-06-17T05:11:36Z |
 | [`01KV9ZQESQQPB7KA778VSAMBM9-build`](./01KV9ZQESQQPB7KA778VSAMBM9-build.md) | # Spec: Architecture Overview Doc | done | — | #52 | 2026-06-17T05:24:56Z |
@@ -88,6 +89,7 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVF137T6AYJ5YKZQNWSNR8SE`](./01KVF137T6AYJ5YKZQNWSNR8SE.md) | Add a 'flowbee status' command — one-glance operator summary | done | — | #179 | 2026-06-19T04:24:16Z |
 | [`01KVF1GQYMPD587D9NKZX6GJ7W-build`](./01KVF1GQYMPD587D9NKZX6GJ7W-build.md) | # ApprovalQueue — Three Generic UI Fixes | done | — | #2299 | 2026-06-19T12:59:31Z |
 | [`01KVF1VPW44BVNA2399VCCYJTS`](./01KVF1VPW44BVNA2399VCCYJTS.md) | 01KVF1VPW44BVNA2399VCCYJTS | done | #2298 | — | 2026-06-19T04:24:11Z |
+| [`01KVF1VPW44BVNA2399VCCYJTS-build`](./01KVF1VPW44BVNA2399VCCYJTS-build.md) | # Spec: ApprovalQueueContext — post-resolution refresh & Brief sync | done | — | #2300 | 2026-06-23T03:14:51Z |
 | [`01KVF2NXYEDPTHQ2PXNMP4RBY7-build`](./01KVF2NXYEDPTHQ2PXNMP4RBY7-build.md) | # Spec: Fix scoping_review False-Positive When Worker Is Seated | done | — | #2304 | 2026-06-19T13:01:46Z |
 | [`01KVF2NXZV9H9Q42Q4ZB1EM32Y-build`](./01KVF2NXZV9H9Q42Q4ZB1EM32Y-build.md) | # Spec: work_review reject carries note to writer rework | done | — | #2303 | 2026-06-19T13:27:34Z |
 | [`01KVF3JHWTEN2TS9YJCAGMC2YP`](./01KVF3JHWTEN2TS9YJCAGMC2YP.md) | 01KVF3JHWTEN2TS9YJCAGMC2YP | done | — | — | 2026-06-19T04:54:06Z |
@@ -98,8 +100,10 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVFZBX849TKC89SZ4TEYWTN6`](./01KVFZBX849TKC89SZ4TEYWTN6.md) | 01KVFZBX849TKC89SZ4TEYWTN6 | done | #2307 | — | 2026-06-19T13:01:15Z |
 | [`01KVG7AD7B30JEET7KAPY5NZFT`](./01KVG7AD7B30JEET7KAPY5NZFT.md) | Instant approval-queue refresh after resolve without clobbering optimistic state (re-do #2300 correctly) | done | — | #2319 | 2026-06-19T16:01:26Z |
 | [`01KVG7AD7CHX221SJH70NX5K19`](./01KVG7AD7CHX221SJH70NX5K19.md) | Activity log: dark-native surface + contrast fix | done | — | #2318 | 2026-06-19T16:00:41Z |
+| [`01KVG7AD7CHX221SJH75E9MQP6`](./01KVG7AD7CHX221SJH75E9MQP6.md) | Speed up internal/chat (and all RLS) tests via a migrated template schema/database | done | — | #2321 | 2026-06-22T17:30:00Z |
 | [`01KVG9EVWJEB2PKBRW9N75VNMG`](./01KVG9EVWJEB2PKBRW9N75VNMG.md) | Add `flowbee version --json` for machine-readable version output | done | — | #187 | 2026-06-19T16:04:25Z |
 | [`01KVGA8081TEF65K9KCHRDATX9`](./01KVGA8081TEF65K9KCHRDATX9.md) | 01KVGA8081TEF65K9KCHRDATX9 | done | #188 | — | 2026-06-19T16:09:29Z |
+| [`01KVGAPX3SYSMRNVP9BA6V9Q8P`](./01KVGAPX3SYSMRNVP9BA6V9Q8P.md) | Activity log: human narrative — humanize event types, resolve actor name/role, kill the double-emit | done | — | #2331 | 2026-06-22T17:30:00Z |
 | [`01KVGB3PRY6MFGTK2CJWMXWR85`](./01KVGB3PRY6MFGTK2CJWMXWR85.md) | 01KVGB3PRY6MFGTK2CJWMXWR85 | done | #190 | — | 2026-06-19T16:25:04Z |
 | [`01KVGB3PRY6MFGTK2CJWMXWR85-build`](./01KVGB3PRY6MFGTK2CJWMXWR85-build.md) | # Spec: Log per-repo merge/archive policy at startup | done | — | #191 | 2026-06-19T16:34:29Z |
 | [`01KVGG94SPY131E5YMKCB3VD7W`](./01KVGG94SPY131E5YMKCB3VD7W.md) | Conflict escalation card: render the specific claim + two decision buttons | done | — | #2336 | 2026-06-20T03:54:48Z |
@@ -126,6 +130,13 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVKC3GN95C0HXG8PN7310BB1-build`](./01KVKC3GN95C0HXG8PN7310BB1-build.md) | # Spec: Prometheus Alert Rules for Flowbee Metrics | done | — | #223 | 2026-06-20T20:55:02Z |
 | [`01KVKC3GN95C0HXG8PNASFT57A`](./01KVKC3GN95C0HXG8PNASFT57A.md) | Document the alerting rules: add an Alerting Rules section to docs/metrics.md that references deploy/prometheus-rules.yml, explains what each alert fires on and why it matters operationally, and how to tune the thresholds for repo size / merge volume / fleet size. Cross-link the new section from the observability area of docs/operating.md. This is a DOCS-only task: change no source under internal/ or cmd/. | done | #221 | — | 2026-06-20T20:40:26Z |
 | [`01KVKC3GN95C0HXG8PNASFT57A-build`](./01KVKC3GN95C0HXG8PNASFT57A-build.md) | # Spec: Document Prometheus Alerting Rules | done | — | #224 | 2026-06-20T20:55:02Z |
+| [`01KVME7T4DVG34SK6ABR70G1JD`](./01KVME7T4DVG34SK6ABR70G1JD.md) | Approval card UX: short summary + the email, not the full prompt — deep context behind click-through | done | — | #2405 | 2026-06-22T17:30:00Z |
+| [`01KVME7T4EYP58X4YM0P70B6AA`](./01KVME7T4EYP58X4YM0P70B6AA.md) | Six-stage flow mints a spurious actor_unavailable card at every sam_review (human gate) | done | — | #2404 | 2026-06-22T17:30:00Z |
+| [`01KVNG62Q9RZCDG5RTS83NSMYH`](./01KVNG62Q9RZCDG5RTS83NSMYH.md) | calendar: subscribed-calendars frontend (manage feeds + read-only event render) | done | — | #2463 | 2026-06-22T18:31:22Z |
+| [`01KVNKABAYGANHJA8G7XT3R4EA`](./01KVNKABAYGANHJA8G7XT3R4EA.md) | Vision/epic: Russell agent builds custom datastore dashboards on request (NL → saved view/dashboard) | done | — | #2464 | 2026-06-22T21:32:06Z |
+| [`01KVPAXN6N6C40CCZAPKKD8WHR`](./01KVPAXN6N6C40CCZAPKKD8WHR.md) | datastore.record.update is a full REPLACE, not a merge — partial payloads silently drop fields (CRM enrichment footgun) | done | — | #2453 | 2026-06-22T18:03:48Z |
+| [`01KVRBDVJ6GJ1Y3EACKES95VDT`](./01KVRBDVJ6GJ1Y3EACKES95VDT.md) | Spec/grounding change should pull affected in-flight drafts from the human brief until re-processed | done | — | #2486 | 2026-06-22T21:23:06Z |
+| [`01KVSEX91XAYJ6HYV5NHQSD06C`](./01KVSEX91XAYJ6HYV5NHQSD06C.md) | merge: transient 405 "required status check is expected" dead-letters as permanent -> mergeable PRs strand in needs_human | done | — | #227 | 2026-06-23T05:59:33Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
