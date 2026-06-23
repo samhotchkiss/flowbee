@@ -81,7 +81,7 @@ func runOutbox(args []string) error {
 
 	fmt.Printf("\n%d actionable, %d benign (done/cancelled job — dropped write no longer matters)\n", actionable, benign)
 	if actionable > 0 {
-		fmt.Println("actionable: fix the cause, then `flowbee retry-outbox <job-id>` to re-arm a job's writes")
+		fmt.Println("actionable: fix the cause, then `flowbee retry-outbox <job-id>` or `flowbee retry-outbox --repo <repo-id>` / `--all` to re-arm writes")
 	}
 	if benign > 0 && !*all {
 		fmt.Println("re-run with --all to also list the benign abandons")

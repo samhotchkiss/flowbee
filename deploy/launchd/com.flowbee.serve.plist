@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.flowbee.serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/share/flowbee/launch/flowbee-serve.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FLOWBEE_SERVE_ENV</key>
+    <string>/Users/sam/.flowbee/serve.env</string>
+    <key>FLOWBEE_BIN</key>
+    <string>/usr/local/bin/flowbee</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/flowbee-serve.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/flowbee-serve.launchd.err</string>
+</dict>
+</plist>
+

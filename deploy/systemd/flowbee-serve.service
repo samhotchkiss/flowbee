@@ -1,0 +1,16 @@
+[Unit]
+Description=Flowbee control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=FLOWBEE_SERVE_ENV=%h/.flowbee/serve.env
+Environment=FLOWBEE_BIN=/usr/local/bin/flowbee
+ExecStart=/usr/local/share/flowbee/launch/flowbee-serve.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+

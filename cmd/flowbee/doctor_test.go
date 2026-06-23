@@ -2,8 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -103,5 +106,29 @@ func TestDoctorJSONWinsOverQuiet(t *testing.T) {
 	var checks []map[string]interface{}
 	if err := json.Unmarshal([]byte(out), &checks); err != nil {
 		t.Fatalf("--json --quiet should emit JSON, got: %q\nerr: %v", out, err)
+	}
+}
+
+func TestRunningConfigCheckUsesWorkerToken(t *testing.T) {
+	const token = "operator-token"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			http.Error(w, "missing auth", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"version":"test-version","pid":123,"database_url":"db","private_addr":":7070","allow_self_merge":true}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("FLOWBEE_URL", srv.URL)
+	t.Setenv("FLOWBEE_WORKER_TOKEN", token)
+
+	check := runningConfigCheck(t.Context())
+	if check.Status != "pass" {
+		t.Fatalf("running-config status=%s detail=%s", check.Status, check.Detail)
+	}
+	if !strings.Contains(check.Detail, "version=test-version") {
+		t.Fatalf("running config detail missing served config: %s", check.Detail)
 	}
 }

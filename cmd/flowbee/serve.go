@@ -239,6 +239,7 @@ func runServe(args []string) error {
 		// PauseMarkerPath: a file beside the live DB whose presence stops new leases.
 		// `flowbee pause` creates it; `flowbee resume` removes it; no server restart needed.
 		PauseMarkerPath: markerPath(cfg.DatabaseURL),
+		RunningConfig:   runningConfigSnapshot(cfg),
 	}, buildVersion())
 	if cfg.AllowSelfMerge {
 		logger.Info("autonomous merge enabled (Branch B): self_merge eligible jobs merge without a human gate")
@@ -655,6 +656,61 @@ func runServe(args []string) error {
 	default:
 	}
 	return bindErr
+}
+
+func runningConfigSnapshot(cfg config.Config) api.RunningConfig {
+	rc := api.RunningConfig{
+		ConfigPath:           runningConfigPath(),
+		DatabaseURL:          cfg.DatabaseURL,
+		PrivateAddr:          cfg.PrivateAddr,
+		HealthAddr:           cfg.HealthAddr,
+		WebhookAddr:          cfg.WebhookAddr,
+		AllowSelfMerge:       cfg.AllowSelfMerge,
+		RequiredReviewers:    cfg.RequiredReviewers,
+		MirrorPath:           os.Getenv("FLOWBEE_MIRROR_PATH"),
+		GitRemote:            os.Getenv("FLOWBEE_GIT_REMOTE"),
+		WorkerGitSSH:         strings.EqualFold(os.Getenv("FLOWBEE_GIT_REMOTE"), "ssh"),
+		BundleProvisioning:   os.Getenv("FLOWBEE_BUNDLE_PROVISIONING") != "",
+		GitHubTokenPresent:   os.Getenv("FLOWBEE_GITHUB_TOKEN") != "",
+		WebhookSecretPresent: os.Getenv("FLOWBEE_WEBHOOK_SECRET") != "",
+		WorkerAuthConfigured: cfg.WorkerAuthSecret != "",
+		InsecureWorkerAPI:    os.Getenv("FLOWBEE_INSECURE") != "",
+		AuthLoopbackBypass:   cfg.AuthLoopbackBypass,
+		LogPath:              os.Getenv("FLOWBEE_LOG_PATH"),
+		BackupDir:            envOr("FLOWBEE_BACKUP_DIR", defaultBackupDir()),
+		ReconcileIntervalEnv: os.Getenv("FLOWBEE_RECONCILE_INTERVAL_S"),
+		UnstickIntervalEnv:   os.Getenv("FLOWBEE_UNSTICK_INTERVAL_S"),
+		FlowbeeURL:           os.Getenv("FLOWBEE_URL"),
+	}
+	for _, r := range cfg.Repos {
+		tokenEnv := r.TokenEnv
+		if tokenEnv == "" {
+			tokenEnv = "FLOWBEE_GITHUB_TOKEN"
+		}
+		rc.Repos = append(rc.Repos, api.RunningConfigRepo{
+			ID: r.ID, Owner: r.Owner, Repo: r.Repo, DefaultBranch: r.DefaultBranch,
+			Active: r.IsActive(), TokenEnv: tokenEnv, TokenPresent: os.Getenv(tokenEnv) != "",
+			ArchiveHistory: r.ArchiveHistory, RequiredReviewers: r.RequiredReviewers,
+		})
+	}
+	if len(rc.Repos) == 0 && cfg.GithubOwner != "" && cfg.GithubRepo != "" {
+		rc.Repos = append(rc.Repos, api.RunningConfigRepo{
+			ID: "default", Owner: cfg.GithubOwner, Repo: cfg.GithubRepo,
+			DefaultBranch: cfg.GithubDefaultBranch, Active: true,
+			TokenEnv: "FLOWBEE_GITHUB_TOKEN", TokenPresent: os.Getenv("FLOWBEE_GITHUB_TOKEN") != "",
+		})
+	}
+	return rc
+}
+
+func runningConfigPath() string {
+	if p := os.Getenv("FLOWBEE_CONFIG"); p != "" {
+		return p
+	}
+	if _, err := os.Stat("flowbee.yaml"); err == nil {
+		return "flowbee.yaml"
+	}
+	return ""
 }
 
 // reexecSelf replaces the running process image with a fresh `flowbee serve` (same binary,

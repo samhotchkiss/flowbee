@@ -334,11 +334,14 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	c.Model = cfg.ModelLabel
-	if _, err := c.Register(ctx, client.Registration{
+	reg := client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
-	}); err != nil {
+	}
+	if resp, err := c.Register(ctx, reg); err != nil {
 		return HarnessOutcome{}, fmt.Errorf("register: %w", err)
+	} else {
+		reg.WorkerID = resp.WorkerID
 	}
 
 	grant, ok, err := c.Lease(ctx, cfg.Identity, cfg.ModelFamily, cfg.Role)
@@ -395,7 +398,7 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 		"FLOWBEE_ROLE="+grant.Role,
 	)
 	agentEnv = append(agentEnv, taskEnv...)
-	if err := runAgentHeartbeat(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
 		return out, err
 	}
 	// Normalize a self-committing agent: an agentic CLI (codex) may `git commit` its own
@@ -498,11 +501,14 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	c.Model = cfg.ModelLabel
-	if _, err := c.Register(ctx, client.Registration{
+	reg := client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
-	}); err != nil {
+	}
+	if resp, err := c.Register(ctx, reg); err != nil {
 		return HarnessOutcome{}, fmt.Errorf("register: %w", err)
+	} else {
+		reg.WorkerID = resp.WorkerID
 	}
 
 	grant, ok, err := c.Lease(ctx, cfg.Identity, cfg.ModelFamily, cfg.Role)
@@ -557,7 +563,7 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		"FLOWBEE_ROLE="+grant.Role,
 	)
 	agentEnv = append(agentEnv, taskEnv...)
-	if err := runAgentHeartbeat(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
 		return out, err
 	}
 
@@ -645,11 +651,14 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	c.Model = cfg.ModelLabel
-	if _, err := c.Register(ctx, client.Registration{
+	reg := client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
-	}); err != nil {
+	}
+	if resp, err := c.Register(ctx, reg); err != nil {
 		return HarnessOutcome{}, fmt.Errorf("register: %w", err)
+	} else {
+		reg.WorkerID = resp.WorkerID
 	}
 	grant, ok, err := c.Lease(ctx, cfg.Identity, cfg.ModelFamily, cfg.Role)
 	if err != nil {
@@ -743,7 +752,7 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	agentEnv := append(os.Environ(),
 		"FLOWBEE_JOB_ID="+grant.JobID, "FLOWBEE_BASE_SHA="+grant.BaseSHA, "FLOWBEE_ROLE="+grant.Role)
 	agentEnv = append(agentEnv, taskEnv...)
-	if err := runAgentHeartbeat(ctx, c, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
 		return out, err
 	}
 	// Normalize a self-committing agent (codex may `git commit` on its own): soft-reset
@@ -875,8 +884,8 @@ func ensureMirror(ctx context.Context, mirrorPath, repoURL, branch string) error
 // TTL; without this its lease would expire mid-run and the result be fenced as a
 // stale epoch (wasting the work + re-arming the job). Heartbeats fire at ~1/3 of the
 // TTL (min 20s). errb captures stderr for a useful failure message.
-func runAgentHeartbeat(ctx context.Context, c *client.Client, jobID string, epoch, ttlS int, dir, agentCmd string, env []string) error {
-	_, err := runAgentHeartbeatIO(ctx, c, jobID, epoch, ttlS, dir, agentCmd, env, false)
+func runAgentHeartbeat(ctx context.Context, c *client.Client, reg *client.Registration, jobID string, epoch, ttlS int, dir, agentCmd string, env []string) error {
+	_, err := runAgentHeartbeatIO(ctx, c, reg, jobID, epoch, ttlS, dir, agentCmd, env, false)
 	return err
 }
 
@@ -916,7 +925,7 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 
 func (w *boundedWriter) String() string { return w.b.String() }
 
-func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, epoch, ttlS int, dir, agentCmd string, env []string, capture bool) (string, error) {
+func runAgentHeartbeatIO(ctx context.Context, c *client.Client, reg *client.Registration, jobID string, epoch, ttlS int, dir, agentCmd string, env []string, capture bool) (string, error) {
 	if agentCmd == "" {
 		return "", nil
 	}
@@ -961,13 +970,7 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, ep
 	// heartbeat well under the soft rungs (phase budget ~TTL/2, stale threshold
 	// ~3×heartbeat) so the lease never lapses mid-build — cap at 60s so a long TTL
 	// doesn't stretch the interval past those thresholds (#40).
-	interval := ttlS / 3
-	if interval > 60 {
-		interval = 60
-	}
-	if interval < 20 {
-		interval = 20
-	}
+	interval := agentHeartbeatIntervalS(ttlS)
 	done := make(chan struct{})
 	go func() {
 		t := time.NewTicker(time.Duration(interval) * time.Second)
@@ -977,6 +980,7 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, ep
 			case <-done:
 				return
 			case <-t.C:
+				refreshWorkerRegistration(runCtx, c, reg)
 				// act on the CP's verdict: a `cancel` directive (over-budget / two-rung kill)
 				// or a stale-epoch 409 means the lease is GONE — stop the now-orphaned agent
 				// at once and free the worker, instead of finishing reassigned work.
@@ -1008,6 +1012,32 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, jobID string, ep
 		return out, fmt.Errorf("agent cmd: %v: %s", werr, strings.TrimSpace(errb.String()))
 	}
 	return out, nil
+}
+
+var (
+	agentHeartbeatMinS = 20
+	agentHeartbeatMaxS = 60
+)
+
+func agentHeartbeatIntervalS(ttlS int) int {
+	interval := ttlS / 3
+	if interval > agentHeartbeatMaxS {
+		interval = agentHeartbeatMaxS
+	}
+	if interval < agentHeartbeatMinS {
+		interval = agentHeartbeatMinS
+	}
+	return interval
+}
+
+func refreshWorkerRegistration(ctx context.Context, c *client.Client, reg *client.Registration) {
+	if reg == nil || reg.Identity == "" {
+		return
+	}
+	resp, err := c.Register(ctx, *reg)
+	if err == nil && resp.WorkerID != "" {
+		reg.WorkerID = resp.WorkerID
+	}
 }
 
 // parseAgentUsage extracts the agent's reported token/cost usage from its stdout when it

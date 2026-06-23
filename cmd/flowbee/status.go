@@ -272,7 +272,7 @@ func printStatusSummary(w io.Writer, summary statusSummary) {
 	// dropped GitHub writes (dead-lettered) — work that never took effect. Surface it in the
 	// human view too (not just the metric/log), pointing at the recovery command.
 	if len(summary.AbandonedGitHubWrites) > 0 {
-		fmt.Fprintf(w, "⚠ abandoned GitHub writes: %s — fix the cause, then `flowbee retry-outbox <job-id>`\n", sortedCounts(summary.AbandonedGitHubWrites))
+		fmt.Fprintf(w, "⚠ abandoned GitHub writes: %s — fix the cause, then `flowbee retry-outbox <job-id>` / `--repo <id>` / `--all`\n", sortedCounts(summary.AbandonedGitHubWrites))
 	}
 	if summary.Paused {
 		fmt.Fprintln(w, "\n*** PAUSED — no new leases are being issued (`flowbee resume` to unpause) ***")
