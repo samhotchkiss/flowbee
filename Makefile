@@ -4,7 +4,7 @@ export FLOWBEE_DATABASE_URL := $(DB_URL)
 .PHONY: build tidy migrate serve seed fmt archcheck lint test accept clean
 
 build:
-	CGO_ENABLED=0 go build -o bin/flowbee ./cmd/flowbee
+	go run ./cmd/flowbee build --output bin/flowbee
 
 tidy:
 	go mod tidy

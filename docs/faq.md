@@ -102,10 +102,10 @@ a separate `flowbee serve` control plane (the multi-box topology).
 
 ### How do I check which build of Flowbee is running?
 
-Run `flowbee version`. It prints the embedded git SHA recorded at build time via
-`debug.ReadBuildInfo`, so you can pin the exact commit without consulting the host
-environment. The control plane also logs the build SHA on its startup line, so the
-same information is available in whatever log aggregator you point at the process.
+Run `flowbee doctor --running`. It queries the live control plane and prints the binary's
+embedded source commit, dirty bit, and `behind_origin_main_by`; it WARNs when the running
+binary was built from a commit behind `origin/main`. `flowbee version` prints the same
+provenance for the binary in your shell.
 
 ---
 

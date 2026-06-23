@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/api"
+	"github.com/samhotchkiss/flowbee/internal/buildinfo"
 	"github.com/samhotchkiss/flowbee/internal/onboarding"
 )
 
@@ -21,27 +22,35 @@ func runDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	dir := fs.String("dir", ".", "repo root to validate")
 	offline := fs.Bool("offline", false, "skip the GitHub reachability check")
+	running := fs.Bool("running", false, "only inspect the running control plane at FLOWBEE_URL")
 	quiet := fs.Bool("quiet", false, "suppress per-check lines; print only the summary")
 	jsonOut := fs.Bool("json", false, "emit check results as a JSON array (name/status/detail per check)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	// honor FLOWBEE_CONFIG so `flowbee doctor` validates the SAME config `flowbee serve`
-	// runs — not a stray <cwd>/flowbee.yaml. An explicit --dir (non-default) still wins.
-	configPath := ""
-	if *dir == "." {
-		configPath = envOr("FLOWBEE_CONFIG", "")
+	var rep onboarding.DoctorReport
+	if *running {
+		rep.Checks = append(rep.Checks, runningConfigCheck(context.Background()))
+	} else {
+		// honor FLOWBEE_CONFIG so `flowbee doctor` validates the SAME config `flowbee serve`
+		// runs — not a stray <cwd>/flowbee.yaml. An explicit --dir (non-default) still wins.
+		configPath := ""
+		if *dir == "." {
+			configPath = envOr("FLOWBEE_CONFIG", "")
+		}
+		var err error
+		rep, err = onboarding.Doctor(context.Background(), onboarding.DoctorOptions{
+			Root:       *dir,
+			ConfigPath: configPath,
+			SkipGitHub: *offline,
+		})
+		if err != nil {
+			return err
+		}
+		rep.Checks = append(rep.Checks, binarySourceCheck(context.Background(), *dir))
+		rep.Checks = append(rep.Checks, runningConfigCheck(context.Background()))
 	}
-	rep, err := onboarding.Doctor(context.Background(), onboarding.DoctorOptions{
-		Root:       *dir,
-		ConfigPath: configPath,
-		SkipGitHub: *offline,
-	})
-	if err != nil {
-		return err
-	}
-	rep.Checks = append(rep.Checks, runningConfigCheck(context.Background()))
 
 	if *jsonOut {
 		type jsonCheck struct {
@@ -85,6 +94,21 @@ func runDoctor(args []string) error {
 		return fmt.Errorf("flowbee doctor: FAIL")
 	}
 	return fmt.Errorf("doctor found failing checks (see above)")
+}
+
+func binarySourceCheck(ctx context.Context, dir string) onboarding.Check {
+	info := buildinfo.Current(version)
+	origin := buildinfo.CheckOriginMain(ctx, dir, info, fetchOriginMain())
+	detail := fmt.Sprintf("version=%s source_commit=%s tree_dirty=%v behind_origin_main_by=%s",
+		info.Version, orDash(info.SourceCommit), info.TreeDirty, behindString(origin))
+	if origin.Warning != "" {
+		return onboarding.Check{Name: "binary-source", Status: onboarding.StatusWarn, Detail: detail + " - " + origin.Warning}
+	}
+	if origin.Err != "" {
+		return onboarding.Check{Name: "binary-source", Status: onboarding.StatusWarn,
+			Detail: detail + " - could not compare against origin/main: " + origin.Err}
+	}
+	return onboarding.Check{Name: "binary-source", Status: onboarding.StatusPass, Detail: detail}
 }
 
 func runningConfigCheck(ctx context.Context) onboarding.Check {
@@ -136,10 +160,46 @@ func runningConfigCheck(ctx context.Context) onboarding.Check {
 	if len(repos) == 0 {
 		repos = append(repos, "none")
 	}
-	return onboarding.Check{Name: "running-config", Status: onboarding.StatusPass,
-		Detail: fmt.Sprintf("version=%s pid=%d config=%s db=%s private=%s self_merge=%v mirror=%s git_remote=%s token_present=%v webhook_secret=%v worker_auth=%v insecure=%v log_path=%s repos=%s",
-			cfg.Version, cfg.PID, orDash(cfg.ConfigPath), cfg.DatabaseURL, cfg.PrivateAddr,
-			cfg.AllowSelfMerge, orDash(cfg.MirrorPath), orDash(cfg.GitRemote), cfg.GitHubTokenPresent,
-			cfg.WebhookSecretPresent, cfg.WorkerAuthConfigured, cfg.InsecureWorkerAPI,
-			orDash(cfg.LogPath), strings.Join(repos, ","))}
+	status := onboarding.StatusPass
+	warn := cfg.OriginMainWarning
+	originErr := cfg.OriginMainError
+	if cfg.SourceCommit != "" && warn == "" {
+		origin := buildinfo.CheckOriginMain(ctx, ".", buildinfo.Info{
+			SourceCommit: cfg.SourceCommit,
+			TreeDirty:    cfg.TreeDirty,
+		}, fetchOriginMain())
+		if origin.Checked {
+			cfg.BehindOriginMainBy = behindPtr(origin)
+			originErr = ""
+		}
+		if origin.Warning != "" {
+			warn = origin.Warning
+		} else if origin.Err != "" && originErr == "" {
+			originErr = origin.Err
+		}
+	}
+	if warn != "" {
+		status = onboarding.StatusWarn
+	}
+	if warn == "" && originErr != "" {
+		warn = "could not compare running binary against origin/main: " + originErr
+		status = onboarding.StatusWarn
+	}
+	detail := fmt.Sprintf("version=%s source_commit=%s tree_dirty=%v behind_origin_main_by=%s pid=%d config=%s db=%s private=%s self_merge=%v mirror=%s git_remote=%s token_present=%v webhook_secret=%v worker_auth=%v insecure=%v log_path=%s repos=%s",
+		cfg.Version, orDash(cfg.SourceCommit), cfg.TreeDirty, runningBehindString(cfg.BehindOriginMainBy),
+		cfg.PID, orDash(cfg.ConfigPath), cfg.DatabaseURL, cfg.PrivateAddr,
+		cfg.AllowSelfMerge, orDash(cfg.MirrorPath), orDash(cfg.GitRemote), cfg.GitHubTokenPresent,
+		cfg.WebhookSecretPresent, cfg.WorkerAuthConfigured, cfg.InsecureWorkerAPI,
+		orDash(cfg.LogPath), strings.Join(repos, ","))
+	if warn != "" {
+		detail += " - " + warn
+	}
+	return onboarding.Check{Name: "running-config", Status: status, Detail: detail}
+}
+
+func runningBehindString(v *int) string {
+	if v == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", *v)
 }

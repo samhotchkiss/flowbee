@@ -18,6 +18,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/alarm"
 	"github.com/samhotchkiss/flowbee/internal/api"
 	"github.com/samhotchkiss/flowbee/internal/auth"
+	"github.com/samhotchkiss/flowbee/internal/buildinfo"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/config"
 	"github.com/samhotchkiss/flowbee/internal/github"
@@ -659,7 +660,14 @@ func runServe(args []string) error {
 }
 
 func runningConfigSnapshot(cfg config.Config) api.RunningConfig {
+	info := buildinfo.Current(version)
+	origin := buildinfo.CheckOriginMain(context.Background(), ".", info, fetchOriginMain())
 	rc := api.RunningConfig{
+		SourceCommit:         info.SourceCommit,
+		TreeDirty:            info.TreeDirty,
+		BehindOriginMainBy:   behindPtr(origin),
+		OriginMainWarning:    origin.Warning,
+		OriginMainError:      origin.Err,
 		ConfigPath:           runningConfigPath(),
 		DatabaseURL:          cfg.DatabaseURL,
 		PrivateAddr:          cfg.PrivateAddr,

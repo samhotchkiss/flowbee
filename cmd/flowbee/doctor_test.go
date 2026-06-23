@@ -30,6 +30,7 @@ func initTestRepo(t *testing.T) string {
 
 func TestDoctorJSONOutput(t *testing.T) {
 	root := initTestRepo(t)
+	t.Setenv("FLOWBEE_SKIP_ORIGIN_FETCH", "1")
 	t.Setenv("FLOWBEE_CONFIG", "")
 	t.Setenv("FLOWBEE_GITHUB_TOKEN", "")
 
@@ -83,6 +84,7 @@ func TestDoctorJSONOutput(t *testing.T) {
 
 func TestDoctorJSONExitCodeOnFail(t *testing.T) {
 	root := t.TempDir() // no flowbee.yaml → config check fails
+	t.Setenv("FLOWBEE_SKIP_ORIGIN_FETCH", "1")
 	t.Setenv("FLOWBEE_CONFIG", "")
 	var doctorErr error
 	captureStdout(t, func() {
@@ -96,6 +98,7 @@ func TestDoctorJSONExitCodeOnFail(t *testing.T) {
 func TestDoctorJSONWinsOverQuiet(t *testing.T) {
 	root := initTestRepo(t)
 	cfgPath := filepath.Join(root, "flowbee.yaml")
+	t.Setenv("FLOWBEE_SKIP_ORIGIN_FETCH", "1")
 	t.Setenv("FLOWBEE_CONFIG", cfgPath)
 	t.Setenv("FLOWBEE_GITHUB_TOKEN", "")
 
@@ -130,5 +133,40 @@ func TestRunningConfigCheckUsesWorkerToken(t *testing.T) {
 	}
 	if !strings.Contains(check.Detail, "version=test-version") {
 		t.Fatalf("running config detail missing served config: %s", check.Detail)
+	}
+}
+
+func TestRunningConfigCheckWarnsWhenRunningBinaryBehind(t *testing.T) {
+	behind := 2
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"version":               "dev-0cef2e5ac1f6+dirty",
+			"source_commit":         "0cef2e5ac1f6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			"tree_dirty":            true,
+			"behind_origin_main_by": behind,
+			"origin_main_warning":   "WARN: running binary is 2 commits behind origin/main (built from 0cef2e5ac1f6, dirty=true) - merged fixes may be missing",
+			"pid":                   123,
+			"database_url":          "db",
+			"private_addr":          ":7070",
+			"allow_self_merge":      true,
+		})
+	}))
+	defer srv.Close()
+
+	t.Setenv("FLOWBEE_URL", srv.URL)
+	check := runningConfigCheck(t.Context())
+	if check.Status != "warn" {
+		t.Fatalf("running-config status=%s detail=%s", check.Status, check.Detail)
+	}
+	for _, want := range []string{
+		"source_commit=0cef2e5ac1f6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"tree_dirty=true",
+		"behind_origin_main_by=2",
+		"WARN: running binary is 2 commits behind origin/main",
+	} {
+		if !strings.Contains(check.Detail, want) {
+			t.Fatalf("running-config detail missing %q: %s", want, check.Detail)
+		}
 	}
 }

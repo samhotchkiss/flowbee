@@ -113,6 +113,11 @@ type Server struct {
 // deliberately limited to non-secret values and boolean "present" bits for secrets.
 type RunningConfig struct {
 	Version              string              `json:"version"`
+	SourceCommit         string              `json:"source_commit,omitempty"`
+	TreeDirty            bool                `json:"tree_dirty"`
+	BehindOriginMainBy   *int                `json:"behind_origin_main_by"`
+	OriginMainWarning    string              `json:"origin_main_warning,omitempty"`
+	OriginMainError      string              `json:"origin_main_error,omitempty"`
 	PID                  int                 `json:"pid"`
 	ConfigPath           string              `json:"config_path,omitempty"`
 	DatabaseURL          string              `json:"database_url"`

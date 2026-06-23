@@ -57,7 +57,7 @@ func TestRequeueByState(t *testing.T) {
 	defer srv.Close()
 
 	c := client.NewWithToken(srv.URL, "")
-	if err := requeueByState(c, st, "needs_human", "russ", false); err != nil {
+	if err := requeueByState(c, st, "needs_human", "russ", "", false); err != nil {
 		t.Fatalf("requeueByState: %v", err)
 	}
 
@@ -72,5 +72,50 @@ func TestRequeueByState(t *testing.T) {
 	}
 	if got["e"] {
 		t.Error("a flowbee job (wrong repo filter) must not be requeued")
+	}
+}
+
+func TestRequeueByStateFiltersReason(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+
+	seed := func(id, reason string) {
+		if _, err := st.SeedJob(ctx, store.SeedParams{
+			ID: id, Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+			Repo: "flowbee", Now: time.Unix(1000, 0),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='needs_human', escalation_reason=? WHERE id=?`, reason, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("merge-405", "project_out: merge rule violation 405")
+	seed("ci-stall", "ci_stalled")
+
+	var mu sync.Mutex
+	got := map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) == 4 && parts[3] == "requeue" {
+			mu.Lock()
+			got[parts[2]] = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, "unexpected", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	c := client.NewWithToken(srv.URL, "")
+	if err := requeueByState(c, st, "needs_human", "", "405", false); err != nil {
+		t.Fatalf("requeueByState reason: %v", err)
+	}
+	if !got["merge-405"] {
+		t.Fatalf("reason-matching job was not requeued: %v", got)
+	}
+	if got["ci-stall"] {
+		t.Fatalf("non-matching reason job was requeued: %v", got)
 	}
 }

@@ -26,9 +26,14 @@ func TestRunningConfigEndpointRequiresAuthAndIsRedacted(t *testing.T) {
 		t.Fatal(err)
 	}
 	authn := auth.NewBearer([]byte("server-secret"), []string{"worker"}, false)
+	behind := 2
 	srv := api.New(st, clock.NewFake(time.Unix(1000, 0)), ulid.NewMinter(nil), api.Config{
 		Authenticator: authn,
 		RunningConfig: api.RunningConfig{
+			SourceCommit:         "0cef2e5ac1f6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			TreeDirty:            true,
+			BehindOriginMainBy:   &behind,
+			OriginMainWarning:    "WARN: running binary is 2 commits behind origin/main (built from 0cef2e5ac1f6, dirty=true) - merged fixes may be missing",
 			ConfigPath:           "/home/sam/.flowbee/flowbee.yaml",
 			DatabaseURL:          "/home/sam/.flowbee/flowbee.db",
 			PrivateAddr:          ":7070",
@@ -56,7 +61,11 @@ func TestRunningConfigEndpointRequiresAuthAndIsRedacted(t *testing.T) {
 		t.Fatalf("GET /v1/config status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{`"version":"test-version"`, `"github_token_present":true`, `"worker_auth_configured":true`, `"allow_self_merge":true`} {
+	for _, want := range []string{
+		`"version":"test-version"`, `"github_token_present":true`, `"worker_auth_configured":true`, `"allow_self_merge":true`,
+		`"source_commit":"0cef2e5ac1f6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`, `"tree_dirty":true`, `"behind_origin_main_by":2`,
+		`"origin_main_warning":"WARN: running binary is 2 commits behind origin/main`,
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("running config missing %s: %s", want, body)
 		}

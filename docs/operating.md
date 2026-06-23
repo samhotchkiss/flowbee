@@ -12,7 +12,7 @@ the world from GitHub + the ledger — there is no hidden in-memory state to los
 
 ## 1. Prerequisites
 
-- **Go 1.22+** to build (`go build -o bin/flowbee ./cmd/flowbee`).
+- **Go 1.22+** to build (`flowbee build --output bin/flowbee` from a clean `origin/main` checkout).
 - A **GitHub token** (`FLOWBEE_GITHUB_TOKEN`) with `repo` scope for each managed repo.
 - An **agent CLI** on every worker box — by default `claude` (authenticated, on `PATH`).
   Verify with `claude --version`; use `codex` instead when running `--agent codex`.
@@ -32,12 +32,15 @@ Run `flowbee doctor` before starting `flowbee serve` to validate your configurat
 - **Lens coverage** — ensures each identity has a lens configured.
 - **Running config** — when a control plane is reachable at `FLOWBEE_URL` (default
   `http://127.0.0.1:7070`), prints the running process's redacted effective config:
-  version, pid, config path, DB, private bind, self-merge, mirror, git remote, token-present
-  bits, auth posture, log path, and managed repos. This is the source of truth for reproducing
-  the live launch; it does not print secret values. If the private API requires worker auth,
-  set `FLOWBEE_WORKER_TOKEN` before running doctor so it can authenticate to `/v1/config`.
+  version, source commit, dirty bit, `behind_origin_main_by`, pid, config path, DB, private
+  bind, self-merge, mirror, git remote, token-present bits, auth posture, log path, and
+  managed repos. This is the source of truth for reproducing the live launch; it does not
+  print secret values. If the private API requires worker auth, set `FLOWBEE_WORKER_TOKEN`
+  before running doctor so it can authenticate to `/v1/config`.
 
 Pass `--offline` to skip the GitHub reachability check when running in an air-gapped or offline environment.
+Pass `--running` to inspect only the live control plane; this is the fastest way to catch a
+running binary built from a dirty or behind local tree.
 
 ---
 
@@ -487,7 +490,7 @@ Flowbee is built so nothing wedges permanently — but here is the operator's to
 Use a managed launcher, not a tmux/manual shell reconstruction:
 
 ```bash
-go build -o bin/flowbee ./cmd/flowbee
+flowbee build --output bin/flowbee
 flowbee version
 install -m 755 bin/flowbee /usr/local/bin/flowbee
 
@@ -498,6 +501,11 @@ launchctl kickstart -k gui/$(id -u)/com.flowbee.serve
 systemctl --user restart flowbee-serve
 ```
 
+`flowbee build` fetches `origin/main` and refuses to build when the checkout is behind
+`origin/main` or dirty. That prevents a local rebuild from silently dropping a merged fix.
+For an intentional emergency build from local changes, pass `--allow-dirty`; the command
+prints a WARN with the dirty/behind status.
+
 `flowbee serve` also handles `SIGHUP` / `SIGUSR1` as a graceful re-exec: listeners and
 loops shut down cleanly, the same binary re-execs with the same env, and config is re-read.
 That is useful for config reloads; replacing the binary plus restarting the service is the
@@ -506,7 +514,7 @@ canonical deploy path.
 Verify the running process, not your invoking shell:
 
 ```bash
-flowbee doctor
+flowbee doctor --running
 curl -s -H "Authorization: Bearer $FLOWBEE_WORKER_TOKEN" http://127.0.0.1:7070/v1/config
 curl -s http://127.0.0.1:7001/healthz
 ```
@@ -541,6 +549,7 @@ flowbee retry-outbox --all           # every abandoned write
 
 flowbee requeue <job-id>             # re-arm a needs_human job
 flowbee requeue --state needs_human  # bulk requeue by state
+flowbee requeue --state needs_human --reason "405"  # bulk requeue a fixed transient
 ```
 
 Then verify the queue is draining:
@@ -559,7 +568,7 @@ flowbee board
 | A job parks with trigger `reviewer_rejections` | ONE review node requested changes on the same task 6 times — a genuine standoff, not normal iteration | read that reviewer's findings on the PR; the disagreement needs a human call, then `flowbee requeue <job-id>` |
 | A job parks with trigger `ci_stalled` | its PR's CI never went green for the whole stall window — CI is wedged (runner down, no workflow triggered, or perpetually pending), not merely slow | fix CI (restart the runner / check the workflow triggers / re-run the run), then `flowbee requeue <job-id>` |
 | A job parks with trigger `project_out` | a GitHub write for it (open-PR / merge / create-issue) failed permanently — the branch/PR was deleted, a 422/404 — so the action was dead-lettered (the rest of the outbox keeps flowing) | fix the GitHub state (the branch/PR), then `flowbee requeue <job-id>` |
-| "which binary is running?" | a stale deploy | `flowbee version` prints the embedded git SHA (`flowbee version --json` for tooling: `{"version":"…"}`); compare it to `/healthz`'s `version` |
+| "which binary is running?" | a stale deploy | `flowbee doctor --running` prints `source_commit`, `tree_dirty`, and `behind_origin_main_by`; it WARNs if the running binary is behind `origin/main` |
 | Suspect a stuck `ready` job | a projection drifted from the ledger | the forward-progress watchdog resyncs it within 60s; it can't persist |
 
 The **forward-progress watchdog** (runs every 60s) is the safety net: it re-folds each

@@ -20,8 +20,11 @@ Or build from a clone:
 
 ```bash
 git clone https://github.com/samhotchkiss/flowbee && cd flowbee
-go build -o flowbee ./cmd/flowbee
+go run ./cmd/flowbee build --output flowbee
 ```
+
+`flowbee build` fetches `origin/main` and refuses to build from a dirty checkout or a
+checkout behind `origin/main`, unless you explicitly pass `--allow-dirty`.
 
 ## 2. Scaffold config into your repo
 

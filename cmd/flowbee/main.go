@@ -5,10 +5,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"runtime/debug"
+
+	"github.com/samhotchkiss/flowbee/internal/buildinfo"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=<sha>".
@@ -19,42 +21,53 @@ var version = "dev"
 // `go build` still tells you EXACTLY which commit is running — the answer to "is this
 // the rebuilt binary or a stale one?", which bit the first multi-repo run).
 func buildVersion() string {
-	if version != "dev" && version != "" {
-		return version
-	}
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		var rev, mod string
-		for _, s := range bi.Settings {
-			switch s.Key {
-			case "vcs.revision":
-				rev = s.Value
-			case "vcs.modified":
-				mod = s.Value
-			}
-		}
-		if rev != "" {
-			if len(rev) > 12 {
-				rev = rev[:12]
-			}
-			if mod == "true" {
-				rev += "+dirty"
-			}
-			return "dev-" + rev
-		}
-	}
-	return version
+	return buildinfo.Current(version).Version
 }
 
 func runVersion(args []string) error {
+	info := buildinfo.Current(version)
+	origin := buildinfo.CheckOriginMain(context.Background(), ".", info, fetchOriginMain())
 	for _, a := range args {
 		if a == "--json" {
-			out, _ := json.Marshal(map[string]string{"version": buildVersion()})
+			out, _ := json.Marshal(map[string]any{
+				"version":               info.Version,
+				"source_commit":         info.SourceCommit,
+				"tree_dirty":            info.TreeDirty,
+				"behind_origin_main_by": behindPtr(origin),
+				"origin_main_warning":   origin.Warning,
+				"origin_main_error":     origin.Err,
+			})
 			fmt.Println(string(out))
 			return nil
 		}
 	}
-	fmt.Printf("flowbee %s\n", buildVersion())
+	fmt.Printf("flowbee %s\n", info.Version)
+	fmt.Printf("source_commit=%s tree_dirty=%v behind_origin_main_by=%s\n",
+		orDash(info.SourceCommit), info.TreeDirty, behindString(origin))
+	if origin.Warning != "" {
+		fmt.Println(origin.Warning)
+	} else if origin.Err != "" {
+		fmt.Println("WARN: could not compare binary source against origin/main: " + origin.Err)
+	}
 	return nil
+}
+
+func behindPtr(st buildinfo.OriginStatus) *int {
+	if !st.Checked {
+		return nil
+	}
+	return &st.BehindBy
+}
+
+func behindString(st buildinfo.OriginStatus) string {
+	if !st.Checked {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", st.BehindBy)
+}
+
+func fetchOriginMain() bool {
+	return os.Getenv("FLOWBEE_SKIP_ORIGIN_FETCH") == ""
 }
 
 func main() {
@@ -116,6 +129,8 @@ func main() {
 		err = runPause(args)
 	case "resume":
 		err = runResume(args)
+	case "build":
+		err = runBuild(args)
 	case "version", "-v", "--version":
 		err = runVersion(args)
 	default:
@@ -130,5 +145,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|retry-outbox|backup|restore|pause|resume|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|retry-outbox|backup|restore|pause|resume|seed|build|version>")
 }

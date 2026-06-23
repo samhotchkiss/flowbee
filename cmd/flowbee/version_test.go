@@ -7,6 +7,7 @@ import (
 )
 
 func TestVersionJSON(t *testing.T) {
+	t.Setenv("FLOWBEE_SKIP_ORIGIN_FETCH", "1")
 	out := captureStdout(t, func() {
 		if err := runVersion([]string{"--json"}); err != nil {
 			t.Fatalf("runVersion --json: %v", err)
@@ -25,6 +26,7 @@ func TestVersionJSON(t *testing.T) {
 }
 
 func TestVersionPlain(t *testing.T) {
+	t.Setenv("FLOWBEE_SKIP_ORIGIN_FETCH", "1")
 	out := captureStdout(t, func() {
 		if err := runVersion(nil); err != nil {
 			t.Fatalf("runVersion: %v", err)
