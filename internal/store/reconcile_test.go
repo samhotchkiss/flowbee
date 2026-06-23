@@ -209,6 +209,38 @@ func TestTerminalSHAGuard(t *testing.T) {
 	}
 }
 
+func TestTerminalFactRepairsActiveProjection(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	seedBuildPR(t, st, "jr", 19)
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='review_pending' WHERE id='jr'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.DB.ExecContext(ctx, `
+		INSERT INTO domain_b_facts
+		    (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged,
+		     head_updated_at, merge_commit, updated_at)
+		VALUES ('jr', 1, 19, 'h', 'b', 1, 1, ?, 'merge-sha', datetime('now'))`,
+		time.Unix(6000, 0).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Unix(7000, 0)
+	out, err := st.ApplyReconciledPR(ctx, "jr", store.ReconciledPR{
+		Number: 19, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "merge-sha",
+	}, now)
+	if err != nil {
+		t.Fatalf("repair terminal fact: %v", err)
+	}
+	if !out.Done || out.Frozen {
+		t.Fatalf("terminal repair outcome = %+v, want Done", out)
+	}
+	if j, _ := st.GetJob(ctx, "jr"); j.State != job.StateDone {
+		t.Fatalf("state=%s want done", j.State)
+	}
+}
+
 // TestSupersedeOnSHAMove: a new head SHA on an open PR (with the job past build)
 // supersedes the SHA-bound verdict and re-arms to ready against the new base, with
 // the lease epoch bumped (I-5, §6.2.4). And the ledger replays to the same row.

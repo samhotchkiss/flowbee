@@ -108,7 +108,23 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		}
 
 		// TERMINAL-SHA guard (I-3): a job with a recorded merge commit is frozen.
+		// If an earlier ingest recorded the terminal fact but the job projection did
+		// not reach done, repair the legal active PR states before freezing future
+		// ingests. Otherwise a partial terminal fact permanently strands review_pending
+		// work outside the reviewer and merge queues.
 		if priorMergeCommit != "" {
+			if prBoundActive(j.State) {
+				if err := reconcileTransitionTx(ctx, tx, &j, seq, job.StateDone,
+					ledger.KindJobCompleted, now,
+					ledger.Payload{MergeProvenance: priorMergeCommit}); err != nil {
+					return err
+				}
+				if err := enqueueHistoryWriteTx(ctx, tx, jobID); err != nil {
+					return err
+				}
+				out.Done = true
+				return nil
+			}
 			out.Frozen = true
 			return nil
 		}

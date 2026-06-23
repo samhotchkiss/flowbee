@@ -879,6 +879,9 @@ func rebaseStaleReviews(ctx context.Context, logger *slog.Logger, st *store.Stor
 			brName := store.IssueBranch(st.ResolveIssueNum(ctx, jobID), jobID)
 			if perr := mirror.PushCommit(pushURL, res.NewSHA, brName); perr != nil {
 				logger.Warn("rebase-before-review push", "job", jobID, "branch", brName, "err", perr)
+				if _, rerr := st.RequeueJob(ctx, jobID, true, time.Now()); rerr != nil {
+					logger.Warn("rebase-before-review push compensation", "job", jobID, "err", rerr)
+				}
 			} else {
 				logger.Info("rebased review onto tip", "job", jobID, "branch", brName, "head", res.NewSHA[:min(7, len(res.NewSHA))])
 			}
