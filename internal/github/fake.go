@@ -32,14 +32,16 @@ type Fake struct {
 	enqueued    []int        // PR numbers enqueued to the merge queue
 	conflictPRs map[int]bool // PRs whose merge returns ErrMergeConflict (set via SetMergeConflict)
 
-	baseModifiedPRs map[int]bool      // PRs whose merge returns ErrMergeBaseModified (retryable)
-	headMovedPRs    map[int]string    // PRs whose live head != this SHA -> merge returns ErrMergeHeadModified
-	mergeHeads      map[int]string    // expectedHead passed to EnqueueMergeQueue, for pin assertions
-	drafted         []int             // PR numbers converted back to draft (compensation, §6.5.4)
-	deletedBranches []string          // branches deleted post-merge (cleanup)
-	cancelled       []string          // SHAs whose CI was cancelled (compensation, §6.5.4)
-	putFiles        map[string][]byte // path -> last content written via PutFile (§F archive)
-	protection      map[string]Protection
+	baseModifiedPRs     map[int]bool // PRs whose merge returns ErrMergeBaseModified (retryable)
+	ruleViolationPRs    map[int]int  // PRs whose merge returns ErrMergeRuleViolationPending N times
+	ruleViolationBehind map[int]bool // ruleViolationPRs that should look like "branch behind"
+	headMovedPRs        map[int]string
+	mergeHeads          map[int]string    // expectedHead passed to EnqueueMergeQueue, for pin assertions
+	drafted             []int             // PR numbers converted back to draft (compensation, §6.5.4)
+	deletedBranches     []string          // branches deleted post-merge (cleanup)
+	cancelled           []string          // SHAs whose CI was cancelled (compensation, §6.5.4)
+	putFiles            map[string][]byte // path -> last content written via PutFile (§F archive)
+	protection          map[string]Protection
 
 	mergeableStates map[int]string // scripted PR mergeable_state ("behind"/"clean"/…) for the #214 un-stick driver
 	updatedBranches []int          // PR numbers passed to UpdateBranch, for assertions
@@ -371,6 +373,16 @@ func (f *Fake) EnqueueMergeQueue(ctx context.Context, number int, expectedHead s
 	if f.baseModifiedPRs[number] {
 		return fmt.Errorf("merge %d: %w", number, ErrMergeBaseModified)
 	}
+	if f.ruleViolationPRs[number] > 0 {
+		f.ruleViolationPRs[number]--
+		msg := `Repository rule violations found
+Required status check "Migration version guard" is expected.`
+		if f.ruleViolationBehind[number] {
+			msg = `Repository rule violations found
+This branch must be up to date with the base branch before merging.`
+		}
+		return fmt.Errorf("merge %d: %w: 405: %s", number, ErrMergeRuleViolationPending, msg)
+	}
 	f.enqueued = append(f.enqueued, number)
 	return nil
 }
@@ -402,6 +414,22 @@ func (f *Fake) SetMergeBaseModified(number int) {
 		f.baseModifiedPRs = map[int]bool{}
 	}
 	f.baseModifiedPRs[number] = true
+}
+
+// SetMergeRuleViolationPending makes EnqueueMergeQueue return the retryable ruleset 405
+// `attempts` times for a PR, then succeed. Use behind=true for the branch-not-up-to-date
+// variant that project-out can answer with update-branch before retrying.
+func (f *Fake) SetMergeRuleViolationPending(number, attempts int, behind bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ruleViolationPRs == nil {
+		f.ruleViolationPRs = map[int]int{}
+	}
+	if f.ruleViolationBehind == nil {
+		f.ruleViolationBehind = map[int]bool{}
+	}
+	f.ruleViolationPRs[number] = attempts
+	f.ruleViolationBehind[number] = behind
 }
 
 // SetMergeConflict makes EnqueueMergeQueue return ErrMergeConflict for a PR — the

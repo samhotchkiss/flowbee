@@ -539,6 +539,14 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 				}
 				return "autonomous merge DEFERRED (head moved after review) -> merge_handoff", nil
 			}
+			if errors.Is(err, gh.ErrMergeRuleViolationPending) && gh.IsMergeRuleBehind(err) {
+				// A branch-up-to-date ruleset violation is retryable, but it will not clear
+				// until GitHub fast-forwards the PR head. Do that best-effort here, then let
+				// the outbox retry path re-attempt after GitHub/reconcile observes the new CI.
+				if u, ok := s.gh.(gh.MergeUnsticker); ok && number != 0 {
+					_ = u.UpdateBranch(ctx, number)
+				}
+			}
 			return "", err
 		}
 		return fmt.Sprintf("merge_enqueue pr=%d", number), nil
