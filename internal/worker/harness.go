@@ -710,6 +710,7 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		issueBranch = grant.Context.IssueBranch
 	}
 	startRef := grant.BaseSHA
+	forceIssueBranchPush := false
 	isConflict := grant.Context != nil && grant.Context.Conflict
 	// A conflict_resolver starts from CURRENT MAIN (BaseSHA, with the sibling's merged
 	// change), NOT the issue-branch tip — it re-applies this job's change on top of main
@@ -718,6 +719,11 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		if tip, exists, terr := mirror.RemoteBranchTip(repoURL, issueBranch); terr == nil && exists && tip != "" {
 			if ferr := mirror.FetchRef(repoURL, "refs/heads/"+issueBranch, "refs/flowbee/issue-tip/"+grant.JobID); ferr == nil {
 				startRef = tip
+				if grant.BaseSHA != "" {
+					if containsBase, aerr := mirror.IsAncestor(grant.BaseSHA, tip); aerr == nil && !containsBase {
+						forceIssueBranchPush = true
+					}
+				}
 			}
 		}
 	}
@@ -727,6 +733,17 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		return out, fmt.Errorf("provision worktree at %s: %w", startRef, err)
 	}
 	defer wt.Destroy()
+	if forceIssueBranchPush {
+		if err := wt.RebaseOnto(grant.BaseSHA); err != nil {
+			_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
+			return out, fmt.Errorf("rebase %s onto granted base %s: %w", issueBranch, grant.BaseSHA, err)
+		}
+		head, herr := wt.HeadSHA()
+		if herr != nil {
+			return out, fmt.Errorf("rebased head: %w", herr)
+		}
+		startRef = head
+	}
 
 	// Git-native conflict resolution: the worktree is at current main (with the sibling's
 	// change); apply THIS job's ORIGINAL change with a 3-way merge so overlapping edits
@@ -771,10 +788,17 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	if !changed {
 		// a re-build of an ALREADY-BUILT issue branch (e.g. after a requeue): the agent
 		// added nothing new, but the branch already carries a build — we started from its
-		// tip (startRef != base), and it's already pushed. Submit that EXISTING build for
-		// review instead of churning to needs_human. No new commit/push; point the result
-		// at the branch tip so the control plane opens the PR.
+		// tip (startRef != base). Submit that EXISTING build for review instead of
+		// churning to needs_human. If we had to rebase the branch onto the granted
+		// base first, publish that rebased tip now; otherwise no new commit/push is
+		// needed.
 		if issueBranch != "" && repoURL != "" && startRef != grant.BaseSHA {
+			if forceIssueBranchPush {
+				if perr := wt.PushTo(repoURL, issueBranch, true); perr != nil {
+					_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
+					return out, fmt.Errorf("push rebased %s: %w", issueBranch, perr)
+				}
+			}
 			diff, _ := wt.DiffAgainst(grant.BaseSHA)
 			idem := fmt.Sprintf("%s-e%d", grant.JobID, grant.LeaseEpoch)
 			body := map[string]any{
@@ -824,7 +848,7 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		// plain push is non-fast-forward and rejected. The resolution deliberately rebases
 		// the issue branch onto main, so replacing it is correct. Every other role
 		// fast-forwards (stacks on the branch tip).
-		if perr := wt.PushTo(repoURL, issueBranch, isConflict); perr != nil {
+		if perr := wt.PushTo(repoURL, issueBranch, isConflict || forceIssueBranchPush); perr != nil {
 			// the branch moved under us (e.g. a rebase-before-review force-update): the
 			// build SUCCEEDED, we just lost the fast-forward race. Re-arm WITHOUT burning
 			// an attempt (re-validation churn must not exhaust the failure budget and

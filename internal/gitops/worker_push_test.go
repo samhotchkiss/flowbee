@@ -74,3 +74,80 @@ func TestWorkerPushStacksNodeCommits(t *testing.T) {
 		t.Fatalf("empty findings-commit must touch no files, got: %q", stat)
 	}
 }
+
+func TestWorkerPushRebasesIssueBranchOntoGrantedBase(t *testing.T) {
+	m, oldBase := newFixture(t)
+	remote := m.Path
+
+	// Existing issue branch was built from the old integration base.
+	ws1 := WorktreeBase(t.TempDir(), "job-b", 1)
+	wt1, err := m.AddWorktree(ws1, oldBase)
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	mustWrite(t, filepath.Join(ws1, "feature.txt"), "built on old base\n")
+	oldTip, err := wt1.CommitAuthored("builder-claude", "build: old base", false)
+	if err != nil {
+		t.Fatalf("commit authored: %v", err)
+	}
+	if err := wt1.PushTo(remote, "flowbee/issue-7", false); err != nil {
+		t.Fatalf("push build: %v", err)
+	}
+	wt1.Destroy()
+
+	// Main advances independently. A rebuild lease now grants this new base SHA.
+	wsMain := WorktreeBase(t.TempDir(), "main", 1)
+	mainWT, err := m.AddWorktree(wsMain, oldBase)
+	if err != nil {
+		t.Fatalf("main worktree: %v", err)
+	}
+	mustWrite(t, filepath.Join(wsMain, "main.txt"), "new main\n")
+	newBase, err := mainWT.CommitAuthored("integrator", "main advances", false)
+	if err != nil {
+		t.Fatalf("main commit: %v", err)
+	}
+	if err := mainWT.PushTo(remote, "main", false); err != nil {
+		t.Fatalf("push main: %v", err)
+	}
+	mainWT.Destroy()
+
+	contains, err := m.IsAncestor(newBase, oldTip)
+	if err != nil {
+		t.Fatalf("IsAncestor: %v", err)
+	}
+	if contains {
+		t.Fatal("old issue branch must not already contain the new base")
+	}
+
+	ws2 := WorktreeBase(t.TempDir(), "job-b", 2)
+	wt2, err := m.AddWorktree(ws2, oldTip)
+	if err != nil {
+		t.Fatalf("rebuild worktree: %v", err)
+	}
+	if err := wt2.RebaseOnto(newBase); err != nil {
+		t.Fatalf("rebase onto granted base: %v", err)
+	}
+	rebasedTip, err := wt2.HeadSHA()
+	if err != nil {
+		t.Fatalf("rebased head: %v", err)
+	}
+	if rebasedTip == oldTip {
+		t.Fatal("rebase must create a new issue-branch head")
+	}
+	if err := wt2.PushTo(remote, "flowbee/issue-7", true); err != nil {
+		t.Fatalf("force-push rebased issue branch: %v", err)
+	}
+	wt2.Destroy()
+
+	tip, exists, err := m.RemoteBranchTip(remote, "flowbee/issue-7")
+	if err != nil || !exists || tip != rebasedTip {
+		t.Fatalf("RemoteBranchTip = %s,%v,%v want %s,true,nil", tip, exists, err, rebasedTip)
+	}
+	contains, err = m.IsAncestor(newBase, tip)
+	if err != nil {
+		t.Fatalf("IsAncestor after rebase: %v", err)
+	}
+	if !contains {
+		t.Fatalf("rebased branch %s must contain granted base %s", tip, newBase)
+	}
+}

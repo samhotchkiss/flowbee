@@ -251,6 +251,25 @@ func (m *Mirror) RemoteBranchTip(remoteURL, branch string) (sha string, exists b
 	return fields[0], true, nil
 }
 
+// IsAncestor reports whether ancestor is reachable from descendant in this mirror.
+// A false result is not an error: it means the descendant is cut from an older or
+// unrelated base and must be rebased before it can honestly claim the new base_sha.
+func (m *Mirror) IsAncestor(ancestor, descendant string) (bool, error) {
+	if strings.TrimSpace(ancestor) == "" || strings.TrimSpace(descendant) == "" {
+		return false, fmt.Errorf("is-ancestor: empty ref")
+	}
+	cmd := exec.Command("git", "--git-dir", m.Path, "merge-base", "--is-ancestor", ancestor, descendant)
+	var errb strings.Builder
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, fmt.Errorf("is-ancestor %s..%s: %w: %s", ancestor, descendant, err, strings.TrimSpace(errb.String()))
+	}
+	return true, nil
+}
+
 // FetchRef fetches a single ref from a remote into the mirror under a local name, so
 // a worktree can be cut from a branch the mirror did not yet have (the issue branch
 // tip the worker-push harness stacks on). Idempotent; force-updates the local ref.
@@ -552,6 +571,15 @@ func (w *Worktree) HasChanges() (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// HeadSHA returns the worktree's current HEAD commit.
+func (w *Worktree) HeadSHA() (string, error) {
+	out, err := run(w.Dir, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("rev-parse HEAD: %w", err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
 // SoftResetTo moves HEAD back to ref while KEEPING every change in the worktree (the
 // index and working tree are untouched). Flowbee owns the commit — the harness commits
 // the work-product authored as the node (§3.5) — but an AGENTIC CLI (e.g. codex) may run
@@ -566,6 +594,19 @@ func (w *Worktree) HasChanges() (bool, error) {
 func (w *Worktree) SoftResetTo(ref string) error {
 	if _, err := run(w.Dir, "git", "reset", "--soft", ref); err != nil {
 		return fmt.Errorf("soft reset to %s: %w", ref, err)
+	}
+	return nil
+}
+
+// RebaseOnto replays the worktree's current branch onto baseSHA. It is used by
+// worker-push rebuilds when the remote issue branch exists but is behind the
+// control plane's granted base_sha. The caller may force-push the rebased HEAD.
+func (w *Worktree) RebaseOnto(baseSHA string) error {
+	if strings.TrimSpace(baseSHA) == "" {
+		return fmt.Errorf("rebase: empty base")
+	}
+	if _, err := run(w.Dir, "git", "rebase", baseSHA); err != nil {
+		return fmt.Errorf("rebase onto %s: %w", baseSHA, err)
 	}
 	return nil
 }
