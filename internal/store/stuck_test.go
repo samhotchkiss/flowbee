@@ -235,15 +235,19 @@ func TestWatchdogLeavesFreshJobsAlone(t *testing.T) {
 }
 
 // TestNormalizeStrandedReadyBuilds: a build job re-armed to `ready` with stale review
-// caps (role:code_reviewer) is repaired to role:eng_worker so a builder can claim it.
+// caps and stale build-attempt artifacts is repaired so a builder can claim it and
+// reservation filtering does not serialize the ready queue behind old write-sets.
 func TestNormalizeStrandedReadyBuilds(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
 	if _, err := st.DB.ExecContext(ctx, `
 		INSERT INTO jobs (id, kind, flow, stage, state, role, blocked_by, required_capabilities,
-		                  enqueued_at, lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq)
+		                  enqueued_at, lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
+		                  patch_diff, declared_blast_radius, reservation_paths, reservation_wide)
 		VALUES ('strand', 'build', 'build', 'build', 'ready', 'code_reviewer', '[]', '["role:code_reviewer"]',
-		        datetime('now'), 0, 0, 5, 0, 4, 1)`); err != nil {
+		        datetime('now'), 0, 0, 5, 0, 4, 1,
+		        'diff --git a/hot.go b/hot.go', '{"paths":["backend/hot.go"],"scope":""}',
+		        '["backend/hot.go"]', 1)`); err != nil {
 		t.Fatal(err)
 	}
 	n, err := st.NormalizeStrandedReadyBuilds(ctx, time.Unix(1000, 0))
@@ -259,5 +263,16 @@ func TestNormalizeStrandedReadyBuilds(t *testing.T) {
 	}
 	if len(j.RequiredCapabilities) != 1 || j.RequiredCapabilities[0] != "role:eng_worker" {
 		t.Fatalf("caps=%v want [role:eng_worker]", j.RequiredCapabilities)
+	}
+	var patch, declared, reservationPaths string
+	var reservationWide int
+	if err := st.DB.QueryRowContext(ctx, `
+		SELECT patch_diff, declared_blast_radius, reservation_paths, reservation_wide
+		  FROM jobs WHERE id='strand'`).Scan(&patch, &declared, &reservationPaths, &reservationWide); err != nil {
+		t.Fatal(err)
+	}
+	if patch != "" || declared != "" || reservationPaths != "" || reservationWide != 0 {
+		t.Fatalf("stale build artifacts survived normalize: patch=%q declared=%q reservation_paths=%q reservation_wide=%d",
+			patch, declared, reservationPaths, reservationWide)
 	}
 }

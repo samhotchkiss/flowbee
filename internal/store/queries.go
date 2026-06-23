@@ -636,8 +636,12 @@ func (s *Store) Release(ctx context.Context, p ReleaseParams) error {
 			UPDATE jobs
 			   SET state = ?, lease_id = NULL, bound_identity = NULL,
 			       bound_model_family = NULL, lease_hb_due = NULL,
+			       patch_diff = CASE WHEN ? = 'ready' THEN '' ELSE patch_diff END,
+			       declared_blast_radius = CASE WHEN ? = 'ready' THEN '' ELSE declared_blast_radius END,
+			       reservation_paths = CASE WHEN ? = 'ready' THEN '' ELSE reservation_paths END,
+			       reservation_wide = CASE WHEN ? = 'ready' THEN 0 ELSE reservation_wide END,
 			       attempts = attempts + ?, updated_at = datetime('now')
-			 WHERE id = ?`, string(toState), attemptsDelta, p.JobID); err != nil {
+			 WHERE id = ?`, string(toState), string(toState), string(toState), string(toState), string(toState), attemptsDelta, p.JobID); err != nil {
 			return fmt.Errorf("apply release projection: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `

@@ -184,22 +184,24 @@ func reviewWaitingOnCITx(ctx context.Context, tx *sql.Tx, id string) (bool, erro
 }
 
 // NormalizeStrandedReadyBuilds is the self-heal safety net for a build job that landed in
-// `ready` carrying STALE review/resolver capabilities — e.g. a re-arm from review or a
-// manual operator re-arm out of needs_human that didn't reset them, leaving
-// required_capabilities pointing at role:code_reviewer. The scheduler matches a `ready`
-// job to a worker BY its required_capabilities, so a build asking for a code_reviewer is
-// unleaseable by EVERY builder and sits forever (no_eligible_worker fires endlessly). A
-// `ready` build job MUST require role:eng_worker; this repairs any that don't, no matter
-// HOW they got there, so a stale capability can never permanently strand a job. Returns
-// the number repaired (a direct projection repair — the canonical re-arm folds already
-// target eng_worker, so this aligns a diverged row, it does not invent a transition).
+// `ready` carrying STALE review/resolver capabilities or stale build-attempt artifacts.
+// A `ready` build job MUST require role:eng_worker and MUST NOT carry the previous
+// attempt's diff/blast-radius/reservation: those stale write-sets make reservation
+// filtering treat old work as current and can serialize the whole fleet behind one
+// active build. This direct projection repair aligns a diverged row with the canonical
+// fresh-build re-arm; it does not invent a transition.
 func (s *Store) NormalizeStrandedReadyBuilds(ctx context.Context, now time.Time) (int, error) {
 	want := marshalStrings([]string{"role:eng_worker"})
 	res, err := s.DB.ExecContext(ctx, `
 		UPDATE jobs
-		   SET role='eng_worker', stage='build', required_capabilities=?, updated_at=datetime('now')
+		   SET role='eng_worker', stage='build', required_capabilities=?,
+		       patch_diff='', declared_blast_radius='',
+		       reservation_paths='', reservation_wide=0,
+		       updated_at=datetime('now')
 		 WHERE state='ready' AND kind='build'
-		   AND (role != 'eng_worker' OR required_capabilities != ?)`,
+		   AND (role != 'eng_worker' OR required_capabilities != ?
+		        OR patch_diff != '' OR declared_blast_radius != ''
+		        OR reservation_paths != '' OR reservation_wide != 0)`,
 		want, want)
 	if err != nil {
 		return 0, fmt.Errorf("normalize stranded ready builds: %w", err)

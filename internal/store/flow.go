@@ -451,6 +451,8 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 				UPDATE jobs
 				   SET state = 'ready', role = 'eng_worker', stage = 'build',
 				       required_capabilities = ?, bounces = bounces + ?,
+				       patch_diff = '', declared_blast_radius = '',
+				       reservation_paths = '', reservation_wide = 0,
 				       enqueued_at = ?,
 				       last_review_notes = CASE WHEN ? <> '' THEN ? ELSE last_review_notes END,
 				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,

@@ -404,6 +404,8 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET state='ready', role='eng_worker', required_capabilities=?,
 		       bounces=bounces+1,
+		       patch_diff='', declared_blast_radius='',
+		       reservation_paths='', reservation_wide=0,
 		       enqueued_at=?, lease_id=NULL, bound_identity=NULL, bound_model_family=NULL,
 		       updated_at=datetime('now') WHERE id=?`,
 		marshalStrings([]string{"role:eng_worker"}), now.Format(rfc3339), j.ID); err != nil {
@@ -438,6 +440,8 @@ func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr Reconc
 		       required_capabilities = ?,
 		       base_sha = COALESCE(NULLIF(?,''), base_sha), head_sha = '',
 		       verdict = NULL,
+		       patch_diff = '', declared_blast_radius = '',
+		       reservation_paths = '', reservation_wide = 0,
 		       lease_epoch = lease_epoch + 1,
 		       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 		       lease_hb_due = NULL, lease_deadline = NULL,
