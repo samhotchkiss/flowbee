@@ -286,6 +286,13 @@ var ErrMergeConflict = errors.New("pull request has merge conflicts (not mergeab
 // Permanent() check treats it as transient (retry) rather than dead-lettering it.
 var ErrMergeBaseModified = errors.New("merge base branch was modified (retryable)")
 
+// ErrMergeRuleViolationPending signals GitHub's 405 "Repository rule violations found"
+// merge refusal when the violated rule can clear without human intervention: a required
+// status check is still "expected" (pending/not reported yet), or the branch must first be
+// brought up to date with its base. It is deliberately NOT an *ErrGitHub so project-out
+// treats it as retryable instead of dead-lettering a merge that raced ahead of CI.
+var ErrMergeRuleViolationPending = errors.New("merge blocked by pending repository rule violation (retryable)")
+
 // ErrMergeHeadModified signals GitHub's 409 "Head branch was modified. Review and try
 // the merge again." — returned when the merge call pins an expected-head `sha` and the
 // PR's live head no longer matches it. This is the SAFETY interlock against an
@@ -333,6 +340,33 @@ func isMergeConflict(err error) bool {
 func isBaseModified(err error) bool {
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "405") && strings.Contains(s, "base branch was modified")
+}
+
+// isMergeRuleViolationPending reports retryable branch-protection/ruleset 405s from the
+// merge endpoint. GitHub returns these when Flowbee asked to merge before a required check
+// reported, or when the repository requires the branch to be current with base. Those are
+// not poison 4xxs; a later drain can succeed after CI reports or after update-branch.
+func isMergeRuleViolationPending(err error) bool {
+	s := strings.ToLower(err.Error())
+	if !strings.Contains(s, "405") || !strings.Contains(s, "repository rule violations found") {
+		return false
+	}
+	return strings.Contains(s, "required status check") && strings.Contains(s, "is expected") ||
+		isMergeRuleBehind(err)
+}
+
+// IsMergeRuleBehind reports the retryable ruleset variant where GitHub requires the PR
+// branch to be up to date with its base before merging. Project-out uses this to trigger
+// a best-effort update-branch before retrying.
+func IsMergeRuleBehind(err error) bool {
+	return isMergeRuleBehind(err)
+}
+
+func isMergeRuleBehind(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "branch is not up to date") ||
+		strings.Contains(s, "must be up to date") ||
+		strings.Contains(s, "behind")
 }
 
 // isHeadModified reports GitHub's 409 "Head branch was modified. Review and try the merge
@@ -1024,6 +1058,21 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int, expected
 		// the human merge gate.
 		return fmt.Errorf("%w: %v", ErrMergeHeadModified, err)
 	}
+	if err != nil && isBaseModified(err) {
+		// GitHub's 405 "Base branch was modified. Review and try the merge again." is
+		// OPTIMISTIC-CONCURRENCY, not a failure: main moved between the mergeability check
+		// and this merge (a sibling PR merged first — exactly what concurrent epic-child
+		// merges produce). It is explicitly retryable. Return a TRANSIENT sentinel (NOT an
+		// *ErrGitHub, whose Permanent() is true for any 4xx) so project-out RETRIES the
+		// merge once the base settles instead of dead-lettering the loser to needs_human.
+		return fmt.Errorf("%w: %v", ErrMergeBaseModified, err)
+	}
+	if err != nil && isMergeRuleViolationPending(err) {
+		// A required-check "is expected" or up-to-date ruleset refusal is a race with
+		// GitHub's own merge preconditions, not a bad request. Surface it as retryable so
+		// the outbox waits for CI / update-branch instead of immediately escalating.
+		return fmt.Errorf("%w: %v", ErrMergeRuleViolationPending, err)
+	}
 	if err != nil && isMergeConflict(err) {
 		// A 405 "not mergeable" is ambiguous: a REAL conflict, GitHub still recomputing
 		// mergeability after a sibling merge (transient), OR the PR is ALREADY MERGED — a
@@ -1037,15 +1086,6 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int, expected
 		// surface a real conflict as the typed error so the sender routes to a resolver
 		// instead of re-queuing a merge that can never succeed.
 		return fmt.Errorf("%w: %v", ErrMergeConflict, err)
-	}
-	if err != nil && isBaseModified(err) {
-		// GitHub's 405 "Base branch was modified. Review and try the merge again." is
-		// OPTIMISTIC-CONCURRENCY, not a failure: main moved between the mergeability check
-		// and this merge (a sibling PR merged first — exactly what concurrent epic-child
-		// merges produce). It is explicitly retryable. Return a TRANSIENT sentinel (NOT an
-		// *ErrGitHub, whose Permanent() is true for any 4xx) so project-out RETRIES the
-		// merge once the base settles instead of dead-lettering the loser to needs_human.
-		return fmt.Errorf("%w: %v", ErrMergeBaseModified, err)
 	}
 	return err
 }
