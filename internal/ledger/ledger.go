@@ -273,13 +273,15 @@ func Fold(events []Event) (job.Job, error) {
 			// pre-requeue epoch (projection != Fold, a latent DR divergence).
 			j.LeaseEpoch = e.LeaseEpoch
 			if e.Payload.ResetCounters {
-				// operator requeue re-arms the job with a fresh budget (attempts/bounces
-				// zeroed) and a clean slate: head_sha + verdict cleared, stage reset to the
-				// job's own entry stage (role/caps come from the ready/spec post-step).
+				// operator requeue re-arms the job with a fresh budget (attempts/bounces/
+				// stall governor zeroed) and a clean slate: head_sha + verdict cleared,
+				// stage reset to the job's own entry stage (role/caps come from the
+				// ready/spec post-step).
 				// Mirror the live UPDATE exactly so projection == Fold(events) holds — else a
 				// rebuild-from-ledger keeps a stale head (reconcile misclassifies) + verdict.
 				j.Attempts = 0
 				j.Bounces = 0
+				j.StallRevocations = 0
 				j.HeadSHA = ""
 				j.Verdict = nil
 				if e.ToState == job.StateSpecAuthoring {

@@ -21,9 +21,11 @@ func TestFoldResetsBuildCapsOnReArmToReady(t *testing.T) {
 			Payload: Payload{Kind: job.KindBuild, Role: job.RoleEngWorker, RequiredCapabilities: []string{"role:eng_worker"}}},
 		{JobID: "B1", JobSeq: 2, Kind: KindLeaseClaimed, ToState: job.StateLeased, LeaseEpoch: 1, CreatedAt: now},
 		{JobID: "B1", JobSeq: 3, Kind: KindResultAccepted, ToState: job.StateReviewPending, CreatedAt: now}, // caps -> code_reviewer
-		{JobID: "B1", JobSeq: 4, Kind: KindStateChanged, ToState: job.StateNeedsHuman, CreatedAt: now,
+		{JobID: "B1", JobSeq: 4, Kind: KindLeaseRevoked, ToState: job.StateReady, CreatedAt: now,
+			Payload: Payload{StallRevocationsDelta: 1}},
+		{JobID: "B1", JobSeq: 5, Kind: KindStateChanged, ToState: job.StateNeedsHuman, CreatedAt: now,
 			Payload: Payload{EscalationReason: "attempts"}},
-		{JobID: "B1", JobSeq: 5, Kind: KindStateChanged, ToState: job.StateReady, CreatedAt: now,
+		{JobID: "B1", JobSeq: 6, Kind: KindStateChanged, ToState: job.StateReady, CreatedAt: now,
 			Payload: Payload{ResetCounters: true}}, // operator requeue back to ready
 	}
 	j, err := Fold(events)
@@ -38,6 +40,9 @@ func TestFoldResetsBuildCapsOnReArmToReady(t *testing.T) {
 	}
 	if len(j.RequiredCapabilities) != 1 || j.RequiredCapabilities[0] != "role:eng_worker" {
 		t.Errorf("caps=%v want [role:eng_worker] — stale review caps strand the build + churn the watchdogs", j.RequiredCapabilities)
+	}
+	if j.StallRevocations != 0 {
+		t.Errorf("stall revocations=%d want 0 — operator requeue must reset the anti-thrash governor too", j.StallRevocations)
 	}
 }
 

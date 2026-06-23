@@ -25,9 +25,9 @@ func TestRequeueJob(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// strand it: needs_human, attempts burned, an old epoch.
+	// strand it: needs_human, budgets burned, an old epoch.
 	if _, err := st.DB.ExecContext(ctx,
-		`UPDATE jobs SET state='needs_human', attempts=2, bounces=1, lease_epoch=6 WHERE id='j'`); err != nil {
+		`UPDATE jobs SET state='needs_human', attempts=2, bounces=1, stall_revocations=4, lease_epoch=6 WHERE id='j'`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -42,8 +42,8 @@ func TestRequeueJob(t *testing.T) {
 	if j.State != job.StateReady {
 		t.Fatalf("state=%s, want ready", j.State)
 	}
-	if j.Attempts != 0 || j.Bounces != 0 {
-		t.Fatalf("budget not reset: attempts=%d bounces=%d, want 0/0", j.Attempts, j.Bounces)
+	if j.Attempts != 0 || j.Bounces != 0 || j.StallRevocations != 0 {
+		t.Fatalf("budget not reset: attempts=%d bounces=%d stall_revocations=%d, want 0/0/0", j.Attempts, j.Bounces, j.StallRevocations)
 	}
 	if j.LeaseEpoch != 7 {
 		t.Fatalf("epoch=%d, want 7 (bumped to fence zombies)", j.LeaseEpoch)
