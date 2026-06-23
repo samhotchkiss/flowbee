@@ -163,6 +163,53 @@ func TestM4SameModelFamilyExcluded(t *testing.T) {
 	}
 }
 
+// TestM4LegacyReviewPendingWithUnknownBuilderFamilyDrains pins the live #225 backlog
+// shape: old review_pending rows had the reviewer capability but no persisted
+// builder_model_family. Unknown builder family must fail open for a DIFFERENT reviewer;
+// otherwise adding a second-family reviewer cannot drain historical review backlog.
+func TestM4LegacyReviewPendingWithUnknownBuilderFamilyDrains(t *testing.T) {
+	st := testutil.NewStore(t)
+	clk := clock.NewFake(time.Unix(5000, 0))
+	srv := newM4Server(st, clk)
+	ts := httptest.NewServer(srv.PrivateHandler())
+	defer ts.Close()
+	ctx := context.Background()
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "legacy-review", Kind: job.KindBuild, Flow: "build", Stage: "review",
+		Role: job.RoleEngWorker, BaseSHA: "base1",
+		RequiredCapabilities: []string{"role:code_reviewer"}, Now: time.Unix(1000, 0),
+	}); err != nil {
+		t.Fatalf("seed legacy review: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `
+		UPDATE jobs
+		   SET state='review_pending',
+		       required_capabilities='["role:code_reviewer"]',
+		       builder_identity=NULL,
+		       builder_model_family=NULL,
+		       bound_identity=NULL,
+		       bound_model_family=NULL,
+		       eng_worker_job=id
+		 WHERE id='legacy-review'`); err != nil {
+		t.Fatalf("shape legacy review row: %v", err)
+	}
+	if err := st.UpsertDomainBFacts(ctx, "legacy-review", job.DomainBFacts{
+		PRExists: true, PRNumber: 1, HeadSHA: "head1", BaseSHA: "base1", CIGreen: true,
+	}); err != nil {
+		t.Fatalf("seed facts: %v", err)
+	}
+
+	reviewer := registerReviewer(t, ctx, ts.URL, "reviewer-claude", "opus")
+	rg, ok, err := reviewer.Lease(ctx, "reviewer-claude", "opus", string(job.RoleCodeReviewer))
+	if err != nil || !ok || rg.JobID != "legacy-review" {
+		t.Fatalf("cross-family reviewer must drain legacy unknown-family review: ok=%v err=%v job=%s", ok, err, rg.JobID)
+	}
+	if j, _ := st.GetJob(ctx, "legacy-review"); j.State != job.StateCodeReview {
+		t.Fatalf("after legacy review lease state=%s want code_review", j.State)
+	}
+}
+
 // TestM4SingleProviderFleetRaisesNoEligibleWorker proves the §5.6 surface: with
 // ONLY model:codex workers (the builder built codex; the only reviewer offering
 // is also codex), the model_family term is unsatisfiable, no reviewer can claim

@@ -64,11 +64,12 @@ type repoLoop struct {
 // repos registry and is the single object the runtime ticks (SweepAll/DrainAll) and
 // the single place a webhook hint is routed to the right repo's reconciler.
 type Manager struct {
-	store *store.Store
-	clk   Clock
-	pub   Publisher
-	loops map[string]*repoLoop // keyed by repos.id
-	order []string             // repo ids in stable (sorted) order
+	store            *store.Store
+	clk              Clock
+	pub              Publisher
+	autoMergeHandoff bool
+	loops            map[string]*repoLoop // keyed by repos.id
+	order            []string             // repo ids in stable (sorted) order
 }
 
 // HistoryWriter is the per-repo LOCAL-git writer that lands the F11 issue-archive
@@ -88,10 +89,11 @@ type HistoryFactory func(r store.Repo) HistoryWriter
 type Option func(*managerConfig)
 
 type managerConfig struct {
-	history        HistoryFactory
-	allowOwnSource map[string]bool
-	archiveHistory map[string]bool
-	logger         *slog.Logger
+	history          HistoryFactory
+	allowOwnSource   map[string]bool
+	archiveHistory   map[string]bool
+	autoMergeHandoff bool
+	logger           *slog.Logger
 }
 
 // WithHistory wires the F11 history writer per repo so each repo's project-OUT
@@ -118,6 +120,13 @@ func WithArchiveHistory(repos map[string]bool) Option {
 	return func(c *managerConfig) { c.archiveHistory = repos }
 }
 
+// WithAutoMergeHandoff lets the #214 sweep advance self_merge-approved
+// merge_handoff jobs into the existing project-OUT merge path. The project sender
+// still performs the SHA-pinned/content-verified GitHub merge; this only queues it.
+func WithAutoMergeHandoff(enabled bool) Option {
+	return func(c *managerConfig) { c.autoMergeHandoff = enabled }
+}
+
 // WithLogger wires a logger into each repo's project-OUT sender so dead-lettered GitHub
 // writes are recorded durably in the serve log (alongside the flowbee_outbox_abandoned metric).
 func WithLogger(l *slog.Logger) Option {
@@ -136,7 +145,7 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 	if err != nil {
 		return nil, fmt.Errorf("list repos: %w", err)
 	}
-	m := &Manager{store: st, clk: clk, pub: pub, loops: map[string]*repoLoop{}}
+	m := &Manager{store: st, clk: clk, pub: pub, autoMergeHandoff: cfg.autoMergeHandoff, loops: map[string]*repoLoop{}}
 	for _, r := range repos {
 		client, writer, ferr := factory(r)
 		if ferr != nil {
@@ -210,15 +219,11 @@ func (m *Manager) DrainAll(ctx context.Context) (map[string]int, error) {
 	return counts, nil
 }
 
-// UnstickAll fast-forwards every merge_handoff PR that is BEHIND its base, per repo, over the
-// repo's own client (#214). It NEVER merges — only brings the PR up to date (server-side FF,
-// re-triggering CI) — so a reviewed, green PR stops rotting behind a base that keeps moving
-// (the "each other merge pushes the waiting ones further behind, they never converge"
-// cascade); a human (or a later self-merge) then lands a CURRENT PR. It acts ONLY on a
-// definitive "behind" — GitHub reports that state only when the repo REQUIRES up-to-date
-// branches, so this self-scopes to exactly the repos that need it; "unknown" (async, not yet
-// computed), "clean", "dirty" (a real conflict — a human resolves) are left alone. A per-PR
-// error is skipped (best-effort), never fatal. Returns the per-repo count of branches updated.
+// UnstickAll fast-forwards every merge_handoff PR that is BEHIND its base, then queues
+// self_merge-approved handoff rows for the existing project-OUT merge path (#214).
+// Updates and merge enqueues are serialized per repo by this loop plus the single
+// project sender, so one merge cannot immediately push the next waiting PR behind
+// without the next sweep seeing and updating it first.
 func (m *Manager) UnstickAll(ctx context.Context) (map[string]int, error) {
 	rows, err := m.store.MergeHandoffView(ctx)
 	if err != nil {
@@ -246,6 +251,17 @@ func (m *Manager) UnstickAll(ctx context.Context) (map[string]int, error) {
 				continue // 422 conflict / transient — a human resolves a real conflict
 			}
 			counts[id]++
+		}
+		if !m.autoMergeHandoff {
+			continue
+		}
+		for _, row := range byRepo[id] {
+			if row.PRNumber == 0 || !row.SelfMerge {
+				continue
+			}
+			if ok, err := m.store.EnqueueMergeForJob(ctx, row.JobID, m.clk.Now()); err == nil && ok {
+				counts[id]++
+			}
 		}
 	}
 	return counts, nil

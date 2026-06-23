@@ -541,6 +541,7 @@ flowbee retry-outbox --all           # every abandoned write
 
 flowbee requeue <job-id>             # re-arm a needs_human job
 flowbee requeue --state needs_human  # bulk requeue by state
+flowbee requeue --state needs_human --reason "405 Repository rule"  # bulk requeue one transient class
 ```
 
 Then verify the queue is draining:
@@ -559,7 +560,7 @@ flowbee board
 | A job parks with trigger `reviewer_rejections` | ONE review node requested changes on the same task 6 times — a genuine standoff, not normal iteration | read that reviewer's findings on the PR; the disagreement needs a human call, then `flowbee requeue <job-id>` |
 | A job parks with trigger `ci_stalled` | its PR's CI never went green for the whole stall window — CI is wedged (runner down, no workflow triggered, or perpetually pending), not merely slow | fix CI (restart the runner / check the workflow triggers / re-run the run), then `flowbee requeue <job-id>` |
 | A job parks with trigger `project_out` | a GitHub write for it (open-PR / merge / create-issue) failed permanently — the branch/PR was deleted, a 422/404 — so the action was dead-lettered (the rest of the outbox keeps flowing) | fix the GitHub state (the branch/PR), then `flowbee requeue <job-id>` |
-| "which binary is running?" | a stale deploy | `flowbee version` prints the embedded git SHA (`flowbee version --json` for tooling: `{"version":"…"}`); compare it to `/healthz`'s `version` |
+| "which binary is running?" | a stale deploy | `flowbee doctor --running` reports version, source commit, dirty state, and behind-`origin/main` count from the live control plane; use `flowbee build -o bin/flowbee` for a clean `origin/main` rebuild |
 | Suspect a stuck `ready` job | a projection drifted from the ledger | the forward-progress watchdog resyncs it within 60s; it can't persist |
 
 The **forward-progress watchdog** (runs every 60s) is the safety net: it re-folds each

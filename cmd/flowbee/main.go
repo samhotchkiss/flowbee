@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -46,14 +47,25 @@ func buildVersion() string {
 }
 
 func runVersion(args []string) error {
+	prov := currentProvenance(context.Background(), true)
 	for _, a := range args {
 		if a == "--json" {
-			out, _ := json.Marshal(map[string]string{"version": buildVersion()})
+			out, _ := json.Marshal(prov)
 			fmt.Println(string(out))
 			return nil
 		}
 	}
-	fmt.Printf("flowbee %s\n", buildVersion())
+	fmt.Printf("flowbee %s\n", prov.Version)
+	if prov.SourceCommit != "" {
+		fmt.Printf("source_commit=%s tree_dirty=%v", prov.SourceCommit, prov.TreeDirty)
+		if prov.BehindOriginMainKnown {
+			fmt.Printf(" behind_origin_main_by=%d", prov.BehindOriginMainBy)
+		}
+		fmt.Println()
+	}
+	if prov.Warning != "" {
+		fmt.Println("WARN: " + prov.Warning)
+	}
 	return nil
 }
 
@@ -110,6 +122,8 @@ func main() {
 		err = runOutbox(args)
 	case "backup":
 		err = runBackup(args)
+	case "build":
+		err = runBuild(args)
 	case "restore":
 		err = runRestore(args)
 	case "pause":
@@ -130,5 +144,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|retry-outbox|backup|restore|pause|resume|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|retry-outbox|backup|build|restore|pause|resume|seed|version>")
 }

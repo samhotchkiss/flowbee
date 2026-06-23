@@ -25,6 +25,7 @@ func runRequeue(args []string) error {
 	force := fs.Bool("force", false, "requeue even if the job is actively leased (fences the live worker, discarding its in-flight work)")
 	state := fs.String("state", "", "requeue ALL jobs in this state (e.g. needs_human) instead of a single job-id")
 	repo := fs.String("repo", "", "with --state: limit to this repo id")
+	reason := fs.String("reason", "", "with --state: limit to jobs whose escalation reason contains this text")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -45,7 +46,7 @@ func runRequeue(args []string) error {
 			return err
 		}
 		defer db.Close()
-		return requeueByState(c, db, *state, *repo, *force)
+		return requeueByState(c, db, *state, *repo, *reason, *force)
 	}
 
 	if fs.NArg() < 1 {
@@ -72,13 +73,17 @@ func requeueOne(c *client.Client, jobID string, force bool) error {
 
 // requeueByState reads the matching job ids from the local control-plane DB (read-only) and
 // requeues each through the same API the single-job form uses.
-func requeueByState(c *client.Client, db *store.Store, state, repo string, force bool) error {
+func requeueByState(c *client.Client, db *store.Store, state, repo, reason string, force bool) error {
 	ctx := context.Background()
 	query := `SELECT id, COALESCE(escalation_reason,'') FROM jobs WHERE state = ?`
 	qargs := []any{state}
 	if repo != "" {
 		query += ` AND COALESCE(repo,'') = ?`
 		qargs = append(qargs, repo)
+	}
+	if reason != "" {
+		query += ` AND COALESCE(escalation_reason,'') LIKE ?`
+		qargs = append(qargs, "%"+reason+"%")
 	}
 	query += ` ORDER BY enqueued_at`
 	rows, err := db.DB.QueryContext(ctx, query, qargs...)
@@ -118,8 +123,8 @@ func requeueByState(c *client.Client, db *store.Store, state, repo string, force
 		}
 		requeued++
 	}
-	fmt.Printf("\nrequeued %d, skipped %d (pr_closed), failed %d — of %d %s job(s)%s\n",
-		requeued, skipped, failed, len(jobs), state, repoSuffix(repo))
+	fmt.Printf("\nrequeued %d, skipped %d (pr_closed), failed %d — of %d %s job(s)%s%s\n",
+		requeued, skipped, failed, len(jobs), state, repoSuffix(repo), reasonSuffix(reason))
 	if failed > 0 {
 		return fmt.Errorf("%d requeue(s) failed", failed)
 	}
@@ -131,4 +136,11 @@ func repoSuffix(repo string) string {
 		return ""
 	}
 	return " in repo " + repo
+}
+
+func reasonSuffix(reason string) string {
+	if reason == "" {
+		return ""
+	}
+	return " matching reason " + reason
 }

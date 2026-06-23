@@ -298,7 +298,8 @@ type MergeHandoffRow struct {
 	// (re-review needed), a denylist/source reason (a human merges it), self_merge_unverifiable
 	// (no mirror), etc. Empty for a bare M3-default handoff. Tells the operator what action to
 	// take — merge it, re-review, or fix a config — instead of guessing.
-	Reason string `json:"reason,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	SelfMerge bool   `json:"self_merge"`
 }
 
 // MergeHandoffView lists every job parked in merge_handoff: Flowbee built, reviewed,
@@ -313,7 +314,8 @@ func (s *Store) MergeHandoffView(ctx context.Context) ([]MergeHandoffRow, error)
 		                  WHERE e.job_id = j.id
 		                    AND json_extract(e.payload, '$.RevokeReason') IS NOT NULL
 		                    AND json_extract(e.payload, '$.RevokeReason') != ''
-		                  ORDER BY e.job_seq DESC LIMIT 1), '') AS reason
+		                  ORDER BY e.job_seq DESC LIMIT 1), '') AS reason,
+		       CASE WHEN json_extract(j.verdict, '$.disposition') = 'self_merge' THEN 1 ELSE 0 END
 		  FROM jobs j LEFT JOIN domain_b_facts f ON f.job_id = j.id
 		 WHERE j.state = 'merge_handoff'
 		 ORDER BY j.updated_at DESC, j.id ASC`)
@@ -324,9 +326,11 @@ func (s *Store) MergeHandoffView(ctx context.Context) ([]MergeHandoffRow, error)
 	out := []MergeHandoffRow{}
 	for rows.Next() {
 		var r MergeHandoffRow
-		if err := rows.Scan(&r.JobID, &r.Repo, &r.IssueNumber, &r.PRNumber, &r.Reason); err != nil {
+		var selfMerge int
+		if err := rows.Scan(&r.JobID, &r.Repo, &r.IssueNumber, &r.PRNumber, &r.Reason, &selfMerge); err != nil {
 			return nil, err
 		}
+		r.SelfMerge = selfMerge == 1
 		out = append(out, r)
 	}
 	return out, rows.Err()

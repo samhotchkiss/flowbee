@@ -659,28 +659,36 @@ func runServe(args []string) error {
 }
 
 func runningConfigSnapshot(cfg config.Config) api.RunningConfig {
+	prov := currentProvenance(context.Background(), true)
 	rc := api.RunningConfig{
-		ConfigPath:           runningConfigPath(),
-		DatabaseURL:          cfg.DatabaseURL,
-		PrivateAddr:          cfg.PrivateAddr,
-		HealthAddr:           cfg.HealthAddr,
-		WebhookAddr:          cfg.WebhookAddr,
-		AllowSelfMerge:       cfg.AllowSelfMerge,
-		RequiredReviewers:    cfg.RequiredReviewers,
-		MirrorPath:           os.Getenv("FLOWBEE_MIRROR_PATH"),
-		GitRemote:            os.Getenv("FLOWBEE_GIT_REMOTE"),
-		WorkerGitSSH:         strings.EqualFold(os.Getenv("FLOWBEE_GIT_REMOTE"), "ssh"),
-		BundleProvisioning:   os.Getenv("FLOWBEE_BUNDLE_PROVISIONING") != "",
-		GitHubTokenPresent:   os.Getenv("FLOWBEE_GITHUB_TOKEN") != "",
-		WebhookSecretPresent: os.Getenv("FLOWBEE_WEBHOOK_SECRET") != "",
-		WorkerAuthConfigured: cfg.WorkerAuthSecret != "",
-		InsecureWorkerAPI:    os.Getenv("FLOWBEE_INSECURE") != "",
-		AuthLoopbackBypass:   cfg.AuthLoopbackBypass,
-		LogPath:              os.Getenv("FLOWBEE_LOG_PATH"),
-		BackupDir:            envOr("FLOWBEE_BACKUP_DIR", defaultBackupDir()),
-		ReconcileIntervalEnv: os.Getenv("FLOWBEE_RECONCILE_INTERVAL_S"),
-		UnstickIntervalEnv:   os.Getenv("FLOWBEE_UNSTICK_INTERVAL_S"),
-		FlowbeeURL:           os.Getenv("FLOWBEE_URL"),
+		SourceCommit:          prov.SourceCommit,
+		TreeDirty:             prov.TreeDirty,
+		TreeDirtyKnown:        prov.TreeDirtyKnown,
+		OriginMainSHA:         prov.OriginMainSHA,
+		BehindOriginMainBy:    prov.BehindOriginMainBy,
+		BehindOriginMainKnown: prov.BehindOriginMainKnown,
+		SourceWarning:         prov.Warning,
+		ConfigPath:            runningConfigPath(),
+		DatabaseURL:           cfg.DatabaseURL,
+		PrivateAddr:           cfg.PrivateAddr,
+		HealthAddr:            cfg.HealthAddr,
+		WebhookAddr:           cfg.WebhookAddr,
+		AllowSelfMerge:        cfg.AllowSelfMerge,
+		RequiredReviewers:     cfg.RequiredReviewers,
+		MirrorPath:            os.Getenv("FLOWBEE_MIRROR_PATH"),
+		GitRemote:             os.Getenv("FLOWBEE_GIT_REMOTE"),
+		WorkerGitSSH:          strings.EqualFold(os.Getenv("FLOWBEE_GIT_REMOTE"), "ssh"),
+		BundleProvisioning:    os.Getenv("FLOWBEE_BUNDLE_PROVISIONING") != "",
+		GitHubTokenPresent:    os.Getenv("FLOWBEE_GITHUB_TOKEN") != "",
+		WebhookSecretPresent:  os.Getenv("FLOWBEE_WEBHOOK_SECRET") != "",
+		WorkerAuthConfigured:  cfg.WorkerAuthSecret != "",
+		InsecureWorkerAPI:     os.Getenv("FLOWBEE_INSECURE") != "",
+		AuthLoopbackBypass:    cfg.AuthLoopbackBypass,
+		LogPath:               os.Getenv("FLOWBEE_LOG_PATH"),
+		BackupDir:             envOr("FLOWBEE_BACKUP_DIR", defaultBackupDir()),
+		ReconcileIntervalEnv:  os.Getenv("FLOWBEE_RECONCILE_INTERVAL_S"),
+		UnstickIntervalEnv:    os.Getenv("FLOWBEE_UNSTICK_INTERVAL_S"),
+		FlowbeeURL:            os.Getenv("FLOWBEE_URL"),
 	}
 	for _, r := range cfg.Repos {
 		tokenEnv := r.TokenEnv
@@ -1036,6 +1044,7 @@ func wireMultiRepo(ctx context.Context, logger *slog.Logger, cfg config.Config, 
 	var historyOpt []multirepo.Option
 	historyOpt = append(historyOpt, multirepo.WithAllowOwnSource(allowOwn))
 	historyOpt = append(historyOpt, multirepo.WithArchiveHistory(archiveHist))
+	historyOpt = append(historyOpt, multirepo.WithAutoMergeHandoff(cfg.AllowSelfMerge))
 	historyOpt = append(historyOpt, multirepo.WithLogger(logger)) // durable dead-letter records
 	if os.Getenv("FLOWBEE_MIRROR_PATH") != "" {
 		// F9: each repo's history archive + base_sha resolution come off ITS OWN bare

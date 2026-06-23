@@ -64,6 +64,14 @@ func TestRunningConfigEndpointRequiresAuthAndIsRedacted(t *testing.T) {
 	if strings.Contains(body, "server-secret") || strings.Contains(body, "github_pat_") {
 		t.Fatalf("running config must not expose secret values: %s", body)
 	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/configz", nil)
+	req.Header.Set("Authorization", "Bearer "+authn.Mint("worker"))
+	srv.PrivateHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /configz status=%d body=%s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestRunningConfigOpenAPIIsLoopbackOnly(t *testing.T) {

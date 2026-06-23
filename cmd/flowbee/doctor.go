@@ -23,23 +23,29 @@ func runDoctor(args []string) error {
 	offline := fs.Bool("offline", false, "skip the GitHub reachability check")
 	quiet := fs.Bool("quiet", false, "suppress per-check lines; print only the summary")
 	jsonOut := fs.Bool("json", false, "emit check results as a JSON array (name/status/detail per check)")
+	runningOnly := fs.Bool("running", false, "check only the currently running control plane's redacted config")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	// honor FLOWBEE_CONFIG so `flowbee doctor` validates the SAME config `flowbee serve`
-	// runs — not a stray <cwd>/flowbee.yaml. An explicit --dir (non-default) still wins.
-	configPath := ""
-	if *dir == "." {
-		configPath = envOr("FLOWBEE_CONFIG", "")
-	}
-	rep, err := onboarding.Doctor(context.Background(), onboarding.DoctorOptions{
-		Root:       *dir,
-		ConfigPath: configPath,
-		SkipGitHub: *offline,
-	})
-	if err != nil {
-		return err
+	var rep onboarding.DoctorReport
+	if !*runningOnly {
+		// honor FLOWBEE_CONFIG so `flowbee doctor` validates the SAME config `flowbee serve`
+		// runs — not a stray <cwd>/flowbee.yaml. An explicit --dir (non-default) still wins.
+		configPath := ""
+		if *dir == "." {
+			configPath = envOr("FLOWBEE_CONFIG", "")
+		}
+		var err error
+		rep, err = onboarding.Doctor(context.Background(), onboarding.DoctorOptions{
+			Root:       *dir,
+			ConfigPath: configPath,
+			SkipGitHub: *offline,
+		})
+		if err != nil {
+			return err
+		}
+		rep.Checks = append(rep.Checks, binarySourceCheck(context.Background()))
 	}
 	rep.Checks = append(rep.Checks, runningConfigCheck(context.Background()))
 
@@ -85,6 +91,23 @@ func runDoctor(args []string) error {
 		return fmt.Errorf("flowbee doctor: FAIL")
 	}
 	return fmt.Errorf("doctor found failing checks (see above)")
+}
+
+func binarySourceCheck(ctx context.Context) onboarding.Check {
+	prov := currentProvenance(ctx, true)
+	detail := fmt.Sprintf("version=%s source_commit=%s tree_dirty=%v behind_origin_main_by=%s",
+		prov.Version, orDash(prov.SourceCommit), prov.TreeDirty, behindProvenanceString(prov))
+	if prov.Warning != "" {
+		return onboarding.Check{Name: "binary-source", Status: onboarding.StatusWarn, Detail: "WARN: " + prov.Warning + "; " + detail}
+	}
+	return onboarding.Check{Name: "binary-source", Status: onboarding.StatusPass, Detail: detail}
+}
+
+func behindProvenanceString(prov provenance) string {
+	if !prov.BehindOriginMainKnown {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", prov.BehindOriginMainBy)
 }
 
 func runningConfigCheck(ctx context.Context) onboarding.Check {
@@ -136,10 +159,24 @@ func runningConfigCheck(ctx context.Context) onboarding.Check {
 	if len(repos) == 0 {
 		repos = append(repos, "none")
 	}
-	return onboarding.Check{Name: "running-config", Status: onboarding.StatusPass,
-		Detail: fmt.Sprintf("version=%s pid=%d config=%s db=%s private=%s self_merge=%v mirror=%s git_remote=%s token_present=%v webhook_secret=%v worker_auth=%v insecure=%v log_path=%s repos=%s",
-			cfg.Version, cfg.PID, orDash(cfg.ConfigPath), cfg.DatabaseURL, cfg.PrivateAddr,
+	st := onboarding.StatusPass
+	prefix := ""
+	if cfg.SourceWarning != "" {
+		st = onboarding.StatusWarn
+		prefix = "WARN: " + cfg.SourceWarning + "; "
+	}
+	return onboarding.Check{Name: "running-config", Status: st,
+		Detail: prefix + fmt.Sprintf("version=%s source_commit=%s tree_dirty=%v behind_origin_main_by=%s pid=%d config=%s db=%s private=%s self_merge=%v mirror=%s git_remote=%s token_present=%v webhook_secret=%v worker_auth=%v insecure=%v log_path=%s repos=%s",
+			cfg.Version, orDash(cfg.SourceCommit), cfg.TreeDirty, behindString(cfg),
+			cfg.PID, orDash(cfg.ConfigPath), cfg.DatabaseURL, cfg.PrivateAddr,
 			cfg.AllowSelfMerge, orDash(cfg.MirrorPath), orDash(cfg.GitRemote), cfg.GitHubTokenPresent,
 			cfg.WebhookSecretPresent, cfg.WorkerAuthConfigured, cfg.InsecureWorkerAPI,
 			orDash(cfg.LogPath), strings.Join(repos, ","))}
+}
+
+func behindString(cfg api.RunningConfig) string {
+	if !cfg.BehindOriginMainKnown {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", cfg.BehindOriginMainBy)
 }

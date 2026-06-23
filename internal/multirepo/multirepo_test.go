@@ -2,6 +2,7 @@ package multirepo_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -187,6 +188,60 @@ func TestMultiRepoControlPlane(t *testing.T) {
 	}
 }
 
+func TestUnstickAllQueuesSelfMergeHandoffOnly(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(20_000, 0)
+	clk := clock.NewFake(now)
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "core", Owner: "acme", Repo: "core", DefaultBranch: "main", Active: true}); err != nil {
+		t.Fatalf("register repo: %v", err)
+	}
+	fake := gh.NewFake()
+	factory := func(r store.Repo) (gh.Client, gh.Writer, error) { return fake, fake, nil }
+	mgr, err := multirepo.New(ctx, st, clk, nil, factory, multirepo.WithAutoMergeHandoff(true))
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+
+	seedHandoff := func(id, disp string) {
+		t.Helper()
+		if _, err := st.SeedJob(ctx, store.SeedParams{
+			ID: id, Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+			Repo: "core", BaseSHA: "base-" + id, Now: now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+		v := job.MintVerdict(job.VerdictApproved, job.Disposition(disp), "head-"+id, "base-"+id)
+		vj := mustJSON(t, v)
+		if _, err := st.DB.ExecContext(ctx,
+			`UPDATE jobs SET state='merge_handoff', pr_number=?, head_sha=?, base_sha=?, verdict=? WHERE id=?`,
+			100, "head-"+id, "base-"+id, vj, id); err != nil {
+			t.Fatalf("handoff %s: %v", id, err)
+		}
+		if err := st.UpsertDomainBFacts(ctx, id, job.DomainBFacts{
+			PRExists: true, PRNumber: 100, HeadSHA: "head-" + id, BaseSHA: "base-" + id, CIGreen: true,
+		}); err != nil {
+			t.Fatalf("facts %s: %v", id, err)
+		}
+	}
+	seedHandoff("self", string(job.DispositionSelfMerge))
+	seedHandoff("human", string(job.DispositionHandoff))
+
+	counts, err := mgr.UnstickAll(ctx)
+	if err != nil {
+		t.Fatalf("unstick: %v", err)
+	}
+	if counts["core"] != 1 {
+		t.Fatalf("self-merge handoff enqueue count=%v, want core:1", counts)
+	}
+	if got := outboxMergeCount(t, st, "self"); got != 1 {
+		t.Fatalf("self merge handoff outbox rows=%d, want 1", got)
+	}
+	if got := outboxMergeCount(t, st, "human"); got != 0 {
+		t.Fatalf("human handoff outbox rows=%d, want 0", got)
+	}
+}
+
 // TestParkedRepoNotManaged: a parked (active=0) repo is omitted from the Manager —
 // its loops do not run.
 func TestParkedRepoNotManaged(t *testing.T) {
@@ -215,6 +270,25 @@ func countCalls(calls []string, want string) int {
 		if c == want {
 			n++
 		}
+	}
+	return n
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal json: %v", err)
+	}
+	return string(b)
+}
+
+func outboxMergeCount(t *testing.T, st *store.Store, jobID string) int {
+	t.Helper()
+	var n int
+	if err := st.DB.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM outbox WHERE job_id=? AND action=?`, jobID, store.ActionEnqueueMerge).Scan(&n); err != nil {
+		t.Fatalf("count outbox %s: %v", jobID, err)
 	}
 	return n
 }

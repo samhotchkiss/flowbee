@@ -112,30 +112,37 @@ type Server struct {
 // RunningConfig is the control plane's redacted effective runtime snapshot. It is
 // deliberately limited to non-secret values and boolean "present" bits for secrets.
 type RunningConfig struct {
-	Version              string              `json:"version"`
-	PID                  int                 `json:"pid"`
-	ConfigPath           string              `json:"config_path,omitempty"`
-	DatabaseURL          string              `json:"database_url"`
-	PrivateAddr          string              `json:"private_addr"`
-	HealthAddr           string              `json:"health_addr"`
-	WebhookAddr          string              `json:"webhook_addr"`
-	AllowSelfMerge       bool                `json:"allow_self_merge"`
-	RequiredReviewers    int                 `json:"required_reviewers"`
-	MirrorPath           string              `json:"mirror_path,omitempty"`
-	GitRemote            string              `json:"git_remote,omitempty"`
-	WorkerGitSSH         bool                `json:"worker_git_ssh"`
-	BundleProvisioning   bool                `json:"bundle_provisioning"`
-	GitHubTokenPresent   bool                `json:"github_token_present"`
-	WebhookSecretPresent bool                `json:"webhook_secret_present"`
-	WorkerAuthConfigured bool                `json:"worker_auth_configured"`
-	InsecureWorkerAPI    bool                `json:"insecure_worker_api"`
-	AuthLoopbackBypass   bool                `json:"auth_loopback_bypass"`
-	Repos                []RunningConfigRepo `json:"repos,omitempty"`
-	LogPath              string              `json:"log_path,omitempty"`
-	BackupDir            string              `json:"backup_dir,omitempty"`
-	ReconcileIntervalEnv string              `json:"reconcile_interval_s,omitempty"`
-	UnstickIntervalEnv   string              `json:"unstick_interval_s,omitempty"`
-	FlowbeeURL           string              `json:"flowbee_url,omitempty"`
+	Version               string              `json:"version"`
+	PID                   int                 `json:"pid"`
+	SourceCommit          string              `json:"source_commit,omitempty"`
+	TreeDirty             bool                `json:"tree_dirty"`
+	TreeDirtyKnown        bool                `json:"tree_dirty_known"`
+	OriginMainSHA         string              `json:"origin_main_sha,omitempty"`
+	BehindOriginMainBy    int                 `json:"behind_origin_main_by,omitempty"`
+	BehindOriginMainKnown bool                `json:"behind_origin_main_known"`
+	SourceWarning         string              `json:"source_warning,omitempty"`
+	ConfigPath            string              `json:"config_path,omitempty"`
+	DatabaseURL           string              `json:"database_url"`
+	PrivateAddr           string              `json:"private_addr"`
+	HealthAddr            string              `json:"health_addr"`
+	WebhookAddr           string              `json:"webhook_addr"`
+	AllowSelfMerge        bool                `json:"allow_self_merge"`
+	RequiredReviewers     int                 `json:"required_reviewers"`
+	MirrorPath            string              `json:"mirror_path,omitempty"`
+	GitRemote             string              `json:"git_remote,omitempty"`
+	WorkerGitSSH          bool                `json:"worker_git_ssh"`
+	BundleProvisioning    bool                `json:"bundle_provisioning"`
+	GitHubTokenPresent    bool                `json:"github_token_present"`
+	WebhookSecretPresent  bool                `json:"webhook_secret_present"`
+	WorkerAuthConfigured  bool                `json:"worker_auth_configured"`
+	InsecureWorkerAPI     bool                `json:"insecure_worker_api"`
+	AuthLoopbackBypass    bool                `json:"auth_loopback_bypass"`
+	Repos                 []RunningConfigRepo `json:"repos,omitempty"`
+	LogPath               string              `json:"log_path,omitempty"`
+	BackupDir             string              `json:"backup_dir,omitempty"`
+	ReconcileIntervalEnv  string              `json:"reconcile_interval_s,omitempty"`
+	UnstickIntervalEnv    string              `json:"unstick_interval_s,omitempty"`
+	FlowbeeURL            string              `json:"flowbee_url,omitempty"`
 }
 
 type RunningConfigRepo struct {
@@ -334,6 +341,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	worker.HandleFunc("POST /v1/jobs/{job}/release", s.release)
 	worker.HandleFunc("GET /v1/jobs/{job}/bundle", s.bundle)
 	worker.HandleFunc("GET /v1/config", s.configJSON)
+	worker.HandleFunc("GET /configz", s.configJSON)
 	authed := auth.Middleware(s.authn, worker)
 
 	mux := http.NewServeMux()
@@ -345,7 +353,7 @@ func (s *Server) PrivateHandler() http.Handler {
 		"POST /v1/jobs/{job}/spec-review", "POST /v1/jobs/{job}/release",
 		"GET /v1/jobs/{job}/bundle",
 		"POST /v1/control/pause", "POST /v1/control/resume", "GET /v1/control",
-		"GET /v1/config",
+		"GET /v1/config", "GET /configz",
 	} {
 		mux.Handle(p, authed)
 	}
