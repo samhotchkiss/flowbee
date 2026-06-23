@@ -598,15 +598,47 @@ func (w *Worktree) SoftResetTo(ref string) error {
 	return nil
 }
 
-// RebaseOnto replays the worktree's current branch onto baseSHA. It is used by
-// worker-push rebuilds when the remote issue branch exists but is behind the
-// control plane's granted base_sha. The caller may force-push the rebased HEAD.
+// RebaseOnto replays the issue branch's net patch onto baseSHA. Worker-push
+// branches may contain old integration commits or Flowbee auto-rebase marker
+// commits in their history; a raw `git rebase baseSHA` can try to replay those
+// unrelated commits. Instead, find the patch anchor, reset to the granted base,
+// and apply the branch's net diff from that anchor. The caller then commits and
+// force-pushes the rebuilt branch head.
 func (w *Worktree) RebaseOnto(baseSHA string) error {
 	if strings.TrimSpace(baseSHA) == "" {
 		return fmt.Errorf("rebase: empty base")
 	}
-	if _, err := run(w.Dir, "git", "rebase", baseSHA); err != nil {
-		return fmt.Errorf("rebase onto %s: %w", baseSHA, err)
+	anchor, err := run(w.Dir, "git", "merge-base", baseSHA, "HEAD")
+	if err != nil {
+		return fmt.Errorf("find rebase anchor: %w", err)
+	}
+	anchor = strings.TrimSpace(anchor)
+	if logOut, err := run(w.Dir, "git", "log", "--format=%H%x00%s", anchor+"..HEAD"); err == nil {
+		for _, line := range strings.Split(logOut, "\n") {
+			parts := strings.SplitN(line, "\x00", 2)
+			if len(parts) == 2 && strings.HasPrefix(parts[1], "flowbee auto-rebase onto ") {
+				anchor = strings.TrimSpace(parts[0])
+				break
+			}
+		}
+	}
+	diff, err := run(w.Dir, "git", "diff", anchor, "HEAD")
+	if err != nil {
+		return fmt.Errorf("diff from %s: %w", anchor, err)
+	}
+	if _, err := run(w.Dir, "git", "reset", "--hard", baseSHA); err != nil {
+		return fmt.Errorf("reset to %s: %w", baseSHA, err)
+	}
+	if strings.TrimSpace(diff) == "" {
+		return nil
+	}
+	patchFile := filepath.Join(w.Dir, ".flowbee-rebase.patch")
+	if err := os.WriteFile(patchFile, []byte(diff), 0o600); err != nil {
+		return fmt.Errorf("write rebase patch: %w", err)
+	}
+	defer os.Remove(patchFile)
+	if _, err := run(w.Dir, "git", "apply", "--3way", "--whitespace=nowarn", patchFile); err != nil {
+		return fmt.Errorf("apply branch patch from %s onto %s: %w", anchor, baseSHA, err)
 	}
 	return nil
 }
