@@ -246,8 +246,7 @@ func modelSlotGateTx(ctx context.Context, tx *sql.Tx, workerID, identity, modelF
 		`SELECT max_slots FROM worker_model_slots WHERE worker_id = ? AND model_family = ?`,
 		workerID, modelFamily).Scan(&maxSlots)
 	if errors.Is(err, sql.ErrNoRows) {
-		// the box advertised no per-model slots (legacy single-slot worker): don't gate.
-		return nil
+		return legacyWorkerSlotGateTx(ctx, tx, workerID, identity)
 	}
 	if err != nil {
 		return err
@@ -260,6 +259,32 @@ func modelSlotGateTx(ctx context.Context, tx *sql.Tx, workerID, identity, modelF
 		SELECT COUNT(*) FROM jobs
 		 WHERE bound_identity = ? AND bound_model_family = ?
 		   AND state IN `+activeLeaseStatesClause, identity, modelFamily).Scan(&active); err != nil {
+		return err
+	}
+	if !capacity.HasFreeSlot(maxSlots, active) {
+		return ErrNoCapacity
+	}
+	return nil
+}
+
+func legacyWorkerSlotGateTx(ctx context.Context, tx *sql.Tx, workerID, identity string) error {
+	var maxSlots int
+	err := tx.QueryRowContext(ctx,
+		`SELECT max_concurrent_leases FROM workers WHERE worker_id = ?`, workerID).Scan(&maxSlots)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if maxSlots < 1 {
+		maxSlots = 1
+	}
+	var active int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM jobs
+		 WHERE bound_identity = ?
+		   AND state IN `+activeLeaseStatesClause, identity).Scan(&active); err != nil {
 		return err
 	}
 	if !capacity.HasFreeSlot(maxSlots, active) {

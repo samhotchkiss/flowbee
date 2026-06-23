@@ -82,6 +82,41 @@ func TestModelSlotGate(t *testing.T) {
 	}
 }
 
+func TestLegacyMaxConcurrentLeasesGate(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(10, 0)
+	if _, err := st.DB.ExecContext(ctx, `
+		INSERT INTO workers (worker_id, identity, host, claimed_capabilities, attested_capabilities,
+		                     max_concurrent_leases, attestation_expires_at)
+		VALUES (?, ?, 'h', '[]', '[]', 1, ?)`,
+		"box-legacy", "ident-legacy", now.Add(time.Hour).Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert legacy worker: %v", err)
+	}
+	attested := []string{"role:eng_worker", "model_family:claude"}
+
+	first := ulid.New()
+	seedReadyClaude(t, st, first)
+	if _, err := st.ClaimReadyJob(ctx, store.ClaimParams{
+		JobID: first, LeaseID: ulid.New(), Identity: "ident-legacy", ModelFamily: "claude",
+		Role: job.RoleEngWorker, Attested: attested, TTL: time.Minute, Now: time.Unix(20, 0),
+	}); err != nil {
+		t.Fatalf("first legacy claim: %v", err)
+	}
+
+	second := ulid.New()
+	seedReadyClaude(t, st, second)
+	if _, err := st.ClaimReadyJob(ctx, store.ClaimParams{
+		JobID: second, LeaseID: ulid.New(), Identity: "ident-legacy", ModelFamily: "claude",
+		Role: job.RoleEngWorker, Attested: attested, TTL: time.Minute, Now: time.Unix(21, 0),
+	}); err == nil {
+		t.Fatal("legacy max_concurrent_leases=1 worker must not win a second active lease")
+	}
+	if j, _ := st.GetJob(ctx, second); j.State != job.StateReady {
+		t.Fatalf("blocked legacy job state=%s want ready", j.State)
+	}
+}
+
 // TestAccountCeilingRollover proves dispatch rolls from the preferred account to the
 // fallback when the preferred is at/over its ceiling, and binds the chosen account.
 func TestAccountCeilingRollover(t *testing.T) {
