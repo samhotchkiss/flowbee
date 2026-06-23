@@ -34,7 +34,8 @@ Run `flowbee doctor` before starting `flowbee serve` to validate your configurat
   `http://127.0.0.1:7070`), prints the running process's redacted effective config:
   version, pid, config path, DB, private bind, self-merge, mirror, git remote, token-present
   bits, auth posture, log path, and managed repos. This is the source of truth for reproducing
-  the live launch; it does not print secret values.
+  the live launch; it does not print secret values. If the private API requires worker auth,
+  set `FLOWBEE_WORKER_TOKEN` before running doctor so it can authenticate to `/v1/config`.
 
 Pass `--offline` to skip the GitHub reachability check when running in an air-gapped or offline environment.
 
@@ -506,7 +507,7 @@ Verify the running process, not your invoking shell:
 
 ```bash
 flowbee doctor
-curl -s http://127.0.0.1:7070/v1/config
+curl -s -H "Authorization: Bearer $FLOWBEE_WORKER_TOKEN" http://127.0.0.1:7070/v1/config
 curl -s http://127.0.0.1:7001/healthz
 ```
 

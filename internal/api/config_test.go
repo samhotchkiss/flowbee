@@ -15,7 +15,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/ulid"
 )
 
-func TestRunningConfigEndpointIsReadOnlyAndRedacted(t *testing.T) {
+func TestRunningConfigEndpointRequiresAuthAndIsRedacted(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir()+"/flowbee.db")
 	if err != nil {
@@ -44,6 +44,14 @@ func TestRunningConfigEndpointIsReadOnlyAndRedacted(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/config", nil)
 	srv.PrivateHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /v1/config status=%d, want 401", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/config", nil)
+	req.Header.Set("Authorization", "Bearer "+authn.Mint("worker"))
+	srv.PrivateHandler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /v1/config status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -55,5 +63,36 @@ func TestRunningConfigEndpointIsReadOnlyAndRedacted(t *testing.T) {
 	}
 	if strings.Contains(body, "server-secret") || strings.Contains(body, "github_pat_") {
 		t.Fatalf("running config must not expose secret values: %s", body)
+	}
+}
+
+func TestRunningConfigOpenAPIIsLoopbackOnly(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir()+"/flowbee.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
+		t.Fatal(err)
+	}
+	srv := api.New(st, clock.NewFake(time.Unix(1000, 0)), ulid.NewMinter(nil), api.Config{
+		RunningConfig: api.RunningConfig{PrivateAddr: ":7070", InsecureWorkerAPI: true},
+	}, "test-version")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/config", nil)
+	req.RemoteAddr = "100.64.0.2:12345"
+	srv.PrivateHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("off-loopback open API GET /v1/config status=%d, want 403", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/config", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	srv.PrivateHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("loopback open API GET /v1/config status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

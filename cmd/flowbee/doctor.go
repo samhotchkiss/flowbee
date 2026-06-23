@@ -95,6 +95,9 @@ func runningConfigCheck(ctx context.Context) onboarding.Check {
 	if err != nil {
 		return onboarding.Check{Name: "running-config", Status: onboarding.StatusWarn, Detail: err.Error()}
 	}
+	if tok := envOr("FLOWBEE_WORKER_TOKEN", ""); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return onboarding.Check{Name: "running-config", Status: onboarding.StatusWarn,
@@ -102,6 +105,14 @@ func runningConfigCheck(ctx context.Context) onboarding.Check {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized {
+			return onboarding.Check{Name: "running-config", Status: onboarding.StatusWarn,
+				Detail: "running control plane requires auth for /v1/config; set FLOWBEE_WORKER_TOKEN to report running config"}
+		}
+		if resp.StatusCode == http.StatusForbidden {
+			return onboarding.Check{Name: "running-config", Status: onboarding.StatusWarn,
+				Detail: "running control plane exposes /v1/config only to loopback callers unless worker auth is configured"}
+		}
 		return onboarding.Check{Name: "running-config", Status: onboarding.StatusWarn,
 			Detail: fmt.Sprintf("running control plane at %s returned status %d", base, resp.StatusCode)}
 	}

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -332,6 +333,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	worker.HandleFunc("POST /v1/jobs/{job}/spec-review", s.specReview)
 	worker.HandleFunc("POST /v1/jobs/{job}/release", s.release)
 	worker.HandleFunc("GET /v1/jobs/{job}/bundle", s.bundle)
+	worker.HandleFunc("GET /v1/config", s.configJSON)
 	authed := auth.Middleware(s.authn, worker)
 
 	mux := http.NewServeMux()
@@ -343,6 +345,7 @@ func (s *Server) PrivateHandler() http.Handler {
 		"POST /v1/jobs/{job}/spec-review", "POST /v1/jobs/{job}/release",
 		"GET /v1/jobs/{job}/bundle",
 		"POST /v1/control/pause", "POST /v1/control/resume", "GET /v1/control",
+		"GET /v1/config",
 	} {
 		mux.Handle(p, authed)
 	}
@@ -358,7 +361,6 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/needs-input", s.needsInputJSON)
 	mux.HandleFunc("GET /v1/backlog", s.backlogJSON)
 	mux.HandleFunc("GET /v1/fleet", s.fleetJSON)
-	mux.HandleFunc("GET /v1/config", s.configJSON)
 	// F7 board-lifecycle WRITE / intake edges (operator / user-agent / planner loop):
 	// answer a needs_design item, promote a backlog item, opt a quiescent item in, retry
 	// a needs_human job, cancel, or inject work via the spec/epic front door. These MUTATE
@@ -390,7 +392,20 @@ func (s *Server) PrivateHandler() http.Handler {
 // configJSON exposes the RUNNING control plane's effective, redacted config. It is
 // read-only and contains no secret material; token/secret fields are booleans only.
 func (s *Server) configJSON(w http.ResponseWriter, r *http.Request) {
+	if s.authn == nil && !requestFromLoopback(r) {
+		http.Error(w, "running config is available only from loopback unless worker auth is configured", http.StatusForbidden)
+		return
+	}
 	writeJSON(w, http.StatusOK, s.runningConfig)
+}
+
+func requestFromLoopback(r *http.Request) bool {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // boardJSON serves the live board snapshot as JSON (the machine-readable board the
