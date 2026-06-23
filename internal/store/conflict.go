@@ -198,7 +198,7 @@ func (s *Store) ReservationReport(ctx context.Context) (ReservationReport, error
 		ws := writeSets[c.JobID]
 		blocker, blocked := scheduler.BlockedBy(c.JobID, active, writeSets)
 		rep.Ready = append(rep.Ready, ReadyReservationView{
-			JobID: c.JobID, Wide: ws.IsWide(), Paths: ws.Paths, Blocked: blocked, BlockedBy: blocker,
+			JobID: c.JobID, Wide: ws.Wide, Paths: ws.Paths, Blocked: blocked, BlockedBy: blocker,
 		})
 	}
 	return rep, nil
