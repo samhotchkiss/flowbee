@@ -1,6 +1,7 @@
 package gitops
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -149,5 +150,52 @@ func TestWorkerPushRebasesIssueBranchOntoGrantedBase(t *testing.T) {
 	}
 	if !contains {
 		t.Fatalf("rebased branch %s must contain granted base %s", tip, newBase)
+	}
+}
+
+func TestWorkerPushFallsBackToFreshBaseForUnrelatedIssueBranch(t *testing.T) {
+	m, base := newFixture(t)
+
+	// Simulate a stale remote issue branch whose history is unrelated to the current
+	// repo mirror. Flowbee cannot safely infer its net patch, so it should cut a fresh
+	// builder worktree from the granted base instead of recycling the lease forever.
+	work := filepath.Join(t.TempDir(), "unrelated")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatalf("mkdir unrelated repo: %v", err)
+	}
+	mustGit(t, work, "git", "init")
+	mustWrite(t, filepath.Join(work, "feature.txt"), "unrelated branch work\n")
+	mustGit(t, work, "git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A")
+	mustGit(t, work, "git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "unrelated issue branch")
+	mustGit(t, work, "git", "remote", "add", "origin", m.Path)
+	mustGit(t, work, "git", "push", "origin", "HEAD:refs/heads/flowbee/issue-8")
+
+	unrelatedTip, err := m.HeadSHA("refs/heads/flowbee/issue-8")
+	if err != nil {
+		t.Fatalf("unrelated branch tip: %v", err)
+	}
+	ws := WorktreeBase(t.TempDir(), "job-unrelated", 1)
+	wt, err := m.AddWorktree(ws, unrelatedTip)
+	if err != nil {
+		t.Fatalf("unrelated worktree: %v", err)
+	}
+	defer wt.Destroy()
+
+	if err := wt.RebaseOnto(base); err != nil {
+		t.Fatalf("fresh-base fallback: %v", err)
+	}
+	head, err := wt.HeadSHA()
+	if err != nil {
+		t.Fatalf("head after fallback: %v", err)
+	}
+	if head != base {
+		t.Fatalf("fallback head = %s, want granted base %s", head, base)
+	}
+	changed, err := wt.HasChanges()
+	if err != nil {
+		t.Fatalf("status after fallback: %v", err)
+	}
+	if changed {
+		t.Fatal("fresh-base fallback must not carry unrelated branch changes")
 	}
 }

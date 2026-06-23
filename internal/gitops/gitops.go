@@ -602,15 +602,20 @@ func (w *Worktree) SoftResetTo(ref string) error {
 // branches may contain old integration commits or Flowbee auto-rebase marker
 // commits in their history; a raw `git rebase baseSHA` can try to replay those
 // unrelated commits. Instead, find the patch anchor, reset to the granted base,
-// and apply the branch's net diff from that anchor. The caller then commits and
-// force-pushes the rebuilt branch head.
+// and apply the branch's net diff from that anchor. If the old branch has no common
+// ancestor with the granted base, the patch cannot be identified reliably; reset to
+// the granted base and let the builder rebuild from the issue/spec. The caller then
+// commits and force-pushes the rebuilt branch head.
 func (w *Worktree) RebaseOnto(baseSHA string) error {
 	if strings.TrimSpace(baseSHA) == "" {
 		return fmt.Errorf("rebase: empty base")
 	}
 	anchor, err := run(w.Dir, "git", "merge-base", baseSHA, "HEAD")
 	if err != nil {
-		return fmt.Errorf("find rebase anchor: %w", err)
+		if _, rerr := run(w.Dir, "git", "reset", "--hard", baseSHA); rerr != nil {
+			return fmt.Errorf("reset no-common-ancestor branch to %s after %v: %w", baseSHA, err, rerr)
+		}
+		return nil
 	}
 	anchor = strings.TrimSpace(anchor)
 	if logOut, err := run(w.Dir, "git", "log", "--format=%H%x00%s", anchor+"..HEAD"); err == nil {
