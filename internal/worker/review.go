@@ -231,9 +231,32 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 			_, _ = c.ReleaseFailed(ctx, grant.JobID, grant.LeaseEpoch)
 			return out, fmt.Errorf("read verdict: %w", e)
 		}
+		// Normalize the decision before matching: agents (both codex and claude) intermittently
+		// emit a case/whitespace/synonym variant of "approved" ("Approved", "approve", "lgtm")
+		// while their notes clearly approve ("No blocking defect identifiable from the diff"),
+		// and the old exact == "approved" silently bounced those — a false rejection that sends a
+		// good PR back to a full rebuild. An EMPTY decision means the agent wrote a verdict file
+		// but never filled the field: retry the review (ReleaseFailed) rather than burn the build
+		// with a bounce. Log the raw decision on any non-approval so a real miscalibration is
+		// visible rather than hiding behind a generic bounce.
+		norm := strings.ToLower(strings.Trim(strings.TrimSpace(v.Decision), "\"'`.,!"))
+		if norm == "" {
+			fmt.Fprintf(os.Stderr, "[%s] review: empty decision in verdict.json for %s — retrying (not bouncing)\n", cfg.Identity, grant.JobID)
+			_, _ = c.ReleaseFailed(ctx, grant.JobID, grant.LeaseEpoch)
+			return out, fmt.Errorf("review: empty decision")
+		}
 		verdict := "changes_requested"
-		if v.Decision == "approved" {
+		switch norm {
+		case "approved", "approve", "approves", "approved_with_nits", "approve_with_comments",
+			"accept", "accepted", "lgtm", "ok", "pass":
 			verdict = "approved"
+		}
+		if verdict == "changes_requested" {
+			tail := v.Notes
+			if len(tail) > 220 {
+				tail = tail[len(tail)-220:]
+			}
+			fmt.Fprintf(os.Stderr, "[%s] review BOUNCE %s raw_decision=%q notes_tail=%q\n", cfg.Identity, grant.JobID, v.Decision, tail)
 		}
 		disp := v.Disposition
 		if disp == "" {
