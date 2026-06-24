@@ -41,12 +41,18 @@ func TestReadVerdict(t *testing.T) {
 }
 
 func TestRenderReviewBriefCodeReviewer(t *testing.T) {
-	c := &client.LeaseContext{Identity: "senior_code_reviewer", Lens: "correctness", Task: "Add CHANGELOG", Diff: "diff"}
+	c := &client.LeaseContext{Identity: "senior_code_reviewer", Lens: "correctness", Task: "Add CHANGELOG", Diff: "MY_UNIQUE_DIFF_BODY"}
 	brief := renderReviewBrief("job-1", "code_reviewer", c)
-	for _, want := range []string{"code_reviewer", "senior_code_reviewer", "$FLOWBEE_DIFF_FILE", "$FLOWBEE_VERDICT_FILE", "approved|changes_requested", "Add CHANGELOG"} {
+	// the diff is now embedded INLINE in the brief (not just referenced by file path) so the
+	// agent always sees the change and cannot review blind.
+	for _, want := range []string{"code_reviewer", "senior_code_reviewer", "full unified diff", "MY_UNIQUE_DIFF_BODY", "$FLOWBEE_VERDICT_FILE", "approved|changes_requested", "Add CHANGELOG"} {
 		if !strings.Contains(brief, want) {
 			t.Fatalf("code_reviewer brief missing %q\n%s", want, brief)
 		}
+	}
+	// an empty diff falls back to the $FLOWBEE_DIFF_FILE reference
+	if fb := renderReviewBrief("job-1", "code_reviewer", &client.LeaseContext{Diff: ""}); !strings.Contains(fb, "$FLOWBEE_DIFF_FILE") {
+		t.Fatalf("empty-diff brief should fall back to $FLOWBEE_DIFF_FILE\n%s", fb)
 	}
 }
 
