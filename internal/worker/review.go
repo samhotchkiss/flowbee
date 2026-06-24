@@ -276,7 +276,28 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 // consensus panel keeps the job in review across rounds, and without tracking this move the
 // async reconcile would see the reviewer's own empty commit as a SHA move and supersede the
 // round (resetting the accumulated approvals).
+// reviewerEmptyCommitEnabled gates the empty findings-commit push. It is OFF.
+//
+// Pushing a no-op commit to the PR branch as a review attestation is net-negative against
+// a repo with required status checks (russ): GitHub re-runs the FULL required-CI matrix on
+// the empty commit (so every review costs a 6-shard backend run, ~3-4m each) AND advances
+// the branch tip PAST the head the verdict pins to. Self-merge SHA-interlocks on the
+// reviewed head, so the live tip (the empty commit) 409s as head_modified_after_review and
+// routes to merge_handoff — while its own required CI sits pending, so it can never merge
+// either. The result is a churn loop: approve -> empty commit -> CI reset + head move ->
+// merge deadlock -> re-arm -> repeat (observed on russ #2359/#2407, and the driver behind
+// #2466's dozens-of-builder-passes churn). Review attribution does NOT depend on this commit:
+// the verdict is canonical in Flowbee's ledger and the control plane mirrors it to the GitHub
+// issue as a durable comment (api.server.review). Re-enable only once CI is made to skip
+// same-tree (empty) pushes so an attestation commit no longer resets required checks.
+var reviewerEmptyCommitEnabled = false
+
 func reviewerEmptyCommit(cfg HarnessConfig, grant client.LeaseGrant, verdict, notes string) (head string) {
+	if !reviewerEmptyCommitEnabled {
+		// no head advance: the verdict stays pinned to the green reviewed SHA so self-merge
+		// can SHA-interlock-merge it immediately, and CI is not re-triggered on a no-op.
+		return ""
+	}
 	issueBranch, repoURL := "", cfg.RepoURL
 	if grant.Context != nil {
 		issueBranch = grant.Context.IssueBranch
