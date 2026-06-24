@@ -412,12 +412,23 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 			"\"meets_style\":true,\"meets_requirements\":true," +
 			"\"spec_markdown\":\"(ONLY if amended: the full corrected spec)\",\"notes\":\"...\"}\n```\n")
 	case "code_reviewer":
-		b.WriteString("You are the code-reviewer. Read the diff at $FLOWBEE_DIFF_FILE and judge whether it correctly, " +
-			"completely, and safely implements the task/spec below. Approve ONLY if it is correct and safe to merge.\n\n")
+		b.WriteString("You are the code-reviewer. Judge whether the unified diff at $FLOWBEE_DIFF_FILE correctly, " +
+			"completely, and safely implements the task/spec below.\n\n")
+		b.WriteString("**How to review (READ THIS):** You are given ONLY the diff (the changed lines) — by design. " +
+			"The full source tree is NOT provided and you do NOT need it. Automated tests run SEPARATELY in CI and " +
+			"gate the merge on their own: you are NOT expected to run tests, execute code, or inspect unchanged files, " +
+			"and you MUST NOT withhold approval merely because you 'could not verify against the source tree', " +
+			"'could not run the tests', or any similar unverifiable caveat. Judge the change FROM THE DIFF plus the " +
+			"task/spec as written.\n\n")
 		writeIf("Task", c.Task)
 		writeIf("Spec", c.Spec)
 		writeIf("Acceptance criteria", c.AcceptanceCriteria)
 		b.WriteString("The change to review is the unified diff at $FLOWBEE_DIFF_FILE (.flowbee/diff.patch).\n\n")
+		b.WriteString("**Decision:** `approved` if the diff is a correct, safe implementation of the task with no " +
+			"blocking defect you can identify FROM THE DIFF. Use `changes_requested` ONLY for a CONCRETE blocking " +
+			"problem visible in the diff — a real bug, a security issue, a missing acceptance criterion, or a clearly " +
+			"wrong approach — and name it specifically in notes. Do NOT bounce for style nits, speculative concerns, " +
+			"or things you simply could not confirm without the source/tests; those are not blocking.\n\n")
 		b.WriteString("**Output:** write JSON to $FLOWBEE_VERDICT_FILE:\n" +
 			"```json\n{\"decision\":\"approved|changes_requested\",\"disposition\":\"self_merge\",\"notes\":\"...\"}\n```\n")
 	}
