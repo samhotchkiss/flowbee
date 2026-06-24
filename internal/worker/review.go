@@ -120,6 +120,20 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	if cctx.Diff != "" {
 		_ = os.WriteFile(diffFile, []byte(cctx.Diff), 0o644)
 	}
+	// INSTRUMENTATION: surface the review INPUT size. A code review of an empty/tiny diff
+	// (cctx.Diff unpopulated at lease-grant) can only bounce — the reviewer has nothing to
+	// approve. Logged to the worker stderr (fleet log) to diagnose the bounce rate.
+	if grant.Role == "code_reviewer" {
+		fmt.Fprintf(os.Stderr, "[%s] REVIEW-INPUT job=%s diff_bytes=%d task_bytes=%d spec_bytes=%d ac_bytes=%d\n",
+			cfg.Identity, grant.JobID, len(cctx.Diff), len(cctx.Task), len(cctx.Spec), len(cctx.AcceptanceCriteria))
+		// dump the EXACT brief + diff the agent will see, to compare against a known-good
+		// controlled run (diagnosing the spurious-bounce rate). Best-effort.
+		dumpDir := filepath.Join("/tmp/flowbee-rev", grant.JobID)
+		if os.MkdirAll(dumpDir, 0o755) == nil {
+			_ = os.WriteFile(filepath.Join(dumpDir, "brief.md"), []byte(renderReviewBrief(grant.JobID, grant.Role, cctx)), 0o644)
+			_ = os.WriteFile(filepath.Join(dumpDir, "diff.patch"), []byte(cctx.Diff), 0o644)
+		}
+	}
 	verdictFile := filepath.Join(fbDir, "verdict.json")
 	specFile := filepath.Join(fbDir, "spec.md")
 

@@ -735,7 +735,15 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	defer wt.Destroy()
 	if forceIssueBranchPush {
 		if err := wt.RebaseOnto(grant.BaseSHA); err != nil {
-			_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
+			// A rebase that fails to apply (a real base conflict on a hotspot file, e.g.
+			// seedboot/steph_pitch_factcheck.go) is NOT transient — every re-attempt replays
+			// the same patch onto the same base and fails identically. Releasing with NO penalty
+			// re-arms the job for the next builder to wedge on the same conflict FOREVER (an
+			// infinite no-progress loop that starves real builders and never escalates). BURN an
+			// attempt instead: a genuinely transient failure still recovers within max_attempts,
+			// while a persistent conflict escalates to needs_human (where a human/resolver re-bases
+			// it) rather than looping. This is the §6.7 attempts ceiling doing its job.
+			_, _ = c.ReleaseFailed(ctx, grant.JobID, grant.LeaseEpoch)
 			return out, fmt.Errorf("rebase %s onto granted base %s: %w", issueBranch, grant.BaseSHA, err)
 		}
 		head, herr := wt.HeadSHA()
