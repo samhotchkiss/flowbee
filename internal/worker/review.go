@@ -245,6 +245,13 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 			_, _ = c.ReleaseFailed(ctx, grant.JobID, grant.LeaseEpoch)
 			return out, fmt.Errorf("read verdict: %w", e)
 		}
+		// CAPTURE the RAW verdict the agent wrote, to resolve why approving notes get a
+		// changes_requested decision in production (the decision field disagrees with the prose).
+		if raw, rerr := os.ReadFile(verdictFile); rerr == nil {
+			dd := filepath.Join("/tmp/flowbee-rev", grant.JobID)
+			_ = os.MkdirAll(dd, 0o755)
+			_ = os.WriteFile(filepath.Join(dd, "verdict-raw.json"), raw, 0o644)
+		}
 		// Normalize the decision before matching: agents (both codex and claude) intermittently
 		// emit a case/whitespace/synonym variant of "approved" ("Approved", "approve", "lgtm")
 		// while their notes clearly approve ("No blocking defect identifiable from the diff"),
