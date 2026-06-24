@@ -152,15 +152,16 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 			   AND NOT EXISTS (
 			        -- F5 panel anti-affinity: a reviewer may not be TWO of the N consensus
 			        -- approvals. Exclude any identity that already approved in THIS round
-			        -- (since the last result_accepted). DISTINCT IDENTITY only, not family —
-			        -- a codex panel runs every reviewer under one model, so requiring distinct
-			        -- families would make N>1 unsatisfiable.
+			        -- (since the last head-establishing event). DISTINCT IDENTITY only, not
+			        -- family — a codex panel runs every reviewer under one model, so requiring
+			        -- distinct families would make N>1 unsatisfiable.
 			        SELECT 1 FROM job_events ja
 			         WHERE ja.job_id = jobs.id AND ja.kind = 'verdict_claim'
 			           AND ja.actor = ?
 			           AND json_extract(ja.payload, '$.VerdictClaim') = 'approved'
 			           AND ja.job_seq > (SELECT COALESCE(MAX(job_seq),0) FROM job_events
-			                              WHERE job_id = jobs.id AND kind = 'result_accepted') )
+			                              WHERE job_id = jobs.id
+			                                AND kind IN ('result_accepted','rebased','conflict_resolved')) )
 			RETURNING lease_epoch, job_seq`,
 			p.Identity, p.ModelFamily, p.Lens, p.LeaseID,
 			deadline.Format(rfc3339), deadline.Format(rfc3339),

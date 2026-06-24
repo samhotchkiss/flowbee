@@ -214,6 +214,41 @@ func TestPanelHeadMoveResetsRound(t *testing.T) {
 	}
 }
 
+// TestPanelHeadMoveAllowsSameReviewerOnNewRound: the same reviewer who approved the old
+// head may review again after a head-establishing re-arm. The "one approval per reviewer"
+// guard is scoped to one reviewed head; otherwise a single live reviewer can permanently
+// strand a default single-reviewer job after project-out moves it from merge_handoff back to
+// review_pending on a rebased head.
+func TestPanelHeadMoveAllowsSameReviewerOnNewRound(t *testing.T) {
+	for _, kind := range []string{"rebased", "conflict_resolved"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			st := testutil.NewStore(t)
+			src := store.DBFactSource{DB: st.DB}
+			panel := job.Policy{RequiredReviewers: 2}
+			now := time.Unix(3000, 0)
+
+			driveToCodeReview(t, st, "same", "h0", "b0")
+			mustGreen(t, st, "same", "h0", "b0")
+
+			if _, err := st.ReviewResult(ctx, src, panel, store.ReviewResultParams{
+				JobID: "same", Epoch: epochOf(t, st, "same"), Claim: job.VerdictApproved, Now: now,
+			}); err != nil {
+				t.Fatalf("approve old head: %v", err)
+			}
+
+			appendRawEvent(t, st, "same", kind, "review_pending")
+
+			if _, err := st.ClaimReviewJob(ctx, store.ClaimReviewParams{
+				JobID: "same", LeaseID: "rl-same-new-head", Identity: "reviewer-same", ModelFamily: "opus",
+				Attested: []string{"role:code_reviewer", "model_family:opus"}, TTL: time.Minute, Now: now,
+			}); err != nil {
+				t.Fatalf("same reviewer must be able to review the new head after %s: %v", kind, err)
+			}
+		})
+	}
+}
+
 // appendRawEvent appends a bare event of the given kind at the job's next ordinal — used to
 // inject a head-establishing re-arm (rebased / conflict_resolved) into a panel round without
 // driving the full GitHub-backed rebase machinery.
