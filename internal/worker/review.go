@@ -449,7 +449,7 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 			"\"meets_style\":true,\"meets_requirements\":true," +
 			"\"spec_markdown\":\"(ONLY if amended: the full corrected spec)\",\"notes\":\"...\"}\n```\n")
 	case "code_reviewer":
-		b.WriteString("You are the code-reviewer. Judge whether the unified diff at $FLOWBEE_DIFF_FILE correctly, " +
+		b.WriteString("You are the code-reviewer. Judge whether the unified diff (included in full below) correctly, " +
 			"completely, and safely implements the task/spec below.\n\n")
 		b.WriteString("**How to review (READ THIS):** You are given ONLY the diff (the changed lines) — by design. " +
 			"The full source tree is NOT provided and you do NOT need it. Automated tests run SEPARATELY in CI and " +
@@ -460,7 +460,21 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 		writeIf("Task", c.Task)
 		writeIf("Spec", c.Spec)
 		writeIf("Acceptance criteria", c.AcceptanceCriteria)
-		b.WriteString("The change to review is the unified diff at $FLOWBEE_DIFF_FILE (.flowbee/diff.patch).\n\n")
+		// Embed the diff INLINE in the brief rather than only referencing $FLOWBEE_DIFF_FILE.
+		// A file reference relies on the agent proactively reading the file; in practice the
+		// reviewer often did NOT (a 48 KB diff "reviewed" in ~70s = never opened), so it judged
+		// blind on task/spec alone and bounced a perfectly good change ("can't verify"). With the
+		// diff in the prompt the agent ALWAYS sees the actual change. (File is still written for
+		// agents that prefer it.)
+		if d := strings.TrimSpace(c.Diff); d != "" {
+			b.WriteString("## The change to review (full unified diff)\n\n" +
+				"Review EXACTLY this diff — it is reproduced IN FULL below; you do not need to open any file:\n\n")
+			b.WriteString("```diff\n")
+			b.WriteString(d)
+			b.WriteString("\n```\n\n")
+		} else {
+			b.WriteString("The change to review is the unified diff at $FLOWBEE_DIFF_FILE (.flowbee/diff.patch).\n\n")
+		}
 		b.WriteString("**Decision:** `approved` if the diff is a correct, safe implementation of the task with no " +
 			"blocking defect you can identify FROM THE DIFF. Use `changes_requested` ONLY for a CONCRETE blocking " +
 			"problem visible in the diff — a real bug, a security issue, a missing acceptance criterion, or a clearly " +
