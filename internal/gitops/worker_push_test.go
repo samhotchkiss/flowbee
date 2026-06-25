@@ -1,6 +1,7 @@
 package gitops
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,6 +151,62 @@ func TestWorkerPushRebasesIssueBranchOntoGrantedBase(t *testing.T) {
 	}
 	if !contains {
 		t.Fatalf("rebased branch %s must contain granted base %s", tip, newBase)
+	}
+}
+
+// TestRebaseOntoReturnsConflictErrorWithBranchDiff: when the branch's change overlaps
+// work that landed on the new base (same file, divergent edits), RebaseOnto's 3-way apply
+// conflicts and it returns a *RebaseConflictError carrying the branch's own diff — the
+// signal + payload the worker uses to divert the job to a conflict_resolver instead of
+// burning attempts to needs_human.
+func TestRebaseOntoReturnsConflictErrorWithBranchDiff(t *testing.T) {
+	m, oldBase := newFixture(t)
+	remote := m.Path
+
+	// branch edits shared.txt one way, from the old base.
+	ws1 := WorktreeBase(t.TempDir(), "job-c", 1)
+	wt1, err := m.AddWorktree(ws1, oldBase)
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	mustWrite(t, filepath.Join(ws1, "shared.txt"), "branch version of the line\n")
+	oldTip, err := wt1.CommitAuthored("builder", "build: edit shared.txt", false)
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := wt1.PushTo(remote, "flowbee/issue-9", false); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	wt1.Destroy()
+
+	// main edits the SAME line differently, so a rebase cannot auto-merge.
+	wsMain := WorktreeBase(t.TempDir(), "main", 1)
+	mainWT, err := m.AddWorktree(wsMain, oldBase)
+	if err != nil {
+		t.Fatalf("main worktree: %v", err)
+	}
+	mustWrite(t, filepath.Join(wsMain, "shared.txt"), "main version of the line\n")
+	newBase, err := mainWT.CommitAuthored("integrator", "main edits shared.txt", false)
+	if err != nil {
+		t.Fatalf("main commit: %v", err)
+	}
+	mainWT.Destroy()
+
+	ws2 := WorktreeBase(t.TempDir(), "job-c", 2)
+	wt2, err := m.AddWorktree(ws2, oldTip)
+	if err != nil {
+		t.Fatalf("rebuild worktree: %v", err)
+	}
+	err = wt2.RebaseOnto(newBase)
+	if err == nil {
+		t.Fatal("rebase onto a divergent same-file base must conflict")
+	}
+	var conflict *RebaseConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("err=%T (%v), want *RebaseConflictError", err, err)
+	}
+	if !strings.Contains(conflict.BranchDiff, "shared.txt") || !strings.Contains(conflict.BranchDiff, "branch version") {
+		t.Fatalf("conflict.BranchDiff must carry the branch's own change, got:\n%s", conflict.BranchDiff)
 	}
 }
 

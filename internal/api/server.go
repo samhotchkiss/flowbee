@@ -339,6 +339,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	worker.HandleFunc("POST /v1/jobs/{job}/spec", s.specSubmit)
 	worker.HandleFunc("POST /v1/jobs/{job}/spec-review", s.specReview)
 	worker.HandleFunc("POST /v1/jobs/{job}/release", s.release)
+	worker.HandleFunc("POST /v1/jobs/{job}/rebase-conflict", s.rebaseConflict)
 	worker.HandleFunc("GET /v1/jobs/{job}/bundle", s.bundle)
 	worker.HandleFunc("GET /v1/config", s.configJSON)
 	worker.HandleFunc("GET /configz", s.configJSON)
@@ -351,6 +352,7 @@ func (s *Server) PrivateHandler() http.Handler {
 		"POST /v1/jobs/{job}/heartbeat", "POST /v1/jobs/{job}/result",
 		"POST /v1/jobs/{job}/review", "POST /v1/jobs/{job}/spec",
 		"POST /v1/jobs/{job}/spec-review", "POST /v1/jobs/{job}/release",
+		"POST /v1/jobs/{job}/rebase-conflict",
 		"GET /v1/jobs/{job}/bundle",
 		"POST /v1/control/pause", "POST /v1/control/resume", "GET /v1/control",
 		"GET /v1/config", "GET /configz",
@@ -951,6 +953,10 @@ type LeaseContext struct {
 	// (the reviewer's "fix X, Y, Z"), carried to a rebuild so the agent addresses what
 	// was flagged instead of re-submitting a patch that already failed review (§F).
 	PriorReviewFindings string `json:"prior_review_findings,omitempty"`
+	// CIFailures names the checks that failed CI on the prior attempt (newline-separated),
+	// carried to a rebuild so the agent re-runs the named gate + fixes the real violation
+	// instead of rebuilding blind and re-failing the same check (§F compounding memory).
+	CIFailures string `json:"ci_failures,omitempty"`
 	// Diff is the eng_worker's build patch, shipped to a code_reviewer so its agent
 	// judges the actual change (the review harness writes .flowbee/diff.patch).
 	Diff string `json:"diff,omitempty"`
@@ -1227,10 +1233,14 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 	// ancestor's materialized issue. Empty until an issue is bound.
 	if reviewing || role == job.RoleEngWorker || resolvingConflict {
 		grant.Context.IssueBranch = store.IssueBranch(s.store.ResolveIssueNum(ctx, jobID), jobID)
-		// a build that has bounced is a re-attempt after a CI failure / changes
-		// requested — tell the agent to fix what broke, not re-submit.
-		if role == job.RoleEngWorker && j.Bounces > 0 {
+		// a build that has bounced — OR that carries recorded CI failures from a prior
+		// attempt — is a re-attempt: tell the agent to fix what broke, not re-submit.
+		// (A manual `requeue` zeroes the bounce counter but preserves last_ci_failures,
+		// so the recorded failures alone still mark this a rebuild.) Carry the NAMES of
+		// the checks that failed so the brief points the agent at the exact gate to fix.
+		if role == job.RoleEngWorker && (j.Bounces > 0 || j.LastCIFailures != "") {
 			grant.Context.Rebuild = true
+			grant.Context.CIFailures = j.LastCIFailures
 		}
 		// F9: tell the (fungible) worker which repo this job belongs to so
 		// worker-push targets the right remote. Resolve the job's repo scope to
@@ -1930,6 +1940,35 @@ func (s *Server) release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.broker.Publish(LifeEvent{JobID: jobID, State: string(job.StateReady), Event: "lease_released", Epoch: epoch})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// rebaseConflict diverts a build whose worker-side rebase hit a REAL conflict (its branch
+// patch doesn't apply onto the granted base) into the conflict_resolver path — the worker
+// reports the conflict + its branch change so resolution actually happens, instead of the
+// build looping to needs_human where the conflict is never resolved. Fenced on lease epoch.
+func (s *Server) rebaseConflict(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job")
+	epoch, ok := epochFromHeader(r)
+	if !ok {
+		http.Error(w, "missing X-Lease-Epoch", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		BaseSHA string `json:"base_sha"`
+		Diff    string `json:"diff"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad body", http.StatusBadRequest)
+		return
+	}
+	if err := s.store.RouteBuildConflict(r.Context(), store.RouteBuildConflictParams{
+		JobID: jobID, Epoch: epoch, NewBaseSHA: body.BaseSHA, BranchDiff: body.Diff, Now: s.clock.Now(),
+	}); err != nil {
+		s.writeFenceError(w, err)
+		return
+	}
+	s.broker.Publish(LifeEvent{JobID: jobID, State: string(job.StateResolvingConflict), Event: "conflict_detected", Epoch: epoch})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

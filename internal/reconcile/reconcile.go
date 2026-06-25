@@ -258,7 +258,10 @@ func toReconciled(pr gh.PullRequest, mainCIRed bool) store.ReconciledPR {
 		// executed. See gh.PullRequest.CIHasRealSuccess.
 		CIGreen: pr.CIRollup == gh.CISuccess && pr.CIHasRealSuccess,
 		// a DEFINITIVE failure (not merely pending/none): the build is broken.
-		CIFailed:       pr.CIRollup == gh.CIFailure || pr.CIRollup == gh.CIError,
+		CIFailed: pr.CIRollup == gh.CIFailure || pr.CIRollup == gh.CIError,
+		// the NAMES of the failed checks, carried to a bounced build so the rebuild brief
+		// tells the agent exactly which gate to re-run + fix (not a generic "CI was red").
+		FailingChecks:  pr.FailingChecks,
 		ClosedUnmerged: pr.ClosedUnmerged,
 	}
 }

@@ -390,6 +390,80 @@ func (s *Store) RebaseOnto(ctx context.Context, mirror *gitops.Mirror, p RebaseO
 	return res, nil
 }
 
+// RouteBuildConflictParams carries a builder's report that its branch patch does not
+// apply onto the granted base — a REAL conflict the WORKER detected directly (it rebased
+// the actual issue branch), unlike RebaseOnto which detects via the stored patch_diff
+// (cleared on requeue, so it can't see these). BranchDiff is the branch's accumulated
+// change (git diff merge-base..HEAD) the resolver re-applies onto current main.
+type RouteBuildConflictParams struct {
+	JobID      string
+	Epoch      int
+	NewBaseSHA string
+	BranchDiff string
+	Now        time.Time
+}
+
+// RouteBuildConflict diverts a BUILD whose worker-side rebase hit a real conflict into
+// the conflict_resolver path, instead of the worker burning attempts to needs_human
+// (where the conflict is never resolved and the job just parks). The worker reports the
+// conflict + the branch's own change (BranchDiff); we store that as the job's patch and
+// re-arm to resolving_conflict at the conflicting base, so the next lease is a
+// conflict_resolver whose worktree 3-way-applies the change onto current main and the
+// agent resolves the markers — the resolution is then re-reviewed + re-CI'd like any
+// build. Fenced: a stale epoch -> ErrStaleEpoch (the worker lost its lease). Only a
+// leased/building job is diverted (the worker must hold the lease).
+func (s *Store) RouteBuildConflict(ctx context.Context, p RouteBuildConflictParams) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		j, seq, err := loadJobTx(ctx, tx, p.JobID)
+		if err != nil {
+			return err
+		}
+		if p.Epoch != j.LeaseEpoch {
+			return lease.ErrStaleEpoch
+		}
+		if j.State != job.StateLeased && j.State != job.StateBuilding {
+			// the worker no longer holds an active build lease (already re-armed/revoked):
+			// nothing to divert. Idempotent no-op, not an error.
+			return nil
+		}
+		nextSeq := seq + 1
+		ev := ledger.Event{
+			JobID: p.JobID, JobSeq: nextSeq, Kind: ledger.KindConflictDetected,
+			FromState: j.State, ToState: job.StateResolvingConflict, LeaseEpoch: j.LeaseEpoch + 1,
+			Actor: j.BoundIdentity, CreatedAt: p.Now,
+			Payload: ledger.Payload{BaseSHA: p.NewBaseSHA},
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		// store the branch's change as the job's patch (the resolver's Context.Diff is read
+		// from patch_diff) and re-arm to resolving_conflict at the conflicting base. Bump the
+		// epoch to fence the reporting worker's now-spent lease.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs
+			   SET state = 'resolving_conflict', role = 'conflict_resolver', stage = 'resolve_conflict',
+			       required_capabilities = ?,
+			       patch_diff = ?, conflict_base_sha = ?, base_sha = ?, verdict = NULL,
+			       lease_epoch = lease_epoch + 1,
+			       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
+			       lease_hb_due = NULL, lease_deadline = NULL,
+			       enqueued_at = ?, updated_at = datetime('now')
+			 WHERE id = ?`,
+			marshalStrings([]string{"role:conflict_resolver"}), p.BranchDiff, p.NewBaseSHA, p.NewBaseSHA,
+			p.Now.Format(rfc3339), p.JobID); err != nil {
+			return fmt.Errorf("apply build conflict divert: %w", err)
+		}
+		// close the reporting worker's lease row (mirrors Release).
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE leases SET ended_at = datetime('now'), end_reason = 'rebase_conflict'
+			 WHERE job_id = ? AND lease_epoch = ? AND ended_at IS NULL`,
+			p.JobID, j.LeaseEpoch); err != nil {
+			return fmt.Errorf("close lease on build conflict: %w", err)
+		}
+		return setJobSeq(ctx, tx, p.JobID, nextSeq)
+	})
+}
+
 // RouteMergeConflict diverts a job whose MERGE failed with a conflict into the
 // conflict_resolver path. A sibling can merge into the same area AFTER this change's
 // verdict was minted (both were reviewed before either merged), so the rebase-before-

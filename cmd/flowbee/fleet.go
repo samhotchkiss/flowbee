@@ -137,6 +137,12 @@ func runFleet(args []string) error {
 	// meter per-job cost (I-15); the harness unwraps `.result` for any text it needs.
 	agentCmd := fs.String("agent-cmd", os.Getenv("FLOWBEE_AGENT_CMD"), "override the review/author agent CLI (empty = per-role defaults for --agent)")
 	buildCmd := fs.String("build-agent-cmd", os.Getenv("FLOWBEE_BUILD_AGENT_CMD"), "override the build agent CLI (empty = per-role defaults for --agent)")
+	// --resolver-agent-cmd overrides ONLY the conflict_resolver's agent, independent of
+	// --agent / --build-agent-cmd. Conflict resolution is a heavy file-writing task; a
+	// builder backend that stalls on it (hitting the lease cap, never resolving) can be
+	// swapped for a more reliable model here WITHOUT changing the eng_worker build agent —
+	// e.g. keep codex builds but run claude/opus for resolution.
+	resolverCmd := fs.String("resolver-agent-cmd", os.Getenv("FLOWBEE_RESOLVER_AGENT_CMD"), "override ONLY the conflict_resolver agent CLI (empty = same default as a build role)")
 	// --agent selects the backend CLI for the built-in per-role commands: claude (default,
 	// Sonnet builds / Opus reviews — genuine §5.5 cross-model review) or codex (one Codex
 	// model for all roles, differing only by task context — spends Codex quota instead of
@@ -279,9 +285,17 @@ func runFleet(args []string) error {
 	// agent. needsMirror roles push to the issue branch, so they get --mirror + repo-url.
 	for _, r := range nonBuilderFleetRoles() {
 		id := host + "-" + r.role
+		roleCmd := roleAgentCmd(*agent, r.family, r.writesFiles, *agentCmd, *buildCmd)
+		label := modelLabelFor(*agent, r.family)
+		// the conflict_resolver can run a different (more reliable) backend than the build
+		// agent: heavy resolution stalls some builders out, so swap just this role when set.
+		if r.role == "conflict_resolver" && *resolverCmd != "" {
+			roleCmd = *resolverCmd
+			label = "resolver-custom"
+		}
 		argv := []string{"work", "--role", r.role, "--identity", id, "--model-family", r.family,
-			"--model-label", modelLabelFor(*agent, r.family),
-			"--agent-cmd", roleAgentCmd(*agent, r.family, r.writesFiles, *agentCmd, *buildCmd)}
+			"--model-label", label,
+			"--agent-cmd", roleCmd}
 		if r.writesFiles {
 			argv = append(argv, "--remote")
 		}

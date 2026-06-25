@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,6 +64,69 @@ func TestControlGlobalPause(t *testing.T) {
 	}
 	if g, ok, err := c.Lease(ctx, "w", "codex", ""); err != nil || !ok || g.JobID != "j" {
 		t.Fatalf("resumed dispatch must lease the ready job (ok=%v job=%s err=%v)", ok, g.JobID, err)
+	}
+}
+
+// TestLeaseGrantCarriesCIFailures: a build job that carries recorded CI failures from a
+// prior attempt (last_ci_failures) leases as a REBUILD with those failing-check names in
+// its context — even when bounces==0, because a manual `requeue` zeroes the bounce counter
+// while preserving the failure memory. This is what lets a requeued build target the exact
+// gate it failed instead of rebuilding blind.
+func TestLeaseGrantCarriesCIFailures(t *testing.T) {
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t)
+	seedReady(t, st, "j", "", clk.Now())
+	// recorded failing checks, bounces still 0 (the requeue-then-grant case).
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET last_ci_failures='Architecture and guardrail lints'||char(10)||'golangci-lint' WHERE id='j'`); err != nil {
+		t.Fatal(err)
+	}
+
+	g, ok, err := c.Lease(ctx, "w", "codex", "")
+	if err != nil || !ok || g.Context == nil {
+		t.Fatalf("lease: ok=%v err=%v ctx=%v", ok, err, g.Context)
+	}
+	if !g.Context.Rebuild {
+		t.Fatalf("a build with recorded CI failures must lease as a rebuild")
+	}
+	for _, want := range []string{"Architecture and guardrail lints", "golangci-lint"} {
+		if !strings.Contains(g.Context.CIFailures, want) {
+			t.Fatalf("grant CIFailures=%q missing %q", g.Context.CIFailures, want)
+		}
+	}
+}
+
+// TestReportRebaseConflictDivertsToResolver: a builder that holds a live lease and finds
+// its branch patch won't apply onto the granted base reports the conflict (with its branch
+// diff) through the client; the control plane diverts the job to the conflict_resolver path
+// at the conflicting base, storing the diff as the job's patch for the resolver.
+func TestReportRebaseConflictDivertsToResolver(t *testing.T) {
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t)
+	seedReady(t, st, "j", "", clk.Now())
+
+	g, ok, err := c.Lease(ctx, "w", "codex", "")
+	if err != nil || !ok {
+		t.Fatalf("lease: ok=%v err=%v", ok, err)
+	}
+	const diff = "diff --git a/x b/x\n+conflicting change"
+	if status, err := c.ReportRebaseConflict(ctx, "j", g.LeaseEpoch, "newmain", diff); err != nil || status != 200 {
+		t.Fatalf("report rebase conflict: status=%d err=%v", status, err)
+	}
+	j, _ := st.GetJob(ctx, "j")
+	if j.State != job.StateResolvingConflict || j.Role != job.RoleConflictResolver {
+		t.Fatalf("job not diverted: state=%s role=%s", j.State, j.Role)
+	}
+	if j.BaseSHA != "newmain" {
+		t.Fatalf("base_sha=%s, want newmain", j.BaseSHA)
+	}
+	if d, _ := st.JobPatchDiff(ctx, "j"); d != diff {
+		t.Fatalf("patch_diff=%q, want the reported branch diff", d)
+	}
+
+	// a stale epoch (lost the lease) is fenced with 409 and leaves the job alone.
+	if status, _ := c.ReportRebaseConflict(ctx, "j", 999, "x", "d"); status != 409 {
+		t.Fatalf("stale-epoch report status=%d, want 409", status)
 	}
 }
 

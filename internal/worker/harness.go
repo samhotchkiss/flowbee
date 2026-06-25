@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -127,6 +128,20 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 			"The prior change is ALREADY in this working directory. Do NOT just re-submit it. " +
 			"Carefully review the existing change for the failure: build errors, linter violations (e.g. golangci-lint), " +
 			"and failing/smoke tests. Run the linter and tests if they are available, and FIX what is broken so CI passes this time.\n")
+		if checks := strings.TrimSpace(c.CIFailures); checks != "" {
+			// the SPECIFIC gates that failed last time: name them and tell the agent to
+			// reproduce each locally and fix the real violation, not guess at "CI was red".
+			b.WriteString("\n### These exact CI checks FAILED last time — make each one pass\n\n")
+			for _, ck := range strings.Split(checks, "\n") {
+				if ck = strings.TrimSpace(ck); ck != "" {
+					fmt.Fprintf(&b, "- **%s**\n", ck)
+				}
+			}
+			b.WriteString("\nReproduce each failing check LOCALLY (run that gate's command — e.g. the " +
+				"arch/lint script, `golangci-lint run`, or the named test shard), read the actual error, " +
+				"and fix the underlying cause in this working directory. Do not stop until every check above " +
+				"would pass.\n")
+		}
 	}
 	if c.Conflict {
 		b.WriteString("\n## ⚠️ This is a CONFLICT RESOLUTION — resolve the merge conflict markers\n\n" +
@@ -735,14 +750,27 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	defer wt.Destroy()
 	if forceIssueBranchPush {
 		if err := wt.RebaseOnto(grant.BaseSHA); err != nil {
-			// A rebase that fails to apply (a real base conflict on a hotspot file, e.g.
-			// seedboot/steph_pitch_factcheck.go) is NOT transient — every re-attempt replays
-			// the same patch onto the same base and fails identically. Releasing with NO penalty
-			// re-arms the job for the next builder to wedge on the same conflict FOREVER (an
-			// infinite no-progress loop that starves real builders and never escalates). BURN an
-			// attempt instead: a genuinely transient failure still recovers within max_attempts,
-			// while a persistent conflict escalates to needs_human (where a human/resolver re-bases
-			// it) rather than looping. This is the §6.7 attempts ceiling doing its job.
+			// A REAL base conflict (the branch change overlaps work that merged into the same
+			// area since) is not something a rebuild can fix — every re-attempt replays the
+			// same patch onto the same base and fails identically. Divert the job to a
+			// conflict_resolver: report the conflict + the branch's own change so the control
+			// plane re-arms resolving_conflict, where the resolver 3-way-applies the change onto
+			// current main and the agent resolves the markers. This is strictly better than the
+			// old burn-attempts-to-needs_human path, where the conflict was NEVER resolved and
+			// the job just parked.
+			var conflict *gitops.RebaseConflictError
+			if errors.As(err, &conflict) && strings.TrimSpace(conflict.BranchDiff) != "" {
+				if _, rerr := c.ReportRebaseConflict(ctx, grant.JobID, grant.LeaseEpoch, grant.BaseSHA, conflict.BranchDiff); rerr != nil {
+					// the report failed (e.g. lost the lease): fall back to burning an attempt so a
+					// persistent failure still escalates rather than looping penalty-free forever.
+					_, _ = c.ReleaseFailed(ctx, grant.JobID, grant.LeaseEpoch)
+					return out, fmt.Errorf("report rebase conflict %s: %w", issueBranch, rerr)
+				}
+				return out, fmt.Errorf("rebase %s conflicts with base %s — diverted to conflict_resolver", issueBranch, grant.BaseSHA)
+			}
+			// a NON-conflict (infra) rebase failure: burn an attempt as before so a genuinely
+			// transient failure recovers within max_attempts while a persistent one escalates,
+			// rather than re-arming penalty-free for the next builder to wedge on identically.
 			_, _ = c.ReleaseFailed(ctx, grant.JobID, grant.LeaseEpoch)
 			return out, fmt.Errorf("rebase %s onto granted base %s: %w", issueBranch, grant.BaseSHA, err)
 		}

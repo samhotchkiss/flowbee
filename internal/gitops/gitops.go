@@ -606,6 +606,30 @@ func (w *Worktree) SoftResetTo(ref string) error {
 // ancestor with the granted base, the patch cannot be identified reliably; reset to
 // the granted base and let the builder rebuild from the issue/spec. The caller then
 // commits and force-pushes the rebuilt branch head.
+// RebaseConflictError reports that a branch's accumulated change does NOT apply cleanly
+// onto the requested base — a REAL conflict with work that merged into the same area
+// since, not a transient failure (re-attempting replays the same patch onto the same base
+// and fails identically). BranchDiff is the branch's own change (git diff merge-base..HEAD)
+// that a conflict_resolver must re-apply onto current main + resolve. The worker reports
+// this (with the diff) so the control plane diverts the job to resolving_conflict instead
+// of burning attempts to needs_human where the conflict is never resolved.
+type RebaseConflictError struct {
+	Anchor     string
+	Base       string
+	BranchDiff string
+}
+
+func (e *RebaseConflictError) Error() string {
+	return fmt.Sprintf("apply branch patch from %s onto %s: conflict", shortRef(e.Anchor), shortRef(e.Base))
+}
+
+func shortRef(s string) string {
+	if len(s) > 7 {
+		return s[:7]
+	}
+	return s
+}
+
 func (w *Worktree) RebaseOnto(baseSHA string) error {
 	if strings.TrimSpace(baseSHA) == "" {
 		return fmt.Errorf("rebase: empty base")
@@ -643,7 +667,10 @@ func (w *Worktree) RebaseOnto(baseSHA string) error {
 	}
 	defer os.Remove(patchFile)
 	if _, err := run(w.Dir, "git", "apply", "--3way", "--whitespace=nowarn", patchFile); err != nil {
-		return fmt.Errorf("apply branch patch from %s onto %s: %w", anchor, baseSHA, err)
+		// a real base conflict: the branch change overlaps work that merged since. Return a
+		// typed error carrying the branch diff so the worker can divert the job to a
+		// conflict_resolver (which re-applies + resolves) rather than looping to needs_human.
+		return &RebaseConflictError{Anchor: anchor, Base: baseSHA, BranchDiff: diff}
 	}
 	return nil
 }

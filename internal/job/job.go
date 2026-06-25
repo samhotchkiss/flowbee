@@ -358,6 +358,13 @@ type Job struct {
 	// side). A projection field folded from the bounce event's payload.
 	LastReviewNotes string
 
+	// LastCIFailures carries the NAMES of the checks that failed CI on the prior attempt
+	// (newline-separated, e.g. "Architecture and guardrail lints\ngolangci-lint") forward
+	// to the rebuild's lease context, so the agent re-runs the named gate + fixes the real
+	// violation instead of rebuilding blind and re-failing the same check (§F compounding
+	// memory, read side). A projection field folded from the ci-fail bounce event.
+	LastCIFailures string
+
 	// counters (§6.7)
 	Attempts         int
 	MaxAttempts      int

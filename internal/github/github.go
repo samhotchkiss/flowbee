@@ -66,7 +66,13 @@ type PullRequest struct {
 	// i.e. no test ran. The merge gate AND-s this with CIRollup==SUCCESS so an all-skipped PR is
 	// never read as green and cannot mint a verdict / self-merge on tests that never executed.
 	CIHasRealSuccess bool
-	Labels           []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
+	// FailingChecks names the checks that DEFINITIVELY failed at the head (CheckRun
+	// FAILURE/TIMED_OUT/CANCELLED/STARTUP_FAILURE or legacy StatusContext FAILURE/ERROR).
+	// Carried to a bounced build so the rebuild brief tells the agent EXACTLY which gate
+	// to re-run + fix locally instead of a generic "CI was red". Empty when CI is green
+	// or only pending.
+	FailingChecks []string
+	Labels        []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
 }
 
 // Issue is the Domain-B snapshot of one open issue from a BoardSweep. Title/Body
@@ -423,7 +429,7 @@ fragment prFields on PullRequest {
   headRefOid baseRefOid
   mergeCommit { oid }
   commits(last:1) { nodes { commit { statusCheckRollup { state
-    contexts(first:100) { nodes { __typename ... on CheckRun { conclusion } ... on StatusContext { state } } } } } } }
+    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
   labels(first:20) { nodes { name } }
 }
 query BoardSweep($owner:String!, $repo:String!, $prCursor:String, $issueCursor:String, $includeMerged:Boolean!) {
@@ -521,7 +527,9 @@ type prNode struct {
 					Contexts struct {
 						Nodes []struct {
 							Typename   string `json:"__typename"`
+							Name       string `json:"name"`       // CheckRun (Actions) check name
 							Conclusion string `json:"conclusion"` // CheckRun (Actions)
+							Context    string `json:"context"`    // StatusContext (legacy) name
 							State      string `json:"state"`      // StatusContext (legacy)
 						} `json:"nodes"`
 					} `json:"contexts"`
@@ -590,7 +598,18 @@ func prFromNode(n prNode) PullRequest {
 		for _, c := range rollup.Contexts.Nodes {
 			if (c.Typename == "CheckRun" && c.Conclusion == "SUCCESS") || (c.Typename == "StatusContext" && c.State == "SUCCESS") {
 				pr.CIHasRealSuccess = true
-				break
+			}
+			// collect the NAMES of definitively-failed checks so a bounced build can be told
+			// exactly which gate to re-run + fix locally (not a generic "CI was red").
+			switch {
+			case c.Typename == "CheckRun" && (c.Conclusion == "FAILURE" || c.Conclusion == "TIMED_OUT" || c.Conclusion == "STARTUP_FAILURE" || c.Conclusion == "CANCELLED"):
+				if c.Name != "" {
+					pr.FailingChecks = append(pr.FailingChecks, c.Name)
+				}
+			case c.Typename == "StatusContext" && (c.State == "FAILURE" || c.State == "ERROR"):
+				if c.Context != "" {
+					pr.FailingChecks = append(pr.FailingChecks, c.Context)
+				}
 			}
 		}
 	}
@@ -732,7 +751,7 @@ query PR($owner:String!, $repo:String!, $number:Int!) {
       headRefOid baseRefOid
       mergeCommit { oid }
       commits(last:1) { nodes { commit { statusCheckRollup { state
-    contexts(first:100) { nodes { __typename ... on CheckRun { conclusion } ... on StatusContext { state } } } } } } }
+    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
       labels(first:20) { nodes { name } }
     }
   }
@@ -761,7 +780,9 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 								Contexts struct {
 									Nodes []struct {
 										Typename   string `json:"__typename"`
+										Name       string `json:"name"`
 										Conclusion string `json:"conclusion"`
+										Context    string `json:"context"`
 										State      string `json:"state"`
 									} `json:"nodes"`
 								} `json:"contexts"`
@@ -803,7 +824,18 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 		for _, c := range rollup.Contexts.Nodes {
 			if (c.Typename == "CheckRun" && c.Conclusion == "SUCCESS") || (c.Typename == "StatusContext" && c.State == "SUCCESS") {
 				pr.CIHasRealSuccess = true
-				break
+			}
+			// collect the NAMES of definitively-failed checks so a bounced build can be told
+			// exactly which gate to re-run + fix locally (not a generic "CI was red").
+			switch {
+			case c.Typename == "CheckRun" && (c.Conclusion == "FAILURE" || c.Conclusion == "TIMED_OUT" || c.Conclusion == "STARTUP_FAILURE" || c.Conclusion == "CANCELLED"):
+				if c.Name != "" {
+					pr.FailingChecks = append(pr.FailingChecks, c.Name)
+				}
+			case c.Typename == "StatusContext" && (c.State == "FAILURE" || c.State == "ERROR"):
+				if c.Context != "" {
+					pr.FailingChecks = append(pr.FailingChecks, c.Context)
+				}
 			}
 		}
 	}

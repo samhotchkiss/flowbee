@@ -48,6 +48,11 @@ type ReconciledPR struct {
 	// build (rebuild), escalating to needs_human at max_bounces. Transient (not
 	// stored) — recomputed from the rollup each sweep.
 	CIFailed bool
+	// FailingChecks names the checks that definitively failed at the head. On a ci-fail
+	// bounce they are persisted onto the job (last_ci_failures) and carried into the
+	// rebuild's lease context so the agent re-runs the named gate + fixes the real
+	// violation rather than rebuilding blind. Empty when CI is green or only pending.
+	FailingChecks []string
 	// ClosedUnmerged is true for a PR a human CLOSED without merging — the change was
 	// rejected, so the job is parked (pr_closed) instead of waiting on a merge that will
 	// never come (and instead of the slow, misleading stall the watchdog would otherwise
@@ -258,7 +263,7 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 			// it's THIS change): bounce it back to build (rebuild), escalating to needs_human
 			// at max_bounces. Gated to review_pending so a single failure bounces once
 			// (the rebuild moves the head; the next sweep sees fresh/pending CI).
-			if err := ciFailBounceTx(ctx, tx, &j, seq, now); err != nil {
+			if err := ciFailBounceTx(ctx, tx, &j, seq, now, pr.FailingChecks); err != nil {
 				return err
 			}
 			out.Applied = true
@@ -385,8 +390,11 @@ func reconcileTransitionTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int,
 // build (a rebuild), or escalates to needs_human at max_bounces. It mirrors the
 // gate's own bounce events (KindReviewBounced / KindBounceExhausted) EXACTLY so the
 // jobs projection stays equal to a re-fold of the ledger (determinism).
-func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time) error {
+func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time, failingChecks []string) error {
 	nextSeq := seq + 1
+	// the names of the gates that failed, recorded on the job so the rebuild's lease
+	// context tells the agent exactly which check to re-run + fix (not "CI was red").
+	ciFails := strings.Join(failingChecks, "\n")
 	if j.Bounces+1 > j.MaxBounces {
 		// the rebuild keeps failing CI: escalate to a human (KindBounceExhausted fold:
 		// state = ToState, bounces += delta, lease cleared).
@@ -400,8 +408,9 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs SET state='needs_human', bounces=bounces+1,
+			       last_ci_failures = CASE WHEN ? <> '' THEN ? ELSE last_ci_failures END,
 			       lease_id=NULL, bound_identity=NULL, bound_model_family=NULL,
-			       updated_at=datetime('now') WHERE id=?`, j.ID); err != nil {
+			       updated_at=datetime('now') WHERE id=?`, ciFails, ciFails, j.ID); err != nil {
 			return fmt.Errorf("apply ci-fail escalate: %w", err)
 		}
 		return setJobSeq(ctx, tx, j.ID, nextSeq)
@@ -422,9 +431,10 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 		       bounces=bounces+1,
 		       patch_diff='', declared_blast_radius='',
 		       reservation_paths='', reservation_wide=0,
+		       last_ci_failures = CASE WHEN ? <> '' THEN ? ELSE last_ci_failures END,
 		       enqueued_at=?, lease_id=NULL, bound_identity=NULL, bound_model_family=NULL,
 		       updated_at=datetime('now') WHERE id=?`,
-		marshalStrings([]string{"role:eng_worker"}), now.Format(rfc3339), j.ID); err != nil {
+		marshalStrings([]string{"role:eng_worker"}), ciFails, ciFails, now.Format(rfc3339), j.ID); err != nil {
 		return fmt.Errorf("apply ci-fail bounce: %w", err)
 	}
 	return setJobSeq(ctx, tx, j.ID, nextSeq)

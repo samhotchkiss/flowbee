@@ -146,6 +146,10 @@ type LeaseContext struct {
 	// PriorReviewFindings is the most recent code-review's changes-requested findings,
 	// carried to a rebuild so the agent fixes what was flagged (§F compounding memory).
 	PriorReviewFindings string `json:"prior_review_findings,omitempty"`
+	// CIFailures names the checks that failed CI on the prior attempt (newline-separated,
+	// e.g. "Architecture and guardrail lints\ngolangci-lint"), carried to a rebuild so the
+	// brief tells the agent the exact gate to re-run + fix rather than rebuilding blind.
+	CIFailures string `json:"ci_failures,omitempty"`
 	// Diff is the eng_worker's build patch, shipped to a code_reviewer so its agent
 	// can judge the actual change (the review harness writes it to .flowbee/diff.patch
 	// + $FLOWBEE_DIFF). Empty for non-review roles.
@@ -477,6 +481,18 @@ func (c *Client) ReleaseNoPenalty(ctx context.Context, jobID string, epoch int) 
 func (c *Client) ReleaseFailed(ctx context.Context, jobID string, epoch int) (status int, err error) {
 	var out map[string]bool
 	return c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/release?fail=1", epochHeader(epoch), nil, &out)
+}
+
+// ReportRebaseConflict tells the control plane that this build's branch patch does NOT
+// apply onto the granted base (a real conflict with merged work). The control plane
+// diverts the job to a conflict_resolver — which re-applies the supplied branch change
+// onto current main + resolves the markers — instead of the build looping to needs_human.
+// baseSHA is the base the rebase targeted (the conflicting head); diff is the branch's
+// own change for the resolver to re-apply. A stale epoch returns 409.
+func (c *Client) ReportRebaseConflict(ctx context.Context, jobID string, epoch int, baseSHA, diff string) (status int, err error) {
+	var out map[string]bool
+	body := map[string]string{"base_sha": baseSHA, "diff": diff}
+	return c.postJSONStatus(ctx, "/v1/jobs/"+jobID+"/rebase-conflict", epochHeader(epoch), body, &out)
 }
 
 func epochHeader(epoch int) map[string]string {
