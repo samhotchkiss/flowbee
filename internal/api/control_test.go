@@ -9,6 +9,7 @@ import (
 
 	"github.com/samhotchkiss/flowbee/client"
 	"github.com/samhotchkiss/flowbee/internal/api"
+	"github.com/samhotchkiss/flowbee/internal/capacity"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/store"
@@ -127,6 +128,46 @@ func TestReportRebaseConflictDivertsToResolver(t *testing.T) {
 	// a stale epoch (lost the lease) is fenced with 409 and leaves the job alone.
 	if status, _ := c.ReportRebaseConflict(ctx, "j", 999, "x", "d"); status != 409 {
 		t.Fatalf("stale-epoch report status=%d, want 409", status)
+	}
+}
+
+// TestLeaseGatedWhenAccountRateLimited: a worker whose agent login (FLOWBEE_ACCOUNT) is
+// rate-limited gets NO work (the F6 per-account ceiling), so dispatch rolls over to boxes
+// on accounts that aren't maxed; once the account clears, work flows again.
+func TestLeaseGatedWhenAccountRateLimited(t *testing.T) {
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t)
+	seedReady(t, st, "j", "", clk.Now())
+	st.UpsertAccounts(ctx, []store.AccountSpec{
+		{AccountID: "codex:s@swh.me", ModelFamily: "codex", CeilingPct: 90},
+	}, clk.Now())
+	t.Setenv("FLOWBEE_ACCOUNT", "codex:s@swh.me") // the client sends this as account_id
+
+	// account is fine -> work is offered.
+	if g, ok, err := c.Lease(ctx, "w", "codex", ""); err != nil || !ok || g.JobID != "j" {
+		t.Fatalf("healthy account should lease the job (ok=%v job=%s err=%v)", ok, g.JobID, err)
+	}
+	// re-arm the job to ready for the next claim, then rate-limit the account.
+	if _, err := st.RequeueJob(ctx, "j", true, clk.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RecordUsage(ctx, []capacity.UsageReport{
+		{AccountID: "codex:s@swh.me", ModelFamily: "codex", UsagePct: 100, RateLimited: true},
+	}, clk.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// gated -> no work, even though a ready job exists.
+	if _, ok, err := c.Lease(ctx, "w", "codex", ""); err != nil || ok {
+		t.Fatalf("a rate-limited account must get NO work (ok=%v err=%v)", ok, err)
+	}
+	// clear the account -> work flows again.
+	if _, err := st.RecordUsage(ctx, []capacity.UsageReport{
+		{AccountID: "codex:s@swh.me", ModelFamily: "codex", UsagePct: 0, RateLimited: false},
+	}, clk.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if g, ok, err := c.Lease(ctx, "w", "codex", ""); err != nil || !ok || g.JobID != "j" {
+		t.Fatalf("cleared account should lease again (ok=%v job=%s err=%v)", ok, g.JobID, err)
 	}
 }
 

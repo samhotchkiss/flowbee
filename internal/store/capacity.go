@@ -352,3 +352,39 @@ func boolToInt(b bool) int {
 	}
 	return 0
 }
+
+// accountGateCooldown is how long a rate-limited account stays gated OUT of dispatch
+// before it is re-tested. A gated account can't run its agent to self-clear (no claim ->
+// no run -> no clean report), so the gate auto-opens after the cooldown; a still-maxed
+// account re-reports on its next run and re-gates. Tuned shorter than a typical reset
+// window so capacity recovers promptly once the real limit window resets.
+const accountGateCooldown = 20 * time.Minute
+
+// IsAccountGated reports whether dispatch should WITHHOLD work from a worker on this
+// account: the account is rate_limited AND its last report is within the cooldown. Empty/
+// unknown account, stale report, or unparseable time => not gated (fail-open: a capacity
+// check must never wedge dispatch). `now` is passed as a value (no clock read).
+func (s *Store) IsAccountGated(ctx context.Context, accountID string, now time.Time) (bool, error) {
+	if accountID == "" {
+		return false, nil
+	}
+	var rl int
+	var reportedAt sql.NullString
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT rate_limited, reported_at FROM worker_accounts WHERE account_id = ?`, accountID).
+		Scan(&rl, &reportedAt)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if rl == 0 || !reportedAt.Valid || reportedAt.String == "" {
+		return false, nil
+	}
+	t, perr := time.Parse(rfc3339, reportedAt.String)
+	if perr != nil {
+		return false, nil
+	}
+	return now.Sub(t) < accountGateCooldown, nil
+}

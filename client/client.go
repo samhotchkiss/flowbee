@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 )
 
@@ -207,6 +208,11 @@ func (c *Client) leaseWithLens(ctx context.Context, identity, family, role, lens
 	q.Set("model_family", family)
 	if c.Model != "" {
 		q.Set("model", c.Model)
+	}
+	// F6 capacity: declare this worker's agent login so dispatch can gate it OUT when the
+	// account is rate-limited (the per-account ceiling). Empty/unset => never gated.
+	if acct := os.Getenv("FLOWBEE_ACCOUNT"); acct != "" {
+		q.Set("account_id", acct)
 	}
 	if role != "" {
 		q.Set("role", role)

@@ -1080,6 +1080,15 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	// F6 per-account ceiling: if this worker's agent login is rate-limited (within the
+	// cooldown), withhold work so dispatch rolls over to boxes/accounts that aren't maxed.
+	// Fail-open (a gate error never blocks dispatch). Mirrors the pause short-circuit.
+	if acct := r.URL.Query().Get("account_id"); acct != "" {
+		if gated, gerr := s.store.IsAccountGated(r.Context(), acct, s.clock.Now()); gerr == nil && gated {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
 
 	deadline := time.Now().Add(s.longPollWait)
 	for {
