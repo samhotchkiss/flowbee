@@ -86,6 +86,20 @@ func roleAgentCmd(agent, family string, writesFiles bool, agentOverride, buildOv
 // modelLabelFor is the worker's ACTUAL model label for the §F card: under --agent codex
 // every role runs Codex (so the family tag sonnet/opus would mislead), else the family IS
 // the real claude model. Sent via --model-label so a card shows which model did each node.
+// accountForAgentCmd returns the F6 account a worker running `cmd` authenticates as: the
+// box's codex login if the command runs codex, its claude login if it runs claude, else ""
+// (that agent isn't metered on this box). This is how a split-stack box attributes its
+// codex-build and claude-review workers to their two separate accounts.
+func accountForAgentCmd(cmd, codexAcct, claudeAcct string) string {
+	switch {
+	case strings.Contains(cmd, "codex"):
+		return codexAcct
+	case strings.Contains(cmd, "claude"):
+		return claudeAcct
+	}
+	return ""
+}
+
 func modelLabelFor(agent, family string) string {
 	if agent == "codex" {
 		return "codex"
@@ -232,12 +246,23 @@ func runFleet(args []string) error {
 	defer shutdown()
 	var mu sync.Mutex
 	var kids []*exec.Cmd
-	supervise := func(identity string, argv ...string) {
+	// F6: each box has at most one codex + one claude login; a worker's account is its
+	// AGENT's login (a codex builder uses the codex account, a claude reviewer the claude
+	// account — so a split-stack box reports to TWO accounts correctly). Set per box via
+	// FLOWBEE_CODEX_ACCOUNT / FLOWBEE_CLAUDE_ACCOUNT; the worker advertises it + reports its
+	// usage/limit, and dispatch gates a maxed account. Empty => that agent isn't metered.
+	codexAcct := os.Getenv("FLOWBEE_CODEX_ACCOUNT")
+	claudeAcct := os.Getenv("FLOWBEE_CLAUDE_ACCOUNT")
+	supervise := func(identity, account string, argv ...string) {
 		go func() {
 			backoff := time.Second
 			for ctx.Err() == nil {
 				c := exec.Command(self, argv...)
 				c.Env = env
+				if account != "" {
+					// per-worker FLOWBEE_ACCOUNT (its agent's login), without mutating the shared env.
+					c.Env = append(append([]string(nil), env...), "FLOWBEE_ACCOUNT="+account)
+				}
 				if secret != "" {
 					c.Env = append(c.Env, "FLOWBEE_WORKER_TOKEN="+auth.NewBearer([]byte(secret), nil, false).Mint(identity))
 				}
@@ -273,7 +298,8 @@ func runFleet(args []string) error {
 	// genuinely different model.
 	for i := 0; i < *builders; i++ {
 		id := fmt.Sprintf("%s-builder-%d", host, i)
-		supervise(id, "work", "--role", "eng_worker", "--remote",
+		supervise(id, accountForAgentCmd(builderCmd, codexAcct, claudeAcct),
+			"work", "--role", "eng_worker", "--remote",
 			"--mirror", *mirror, "--repo-url", repoURL,
 			"--identity", id, "--model-family", fleetBuilderFamily,
 			"--model-label", modelLabelFor(*agent, fleetBuilderFamily), "--agent-cmd", builderCmd)
@@ -317,7 +343,7 @@ func runFleet(args []string) error {
 			if r.needsMirror {
 				argv = append(argv, "--mirror", *mirror, "--repo-url", repoURL)
 			}
-			supervise(id, argv...)
+			supervise(id, accountForAgentCmd(roleCmd, codexAcct, claudeAcct), argv...)
 		}
 	}
 
