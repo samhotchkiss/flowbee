@@ -82,6 +82,17 @@ func runWork(args []string) error {
 	}
 	slots := parseModelSlots(*modelSlots)
 	accts := parseAccounts(*accounts)
+	// F6: a worker that declares its agent login via FLOWBEE_ACCOUNT auto-advertises that
+	// account (account_id = the login, model_family = the agent prefix, ceiling 90) so the
+	// control plane enrolls it without a separate --accounts spec. The worker then reports
+	// the account's usage/limit (harness.reportAccountLimit), and dispatch gates it at 90%.
+	if acct := os.Getenv("FLOWBEE_ACCOUNT"); acct != "" {
+		fam := acct
+		if i := strings.IndexByte(acct, ':'); i > 0 {
+			fam = acct[:i]
+		}
+		accts = append(accts, client.AccountSpecMsg{AccountID: acct, ModelFamily: fam, CeilingPct: 90})
+	}
 	url := envOr("FLOWBEE_URL", "http://127.0.0.1:7070")
 	ctx := context.Background()
 

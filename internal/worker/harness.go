@@ -1063,6 +1063,10 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, reg *client.Regi
 			TokensInDelta: ti, TokensOutDelta: to, MicroUSDDelta: micro,
 		})
 	}
+	// F6 capacity: if the agent's output shows its account hit a usage limit (codex
+	// "usage limit" / claude rate-limit / 429), report the account as rate-limited so
+	// dispatch gates it OUT until it clears — the per-account ceiling the operator wanted.
+	reportAccountLimit(ctx, c, out)
 	if werr != nil {
 		// distinguish a deadline/revoke kill (the lease is gone — the caller releases and
 		// loops to fresh work) from a genuine agent failure, so the log isn't misleading.
@@ -1098,6 +1102,53 @@ func refreshWorkerRegistration(ctx context.Context, c *client.Client, reg *clien
 	if err == nil && resp.WorkerID != "" {
 		reg.WorkerID = resp.WorkerID
 	}
+}
+
+// workerAccountID is the worker's agent login as the F6 capacity selector sees it
+// (e.g. "codex:s@swh.me"). Set from FLOWBEE_ACCOUNT at startup. Empty disables capacity
+// reporting (back-compat: a worker that advertises no account is never gated/metered).
+var workerAccountID = os.Getenv("FLOWBEE_ACCOUNT")
+
+// reportAccountLimit detects whether the agent's output shows its account hit a usage
+// limit / 429 and reports the account's state to the control plane (F6): rate-limited so
+// dispatch gates it OUT, or clear (a clean run after the window reset un-gates it). The
+// account is per-LOGIN and shared across boxes, so one box's report gates every box on the
+// same login. No-op when no account is configured. Best-effort: a failed report never
+// blocks the worker (the next run re-reports).
+func reportAccountLimit(ctx context.Context, c *client.Client, out string) {
+	if workerAccountID == "" {
+		return
+	}
+	maxed := agentHitLimit(out)
+	fam := workerAccountID
+	if i := strings.IndexByte(workerAccountID, ':'); i > 0 {
+		fam = workerAccountID[:i] // "codex:s@swh.me" -> "codex"
+	}
+	pct := 0
+	if maxed {
+		pct = 100
+	}
+	_, _ = c.ReportUsage(ctx, []client.UsageReport{{
+		AccountID: workerAccountID, ModelFamily: fam, UsagePct: pct, RateLimited: maxed,
+	}})
+}
+
+// agentHitLimit reports whether the agent's output indicates its ACCOUNT is usage/rate
+// limited (codex "you've hit your usage limit" / claude rate-limit / a 429). Matches the
+// distinctive limit phrases, not an incidental mention, to avoid false positives.
+func agentHitLimit(out string) bool {
+	l := strings.ToLower(out)
+	switch {
+	case strings.Contains(l, "usage limit"): // codex: "You've hit your usage limit"
+		return true
+	case strings.Contains(l, "rate limit") || strings.Contains(l, "rate_limit"):
+		return true
+	case strings.Contains(l, "429") && (strings.Contains(l, "too many") || strings.Contains(l, "rate")):
+		return true
+	case strings.Contains(l, "quota") && strings.Contains(l, "exceed"):
+		return true
+	}
+	return false
 }
 
 // parseAgentUsage extracts the agent's reported token/cost usage from its stdout when it
