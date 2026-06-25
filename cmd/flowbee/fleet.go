@@ -126,6 +126,10 @@ func runFleet(args []string) error {
 	url := fs.String("url", envOr("FLOWBEE_URL", ""), "control-plane URL, e.g. http://100.67.2.108:7070")
 	mirror := fs.String("mirror", envOr("FLOWBEE_WORKER_MIRRORS_DIR", ""), "directory for the worker's per-repo BARE mirrors (default ~/.flowbee/mirrors; NOT a working checkout)")
 	builders := fs.Int("builders", 1, "parallel build workers on this box (each gets its own worktree off the shared mirror)")
+	// conflict resolution is a slow, file-writing agent task; ONE resolver can't keep up with
+	// a burst of conflicts (the waiters get stall-governed out before a resolver frees up).
+	// Run several so a backlog of resolving_conflict jobs drains concurrently.
+	resolvers := fs.Int("resolvers", 1, "parallel conflict_resolver workers on this box (scale up when conflicts queue faster than one can resolve)")
 	// Per-role default agent commands inject `--model <family>` so the build and review
 	// roles run GENUINELY DIFFERENT models — real §5.5 uncorrelated review, not the same
 	// CLI-default model hiding behind distinct family labels (a reviewer that shares the
@@ -284,25 +288,37 @@ func runFleet(args []string) error {
 	// findings-commit (code_reviewer) or only emit a verdict (spec roles) use the review
 	// agent. needsMirror roles push to the issue branch, so they get --mirror + repo-url.
 	for _, r := range nonBuilderFleetRoles() {
-		id := host + "-" + r.role
 		roleCmd := roleAgentCmd(*agent, r.family, r.writesFiles, *agentCmd, *buildCmd)
 		label := modelLabelFor(*agent, r.family)
 		// the conflict_resolver can run a different (more reliable) backend than the build
 		// agent: heavy resolution stalls some builders out, so swap just this role when set.
-		if r.role == "conflict_resolver" && *resolverCmd != "" {
-			roleCmd = *resolverCmd
-			label = "resolver-custom"
+		// It also scales out (--resolvers N) since one resolver can't keep up with a burst.
+		count := 1
+		if r.role == "conflict_resolver" {
+			if *resolverCmd != "" {
+				roleCmd = *resolverCmd
+				label = "resolver-custom"
+			}
+			if *resolvers > 1 {
+				count = *resolvers
+			}
 		}
-		argv := []string{"work", "--role", r.role, "--identity", id, "--model-family", r.family,
-			"--model-label", label,
-			"--agent-cmd", roleCmd}
-		if r.writesFiles {
-			argv = append(argv, "--remote")
+		for n := 0; n < count; n++ {
+			id := host + "-" + r.role
+			if count > 1 {
+				id = fmt.Sprintf("%s-%d", id, n)
+			}
+			argv := []string{"work", "--role", r.role, "--identity", id, "--model-family", r.family,
+				"--model-label", label,
+				"--agent-cmd", roleCmd}
+			if r.writesFiles {
+				argv = append(argv, "--remote")
+			}
+			if r.needsMirror {
+				argv = append(argv, "--mirror", *mirror, "--repo-url", repoURL)
+			}
+			supervise(id, argv...)
 		}
-		if r.needsMirror {
-			argv = append(argv, "--mirror", *mirror, "--repo-url", repoURL)
-		}
-		supervise(id, argv...)
 	}
 
 	fmt.Printf("🐝 flowbee fleet up on %s → %s  [%s]\n   %d build + 1 code-review + 1 conflict-resolver + 1 author + 1 issue-review worker (all roles; this box is fungible capacity)\n",
