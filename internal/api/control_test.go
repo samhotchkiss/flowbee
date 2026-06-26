@@ -243,6 +243,36 @@ func TestLeaseDispatchAccountHardLine(t *testing.T) {
 	}
 }
 
+// TestLeaseResolverAccountPin: conflicts route only to FLOWBEE_RESOLVER_ACCOUNTS logins
+// (codex stalls on 3-way merges, so the operator pins resolution to a claude login that
+// has headroom) while other roles are unaffected.
+func TestLeaseResolverAccountPin(t *testing.T) {
+	t.Setenv("FLOWBEE_RESOLVER_ACCOUNTS", "claude:pearl@swh.me")
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t)
+	if _, err := c.Register(ctx, client.Registration{
+		WorkerID: "cr", Identity: "cr", Host: "h",
+		Capabilities: []string{"role:conflict_resolver", "model_family:opus"},
+	}); err != nil {
+		t.Fatalf("register resolver: %v", err)
+	}
+	seedReady(t, st, "j", "", clk.Now())
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET state='resolving_conflict', role='conflict_resolver', required_capabilities='["role:conflict_resolver"]' WHERE id='j'`); err != nil {
+		t.Fatal(err)
+	}
+	// a non-pinned login (e.g. codex) gets no conflict work.
+	t.Setenv("FLOWBEE_ACCOUNT", "codex:gpt@swh.me")
+	if _, ok, err := c.Lease(ctx, "cr", "opus", "conflict_resolver"); err != nil || ok {
+		t.Fatalf("non-pinned login must get NO conflict work (ok=%v err=%v)", ok, err)
+	}
+	// the pinned claude login claims it.
+	t.Setenv("FLOWBEE_ACCOUNT", "claude:pearl@swh.me")
+	if g, ok, err := c.Lease(ctx, "cr", "opus", "conflict_resolver"); err != nil || !ok || g.JobID != "j" {
+		t.Fatalf("pinned login must claim the conflict (ok=%v job=%s err=%v)", ok, g.JobID, err)
+	}
+}
+
 func TestLeaseDryRunDoesNotClaim(t *testing.T) {
 	ctx := context.Background()
 	st, c, clk := ctrlServer(t)

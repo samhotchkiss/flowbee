@@ -110,6 +110,11 @@ type Server struct {
 	// other builders sit idle for builds — the operator "run builds through codex, not
 	// claude" lever. Review / spec / conflict roles are unaffected. Empty = no restriction.
 	buildAccounts map[string]bool
+	// resolverAccounts is the per-role pin for conflict_resolver (env
+	// FLOWBEE_RESOLVER_ACCOUNTS): only these logins claim conflict-resolution work. Codex
+	// stalls on the heavy 3-way-merge task, so this lets the operator route conflicts to a
+	// claude login that has headroom while builds/reviews stay on codex. Empty = off.
+	resolverAccounts map[string]bool
 	// dispatchAccounts is the GLOBAL allowlist (env FLOWBEE_DISPATCH_ACCOUNTS): when set,
 	// ONLY these logins get ANY work, of ANY role — the operator "park an entire agent"
 	// lever (e.g. a maxed claude: pin every role to codex, claude idle until it recovers).
@@ -289,6 +294,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		pauseMarkerPath:    cfg.PauseMarkerPath,
 		reviewAccounts:     parseReviewAccounts(os.Getenv("FLOWBEE_REVIEW_ACCOUNTS")),
 		buildAccounts:      parseReviewAccounts(os.Getenv("FLOWBEE_BUILD_ACCOUNTS")),
+		resolverAccounts:   parseReviewAccounts(os.Getenv("FLOWBEE_RESOLVER_ACCOUNTS")),
 		dispatchAccounts:   parseReviewAccounts(os.Getenv("FLOWBEE_DISPATCH_ACCOUNTS")),
 		runningConfig:      runningConfig,
 	}
@@ -1141,6 +1147,15 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	// reviewers automatically. Review / spec / conflict roles are unaffected. Empty = off.
 	if role == job.RoleEngWorker && len(s.buildAccounts) > 0 {
 		if acct := r.URL.Query().Get("account_id"); !s.buildAccounts[acct] {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+	// Conflict-resolver pin (FLOWBEE_RESOLVER_ACCOUNTS): route the heavy 3-way-merge task
+	// to a login that handles it (codex stalls), e.g. a rolled-over claude — while builds
+	// stay on codex. Only listed logins claim conflict-resolution work. Empty = off.
+	if resolvingConflict && len(s.resolverAccounts) > 0 {
+		if acct := r.URL.Query().Get("account_id"); !s.resolverAccounts[acct] {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
