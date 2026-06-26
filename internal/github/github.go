@@ -72,7 +72,13 @@ type PullRequest struct {
 	// to re-run + fix locally instead of a generic "CI was red". Empty when CI is green
 	// or only pending.
 	FailingChecks []string
-	Labels        []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
+	// PassedChecks names the checks that concluded SUCCESS at the head (CheckRun SUCCESS
+	// or legacy StatusContext SUCCESS). Used to evaluate whether the repo's REQUIRED
+	// status checks are green independently of the aggregate rollup — a PR can be
+	// UNSTABLE/PENDING overall (a non-required cosmetic check) while every REQUIRED check
+	// has passed, which is exactly when GitHub itself permits the merge.
+	PassedChecks []string
+	Labels       []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
 }
 
 // Issue is the Domain-B snapshot of one open issue from a BoardSweep. Title/Body
@@ -598,6 +604,12 @@ func prFromNode(n prNode) PullRequest {
 		for _, c := range rollup.Contexts.Nodes {
 			if (c.Typename == "CheckRun" && c.Conclusion == "SUCCESS") || (c.Typename == "StatusContext" && c.State == "SUCCESS") {
 				pr.CIHasRealSuccess = true
+				switch {
+				case c.Typename == "CheckRun" && c.Name != "":
+					pr.PassedChecks = append(pr.PassedChecks, c.Name)
+				case c.Typename == "StatusContext" && c.Context != "":
+					pr.PassedChecks = append(pr.PassedChecks, c.Context)
+				}
 			}
 			// collect the NAMES of definitively-failed checks so a bounced build can be told
 			// exactly which gate to re-run + fix locally (not a generic "CI was red").
@@ -824,6 +836,12 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 		for _, c := range rollup.Contexts.Nodes {
 			if (c.Typename == "CheckRun" && c.Conclusion == "SUCCESS") || (c.Typename == "StatusContext" && c.State == "SUCCESS") {
 				pr.CIHasRealSuccess = true
+				switch {
+				case c.Typename == "CheckRun" && c.Name != "":
+					pr.PassedChecks = append(pr.PassedChecks, c.Name)
+				case c.Typename == "StatusContext" && c.Context != "":
+					pr.PassedChecks = append(pr.PassedChecks, c.Context)
+				}
 			}
 			// collect the NAMES of definitively-failed checks so a bounced build can be told
 			// exactly which gate to re-run + fix locally (not a generic "CI was red").

@@ -47,6 +47,15 @@ type Reconciler struct {
 	// issue intake for this repo (e.g. tests with no local mirror).
 	mirror RepoMirror
 	branch string
+	// requiredChecks is the repo's REQUIRED status-check contexts (server-side branch
+	// protection / ruleset), cached after the first successful fetch. A PR whose every
+	// required check has passed is CI-green for the merge gate even if the AGGREGATE
+	// rollup is UNSTABLE from a NON-required (e.g. cosmetic post-merge) check — matching
+	// GitHub's own merge policy. nil + requiredFetched=false = not yet fetched; an empty
+	// (non-nil via requiredFetched=true) list means "no required checks configured", in
+	// which case the gate falls back to the conservative full-rollup-green rule.
+	requiredChecks  []string
+	requiredFetched bool
 }
 
 // RepoMirror resolves a ref to a commit SHA (satisfied by *gitops.Mirror) so the
@@ -101,6 +110,7 @@ func (r *Reconciler) Sweep(ctx context.Context) ([]store.ReconcileOutcome, error
 	}
 	mainCIRed := r.mainCIRed(ctx)
 	_ = r.store.RecordMainCIRed(ctx, r.repo, mainCIRed) // surface a red main on /metrics + status
+	r.ensureRequiredChecks(ctx)                         // warm the required-checks cache once per sweep (not per PR)
 	var outs []store.ReconcileOutcome
 	for _, pr := range snap.PullRequests {
 		out, applied, err := r.ingest(ctx, pr, now, mainCIRed)
@@ -201,7 +211,7 @@ func (r *Reconciler) ingest(ctx context.Context, pr gh.PullRequest, now time.Tim
 	if !ok {
 		return store.ReconcileOutcome{}, false, nil
 	}
-	out, err := r.store.ApplyReconciledPR(ctx, jobID, toReconciled(pr, mainCIRed), now)
+	out, err := r.store.ApplyReconciledPR(ctx, jobID, toReconciled(pr, mainCIRed, r.requiredChecks), now)
 	if err != nil {
 		return store.ReconcileOutcome{}, false, err
 	}
@@ -242,7 +252,91 @@ func (r *Reconciler) mainCIRed(ctx context.Context) bool {
 	return st == gh.CIFailure || st == gh.CIError
 }
 
-func toReconciled(pr gh.PullRequest, mainCIRed bool) store.ReconciledPR {
+// ensureRequiredChecks warms r.requiredChecks (the repo's required status-check contexts)
+// once via branch protection, then caches it — called at the start of each Sweep, NOT in
+// the per-PR / webhook-refetch path (so a targeted refetch issues no extra GitHub call).
+// A client that can't read protection, or any error, leaves it nil and the gate uses the
+// conservative full-rollup-green rule — a missing signal never LOOSENS the gate.
+func (r *Reconciler) ensureRequiredChecks(ctx context.Context) {
+	if r.requiredFetched {
+		return
+	}
+	br, ok := r.gh.(gh.BranchProtectionReader)
+	if !ok {
+		r.requiredFetched = true // no protection surface; never retry
+		return
+	}
+	branch := r.branch
+	if branch == "" {
+		branch = "main"
+	}
+	prot, ok, err := br.BranchProtection(ctx, branch)
+	if err != nil {
+		return // transient: leave unfetched so a later sweep retries
+	}
+	r.requiredFetched = true
+	if ok {
+		r.requiredChecks = prot.RequiredChecks
+	}
+}
+
+// requiredChecksGreen reports whether EVERY required check has passed at the head. Empty
+// required => false (caller falls back to the full-rollup rule). A required check that is
+// pending/missing/failing is simply absent from PassedChecks, so this stays false until it
+// genuinely concludes SUCCESS — it can only ever make the gate match GitHub's required-
+// checks policy, never approve a PR whose required check has not passed.
+// anyIn reports whether any name in xs is also in ys (set intersection non-empty) —
+// used to detect whether a REQUIRED check is among the definitively-failed checks.
+func anyIn(xs, ys []string) bool {
+	if len(xs) == 0 || len(ys) == 0 {
+		return false
+	}
+	set := make(map[string]bool, len(ys))
+	for _, y := range ys {
+		set[y] = true
+	}
+	for _, x := range xs {
+		if set[x] {
+			return true
+		}
+	}
+	return false
+}
+
+func requiredChecksGreen(pr gh.PullRequest, required []string) bool {
+	if len(required) == 0 {
+		return false
+	}
+	passed := make(map[string]bool, len(pr.PassedChecks))
+	for _, n := range pr.PassedChecks {
+		passed[n] = true
+	}
+	for _, req := range required {
+		if !passed[req] {
+			return false
+		}
+	}
+	return true
+}
+
+func toReconciled(pr gh.PullRequest, mainCIRed bool, requiredChecks []string) store.ReconciledPR {
+	// Green/failed are evaluated against the repo's REQUIRED checks when known, else the
+	// aggregate rollup. Both paths require a real (non-skipped) passing check — GitHub
+	// rolls an ALL-SKIPPED head up to SUCCESS (no test ran), so the aggregate alone would
+	// let a paths-filtered or hostile-workflow PR pass on tests that never executed.
+	var ciGreen, ciFailed bool
+	if len(requiredChecks) > 0 {
+		// Required-checks policy (matches GitHub's own merge gate): green iff EVERY required
+		// check passed; failed iff a REQUIRED check definitively failed. A non-required
+		// (e.g. cosmetic post-merge) check that is pending/failing makes the AGGREGATE
+		// UNSTABLE but neither blocks green nor bounces the build — which is the whole point.
+		ciGreen = pr.CIHasRealSuccess && requiredChecksGreen(pr, requiredChecks)
+		ciFailed = anyIn(pr.FailingChecks, requiredChecks)
+	} else {
+		// Unknown required checks: the conservative aggregate-only rule (unchanged behavior).
+		ciGreen = pr.CIHasRealSuccess && pr.CIRollup == gh.CISuccess
+		ciFailed = pr.CIRollup == gh.CIFailure || pr.CIRollup == gh.CIError
+	}
 	return store.ReconciledPR{
 		Number:      pr.Number,
 		UpdatedAt:   pr.UpdatedAt,
@@ -252,13 +346,8 @@ func toReconciled(pr gh.PullRequest, mainCIRed bool) store.ReconciledPR {
 		BaseSHA:     pr.BaseRefOid,
 		MergeCommit: pr.MergeCommit,
 		MainCIRed:   mainCIRed,
-		// green requires BOTH the aggregate SUCCESS AND a real (non-skipped) passing check —
-		// GitHub rolls an ALL-SKIPPED head up to SUCCESS (no test ran), so the aggregate alone
-		// would let a paths-filtered or hostile-workflow PR pass the gate on tests that never
-		// executed. See gh.PullRequest.CIHasRealSuccess.
-		CIGreen: pr.CIRollup == gh.CISuccess && pr.CIHasRealSuccess,
-		// a DEFINITIVE failure (not merely pending/none): the build is broken.
-		CIFailed: pr.CIRollup == gh.CIFailure || pr.CIRollup == gh.CIError,
+		CIGreen:     ciGreen,
+		CIFailed:    ciFailed,
 		// the NAMES of the failed checks, carried to a bounced build so the rebuild brief
 		// tells the agent exactly which gate to re-run + fix (not a generic "CI was red").
 		FailingChecks:  pr.FailingChecks,
