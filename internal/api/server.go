@@ -97,6 +97,24 @@ type Server struct {
 	// pause. When present, the lease endpoint returns no-work (204) without
 	// attempting a claim — in-flight leases/heartbeats/results are unaffected.
 	pauseMarkerPath string
+	// reviewAccounts, when non-empty, is the allowlist of agent logins (FLOWBEE_ACCOUNT
+	// values) permitted to claim code_review work — the operator "route all reviews to a
+	// chosen (low-usage) account" lever (env FLOWBEE_REVIEW_ACCOUNTS, comma-separated).
+	// Every reviewer NOT on the list is withheld review work (204) so reviews concentrate
+	// on the pinned account(s); build / spec / conflict roles are unaffected. Empty
+	// (default) = no restriction, every reviewer claims normally.
+	reviewAccounts map[string]bool
+	// buildAccounts is the symmetric allowlist for BUILD (eng_worker) leases — env
+	// FLOWBEE_BUILD_ACCOUNTS. When set, only those agent logins may claim build work, so
+	// builds concentrate on a chosen account (e.g. the codex login with headroom) and the
+	// other builders sit idle for builds — the operator "run builds through codex, not
+	// claude" lever. Review / spec / conflict roles are unaffected. Empty = no restriction.
+	buildAccounts map[string]bool
+	// dispatchAccounts is the GLOBAL allowlist (env FLOWBEE_DISPATCH_ACCOUNTS): when set,
+	// ONLY these logins get ANY work, of ANY role — the operator "park an entire agent"
+	// lever (e.g. a maxed claude: pin every role to codex, claude idle until it recovers).
+	// Broader than the per-role build/review pins; checked first. Empty = no restriction.
+	dispatchAccounts map[string]bool
 	// authn is the worker-transport authenticator (§7.6). Nil = loopback-only dev
 	// (no mutual auth); set for a non-loopback listener (bearer token / mTLS).
 	authn auth.Authenticator
@@ -269,6 +287,9 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		authn:              cfg.Authenticator,
 		ui:                 ui,
 		pauseMarkerPath:    cfg.PauseMarkerPath,
+		reviewAccounts:     parseReviewAccounts(os.Getenv("FLOWBEE_REVIEW_ACCOUNTS")),
+		buildAccounts:      parseReviewAccounts(os.Getenv("FLOWBEE_BUILD_ACCOUNTS")),
+		dispatchAccounts:   parseReviewAccounts(os.Getenv("FLOWBEE_DISPATCH_ACCOUNTS")),
 		runningConfig:      runningConfig,
 	}
 	// seed GitHub health to "just succeeded" so the age metric starts ~0, not at the
@@ -1089,6 +1110,41 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// HARD LINE: global dispatch-account allowlist (FLOWBEE_DISPATCH_ACCOUNTS). When set,
+	// ONLY the listed logins get ANY work of ANY role — every worker on a non-listed
+	// account (e.g. a maxed claude) OR advertising no account at all is withheld here,
+	// before any role/claim logic. This keys on the account_id the worker authenticates
+	// as, NOT the (misleading) sonnet/opus family tag, so a codex worker that labels
+	// itself sonnet still passes and a claude worker never does. Empty = no restriction.
+	if len(s.dispatchAccounts) > 0 {
+		if acct := r.URL.Query().Get("account_id"); !s.dispatchAccounts[acct] {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+	// Operator review-account pin (FLOWBEE_REVIEW_ACCOUNTS): concentrate ALL code_review
+	// work on a chosen low-usage login. When the allowlist is set, a reviewer whose
+	// advertised account_id is not on it gets no review work (204), so reviews roll onto
+	// the pinned account only — other reviewers (claude OR codex) stay idle for reviews
+	// while their build / spec / conflict roles keep flowing. Empty allowlist = no
+	// restriction. The pinned worker advertises its account_id, so this never starves it.
+	if reviewing && len(s.reviewAccounts) > 0 {
+		if acct := r.URL.Query().Get("account_id"); !s.reviewAccounts[acct] {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+	// Symmetric build-account pin (FLOWBEE_BUILD_ACCOUNTS): only the listed logins may
+	// claim BUILD (eng_worker) work, so builds concentrate on a chosen agent (e.g. codex)
+	// while a rate-limited agent's builders (e.g. a maxed claude) sit idle for builds. The
+	// anti-affinity (§5.5) then routes those codex-built jobs to NON-codex (claude)
+	// reviewers automatically. Review / spec / conflict roles are unaffected. Empty = off.
+	if role == job.RoleEngWorker && len(s.buildAccounts) > 0 {
+		if acct := r.URL.Query().Get("account_id"); !s.buildAccounts[acct] {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
 
 	deadline := time.Now().Add(s.longPollWait)
 	for {
@@ -1202,6 +1258,24 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(s.pollInterval):
 		}
 	}
+}
+
+// parseReviewAccounts parses a comma-separated FLOWBEE_REVIEW_ACCOUNTS allowlist into a
+// set of agent logins permitted to claim code_review work. Empty/whitespace entries are
+// dropped; an all-empty value yields nil (no restriction — every reviewer claims). The
+// lease handler consults it only for code_review claims, so build/spec/conflict roles are
+// never affected.
+func parseReviewAccounts(v string) map[string]bool {
+	m := map[string]bool{}
+	for _, p := range strings.Split(v, ",") {
+		if s := strings.TrimSpace(p); s != "" {
+			m[s] = true
+		}
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 func truthyQuery(v string) bool {

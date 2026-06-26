@@ -171,6 +171,78 @@ func TestLeaseGatedWhenAccountRateLimited(t *testing.T) {
 	}
 }
 
+// TestLeaseReviewAccountPin: with FLOWBEE_REVIEW_ACCOUNTS set, ONLY a reviewer whose
+// agent login is on the allowlist may claim code_review work — every other reviewer
+// (a different claude login OR a codex login) is withheld, so reviews concentrate on
+// the pinned low-usage account. This is the "route all reviews to pearl" lever.
+func TestLeaseReviewAccountPin(t *testing.T) {
+	t.Setenv("FLOWBEE_REVIEW_ACCOUNTS", "claude:pearl@swh.me")
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t) // reads the env at api.New
+	if _, err := c.Register(ctx, client.Registration{
+		WorkerID: "rv", Identity: "rv", Host: "h",
+		Capabilities: []string{"role:code_reviewer", "model_family:opus"},
+	}); err != nil {
+		t.Fatalf("register reviewer: %v", err)
+	}
+	seedReady(t, st, "j", "", clk.Now())
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET state='review_pending', role='code_reviewer', required_capabilities='["role:code_reviewer"]' WHERE id='j'`); err != nil {
+		t.Fatal(err)
+	}
+	// a review is only an offerable candidate when its reconciled CI is green (CIReady).
+	if _, err := st.DB.ExecContext(ctx,
+		`INSERT INTO domain_b_facts (job_id, pr_exists, pr_number, ci_green, merged) VALUES ('j',1,7,1,0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// a reviewer on a NON-allowlisted account (another claude, or a codex) gets nothing.
+	t.Setenv("FLOWBEE_ACCOUNT", "claude:other@swh.me")
+	if _, ok, err := c.Lease(ctx, "rv", "opus", "code_reviewer"); err != nil || ok {
+		t.Fatalf("a non-pinned reviewer must get NO review work (ok=%v err=%v)", ok, err)
+	}
+	// the pinned account claims the review.
+	t.Setenv("FLOWBEE_ACCOUNT", "claude:pearl@swh.me")
+	if g, ok, err := c.Lease(ctx, "rv", "opus", "code_reviewer"); err != nil || !ok || g.JobID != "j" {
+		t.Fatalf("the pinned reviewer must claim the review (ok=%v job=%s err=%v)", ok, g.JobID, err)
+	}
+}
+
+// TestLeaseReviewPinDoesNotAffectBuilds: the review-account pin is review-only — a build
+// (eng_worker) on a non-allowlisted account still leases normally, so concentrating
+// reviews never throttles building.
+func TestLeaseReviewPinDoesNotAffectBuilds(t *testing.T) {
+	t.Setenv("FLOWBEE_REVIEW_ACCOUNTS", "claude:pearl@swh.me")
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t)
+	seedReady(t, st, "j", "", clk.Now())
+	t.Setenv("FLOWBEE_ACCOUNT", "codex:other@swh.me") // not on the review allowlist
+	if g, ok, err := c.Lease(ctx, "w", "codex", ""); err != nil || !ok || g.JobID != "j" {
+		t.Fatalf("the review pin must NOT block builds (ok=%v job=%s err=%v)", ok, g.JobID, err)
+	}
+}
+
+// TestLeaseDispatchAccountHardLine: FLOWBEE_DISPATCH_ACCOUNTS is the global "park an
+// entire agent" lever — a worker whose login isn't on the list gets NO work of ANY role
+// (the maxed-claude hard line), keyed on the authenticated account, not the family tag.
+func TestLeaseDispatchAccountHardLine(t *testing.T) {
+	t.Setenv("FLOWBEE_DISPATCH_ACCOUNTS", "codex:gpt@swh.me")
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t) // reads the env at api.New
+	seedReady(t, st, "j", "", clk.Now())
+
+	// a non-listed login (e.g. a maxed claude) is withheld ALL work, even a plain build.
+	t.Setenv("FLOWBEE_ACCOUNT", "claude:s@swh.me")
+	if _, ok, err := c.Lease(ctx, "w", "codex", ""); err != nil || ok {
+		t.Fatalf("a non-allowlisted login must get NO work of any role (ok=%v err=%v)", ok, err)
+	}
+	// the listed codex login flows normally.
+	t.Setenv("FLOWBEE_ACCOUNT", "codex:gpt@swh.me")
+	if g, ok, err := c.Lease(ctx, "w", "codex", ""); err != nil || !ok || g.JobID != "j" {
+		t.Fatalf("the allowlisted login must lease (ok=%v job=%s err=%v)", ok, g.JobID, err)
+	}
+}
+
 func TestLeaseDryRunDoesNotClaim(t *testing.T) {
 	ctx := context.Background()
 	st, c, clk := ctrlServer(t)
