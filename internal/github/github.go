@@ -225,6 +225,12 @@ type BranchProtectionReader interface {
 	BranchProtection(ctx context.Context, branch string) (Protection, bool, error)
 }
 
+// RequiredChecksReader reads the required status-check contexts enforced on a branch from
+// ANY source — modern rulesets included (BranchProtection only sees classic protection).
+type RequiredChecksReader interface {
+	BranchRequiredChecks(ctx context.Context, branch string) ([]string, error)
+}
+
 // Protection is the server-side branch-protection backstop (I-8, §9.6).
 type Protection struct {
 	RequirePR               bool
@@ -1381,4 +1387,37 @@ func (c *RealClient) BranchProtection(ctx context.Context, branch string) (Prote
 		p.RequiredChecks = out.RequiredStatusChecks.Contexts
 	}
 	return p, true, nil
+}
+
+// BranchRequiredChecks returns the required status-check contexts ENFORCED on a branch,
+// covering modern repository RULESETS (not just classic branch protection). The
+// /rules/branches/{branch} endpoint returns the effective active rules for the branch
+// from every source; we extract the contexts from any required_status_checks rule. A repo
+// like russ enforces via a ruleset and has NO classic branch protection (that API 404s),
+// so BranchProtection alone reports zero required checks — this is the gap this closes.
+// Returns nil (no error) when the branch has no required-check rule.
+func (c *RealClient) BranchRequiredChecks(ctx context.Context, branch string) ([]string, error) {
+	var rules []struct {
+		Type       string `json:"type"`
+		Parameters struct {
+			RequiredStatusChecks []struct {
+				Context string `json:"context"`
+			} `json:"required_status_checks"`
+		} `json:"parameters"`
+	}
+	if err := c.rest(ctx, http.MethodGet, fmt.Sprintf("/rules/branches/%s", branch), nil, &rules); err != nil {
+		return nil, err
+	}
+	var checks []string
+	for _, r := range rules {
+		if r.Type != "required_status_checks" {
+			continue
+		}
+		for _, sc := range r.Parameters.RequiredStatusChecks {
+			if sc.Context != "" {
+				checks = append(checks, sc.Context)
+			}
+		}
+	}
+	return checks, nil
 }

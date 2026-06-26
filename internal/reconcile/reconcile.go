@@ -261,23 +261,38 @@ func (r *Reconciler) ensureRequiredChecks(ctx context.Context) {
 	if r.requiredFetched {
 		return
 	}
-	br, ok := r.gh.(gh.BranchProtectionReader)
-	if !ok {
-		r.requiredFetched = true // no protection surface; never retry
-		return
-	}
 	branch := r.branch
 	if branch == "" {
 		branch = "main"
 	}
-	prot, ok, err := br.BranchProtection(ctx, branch)
-	if err != nil {
-		return // transient: leave unfetched so a later sweep retries
+	// Prefer the rules API (covers modern rulesets — what russ uses). A repo enforcing
+	// required checks via a ruleset has NO classic branch protection (that API 404s), so
+	// BranchProtection alone would report zero required checks and silently disable the
+	// required-checks CI gate. Fall back to classic branch protection for repos that use it.
+	if rr, ok := r.gh.(gh.RequiredChecksReader); ok {
+		checks, err := rr.BranchRequiredChecks(ctx, branch)
+		if err != nil {
+			return // transient: leave unfetched so a later sweep retries
+		}
+		r.requiredFetched = true
+		r.requiredChecks = checks
+		if len(checks) > 0 {
+			return
+		}
+		// empty from rules — fall through to classic protection (belt-and-suspenders).
 	}
-	r.requiredFetched = true
-	if ok {
-		r.requiredChecks = prot.RequiredChecks
+	if br, ok := r.gh.(gh.BranchProtectionReader); ok {
+		prot, ok, err := br.BranchProtection(ctx, branch)
+		if err != nil {
+			return
+		}
+		r.requiredFetched = true
+		if ok && len(prot.RequiredChecks) > 0 {
+			r.requiredChecks = prot.RequiredChecks
+		}
+		return
 	}
+	r.requiredFetched = true // no protection surface at all; never retry
 }
 
 // requiredChecksGreen reports whether EVERY required check has passed at the head. Empty
