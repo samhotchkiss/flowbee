@@ -56,7 +56,13 @@ func runWork(args []string) error {
 	// named per-model rollover chain (account:model:ceiling_pct:rank).
 	modelSlots := fs.String("model-slots", envOr("FLOWBEE_MODEL_SLOTS", ""), "per-model concurrency, e.g. claude:3,codex:3")
 	weight := fs.Int("weight", 0, "per-box distribution weight (default 1)")
-	accounts := fs.String("accounts", envOr("FLOWBEE_ACCOUNTS", ""), "named accounts: account:model:ceiling_pct:rank,...")
+	accounts := fs.String("accounts", envOr("FLOWBEE_ACCOUNTS", ""), "named accounts: account:model:ceiling_pct:rank[:budget_tokens],...")
+	// --account is THIS worker's own login (FLOWBEE_ACCOUNT, e.g. "codex:s@swh.me"):
+	// after each run the harness reports the run's tokens (and a 429) against it so the
+	// control plane accumulates a real usage_pct and rolls dispatch over off a busy
+	// login at ~90% BEFORE its hard limit (F6 preemptive ceiling). Defaults to the
+	// first --accounts entry; empty disables usage reporting (legacy posture).
+	account := fs.String("account", envOr("FLOWBEE_ACCOUNT", ""), "this worker's own login for usage attribution (default: first --accounts entry)")
 	// --remote: a build box that keeps its OWN local mirror + worktrees per job (many
 	// workers in parallel) and returns a diff for the control plane to push/PR/merge.
 	// Needs only repo READ; --mirror is its local bare mirror, --repo-url where to
@@ -118,7 +124,7 @@ func runWork(args []string) error {
 	cfg := worker.HarnessConfig{
 		BaseURL: url, Identity: *identity, ModelFamily: *family, ModelLabel: *modelLabel, Role: *role,
 		AgentCmd: *agentCmd, BearerToken: token,
-		ModelSlots: slots, Weight: *weight, Accounts: accts,
+		ModelSlots: slots, Weight: *weight, Accounts: accts, AccountID: *account,
 		MirrorPath: *mirror, RepoURL: *repoURL, Branch: *branch,
 	}
 	run := func() error {
@@ -234,8 +240,10 @@ func parseModelSlots(s string) map[string]int {
 	return out
 }
 
-// parseAccounts parses the F6 rollover chain "account:model:ceiling_pct:rank,..."
-// into client account specs. ceiling_pct/rank default to 90/0 when omitted.
+// parseAccounts parses the F6 rollover chain
+// "account:model:ceiling_pct:rank[:budget_tokens],..." into client account specs.
+// ceiling_pct/rank default to 90/0 when omitted; budget_tokens (optional 5th field)
+// overrides the fleet-wide per-account token budget for the preemptive usage ceiling.
 func parseAccounts(s string) []client.AccountSpecMsg {
 	if s == "" {
 		return nil
@@ -259,6 +267,11 @@ func parseAccounts(s string) []client.AccountSpecMsg {
 		if len(f) >= 4 {
 			if n, err := strconv.Atoi(f[3]); err == nil {
 				a.PreferenceRank = n
+			}
+		}
+		if len(f) >= 5 {
+			if n, err := strconv.ParseInt(f[4], 10, 64); err == nil {
+				a.BudgetTokens = n
 			}
 		}
 		out = append(out, a)

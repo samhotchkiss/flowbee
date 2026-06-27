@@ -52,6 +52,9 @@ type AccountSpecMsg struct {
 	ModelFamily    string `json:"model_family"`
 	CeilingPct     int    `json:"ceiling_pct"`
 	PreferenceRank int    `json:"preference_rank"`
+	// BudgetTokens optionally overrides the fleet-wide per-account token budget the
+	// preemptive usage ceiling derives usage_pct from (F6). 0 = use the server default.
+	BudgetTokens int64 `json:"budget_tokens,omitempty"`
 }
 
 // RegisterResponse is returned by POST /v1/workers/register.
@@ -184,6 +187,7 @@ func (r *Registry) Register(ctx context.Context, reg Registration, now time.Time
 			specs = append(specs, store.AccountSpec{
 				AccountID: a.AccountID, ModelFamily: a.ModelFamily,
 				CeilingPct: a.CeilingPct, PreferenceRank: a.PreferenceRank,
+				BudgetTokens: a.BudgetTokens,
 			})
 		}
 		if err := r.st.UpsertAccounts(ctx, specs, now); err != nil {

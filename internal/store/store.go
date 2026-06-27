@@ -39,6 +39,17 @@ type Store struct {
 	// from config.CostCeilingMicroUSD().
 	DefaultCostCeilingMicroUSD int64
 
+	// AccountBudgetTokens / AccountWindow drive the F6 PREEMPTIVE usage ceiling: the
+	// per-account token budget and reset-window length the usage fold uses to turn the
+	// boxes' incremental token reports into a REAL accumulating usage_pct (so dispatch
+	// rolls over off a near-exhausted codex login at the ceiling, ~90%, BEFORE its hard
+	// 429). A per-account budget_tokens override (enrolled via --accounts) wins over the
+	// default here. Zero AccountBudgetTokens disables the estimate (usage_pct then only
+	// moves on a 429 — the old binary behavior); zero AccountWindow disables window
+	// resets (the accumulator never zeroes). Set by the runtime from config.
+	AccountBudgetTokens int64
+	AccountWindow       time.Duration
+
 	// AllowOwnSourceRepos is the set of repo ids whose own source (internal/, cmd/,
 	// tools/, flows/) is NOT the Flowbee control plane's, so the `flowbee_source`
 	// content-denylist class is relaxed for them — letting their internal//cmd/ changes

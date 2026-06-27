@@ -32,7 +32,7 @@ func TestHungAgentKilledOnContextEnd(t *testing.T) {
 		// a hung agent that FORKS a child holding the stdout pipe (`| cat`) — the real
 		// case: killing only the direct child leaves the orphan pinning cmd.Wait(). The
 		// fix kills the whole process group, so Wait returns when the GROUP dies.
-		_, err := runAgentHeartbeatIO(ctx, c, nil, "j", 1, 3600, t.TempDir(), "sleep 30 | cat", nil, true)
+		_, err := runAgentHeartbeatIO(ctx, c, nil, "j", 1, 3600, t.TempDir(), "sleep 30 | cat", nil, true, usageTarget{})
 		done <- err
 	}()
 
@@ -76,7 +76,7 @@ func TestAgentHeartbeatRefreshesRegistration(t *testing.T) {
 
 	reg := client.Registration{Identity: "builder-1", Capabilities: []string{"role:eng_worker"}}
 	_, err := runAgentHeartbeatIO(context.Background(), client.New(srv.URL), &reg, "j", 1, 300,
-		t.TempDir(), "sleep 2", nil, true)
+		t.TempDir(), "sleep 2", nil, true, usageTarget{})
 	if err != nil {
 		t.Fatalf("runAgentHeartbeatIO: %v", err)
 	}

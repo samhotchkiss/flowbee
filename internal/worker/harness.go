@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -278,6 +280,16 @@ type HarnessConfig struct {
 	ModelSlots map[string]int
 	Weight     int
 	Accounts   []client.AccountSpecMsg
+	// AccountID is THIS worker's own login (FLOWBEE_ACCOUNT, e.g. "codex:s@swh.me")
+	// for PREEMPTIVE usage attribution (F6): after each run the harness reports the
+	// run's tokens (and a 429) against this account so the server accumulates a real
+	// usage_pct over the reset window and rolls dispatch over off a near-exhausted
+	// login at the ceiling (~90%) BEFORE its hard 429. A worker process serves ONE
+	// login (shared across boxes — codex:gpt on buncher+imac fold into one bucket).
+	// Empty (the default) => no usage reporting (the legacy posture; the ceiling gate
+	// then only moves on a 429 reported by some other path). Defaults to the first
+	// configured Account when unset.
+	AccountID string
 	// MirrorPath + RepoURL drive --remote mode (RunOnceHarnessRemote): the worker
 	// keeps its OWN bare mirror at MirrorPath (cloned from RepoURL, fetched each job
 	// to stay current) and provisions a worktree per job off it — so many workers on
@@ -298,6 +310,17 @@ func (cfg HarnessConfig) modelTag() string {
 		return cfg.ModelLabel
 	}
 	return cfg.ModelFamily
+}
+
+// usageTargetFor builds the F6 usage-attribution target for a run: the worker's
+// own login (AccountID, or the first configured account when AccountID is unset) and
+// the model family. AccountID == "" disables usage reporting (the legacy posture).
+func (cfg HarnessConfig) usageTargetFor() usageTarget {
+	acct := cfg.AccountID
+	if acct == "" && len(cfg.Accounts) > 0 {
+		acct = cfg.Accounts[0].AccountID
+	}
+	return usageTarget{AccountID: acct, ModelFamily: cfg.ModelFamily}
 }
 
 // HarnessOutcome reports what one lease cycle did.
@@ -398,7 +421,7 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 		"FLOWBEE_ROLE="+grant.Role,
 	)
 	agentEnv = append(agentEnv, taskEnv...)
-	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv, cfg.usageTargetFor()); err != nil {
 		return out, err
 	}
 	// Normalize a self-committing agent: an agentic CLI (codex) may `git commit` its own
@@ -563,7 +586,7 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		"FLOWBEE_ROLE="+grant.Role,
 	)
 	agentEnv = append(agentEnv, taskEnv...)
-	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv, cfg.usageTargetFor()); err != nil {
 		return out, err
 	}
 
@@ -769,7 +792,7 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	agentEnv := append(os.Environ(),
 		"FLOWBEE_JOB_ID="+grant.JobID, "FLOWBEE_BASE_SHA="+grant.BaseSHA, "FLOWBEE_ROLE="+grant.Role)
 	agentEnv = append(agentEnv, taskEnv...)
-	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv, cfg.usageTargetFor()); err != nil {
 		return out, err
 	}
 	// Normalize a self-committing agent (codex may `git commit` on its own): soft-reset
@@ -908,9 +931,16 @@ func ensureMirror(ctx context.Context, mirrorPath, repoURL, branch string) error
 // TTL; without this its lease would expire mid-run and the result be fenced as a
 // stale epoch (wasting the work + re-arming the job). Heartbeats fire at ~1/3 of the
 // TTL (min 20s). errb captures stderr for a useful failure message.
-func runAgentHeartbeat(ctx context.Context, c *client.Client, reg *client.Registration, jobID string, epoch, ttlS int, dir, agentCmd string, env []string) error {
-	_, err := runAgentHeartbeatIO(ctx, c, reg, jobID, epoch, ttlS, dir, agentCmd, env, false)
+func runAgentHeartbeat(ctx context.Context, c *client.Client, reg *client.Registration, jobID string, epoch, ttlS int, dir, agentCmd string, env []string, usage usageTarget) error {
+	_, err := runAgentHeartbeatIO(ctx, c, reg, jobID, epoch, ttlS, dir, agentCmd, env, false, usage)
 	return err
+}
+
+// usageTarget identifies the account a run's usage is attributed to (F6 preemptive
+// ceiling). AccountID empty disables usage reporting (legacy posture).
+type usageTarget struct {
+	AccountID   string
+	ModelFamily string
 }
 
 // runAgentHeartbeatIO is runAgentHeartbeat with an optional stdout capture. The
@@ -949,7 +979,7 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 
 func (w *boundedWriter) String() string { return w.b.String() }
 
-func runAgentHeartbeatIO(ctx context.Context, c *client.Client, reg *client.Registration, jobID string, epoch, ttlS int, dir, agentCmd string, env []string, capture bool) (string, error) {
+func runAgentHeartbeatIO(ctx context.Context, c *client.Client, reg *client.Registration, jobID string, epoch, ttlS int, dir, agentCmd string, env []string, capture bool, usage usageTarget) (string, error) {
 	if agentCmd == "" {
 		return "", nil
 	}
@@ -1027,6 +1057,11 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, reg *client.Regi
 			TokensInDelta: ti, TokensOutDelta: to, MicroUSDDelta: micro,
 		})
 	}
+	// F6 PREEMPTIVE account ceiling: report this run's tokens (and a hard 429) against
+	// the worker's login so the server accumulates a real usage_pct over the reset
+	// window and rolls dispatch over off a near-exhausted account at ~90% BEFORE the
+	// hard limit. Best-effort + non-fatal: a usage-report failure never fails the run.
+	reportAccountUsage(ctx, c, usage, out)
 	if werr != nil {
 		// distinguish a deadline/revoke kill (the lease is gone — the caller releases and
 		// loops to fresh work) from a genuine agent failure, so the log isn't misleading.
@@ -1084,6 +1119,173 @@ func parseAgentUsage(stdout string) (tokensIn, tokensOut, microUSD int64, ok boo
 		return 0, 0, 0, false
 	}
 	return r.Usage.InputTokens, r.Usage.OutputTokens, int64(r.TotalCostUSD * 1_000_000), true
+}
+
+// reportAccountUsage posts the just-finished run's usage against the worker's login
+// for the F6 PREEMPTIVE ceiling. It is the worker side of the token-budget estimate:
+//   - tokens consumed this run (codex `exec --json` turn.completed.usage, the claude
+//     JSON usage, or a plain "tokens used N" line) -> TokensDelta, which the server
+//     accumulates over the reset window to derive a rising usage_pct.
+//   - a hard rate-limit / 429 / quota phrase in the output -> RateLimited, the BINARY
+//     BACKSTOP that pins the account out regardless of the estimate (never removed: if
+//     the estimate is wrong and the provider 429s before 90%, this still gates it).
+//   - a parseable "X% of your usage limit" line -> a direct UsagePct (a provider that
+//     exposes a real %); codex emits none today, so this is opportunistic.
+//
+// No account configured, or nothing observed and no limit hit, => no report (the
+// legacy posture is preserved). Best-effort: any error is swallowed by the caller.
+func reportAccountUsage(ctx context.Context, c *client.Client, t usageTarget, out string) {
+	if t.AccountID == "" {
+		return
+	}
+	tokens := parseRunTokens(out)
+	pct, hasPct := parseUsagePct(out)
+	limited := agentHitLimit(out)
+	if tokens == 0 && !hasPct && !limited {
+		return // nothing to report — don't churn the usage endpoint
+	}
+	rep := client.UsageReport{
+		AccountID:   t.AccountID,
+		ModelFamily: t.ModelFamily,
+		TokensDelta: tokens,
+		RateLimited: limited,
+	}
+	if hasPct {
+		rep.UsagePct = pct
+	}
+	_, _ = c.ReportUsage(ctx, []client.UsageReport{rep})
+}
+
+// parseRunTokens returns the TOTAL tokens the agent consumed this run, from whichever
+// surface its CLI exposed (best-effort, 0 when none): codex `exec --json` emits a
+// `turn.completed` JSONL event carrying usage.{input,output,reasoning_output}_tokens;
+// claude `--output-format json` emits one object with usage.{input,output}_tokens;
+// codex plain output prints a "tokens used\nN" line. Cached input tokens are EXCLUDED
+// (they don't draw down the live budget the same way). The estimate only needs to be
+// roughly proportional to consumption for the cumulative % to track real usage.
+func parseRunTokens(stdout string) int64 {
+	// claude single-object JSON (reuse the cost parser's token fields).
+	if ti, to, _, ok := parseAgentUsage(stdout); ok && (ti != 0 || to != 0) {
+		return ti + to
+	}
+	// codex JSONL: the LAST turn.completed.usage wins (the final accounting for the run).
+	var total int64
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") || !strings.Contains(line, "turn.completed") {
+			continue
+		}
+		var ev struct {
+			Type  string `json:"type"`
+			Usage struct {
+				InputTokens           int64 `json:"input_tokens"`
+				OutputTokens          int64 `json:"output_tokens"`
+				ReasoningOutputTokens int64 `json:"reasoning_output_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal([]byte(line), &ev) == nil && ev.Type == "turn.completed" {
+			total = ev.Usage.InputTokens + ev.Usage.OutputTokens + ev.Usage.ReasoningOutputTokens
+		}
+	}
+	if total > 0 {
+		return total
+	}
+	// codex plain output: a "tokens used" line followed by the count (commas allowed).
+	return parsePlainTokensUsed(stdout)
+}
+
+// parsePlainTokensUsed scans codex's non-JSON output for a "tokens used\n<N>" pair
+// (the count may carry thousands separators, e.g. "13,937"). 0 when absent.
+func parsePlainTokensUsed(stdout string) int64 {
+	lines := strings.Split(stdout, "\n")
+	for i, line := range lines {
+		if !strings.Contains(strings.ToLower(line), "tokens used") {
+			continue
+		}
+		// the count may be on the same line or the next one.
+		for _, cand := range []string{line, nextLine(lines, i)} {
+			if n := parseIntWithCommas(cand); n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func nextLine(lines []string, i int) string {
+	if i+1 < len(lines) {
+		return lines[i+1]
+	}
+	return ""
+}
+
+// parseIntWithCommas extracts the first run of digits/commas in s as an int64.
+func parseIntWithCommas(s string) int64 {
+	var b strings.Builder
+	started := false
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+			started = true
+		} else if r == ',' && started {
+			continue
+		} else if started {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return 0
+	}
+	n, err := strconv.ParseInt(b.String(), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// usagePctRe matches a provider-exposed live percentage, e.g. "73% of your usage
+// limit" or "used 73% of your weekly limit". Opportunistic: codex emits none today.
+var usagePctRe = regexp.MustCompile(`(?i)(\d{1,3})\s*%\s*of\s+your\s+[a-z ]*limit`)
+
+func parseUsagePct(stdout string) (pct int, ok bool) {
+	m := usagePctRe.FindStringSubmatch(stdout)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// limitPhrases are the hard rate-limit / quota signals that mean the login is SPENT
+// (the binary backstop). A match pins the account out (rate_limited) regardless of
+// the token-budget estimate, so a provider that 429s before the estimated 90% is
+// still caught. Kept deliberately broad across codex/claude wording.
+var limitPhrases = []string{
+	"usage limit",
+	"rate limit",
+	"rate_limit",
+	"429 too many",
+	"too many requests",
+	"quota exceed",
+	"quota_exceeded",
+	"insufficient_quota",
+	"you've reached your",
+	"you have reached your",
+}
+
+// agentHitLimit reports whether the agent's output indicates a hard usage/rate limit
+// (the F6 binary backstop — preserved from the pre-estimate design). Case-insensitive.
+func agentHitLimit(stdout string) bool {
+	low := strings.ToLower(stdout)
+	for _, p := range limitPhrases {
+		if strings.Contains(low, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // agentResultText returns the agent's response text: the `.result` of a claude JSON

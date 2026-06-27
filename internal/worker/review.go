@@ -137,7 +137,7 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		"FLOWBEE_VERDICT_FILE="+verdictFile,
 		"FLOWBEE_SPEC_FILE="+specFile,
 	)
-	agentOut, err := runAgentHeartbeatIO(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, dir, cfg.AgentCmd, agentEnv, true)
+	agentOut, err := runAgentHeartbeatIO(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, dir, cfg.AgentCmd, agentEnv, true, cfg.usageTargetFor())
 	if err != nil {
 		return out, err
 	}

@@ -61,6 +61,10 @@ type AccountSpec struct {
 	ModelFamily    string
 	CeilingPct     int
 	PreferenceRank int
+	// BudgetTokens is an optional per-account override of the fleet-wide token budget
+	// for the preemptive usage ceiling (F6). 0 = use the server default
+	// (Store.AccountBudgetTokens). A bigger-quota login can carry more before it gates.
+	BudgetTokens int64
 }
 
 // UpsertAccounts enrolls/updates the named per-model accounts (the rollover chain).
@@ -76,14 +80,15 @@ func (s *Store) UpsertAccounts(ctx context.Context, specs []AccountSpec, now tim
 			}
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO worker_accounts
-				    (account_id, model_family, ceiling_pct, preference_rank, updated_at)
-				VALUES (?, ?, ?, ?, ?)
+				    (account_id, model_family, ceiling_pct, preference_rank, budget_tokens, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?)
 				ON CONFLICT (account_id) DO UPDATE SET
 				    model_family    = excluded.model_family,
 				    ceiling_pct     = excluded.ceiling_pct,
 				    preference_rank = excluded.preference_rank,
+				    budget_tokens   = excluded.budget_tokens,
 				    updated_at      = excluded.updated_at`,
-				a.AccountID, a.ModelFamily, ceiling, a.PreferenceRank, now.Format(rfc3339)); err != nil {
+				a.AccountID, a.ModelFamily, ceiling, a.PreferenceRank, a.BudgetTokens, now.Format(rfc3339)); err != nil {
 				return err
 			}
 		}
@@ -94,14 +99,25 @@ func (s *Store) UpsertAccounts(ctx context.Context, specs []AccountSpec, now tim
 // RecordUsage folds per-account usage reports into the shared account buckets (the
 // POST /v1/workers/usage path, §C). Usage is PER ACCOUNT (shared across boxes on
 // the same login), so a report keyed by account_id updates the canonical bucket
-// the ceiling gate reads. A 429 report pins the account to a cool-down; a normal
-// sub-ceiling report clears a prior 429. Returns the accounts that are now AT/OVER
-// ceiling (a capacity-alarm surface). PURE fold via capacity.FoldUsage.
+// the ceiling gate reads. Returns the accounts that are now AT/OVER ceiling (a
+// capacity-alarm surface).
+//
+// PREEMPTIVE token-budget accumulation (F6): when a report carries TokensDelta and
+// a budget is configured (per-account override or the store default), this
+// ACCUMULATES the delta into the account's reset-window bucket and derives a rising
+// usage_pct = window_tokens/budget*100, so the existing ceiling gate (usage_pct >=
+// ceiling_pct, default 90) trips with headroom BEFORE the hard 429 and dispatch
+// rolls over to a less-used login. The window RESETS (bucket zeroes, account
+// un-gates) once AccountWindow has elapsed since window_started_at. The binary
+// rate-limit backstop is PRESERVED: a 429 report still pins the account to >=100%
+// + rate_limited regardless of the estimate (so a login that 429s before 90% is
+// always caught). The pure fold is capacity.FoldWindowedUsage; the store owns only
+// the clock-derived window-reset decision and the budget choice.
 func (s *Store) RecordUsage(ctx context.Context, reports []capacity.UsageReport, now time.Time) ([]string, error) {
 	var atCeiling []string
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		for _, r := range reports {
-			prior, err := loadAccountTx(ctx, tx, r.AccountID)
+			prior, windowStart, err := loadAccountWindowTx(ctx, tx, r.AccountID)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					// auto-enroll an unknown account on first report so usage is never
@@ -109,6 +125,7 @@ func (s *Store) RecordUsage(ctx context.Context, reports []capacity.UsageReport,
 					prior = capacity.Account{
 						AccountID: r.AccountID, ModelFamily: r.ModelFamily, CeilingPct: 90,
 					}
+					windowStart = sql.NullString{}
 					if _, ierr := tx.ExecContext(ctx, `
 						INSERT INTO worker_accounts (account_id, model_family, ceiling_pct, preference_rank, updated_at)
 						VALUES (?, ?, ?, 0, ?)`,
@@ -119,12 +136,40 @@ func (s *Store) RecordUsage(ctx context.Context, reports []capacity.UsageReport,
 					return err
 				}
 			}
-			pct, rl := capacity.FoldUsage(prior, r)
+
+			// budget: a per-account override (>0) wins over the store-wide default.
+			budget := prior.BudgetTokens
+			if budget <= 0 {
+				budget = s.AccountBudgetTokens
+			}
+
+			// window reset is the ONLY clock-derived input to the (pure) fold: the prior
+			// window has elapsed when now - window_started_at >= AccountWindow. A first
+			// report (no window start) opens a fresh window now (treated as a reset). A
+			// 429 never resets — recovery happens only via the window boundary.
+			reset := false
+			newWindowStart := windowStart
+			if !windowStart.Valid {
+				reset = true
+				newWindowStart = sql.NullString{String: now.Format(rfc3339), Valid: true}
+			} else if s.AccountWindow > 0 {
+				if t, perr := time.Parse(rfc3339, windowStart.String); perr == nil {
+					if !now.Before(t.Add(s.AccountWindow)) {
+						reset = true
+						newWindowStart = sql.NullString{String: now.Format(rfc3339), Valid: true}
+					}
+				}
+			}
+
+			windowTokens, pct, rl := capacity.FoldWindowedUsage(prior, r, reset, budget)
+
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE worker_accounts
-				   SET usage_pct = ?, rate_limited = ?, reported_at = ?, updated_at = ?
+				   SET usage_pct = ?, rate_limited = ?, window_tokens = ?, window_started_at = ?,
+				       reported_at = ?, updated_at = ?
 				 WHERE account_id = ?`,
-				pct, boolToInt(rl), now.Format(rfc3339), now.Format(rfc3339), r.AccountID); err != nil {
+				pct, boolToInt(rl), windowTokens, newWindowStart,
+				now.Format(rfc3339), now.Format(rfc3339), r.AccountID); err != nil {
 				return err
 			}
 			folded := prior
@@ -293,12 +338,6 @@ func legacyWorkerSlotGateTx(ctx context.Context, tx *sql.Tx, workerID, identity 
 	return nil
 }
 
-func loadAccountTx(ctx context.Context, tx *sql.Tx, accountID string) (capacity.Account, error) {
-	return scanAccount(tx.QueryRowContext(ctx, `
-		SELECT account_id, model_family, ceiling_pct, preference_rank, usage_pct, rate_limited
-		  FROM worker_accounts WHERE account_id = ?`, accountID))
-}
-
 func scanAccount(row rowScanner) (capacity.Account, error) {
 	var a capacity.Account
 	var rl int
@@ -307,6 +346,29 @@ func scanAccount(row rowScanner) (capacity.Account, error) {
 	}
 	a.RateLimited = rl != 0
 	return a, nil
+}
+
+// accountSelectCols is the column list the selection/projection reads. The
+// preemptive-ceiling columns (window_tokens, budget_tokens, window_started_at) are
+// folded in RecordUsage only, so the dispatch-path scans stay on the lean set —
+// usage_pct already reflects the accumulation by the time the gate reads it.
+
+// loadAccountWindowTx loads an account WITH its window-accumulation state for the
+// usage fold: the cumulative tokens in the current window, the per-account budget
+// override, and the window-start instant. Separate from scanAccount so the hot
+// dispatch path is unaffected.
+func loadAccountWindowTx(ctx context.Context, tx *sql.Tx, accountID string) (acct capacity.Account, windowStart sql.NullString, err error) {
+	var rl int
+	row := tx.QueryRowContext(ctx, `
+		SELECT account_id, model_family, ceiling_pct, preference_rank, usage_pct, rate_limited,
+		       window_tokens, budget_tokens, window_started_at
+		  FROM worker_accounts WHERE account_id = ?`, accountID)
+	if e := row.Scan(&acct.AccountID, &acct.ModelFamily, &acct.CeilingPct, &acct.PreferenceRank,
+		&acct.UsagePct, &rl, &acct.WindowTokens, &acct.BudgetTokens, &windowStart); e != nil {
+		return capacity.Account{}, sql.NullString{}, e
+	}
+	acct.RateLimited = rl != 0
+	return acct, windowStart, nil
 }
 
 // AccountUsageRow is one account's reported usage for the fleet view / capacity

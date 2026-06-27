@@ -24,6 +24,14 @@ package capacity
 // PreferenceRank orders the rollover chain (lower = preferred); RateLimited pins
 // the account out of rotation after a 429 until a fresh sub-ceiling report clears
 // it. All fields are plain values folded from the worker_accounts projection.
+//
+// WindowTokens / BudgetTokens drive the PREEMPTIVE token-budget estimate (F6
+// preemptive ceiling): codex exposes no live usage %, so the box reports the
+// incremental tokens each run consumed and the server ACCUMULATES them over the
+// account's reset window. UsagePct is then derived as WindowTokens/BudgetTokens —
+// a real, rising percentage that crosses the ceiling (default 90) BEFORE the hard
+// 429, so dispatch rolls over to a less-used account with headroom to spare. A
+// non-positive budget disables the estimate (UsagePct then only moves on a 429).
 type Account struct {
 	AccountID      string
 	ModelFamily    string
@@ -31,6 +39,11 @@ type Account struct {
 	PreferenceRank int
 	UsagePct       int
 	RateLimited    bool
+	// WindowTokens is the cumulative tokens consumed in the CURRENT reset window
+	// (shared across every box on this login). BudgetTokens is the window's total
+	// token budget; UsagePct = WindowTokens/BudgetTokens*100 when budget > 0.
+	WindowTokens int64
+	BudgetTokens int64
 }
 
 // AtCeiling reports whether the account is gated OUT of dispatch: either a 429
@@ -94,14 +107,79 @@ func HasFreeSlot(maxSlots, active int) bool {
 
 // UsageReport is one per-account usage observation a box reports (POST
 // /v1/workers/usage), best-effort from rate-limit headers / token counts, or
-// IMMEDIATELY on a 429. UsagePct is the account's usage as a percent of its budget
-// (0..100+). RateLimited is set when the report was triggered by a 429: it pins
-// the account to a cool-down (gated out of dispatch) regardless of the percent.
+// IMMEDIATELY on a 429. RateLimited is set when the report was triggered by a 429:
+// it pins the account to a cool-down (gated out of dispatch) regardless of percent.
+//
+// Two reporting modes, not mutually exclusive:
+//   - TokensDelta > 0: the box ran the agent and observed it consumed this many
+//     tokens. The server ACCUMULATES the delta into the account's reset-window
+//     bucket and DERIVES usage_pct from the budget (the preemptive estimate). This
+//     is the codex path — codex emits token counts, not a live %.
+//   - UsagePct > 0 (TokensDelta == 0): a direct percentage the box parsed from a
+//     provider that exposes one (e.g. an "X% of usage limit" line). Adopted as-is.
+//
+// TokensDelta is INCREMENTAL (one run's tokens), never cumulative — the server owns
+// the running total so per-login sharing across boxes folds into ONE bucket.
 type UsageReport struct {
 	AccountID   string `json:"account_id"`
 	ModelFamily string `json:"model_family,omitempty"`
 	UsagePct    int    `json:"usage_pct"`
+	TokensDelta int64  `json:"tokens_delta,omitempty"`
 	RateLimited bool   `json:"rate_limited,omitempty"`
+}
+
+// FoldWindowedUsage is the PREEMPTIVE token-budget fold (F6): it accumulates a
+// report's incremental tokens into the account's reset-window bucket and DERIVES a
+// rising usage percentage from the budget, so the ceiling gate (usage_pct >=
+// ceiling_pct) trips with headroom to spare instead of only at the hard 429. PURE:
+// the window-boundary decision is passed IN as windowReset (the store computes it
+// from the clock), so this stays clock-free and deterministic.
+//
+//   - windowReset true => the prior window has elapsed: start a fresh bucket at
+//     this report's delta (cumulative consumption resets, the account un-gates).
+//   - a 429 (r.RateLimited) pins usage to >=100% AND the rate-limited flag, exactly
+//     as the binary backstop did — it OVERRIDES the estimate so a provider that
+//     429s before 90% is still caught (the estimate is best-effort, the 429 is truth).
+//   - otherwise: add the delta, and if a budget is set derive usage_pct from it;
+//     with no budget fall back to the directly reported UsagePct (provider-% path).
+//
+// Returns the new cumulative window tokens and the (usagePct, rateLimited) to persist.
+func FoldWindowedUsage(prior Account, r UsageReport, windowReset bool, budgetTokens int64) (windowTokens int64, usagePct int, rateLimited bool) {
+	base := prior.WindowTokens
+	if windowReset {
+		base = 0
+	}
+	delta := r.TokensDelta
+	if delta < 0 {
+		delta = 0
+	}
+	windowTokens = base + delta
+
+	// a 429 is ground truth: pin to spent + rate-limited regardless of the estimate.
+	if r.RateLimited {
+		pct := r.UsagePct
+		if pct < 100 {
+			pct = 100
+		}
+		return windowTokens, pct, true
+	}
+
+	// derive the percentage. Prefer the token-budget estimate (codex path); fall
+	// back to a directly reported provider-% when no budget is configured.
+	switch {
+	case budgetTokens > 0:
+		usagePct = int(windowTokens * 100 / budgetTokens)
+	default:
+		usagePct = r.UsagePct
+	}
+
+	// recovery: clear a prior 429 pin only once the (reset-or-derived) usage is back
+	// under the ceiling — matching the original FoldUsage recovery semantics.
+	rateLimited = prior.RateLimited
+	if rateLimited && (prior.CeilingPct <= 0 || usagePct < prior.CeilingPct) {
+		rateLimited = false
+	}
+	return windowTokens, usagePct, rateLimited
 }
 
 // FoldUsage applies a usage report onto an account's prior state, returning the
