@@ -617,6 +617,14 @@ func prFromNode(n prNode) PullRequest {
 					pr.PassedChecks = append(pr.PassedChecks, c.Context)
 				}
 			}
+			// A SKIPPED or NEUTRAL required check is SATISFIED for GitHub's own merge gate — a
+			// skipped required check (e.g. "Migration version guard" on a PR with no migration
+			// changes) does NOT block merge (such PRs read mergeStateStatus=CLEAN). Count it as
+			// passed so the required-checks gate matches GitHub. It is NOT a real success (no test
+			// ran), so it does NOT set CIHasRealSuccess — the all-skipped-rollup guard still holds.
+			if c.Typename == "CheckRun" && (c.Conclusion == "SKIPPED" || c.Conclusion == "NEUTRAL") && c.Name != "" {
+				pr.PassedChecks = append(pr.PassedChecks, c.Name)
+			}
 			// collect the NAMES of definitively-failed checks so a bounced build can be told
 			// exactly which gate to re-run + fix locally (not a generic "CI was red").
 			switch {
@@ -848,6 +856,14 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 				case c.Typename == "StatusContext" && c.Context != "":
 					pr.PassedChecks = append(pr.PassedChecks, c.Context)
 				}
+			}
+			// A SKIPPED or NEUTRAL required check is SATISFIED for GitHub's own merge gate — a
+			// skipped required check (e.g. "Migration version guard" on a PR with no migration
+			// changes) does NOT block merge (such PRs read mergeStateStatus=CLEAN). Count it as
+			// passed so the required-checks gate matches GitHub. It is NOT a real success (no test
+			// ran), so it does NOT set CIHasRealSuccess — the all-skipped-rollup guard still holds.
+			if c.Typename == "CheckRun" && (c.Conclusion == "SKIPPED" || c.Conclusion == "NEUTRAL") && c.Name != "" {
+				pr.PassedChecks = append(pr.PassedChecks, c.Name)
 			}
 			// collect the NAMES of definitively-failed checks so a bounced build can be told
 			// exactly which gate to re-run + fix locally (not a generic "CI was red").
