@@ -37,6 +37,23 @@ import (
 // not a content-safety condition, and the Sender does not carry the operator policy. The
 // blast-radius declared-vs-actual check is also omitted (a declaration-consistency tamper
 // signal whose "declared" set is itself worker-reported, not a content-safety property).
+// isUnreachableRev reports whether a git error is a PERMANENT "this revision/object does
+// not exist" failure (as opposed to a transient network/lock error). Used so the
+// autonomous-merge verify fails-open to the human gate when its HeadSHA is unreachable
+// (GitHub squash-merged the PR and discarded Flowbee's promoted epoch commit) instead of
+// retrying that diff forever. Matches git's stderr for a missing object / bad range.
+func isUnreachableRev(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "invalid revision range") ||
+		strings.Contains(s, "unknown revision") ||
+		strings.Contains(s, "bad revision") ||
+		strings.Contains(s, "ambiguous argument") ||
+		strings.Contains(s, "bad object")
+}
+
 func contentDenyReason(actualDiff string, allowOwnSource bool) string {
 	r := content.CheckWithPolicy(content.Patch{Diff: actualDiff}, content.Policy{
 		Limits:         content.Limits{MaxDiffBytes: 1 << 30, MaxChangedFiles: 1 << 20},
@@ -501,6 +518,22 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			}
 			actualDiff, derr := s.history.DiffBetween(j.BaseSHA, j.HeadSHA)
 			if derr != nil {
+				// An UNREACHABLE revision is permanent, not transient: Flowbee self-merged by
+				// promoting an epoch commit, but GitHub SQUASH-merged the PR and discarded that
+				// commit, so HeadSHA can never be diffed in the mirror — the verify would retry
+				// forever (the observed serve-log loop). The PR is already merged on GitHub, so
+				// fail-open to the human merge gate exactly like the no-mirror case; the next
+				// reconcile sees merged=1 and marks the job done. A TRANSIENT diff error (network,
+				// lock) is NOT unreachable and still returns -> retries, unchanged.
+				if isUnreachableRev(derr) {
+					if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, "self_merge_unverifiable_head_unreachable", s.clock.Now()); rerr != nil {
+						return "", fmt.Errorf("route unverifiable self-merge to handoff: %w", rerr)
+					}
+					if s.pub != nil {
+						s.pub.PublishReconcile(row.JobID, "project_out:self_merge_unverifiable")
+					}
+					return "autonomous merge UNVERIFIABLE (head SHA unreachable — squash-discarded epoch) -> merge_handoff", nil
+				}
 				return "", fmt.Errorf("verify autonomous merge: diff %s..%s: %w", j.BaseSHA, j.HeadSHA, derr)
 			}
 			if reason := contentDenyReason(actualDiff, s.allowOwnSource); reason != "" {
