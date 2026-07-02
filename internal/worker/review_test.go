@@ -56,6 +56,34 @@ func TestRenderReviewBriefCodeReviewer(t *testing.T) {
 	}
 }
 
+// TestRenderReviewBriefCapsOversizedDiff is the regression for russ #3388's chronic
+// needs_human bounce: a big diff embedded inline makes the rendered brief the single shell
+// argv passed to the review agent (`codex exec "$(cat "$FLOWBEE_TASK_FILE")"`), and Linux's
+// MAX_ARG_STRLEN caps any ONE argv string at ~128KiB regardless of the much larger total
+// ARG_MAX — confirmed live: a real 269,705-byte review brief for PR #3396 (a large doc-sweep
+// diff) made every single reviewer's `codex exec` invocation fail at exec() with "Argument
+// list too long" (exit 126), night after night, before the agent ever ran. A diff at/above
+// maxInlineDiffBytes must fall back to the $FLOWBEE_DIFF_FILE reference (with an explicit
+// "you must read this file" instruction) instead of being embedded, so the review can still
+// launch; a diff comfortably under the cap stays inline (the original spurious-bounce fix).
+func TestRenderReviewBriefCapsOversizedDiff(t *testing.T) {
+	small := strings.Repeat("x", 100)
+	fb := renderReviewBrief("job-1", "code_reviewer", &client.LeaseContext{Diff: small})
+	if !strings.Contains(fb, small) {
+		t.Fatalf("a small diff (%d bytes, well under the cap) must stay inline\n%s", len(small), fb)
+	}
+
+	huge := strings.Repeat("x", maxInlineDiffBytes+1)
+	fb = renderReviewBrief("job-1", "code_reviewer", &client.LeaseContext{Diff: huge})
+	if strings.Contains(fb, huge) {
+		t.Fatalf("a diff over maxInlineDiffBytes (%d) must NOT be embedded inline — it would "+
+			"blow the OS exec argv-string limit and fail every review attempt", len(huge))
+	}
+	if !strings.Contains(fb, "$FLOWBEE_DIFF_FILE") || !strings.Contains(fb, "MUST open and read") {
+		t.Fatalf("an oversized diff must fall back to a forceful $FLOWBEE_DIFF_FILE read instruction\n%s", fb)
+	}
+}
+
 func TestRenderReviewBriefSpecReviewer(t *testing.T) {
 	c := &client.LeaseContext{Identity: "engineering_manager", Spec: "# Feature\n\nbody"}
 	brief := renderReviewBrief("job-2", "spec_reviewer", c)

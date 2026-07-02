@@ -153,6 +153,21 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	)
 	agentOut, err := runAgentHeartbeatIO(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, dir, cfg.AgentCmd, agentEnv, true)
 	if err != nil {
+		// The agent CLI failed to even RUN (e.g. `sh: 1: codex: Argument list too long` — a
+		// large diff embedded inline in the review brief blowing the OS's per-argument exec
+		// limit; see RunOnceHarness's identical guard, commit 7b5cc91, which fixed this for
+		// the BUILD / conflict_resolver harnesses but missed this review harness). Without an
+		// explicit release the lease sits silently claimed (one heartbeat already sent above,
+		// then nothing) until the server's heartbeat-stale reap (~4min), which just hands the
+		// SAME oversized diff to the next reviewer to fail identically — the review-path
+		// analogue of the conflict_resolver thrash (russ #3388's chronic needs_human bounce:
+		// review_claimed -> silence -> heartbeat_stale reap -> review_claimed by a different
+		// identity -> silence -> ... for hours, night after night). Release as FAILED (burns
+		// an attempt, matching this file's other review-failure paths below) so a persistent
+		// failure escalates to needs_human after max_attempts instead of thrashing in ~4min
+		// cycles forever. Best-effort: if the lease was already revoked (stale epoch), this is
+		// a no-op.
+		_, _ = c.ReleaseFailed(ctx, grant.JobID, grant.LeaseEpoch)
 		return out, err
 	}
 
@@ -413,6 +428,21 @@ func readVerdict(path string) (reviewVerdict, error) {
 	return v, nil
 }
 
+// maxInlineDiffBytes caps the diff renderReviewBrief will embed INLINE in the code_reviewer
+// brief. The rendered brief is what gets passed as a SINGLE shell argv element to the review
+// agent (`codex exec "$(cat "$FLOWBEE_TASK_FILE")"` / the claude equivalent — see
+// cmd/flowbee/fleet.go's codexReviewTmpl/reviewAgentTmpl), and Linux enforces MAX_ARG_STRLEN
+// — a hard ~128KiB cap on any SINGLE argv string, independent of the much larger total
+// ARG_MAX (2MiB) most people check. A diff at or beyond that blows the exec call before the
+// agent even starts: reproduced live against a real 269,705-byte review brief on the feller
+// fleet box while diagnosing russ #3388's chronic needs_human bounce (`sh: 1: /bin/true:
+// Argument list too long`, exit 126) — the review-path sibling of the conflict_resolver argv
+// bug fixed for the build harnesses in commit 7b5cc91. Cap comfortably under the 128KiB wall
+// (a brief's task/spec/acceptance-criteria text adds a few more KB on top of the diff) so an
+// oversized diff falls back to the $FLOWBEE_DIFF_FILE reference instead of making every
+// single review attempt fail to launch, forever.
+const maxInlineDiffBytes = 100 * 1024
+
 // renderReviewBrief writes the role-specific instructions + the EXACT verdict
 // schema the agent must emit to $FLOWBEE_VERDICT_FILE, so an operator's generic
 // agent-cmd (e.g. `claude -p "$(cat $FLOWBEE_TASK_FILE)"`) produces a usable
@@ -473,12 +503,25 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 		// blind on task/spec alone and bounced a perfectly good change ("can't verify"). With the
 		// diff in the prompt the agent ALWAYS sees the actual change. (File is still written for
 		// agents that prefer it.)
-		if d := strings.TrimSpace(c.Diff); d != "" {
+		//
+		// EXCEPT past maxInlineDiffBytes: inlining then would make the agent invocation blow the
+		// OS's per-argument exec limit and fail to launch on EVERY attempt (see the constant's
+		// doc). Fall back to a forceful file-read instruction instead — a review that requires
+		// reading a file beats one that can never even start.
+		if d := strings.TrimSpace(c.Diff); d != "" && len(d) <= maxInlineDiffBytes {
 			b.WriteString("## The change to review (full unified diff)\n\n" +
 				"Review EXACTLY this diff — it is reproduced IN FULL below; you do not need to open any file:\n\n")
 			b.WriteString("```diff\n")
 			b.WriteString(d)
 			b.WriteString("\n```\n\n")
+		} else if d != "" {
+			fmt.Fprintf(&b, "## The change to review (full unified diff)\n\n"+
+				"This diff is %d bytes — too large to embed inline safely (it would blow the OS's "+
+				"exec argument-length limit and make this review agent invocation fail to even "+
+				"launch). The FULL unified diff is written to $FLOWBEE_DIFF_FILE (.flowbee/diff.patch) "+
+				"in this working directory. You MUST open and read that file IN FULL before judging — "+
+				"do not withhold approval merely because you have not read it yet; read it first, then "+
+				"judge exactly as you would a diff shown inline.\n\n", len(d))
 		} else {
 			b.WriteString("The change to review is the unified diff at $FLOWBEE_DIFF_FILE (.flowbee/diff.patch).\n\n")
 		}
