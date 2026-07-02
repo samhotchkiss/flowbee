@@ -61,6 +61,45 @@ func TestDecideLivenessAbsoluteCapUnilateral(t *testing.T) {
 	}
 }
 
+// TestDecideLivenessHeartbeatStaleDistinctFromAbsoluteCap is the regression for the
+// ledger mislabeling that made the conflict_resolver heartbeat bug take three
+// independent ledger investigations to find (russ #3470/#3498/#3566): a worker gone
+// SILENT (Rung3.HeartbeatStale, e.g. its agent CLI crashed / never started) is a
+// unilateral kill just like the absolute cap, but it fires at ~4min instead of
+// ~20min and for a completely different reason. Before the fix both collapsed to the
+// SAME "absolute_cap" RevokeReason on the ledger; they must now be distinguishable.
+func TestDecideLivenessHeartbeatStaleDistinctFromAbsoluteCap(t *testing.T) {
+	s := state(job.StateResolvingConflict, 3)
+	s.Job.MaxAttempts = 5
+	d := Decide(s, LivenessVerdict{
+		Rungs: liveness.RungSet{Rung2: liveness.Rung2Abstain, Rung3: liveness.Rung3State{HeartbeatStale: true}},
+	})
+	if len(d.Transitions) != 1 {
+		t.Fatalf("heartbeat-stale must revoke unilaterally, got %+v", d.Transitions)
+	}
+	if got := d.Transitions[0].RevokeReason; got != "heartbeat_stale" {
+		t.Fatalf("reason=%q want heartbeat_stale (must NOT collapse into absolute_cap)", got)
+	}
+
+	// the true absolute-cap kill is unaffected: still labeled absolute_cap.
+	d2 := Decide(s, LivenessVerdict{
+		Rungs: liveness.RungSet{Rung2: liveness.Rung2Abstain, Rung3: liveness.Rung3State{AbsoluteCap: true}},
+	})
+	if got := d2.Transitions[0].RevokeReason; got != "absolute_cap" {
+		t.Fatalf("reason=%q want absolute_cap", got)
+	}
+
+	// when BOTH windows have been crossed (a job silent long enough to blow past the
+	// absolute cap too), EvaluateKill's own precedence picks AbsoluteCap first — the
+	// ledger label must match that, not just "whichever flag we see first".
+	d3 := Decide(s, LivenessVerdict{
+		Rungs: liveness.RungSet{Rung2: liveness.Rung2Abstain, Rung3: liveness.Rung3State{AbsoluteCap: true, HeartbeatStale: true}},
+	})
+	if got := d3.Transitions[0].RevokeReason; got != "absolute_cap" {
+		t.Fatalf("reason=%q want absolute_cap when both windows crossed (matches EvaluateKill's precedence)", got)
+	}
+}
+
 // TestDecideLivenessGovernorEscalates: at the Rung-4 governor ceiling a stall kill
 // sticks in needs_human (anti-thrash) rather than re-dispatching.
 func TestDecideLivenessGovernorEscalates(t *testing.T) {
