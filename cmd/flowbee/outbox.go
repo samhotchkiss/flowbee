@@ -58,7 +58,10 @@ func runOutbox(args []string) error {
 	}
 
 	if len(rows) == 0 {
-		fmt.Println("no abandoned GitHub writes — the outbox is clean")
+		// name the DB: a cwd flowbee.yaml (e.g. the repo's sample config) silently
+		// points the CLI at a different database than the serve daemon's, making a
+		// dirty live outbox read as "clean" (russ spec-materialization triage, 2026-07).
+		fmt.Printf("no abandoned GitHub writes — the outbox is clean (db: %s)\n", cfg.DatabaseURL)
 		return nil
 	}
 

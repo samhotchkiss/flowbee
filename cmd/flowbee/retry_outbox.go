@@ -64,9 +64,12 @@ func runRetryOutbox(args []string) error {
 		return err
 	}
 	if n == 0 {
-		fmt.Printf("no abandoned outbox actions for %s (nothing to retry)\n", scope)
+		// name the DB: a cwd flowbee.yaml (e.g. the repo's sample config) silently
+		// points the CLI at a different database than the serve daemon's — "nothing
+		// to retry" while the live outbox holds abandoned rows (russ, 2026-07).
+		fmt.Printf("no abandoned outbox actions for %s (nothing to retry; db: %s)\n", scope, cfg.DatabaseURL)
 		return nil
 	}
-	fmt.Printf("re-armed %d abandoned outbox action(s) for %s — the control plane will re-attempt them on its next drain\n", n, scope)
+	fmt.Printf("re-armed %d abandoned outbox action(s) for %s (db: %s) — the control plane will re-attempt them on its next drain\n", n, scope, cfg.DatabaseURL)
 	return nil
 }
