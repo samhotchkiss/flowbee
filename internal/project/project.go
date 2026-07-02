@@ -677,12 +677,34 @@ func orDefault(v, def string) string {
 	return v
 }
 
+// gitHubTitleMax is GitHub's hard cap on issue/PR titles. A longer title 422s
+// ("title is too long (maximum is 256 characters)"), which the drain rightly
+// dead-letters as permanent — so every rendered title must be clamped. A
+// one-paragraph `flowbee spec` task has no newline, making its "first line"
+// 1000+ chars; this silently killed every spec materialization (russ, 2026-06).
+const gitHubTitleMax = 256
+
+// clampTitle truncates a rendered title to gitHubTitleMax characters, breaking
+// at a word boundary where one exists in the back half and appending an
+// ellipsis. Nothing is lost: the full task/spec text is always in the body.
+func clampTitle(s string) string {
+	r := []rune(s)
+	if len(r) <= gitHubTitleMax {
+		return s
+	}
+	cut := string(r[:gitHubTitleMax-1])
+	if i := strings.LastIndex(cut, " "); i > gitHubTitleMax/2 {
+		cut = cut[:i]
+	}
+	return strings.TrimRight(cut, " \t.,;:-") + "…"
+}
+
 // prTitle renders the PR title from the build job's task/spec (the issue title),
 // falling back to the job id.
 func prTitle(j job.Job, jobID string) string {
 	for _, s := range []string{j.TaskText, j.SpecText} {
 		if line := firstNonEmptyLine(s); line != "" {
-			return strings.TrimSpace(strings.TrimLeft(line, "# "))
+			return clampTitle(strings.TrimSpace(strings.TrimLeft(line, "# ")))
 		}
 	}
 	return "flowbee: " + jobID
@@ -799,7 +821,7 @@ func (s *Sender) seedBuildFromSpec(ctx context.Context, spec job.Job, now time.T
 func issueTitle(j job.Job) string {
 	for _, s := range []string{j.TaskText, j.SpecText} {
 		if line := firstNonEmptyLine(s); line != "" {
-			return strings.TrimSpace(strings.TrimLeft(line, "# "))
+			return clampTitle(strings.TrimSpace(strings.TrimLeft(line, "# ")))
 		}
 	}
 	return j.ID
