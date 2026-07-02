@@ -414,6 +414,19 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	)
 	agentEnv = append(agentEnv, taskEnv...)
 	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+		// The agent CLI failed to even RUN (e.g. `sh: 1: codex: Argument list too long` —
+		// a huge embedded task/diff blowing the OS exec argv limit; or a crash before the
+		// heartbeat ticker's first ~60s tick). The lease is still held but nothing is
+		// watching it: without an explicit release here the job sits silently until the
+		// server's HeartbeatReapAfter (~4x the heartbeat interval, ~4min) reaps it as
+		// heartbeat_stale — turning a sub-second failure into a multi-minute blackout that
+		// repeats every cycle (the conflict_resolver thrash on #3470/#3498/#3566: a
+		// conflict's embedded diff is far more likely than an ordinary build's spec/task to
+		// approach that limit). Release burns an attempt (same accounting as the no-output
+		// path below) so a persistently-failing agent still escalates to needs_human after
+		// max_attempts instead of looping forever — it just does so in seconds, not hours.
+		// Best-effort: if the lease was already revoked (stale epoch), this is a no-op.
+		_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
 		return out, err
 	}
 	// Normalize a self-committing agent: an agentic CLI (codex) may `git commit` its own
@@ -579,6 +592,10 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	)
 	agentEnv = append(agentEnv, taskEnv...)
 	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+		// See RunOnceHarness's identical guard: an agent that fails to start/crashes still
+		// holds the lease; without a release it silently blacks out until the server's
+		// heartbeat-stale reap (~4min) instead of failing fast. Best-effort.
+		_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
 		return out, err
 	}
 
@@ -806,6 +823,16 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		"FLOWBEE_JOB_ID="+grant.JobID, "FLOWBEE_BASE_SHA="+grant.BaseSHA, "FLOWBEE_ROLE="+grant.Role)
 	agentEnv = append(agentEnv, taskEnv...)
 	if err := runAgentHeartbeat(ctx, c, &reg, grant.JobID, grant.LeaseEpoch, grant.LeaseTTLS, wsDir, cfg.AgentCmd, agentEnv); err != nil {
+		// See RunOnceHarness's identical guard: an agent that fails to start/crashes still
+		// holds the lease; without a release it silently blacks out until the server's
+		// heartbeat-stale reap (~4min) instead of failing fast. This is the conflict_resolver
+		// path (isConflict): its task embeds the FULL original diff on top of the normal
+		// task text, so it is far more likely than an ordinary build to overrun the exec
+		// argv limit (`sh: 1: codex: Argument list too long` / `claude: Argument list too
+		// long`, confirmed live on the imac fleet box) and land exactly here. Release
+		// (burns an attempt) so it fails fast and escalates after max_attempts instead of
+		// thrashing claim->silence->reap for hours. Best-effort.
+		_, _ = c.Release(ctx, grant.JobID, grant.LeaseEpoch)
 		return out, err
 	}
 	// Normalize a self-committing agent (codex may `git commit` on its own): soft-reset

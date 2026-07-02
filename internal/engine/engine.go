@@ -327,9 +327,25 @@ func Decide(s EngineState, e Event) Decision {
 		// A kill IS a lease revocation (§10.3): bump the epoch (fence the zombie) and
 		// fire compensation. The absolute cap is unilateral; a two-rung stall kill is
 		// governed by Rung-4 anti-thrash.
+		//
+		// Both unilateral kills collapse to kd.Unilateral=true (liveness.EvaluateKill), but
+		// they are DIFFERENT failure modes worth distinguishing on the ledger: absolute_cap
+		// is a healthy-but-slow agent that simply outran the 20min ceiling; heartbeat_stale
+		// is a worker that has gone SILENT (a clean crash, a hung/never-started agent, or —
+		// as confirmed live for conflict_resolver — an exec failure like "Argument list too
+		// long" from a huge embedded diff) and was presumed dead well before the absolute
+		// cap. Collapsing them into one "absolute_cap" label (the pre-fix behavior) hid the
+		// real cause and made this bug take three independent ledger investigations to find.
 		reason := "two_rung_stall"
 		if kd.Unilateral {
+			// Mirror liveness.EvaluateKill's own precedence (it checks AbsoluteCap before
+			// HeartbeatStale, §10.3): the two conditions can both be true once a job has
+			// been silent long enough to cross both windows, and the absolute cap is the
+			// one that actually fired the kill in that case.
 			reason = "absolute_cap"
+			if !ev.Rungs.Rung3.AbsoluteCap && ev.Rungs.Rung3.HeartbeatStale {
+				reason = "heartbeat_stale"
+			}
 		}
 		// Rung-4 governor (§10.7): a repeatedly killed-and-resumed job is held in
 		// needs_human rather than re-armed. The absolute cap also escalates when
