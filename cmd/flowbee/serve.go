@@ -456,6 +456,32 @@ func runServe(args []string) error {
 		logger.Info("🧭 Rung-E stuck-job advisor enabled", "cmd_is_default", cfg.AdvisorCmd == "")
 	}
 
+	// merge-fixer (0024): a PR approved but un-mergeable (head moved after review, or an
+	// unverifiable merge) is re-armed to a fixer worker with a "make it mergeable" brief,
+	// instead of parking for a human — the autonomy goal for the merge tail. Its own slow
+	// ticker so it never contends with the fast watchdog; runs after the cheaper UnstickAll
+	// branch-refresh has had its ~5m crack. flowbee-source PRs are excluded (allowlist).
+	if cfg.MergeFixer {
+		go func() {
+			t := time.NewTicker(5 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					rep, err := st.EscalateStuckMergeHandoff(ctx, 10*time.Minute, 3, time.Now())
+					if err != nil {
+						logger.Error("merge-fixer", "err", err)
+					} else if len(rep.Escalated) > 0 {
+						logger.Warn("🔧 merge-fixer re-armed un-mergeable PRs to a fixer", "jobs", rep.Escalated)
+					}
+				}
+			}
+		}()
+		logger.Info("🔧 merge-fixer enabled (un-mergeable PRs escalate to a fixer agent)")
+	}
+
 	// epic fan-out drain (§F4): once an epic's barrier review passes, its child issues
 	// are released from backlog into their own spec flows. Review and fan-out are kept
 	// distinct steps (barrier-before-fan-out); this drain is the trigger that releases

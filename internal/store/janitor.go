@@ -328,6 +328,97 @@ func (s *Store) ApplyAdvisorVerdict(ctx context.Context, jobID, action, note, ha
 	return rearmed, err
 }
 
+// mergeFixableReasons are the merge_handoff reasons a fixer agent can autonomously resolve
+// by rebuilding/re-reviewing the PR — the head moved, or the merge could not be verified.
+// It is an ALLOWLIST on purpose: an unknown or policy reason (a denylist/source-protection
+// hit — e.g. flowbee merging its OWN source) is NOT here, so it stays parked for a human
+// rather than looping into the same denial. A blank reason is also excluded (unclassified).
+var mergeFixableReasons = map[string]bool{
+	"head_modified_after_review":               true, // review is stale at the new head — re-review
+	"self_merge_unverifiable":                  true, // no mirror to SHA-pin — rebuild re-establishes it
+	"self_merge_unverifiable_head_unreachable": true,
+	"heartbeat_stale":                          true, // the merge dispatch went stale — re-drive it
+}
+
+// MergeFixReport summarizes one merge-fixer pass.
+type MergeFixReport struct {
+	Escalated []string // merge_handoff job ids re-armed to a fixer
+}
+
+// EscalateStuckMergeHandoff is the "a PR can't merge -> hand it to an agent who can figure
+// out why and fix it" path. A job parked in merge_handoff for a FIXABLE reason (the head
+// moved, or the merge was unverifiable — never a policy/source denial) is re-armed back into
+// the build->review->merge pipeline with a "make this PR mergeable" brief, so a fixer worker
+// rebases onto main, resolves conflicts, fixes failing checks, and the normal merge gate
+// takes it from there. It reuses the SAME fold-consistent re-arm as the advisor. Bounded by
+// unblock_attempts (< cap) so a PR that genuinely can't be made mergeable stops looping;
+// gated on a minimum parked age so the cheaper UnstickAll branch-refresh gets first crack.
+func (s *Store) EscalateStuckMergeHandoff(ctx context.Context, minAge time.Duration, cap int, now time.Time) (MergeFixReport, error) {
+	var rep MergeFixReport
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT j.id, j.updated_at, COALESCE(j.unblock_attempts,0),
+		       COALESCE((SELECT json_extract(e.payload,'$.RevokeReason') FROM job_events e
+		                  WHERE e.job_id = j.id
+		                    AND json_extract(e.payload,'$.RevokeReason') IS NOT NULL
+		                    AND json_extract(e.payload,'$.RevokeReason') != ''
+		                  ORDER BY e.job_seq DESC LIMIT 1),'') AS reason
+		  FROM jobs j
+		 WHERE j.state = 'merge_handoff'
+		 ORDER BY j.id`)
+	if err != nil {
+		return rep, err
+	}
+	type cand struct {
+		id, reason string
+		tries      int
+	}
+	var cands []cand
+	for rows.Next() {
+		var id, updated, reason string
+		var tries int
+		if err := rows.Scan(&id, &updated, &tries, &reason); err != nil {
+			rows.Close()
+			return rep, err
+		}
+		if !mergeFixableReasons[reason] || tries >= cap {
+			continue
+		}
+		if ts, perr := time.Parse(rfc3339, updated); perr == nil && now.Sub(ts) < minAge {
+			continue // give the cheap branch-refresh unstick a chance first
+		}
+		cands = append(cands, cand{id: id, reason: reason, tries: tries})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return rep, err
+	}
+	for _, c := range cands {
+		brief := "This PR was approved but could NOT be merged (reason: " + c.reason +
+			"). Diagnose why and FIX it so it merges: fetch the PR's branch, rebase onto the " +
+			"latest main, resolve any conflicts, run and fix any failing CI checks, and push. " +
+			"Do not change unrelated behavior — just make the approved change mergeable."
+		err := s.tx(ctx, func(tx *sql.Tx) error {
+			cur, seq, err := loadJobTx(ctx, tx, c.id)
+			if err != nil {
+				return err
+			}
+			if cur.State != job.StateMergeHandoff { // race
+				return nil
+			}
+			snapshot := cur.HeadSHA + "|" + cur.BaseSHA
+			if err := rearmFromNeedsHumanTx(ctx, tx, cur, seq, snapshot, brief, true, now, 0); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			return rep, err
+		}
+		rep.Escalated = append(rep.Escalated, c.id)
+	}
+	return rep, nil
+}
+
 // AutoCancelReport summarizes one terminal-backstop pass.
 type AutoCancelReport struct {
 	Cancelled []string // job ids the ladder gave up on and auto-cancelled

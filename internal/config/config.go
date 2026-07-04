@@ -135,6 +135,14 @@ type Config struct {
 	// once you trust the ladder. Requires the advisor (nothing exhausts the cap without it).
 	AutoCancelExhausted bool `yaml:"auto_cancel_exhausted"`
 
+	// MergeFixer turns on the "a PR can't merge -> escalate to an agent who fixes it" path:
+	// a job parked in merge_handoff for a FIXABLE reason (head moved after review, or an
+	// unverifiable merge — never a policy/source denial) is re-armed back through the
+	// build->review->merge pipeline with a "make this PR mergeable" brief, so a fixer worker
+	// rebases, resolves conflicts, and fixes failing checks. OFF by default (it re-drives the
+	// merge path); enable via FLOWBEE_MERGE_FIXER=on. flowbee-source PRs stay a human gate.
+	MergeFixer bool `yaml:"merge_fixer"`
+
 	// GithubOwner / GithubRepo are the single-repo coordinates `flowbee init`
 	// prefills from the git remote (F13). They are the config-file form of the
 	// legacy FLOWBEE_GITHUB_OWNER/REPO env path: when Repos is empty, serve uses
@@ -366,6 +374,14 @@ func applyEnv(c *Config) {
 			c.AutoCancelExhausted = true
 		default:
 			c.AutoCancelExhausted = false
+		}
+	}
+	if v := os.Getenv("FLOWBEE_MERGE_FIXER"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on", "yes", "enable", "enabled":
+			c.MergeFixer = true
+		default:
+			c.MergeFixer = false
 		}
 	}
 	if v := os.Getenv("FLOWBEE_GITHUB_OWNER"); v != "" {

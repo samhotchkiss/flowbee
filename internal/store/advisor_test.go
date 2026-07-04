@@ -70,6 +70,65 @@ func TestAdvisorFirstResponderForFailures(t *testing.T) {
 	assertFoldMatchesProjection(t, st, "j")
 }
 
+// mergeHandoffWithReason parks a build job in merge_handoff carrying a routing reason (via
+// the real RouteSelfMergeToHandoff event), then ages it so the fixer's min-age gate passes.
+func mergeHandoffWithReason(t *testing.T, st *store.Store, id, reason string, now time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: id, Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+		BaseSHA: "b0", RequiredCapabilities: []string{"role:eng_worker"}, Now: now,
+	}); err != nil {
+		t.Fatalf("seed %s: %v", id, err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='mergeable', head_sha='h1' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RouteSelfMergeToHandoff(ctx, id, reason, now); err != nil {
+		t.Fatalf("route handoff %s: %v", id, err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at='2020-01-01T00:00:00Z' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMergeFixerEscalatesFixable: a PR parked in merge_handoff for a FIXABLE reason (head
+// moved after review) is re-armed to a fixer worker with a "make it mergeable" brief; a
+// POLICY denial (denylist/source) stays a human gate; a capped one stops looping.
+func TestMergeFixerEscalatesFixable(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(2_000_000_000, 0) // 2033, well past the aged updated_at
+
+	mergeHandoffWithReason(t, st, "fixable", "head_modified_after_review", now)
+	mergeHandoffWithReason(t, st, "policy", "denylist:flowbee_source", now)
+	mergeHandoffWithReason(t, st, "capped", "head_modified_after_review", now)
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET unblock_attempts=3 WHERE id='capped'`); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := st.EscalateStuckMergeHandoff(ctx, 0, 3, now)
+	if err != nil {
+		t.Fatalf("merge-fixer: %v", err)
+	}
+	if len(rep.Escalated) != 1 || rep.Escalated[0] != "fixable" {
+		t.Fatalf("Escalated=%v, want [fixable]", rep.Escalated)
+	}
+	fx, _ := st.GetJob(ctx, "fixable")
+	if fx.State != job.StateReady {
+		t.Fatalf("fixable state=%s, want ready (re-armed to a fixer)", fx.State)
+	}
+	if fx.StuckHint == "" || fx.Role != job.RoleEngWorker {
+		t.Fatalf("fixable must carry the make-it-mergeable brief as an eng_worker; hint=%q role=%s", fx.StuckHint, fx.Role)
+	}
+	if p, _ := st.GetJob(ctx, "policy"); p.State != job.StateMergeHandoff {
+		t.Fatalf("policy state=%s, want merge_handoff (source denial stays a human gate)", p.State)
+	}
+	if c, _ := st.GetJob(ctx, "capped"); c.State != job.StateMergeHandoff {
+		t.Fatalf("capped state=%s, want merge_handoff (stopped looping)", c.State)
+	}
+}
+
 // TestAutoCancelExhausted: the terminal backstop cancels a job the advisor has exhausted
 // (consulted its cap of times, still parked for an advisable reason) so the board
 // self-clears — but never a job still under the cap, nor a non-advisable park.
