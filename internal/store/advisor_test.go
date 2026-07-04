@@ -87,7 +87,9 @@ func mergeHandoffWithReason(t *testing.T, st *store.Store, id, reason string, no
 	if err := st.RouteSelfMergeToHandoff(ctx, id, reason, now); err != nil {
 		t.Fatalf("route handoff %s: %v", id, err)
 	}
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at='2020-01-01T00:00:00Z' WHERE id=?`, id); err != nil {
+	// age it in the REAL SQLite datetime('now') format (space-separated, NOT RFC3339) so the
+	// fixer's parse is exercised the way production stores timestamps.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at='2020-01-01 00:00:00' WHERE id=?`, id); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -205,11 +207,13 @@ func TestAutoCancelTimeBackstop(t *testing.T) {
 
 	seedNeedsHuman(t, st, "aged", string(job.EscalationBounces), now)
 	seedNeedsHuman(t, st, "fresh", string(job.EscalationBounces), now)
-	// both under the advisor cap; only "aged" is past maxParkedAge.
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=1, updated_at='2020-01-01T00:00:00Z' WHERE id='aged'`); err != nil {
+	// both under the advisor cap; only "aged" is past maxParkedAge. Use the REAL SQLite
+	// datetime('now') format (space-separated) — an RFC3339 literal here would let the parse
+	// bug hide, which is exactly how this shipped inert once.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=1, updated_at='2020-01-01 00:00:00' WHERE id='aged'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=1, updated_at=? WHERE id='fresh'`, now.Format(time.RFC3339Nano)); err != nil {
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=1, updated_at=? WHERE id='fresh'`, now.UTC().Format("2006-01-02 15:04:05")); err != nil {
 		t.Fatal(err)
 	}
 

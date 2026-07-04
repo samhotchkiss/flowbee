@@ -11,6 +11,23 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
 
+// sqliteDatetime is the format SQLite's datetime('now') writes into updated_at et al.:
+// "2006-01-02 15:04:05" (space-separated, UTC, no zone) — NOT RFC3339. Parsing it with
+// rfc3339 silently errors, which had made the janitor's age gates inert in production.
+const sqliteDatetime = "2006-01-02 15:04:05"
+
+// parseDBTime parses a timestamp column that may be either SQLite's datetime('now') form
+// (updated_at, created_at) or an RFC3339 value the code writes elsewhere (enqueued_at,
+// unblock_next_at). Both resolve to UTC. Returns ok=false only if neither layout matches.
+func parseDBTime(s string) (time.Time, bool) {
+	for _, layout := range []string{sqliteDatetime + ".999999999", sqliteDatetime, rfc3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
 // mechanicalUnblockReasons are the needs_human escalation reasons the janitor is allowed
 // to auto-requeue. A "mechanical" reason is one whose fix is a retry, not a decision:
 //
@@ -170,7 +187,10 @@ func (s *Store) JanitorUnblock(ctx context.Context, now time.Time, staleHB time.
 		// Rung C: SHA-progress. If we have already auto-unblocked this job (tries>0) and its
 		// head||base is IDENTICAL to the snapshot taken at that unblock, the retry moved
 		// nothing — a churn plateau. Leave it parked rather than spend another attempt.
-		if c.unblockTries > 0 && snapshot == c.lastProgress {
+		// EXCEPT an empty head (worker died before pushing anything): that is not a churn
+		// plateau, it is a job that never got off the ground, so a fresh worker is worth a
+		// real retry — keep its full mechanical budget (still capped by MaxUnblockAttempts).
+		if c.unblockTries > 0 && snapshot == c.lastProgress && c.headSHA != "" {
 			continue
 		}
 		did, err := s.unblockOne(ctx, c.id, snapshot, "", now, cfg.Cooldown)
@@ -383,7 +403,7 @@ func (s *Store) EscalateStuckMergeHandoff(ctx context.Context, minAge time.Durat
 		if !mergeFixableReasons[reason] || tries >= cap {
 			continue
 		}
-		if ts, perr := time.Parse(rfc3339, updated); perr == nil && now.Sub(ts) < minAge {
+		if ts, ok := parseDBTime(updated); ok && now.Sub(ts) < minAge {
 			continue // give the cheap branch-refresh unstick a chance first
 		}
 		cands = append(cands, cand{id: id, reason: reason, tries: tries})
@@ -465,7 +485,7 @@ func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, maxPark
 		exhausted := tries >= advisorCap
 		aged := false
 		if maxParkedAge > 0 {
-			if ts, perr := time.Parse(rfc3339, updated); perr == nil && now.Sub(ts) > maxParkedAge {
+			if ts, ok := parseDBTime(updated); ok && now.Sub(ts) > maxParkedAge {
 				aged = true
 			}
 		}
