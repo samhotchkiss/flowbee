@@ -351,11 +351,14 @@ func (s *Store) ApplyAdvisorVerdict(ctx context.Context, jobID, action, note, ha
 // It is an ALLOWLIST on purpose: an unknown or policy reason (a denylist/source-protection
 // hit — e.g. flowbee merging its OWN source) is NOT here, so it stays parked for a human
 // rather than looping into the same denial. A blank reason is also excluded (unclassified).
+// These are reasons a REBUILD/RE-REVIEW resolves. Deliberately NOT included: heartbeat_stale
+// (a merge-DISPATCH-layer stall, not a PR-content problem — a rebuild is the wrong tool and
+// on a flowbee-source PR it just burns a cycle before re-denying), and any blank/unknown
+// reason, and every denylist/source policy reason (those stay the human gate).
 var mergeFixableReasons = map[string]bool{
 	"head_modified_after_review":               true, // review is stale at the new head — re-review
 	"self_merge_unverifiable":                  true, // no mirror to SHA-pin — rebuild re-establishes it
 	"self_merge_unverifiable_head_unreachable": true,
-	"heartbeat_stale":                          true, // the merge dispatch went stale — re-drive it
 }
 
 // MergeFixReport summarizes one merge-fixer pass.
