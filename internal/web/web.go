@@ -61,9 +61,9 @@ type UI struct {
 
 // Config carries the UI knobs.
 type Config struct {
-	StaleHB      time.Duration // the roster stale-heartbeat threshold (mirrors api).
-	StageAmber   time.Duration // a card turns amber after this long in a stage.
-	StageRed     time.Duration // a card turns red after this long in a stage.
+	StaleHB    time.Duration // the roster stale-heartbeat threshold (mirrors api).
+	StageAmber time.Duration // a card turns amber after this long in a stage.
+	StageRed   time.Duration // a card turns red after this long in a stage.
 }
 
 // New builds the UI, parsing the embedded templates with the helper funcs.
@@ -86,12 +86,14 @@ func New(data Data, clk clock.Clock, cfg Config) *UI {
 
 // Mount registers the UI routes + the embedded asset handler on a mux. The board
 // is the home page; /fleet and /dashboard are the other panes; /roster keeps the
-// legacy roster page. /board/detail serves the drawer fragment.
+// legacy roster page. /board/detail serves the normal drawer fragment, while
+// /board/trace serves the same stage trace behind the superadmin gate.
 func (u *UI) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /assets/", http.FileServer(http.FS(assetsFS)))
 	mux.HandleFunc("GET /", u.board)
 	mux.HandleFunc("GET /board", u.board)
 	mux.HandleFunc("GET /board/detail", u.detail)
+	mux.HandleFunc("GET /board/trace", u.trace)
 	mux.HandleFunc("GET /fleet", u.fleet)
 	mux.HandleFunc("GET /dashboard", u.dashboard)
 	mux.HandleFunc("GET /roster", u.roster)

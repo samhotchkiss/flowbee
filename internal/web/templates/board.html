@@ -46,6 +46,14 @@
   <div class="ttl">
     <span class="flag" title="{{if .Repo}}{{.Repo}}{{else}}flowbee{{end}}">{{.ProjectEmoji}}</span>
     <span>{{.Title}}</span>
+    {{if .IsSuperadmin}}
+    <details class="card-menu">
+      <summary aria-label="card actions">⋮</summary>
+      <div class="card-menu-popover" role="menu">
+        <button type="button" role="menuitem" data-trace-job="{{.JobID}}">View trace</button>
+      </div>
+    </details>
+    {{end}}
   </div>
   <div class="meta">
     {{if .IsEpic}}<span class="chip epic">epic</span>{{else if .EpicID}}<span class="chip epic">epic·{{.EpicID}}</span>{{end}}
