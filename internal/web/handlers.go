@@ -52,7 +52,6 @@ type boardCard struct {
 	Flowbee      bool         // the yellow flowbee umbrella marker
 	ProjectEmoji string       // per-project glyph (replaces the generic bee on the card)
 	ProjectColor template.CSS // per-project left-stripe color (derived from the repo)
-	IsSuperadmin bool         // gates privileged trace actions on each card
 }
 
 type boardView struct {
@@ -202,7 +201,6 @@ func (u *UI) board(w http.ResponseWriter, r *http.Request) {
 			Flowbee:      true,
 			ProjectEmoji: projectEmoji(c.Repo),
 			ProjectColor: projectColor(c.Repo),
-			IsSuperadmin: isSuperadmin(r),
 		}
 		if c.State == "done" {
 			done = append(done, card)
@@ -299,39 +297,6 @@ func (u *UI) detail(w http.ResponseWriter, r *http.Request) {
 	if err := u.tmpl.ExecuteTemplate(w, "drawer.html", drawerView{Detail: d}); err != nil {
 		http.Error(w, "render error", http.StatusInternalServerError)
 	}
-}
-
-func (u *UI) trace(w http.ResponseWriter, r *http.Request) {
-	if !isSuperadmin(r) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	u.detail(w, r)
-}
-
-func isSuperadmin(r *http.Request) bool {
-	if hasRole(r.Header.Get("X-Flowbee-Role"), "superadmin") ||
-		hasRole(r.Header.Get("X-Flowbee-Roles"), "superadmin") {
-		return true
-	}
-	if c, err := r.Cookie("flowbee_role"); err == nil && hasRole(c.Value, "superadmin") {
-		return true
-	}
-	if c, err := r.Cookie("flowbee_roles"); err == nil && hasRole(c.Value, "superadmin") {
-		return true
-	}
-	return false
-}
-
-func hasRole(v, role string) bool {
-	for _, part := range strings.FieldsFunc(v, func(r rune) bool {
-		return r == ',' || r == ' ' || r == ';' || r == '|'
-	}) {
-		if strings.EqualFold(strings.TrimSpace(part), role) {
-			return true
-		}
-	}
-	return false
 }
 
 // ── FLEET ──

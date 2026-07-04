@@ -41,17 +41,16 @@
 
   // ── detail drawer ── click a card to open the drawer; click another card to
   // swap its contents in place (no board dim, no navigation).
-  function openDrawer(jobID, trace) {
+  function openDrawer(jobID) {
     var drawer = document.getElementById("fb-drawer");
     if (!drawer) { return; }
     drawer.classList.add("open");
     var body = drawer.querySelector(".drawer-body");
     body.innerHTML = '<p class="muted">Loading ' + jobID + '…</p>';
-    var path = trace ? "/board/trace" : "/board/detail";
-    fetch(path + "?job=" + encodeURIComponent(jobID), { headers: { "Accept": "text/html" } })
+    fetch("/board/detail?job=" + encodeURIComponent(jobID), { headers: { "Accept": "text/html" } })
       .then(function (r) {
         if (r.ok) { return r.text(); }
-        return r.status === 403 ? "<p class='over'>forbidden</p>" : "<p class='over'>not found</p>";
+        return "<p class='over'>not found</p>";
       })
       .then(function (html) { body.innerHTML = html; wireDrawerLinks(); })
       .catch(function () { body.innerHTML = "<p class='over'>load error</p>"; });
@@ -66,24 +65,6 @@
     var cards = document.querySelectorAll(".card[data-job]");
     for (var i = 0; i < cards.length; i++) {
       cards[i].addEventListener("click", function () { openDrawer(this.getAttribute("data-job")); });
-    }
-    wireTraceMenus();
-  }
-
-  function wireTraceMenus() {
-    var menus = document.querySelectorAll(".card-menu");
-    for (var i = 0; i < menus.length; i++) {
-      menus[i].addEventListener("click", function (e) { e.stopPropagation(); });
-    }
-    var items = document.querySelectorAll("[data-trace-job]");
-    for (var j = 0; j < items.length; j++) {
-      items[j].addEventListener("click", function (e) {
-        e.preventDefault();
-        e.stopPropagation();
-        var menu = this.closest ? this.closest(".card-menu") : null;
-        if (menu) { menu.open = false; }
-        openDrawer(this.getAttribute("data-trace-job"), true);
-      });
     }
   }
 
