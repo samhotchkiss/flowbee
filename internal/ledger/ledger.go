@@ -89,6 +89,18 @@ const (
 	KindConflictResolved EventKind = "conflict_resolved" // resolver returned the resolved diff -> review_pending (re-review + re-CI)
 	KindStackedRebased   EventKind = "stacked_rebased"   // a parent PR merged -> auto-rebase + re-arm this descendant (supersede)
 
+	// Self-unblock janitor (0023). KindJanitorUnblocked is the AUTOMATIC exit from the
+	// needs_human sink for a MECHANICAL escalation reason (currently `stall`): the
+	// forward-progress watchdog re-arms the parked job back to its own entry stage
+	// (ready / spec_authoring) WITHOUT resetting the attempts/bounces budget (so a job
+	// genuinely out of build budget still re-escalates normally). It increments a distinct
+	// unblock_attempts counter — capped so a job that keeps re-stalling converges BACK to
+	// needs_human instead of looping forever — and records the head||base SHA snapshot at
+	// unblock time (last_progress_sha) for the deterministic anti-thrash progress check.
+	// Distinct from KindStateChanged+ResetCounters (the operator requeue, which zeroes the
+	// budget): the janitor is bounded and signal-preserving, the operator's is a full reset.
+	KindJanitorUnblocked EventKind = "janitor_unblocked"
+
 	// F10 CI-as-a-pluggable-fact (§F10). KindTestCIRecorded: a Flowbee `test` job
 	// ran the build's tests on a capability-matched worker and reported a result; the
 	// ci_green@sha fact it produced is honored by the merge gate exactly like
@@ -148,6 +160,15 @@ type Payload struct {
 	// reset them too or a rebuild-from-ledger keeps the pre-requeue counts (a divergence
 	// that could trip premature re-escalation after a DR rebuild).
 	ResetCounters bool `json:",omitempty"`
+	// UnblockSHA rides the janitor_unblocked event: the head||base SHA snapshot the
+	// janitor captured at auto-unblock time. The fold records it on last_progress_sha so
+	// the next escalation's progress check (SHA moved => real work; SHA static => churn
+	// plateau) survives a DR rebuild. NOT reset by any other path (empty elsewhere).
+	UnblockSHA string `json:",omitempty"`
+	// StuckHint rides a janitor_unblocked event driven by the Rung-E advisor (0024): the
+	// model's short note, folded onto stuck_hint and injected into the next lease context.
+	// Empty on a plain mechanical unblock (no advisor involved).
+	StuckHint string `json:",omitempty"`
 	// ReviewNotes carries a code-review's changes-requested findings on the bounce event,
 	// so the rebuild can surface them (§F compounding memory). Folded onto LastReviewNotes.
 	ReviewNotes string `json:",omitempty"`
@@ -290,6 +311,31 @@ func Fold(events []Event) (job.Job, error) {
 					j.Stage = "build"
 				}
 			}
+		case KindJanitorUnblocked:
+			// 0023: the forward-progress janitor auto-requeued a needs_human job out of the
+			// sink for a MECHANICAL reason. Re-arm to the entry stage and clear the prior
+			// attempt's artifacts (fresh build candidate) — mirroring the operator requeue —
+			// but PRESERVE attempts/bounces/stall_revocations (the janitor is bounded, not a
+			// budget reset): a job truly out of build budget still re-escalates on its own.
+			// Increment the distinct unblock_attempts counter (the janitor's own cap) and
+			// record the SHA snapshot for the progress check. role/caps + the escalation_reason
+			// clear come from the state-derived post-steps below, exactly like the requeue path.
+			j.State = e.ToState
+			j.LeaseEpoch = e.LeaseEpoch
+			j.UnblockAttempts++
+			j.LastProgressSHA = e.Payload.UnblockSHA
+			j.HeadSHA = ""
+			j.Verdict = nil
+			j.StuckHint = e.Payload.StuckHint // advisor note (empty on a plain mechanical unblock)
+			if e.ToState == job.StateSpecAuthoring {
+				j.Stage = "spec"
+			} else {
+				j.Stage = "build"
+				j.EnqueuedAt = e.CreatedAt // re-armed to ready: aging clock restarts
+			}
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
 		case KindBaseRefreshed:
 			// a sibling PR merged; this still-`ready` job's base advances to the new main
 			// so it builds on current code (state/role unchanged — it was never leased).

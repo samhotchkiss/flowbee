@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -127,6 +128,15 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 			b.Write(raw)
 			b.WriteString("\n```\n")
 		}
+	}
+	if h := strings.TrimSpace(c.StuckHint); h != "" {
+		// Rung-E advisor re-entry (0024): this job was stuck and an advisor nominated a
+		// direction. Surface it prominently so the fresh attempt follows the guidance instead
+		// of blindly repeating the stalled approach.
+		b.WriteString("\n## 🔓 This job was STUCK — an advisor suggested a direction\n\n" +
+			"A prior attempt stalled and needed help. Before you start, follow this guidance:\n\n> ")
+		b.WriteString(h)
+		b.WriteString("\n")
 	}
 	if c.Rebuild {
 		b.WriteString("\n## ⚠️ This is a RE-ATTEMPT — a previous build was rejected\n\n" +
@@ -1019,11 +1029,18 @@ const (
 type boundedWriter struct {
 	b   strings.Builder
 	max int
+	// hook, if set, observes every chunk in real time (BEFORE the cap discards it) so a
+	// downstream detector sees the full stream even when the bounded buffer is full. Must be
+	// cheap + non-blocking — it runs on the exec pipe-drain path.
+	hook func([]byte)
 }
 
 func newBoundedWriter(max int) *boundedWriter { return &boundedWriter{max: max} }
 
 func (w *boundedWriter) Write(p []byte) (int, error) {
+	if w.hook != nil {
+		w.hook(p)
+	}
 	if rem := w.max - w.b.Len(); rem > 0 {
 		if len(p) <= rem {
 			w.b.Write(p)
@@ -1035,6 +1052,105 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 }
 
 func (w *boundedWriter) String() string { return w.b.String() }
+
+// elicitationTailBytes is how much trailing output the detector keeps to test for a prompt.
+const elicitationTailBytes = 512
+
+// promptDetector spots an agent that has BLOCKED on an interactive prompt. Flowbee runs
+// agents non-interactively (claude --dangerously-skip-permissions / codex
+// --dangerously-bypass-approvals-and-sandbox < /dev/null), so this is a belt-and-suspenders
+// for the edge where a sub-tool or a mode still stops to ask: instead of the worker hanging
+// until the ~4-min heartbeat-stale reap (or the ~20-min absolute cap), it reports
+// awaiting_input and the CP cleanly re-dispatches (no attempt burned). Precision matters —
+// a false fire only costs a clean re-dispatch, but we still gate on TWO conditions to avoid
+// tripping on a prompt-shaped string in legitimate output: (1) a known interactive-prompt
+// pattern sits at the output TAIL, and (2) output has gone IDLE since (the process printed
+// the question and stopped, i.e. it is waiting on stdin, not still working).
+type promptDetector struct {
+	enabled bool
+	mu      sync.Mutex
+	tail    []byte
+	bytes   int64
+	matched bool
+}
+
+func (d *promptDetector) observe(p []byte) {
+	if !d.enabled {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.bytes += int64(len(p))
+	d.tail = append(d.tail, p...)
+	if len(d.tail) > elicitationTailBytes {
+		d.tail = d.tail[len(d.tail)-elicitationTailBytes:]
+	}
+	d.matched = looksLikePrompt(d.tail)
+}
+
+// snapshot returns the running byte count and whether a prompt is currently at the tail.
+func (d *promptDetector) snapshot() (int64, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.bytes, d.matched
+}
+
+// promptSuffixMarkers are high-precision tells that a blocked CLI leaves at the END of its
+// last line (the cursor waits right after them). Kept tight: each is something a stalled
+// prompt prints, not prose an agent emits mid-work.
+var promptSuffixMarkers = []string{
+	"? [y/n]", "? (y/n)", "? [y/n]:", "(y/n)?", "? [y/n/a]",
+	"[y/n]", "(yes/no)", "[yes/no]", "? (y/n/a)",
+	"press enter to continue", "approval required",
+	"waiting for user input", "› ", "❯ ",
+}
+
+// promptQuestionPrefixes fire only when the last line ALSO ends with "?" — a genuine
+// interactive question (e.g. claude's "Do you want to make this edit to config.go?"), while
+// still excluding a mid-sentence "…do you want to proceed? Then…" (that line does not end
+// with "?"). The two conditions together keep the false-fire rate low.
+var promptQuestionPrefixes = []string{
+	"do you want to", "do you wish to", "would you like to",
+	"allow this command", "allow command", "overwrite", "proceed",
+}
+
+// looksLikePrompt reports whether the tail ends in a recognized interactive prompt. It
+// examines only the LAST non-empty line: a blocked CLI leaves the cursor after the question,
+// so a marker in the MIDDLE of output (more text after it) never matches.
+func looksLikePrompt(tail []byte) bool {
+	s := strings.ToLower(strings.TrimRight(string(tail), " \t\r\n"))
+	if s == "" {
+		return false
+	}
+	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+		s = s[i+1:]
+	}
+	s = strings.TrimSpace(s)
+	for _, m := range promptSuffixMarkers {
+		if strings.HasSuffix(s, m) {
+			return true
+		}
+	}
+	if strings.HasSuffix(s, "?") {
+		for _, p := range promptQuestionPrefixes {
+			if strings.HasPrefix(s, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// elicitationFailfastEnabled reports whether the awaiting-input detector is on (default on;
+// FLOWBEE_ELICITATION_FAILFAST=off/0/false/no disables — the reversible kill-switch).
+func elicitationFailfastEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FLOWBEE_ELICITATION_FAILFAST"))) {
+	case "0", "false", "off", "no", "disable", "disabled":
+		return false
+	default:
+		return true
+	}
+}
 
 func runAgentHeartbeatIO(ctx context.Context, c *client.Client, reg *client.Registration, jobID string, epoch, ttlS int, dir, agentCmd string, env []string, capture bool) (string, error) {
 	if agentCmd == "" {
@@ -1072,6 +1188,12 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, reg *client.Regi
 	// submitted as the artifact when the verdict/spec file is absent. Cap both; the writer
 	// keeps consuming past the cap so the child's pipe never blocks.
 	errb, outb := newBoundedWriter(maxAgentStderrBytes), newBoundedWriter(maxAgentStdoutBytes)
+	// awaiting-input fail-fast: watch the live stream for a blocked interactive prompt so a
+	// stuck agent frees in one heartbeat instead of the ~4-min stale reap. Both streams feed
+	// the same detector (a prompt can land on either).
+	elic := &promptDetector{enabled: elicitationFailfastEnabled()}
+	outb.hook = elic.observe
+	errb.hook = elic.observe
 	cmd.Stderr = errb
 	cmd.Stdout = outb // capture: needed to parse the agent's reported cost/usage
 	_ = capture       // (capture is now always on; the param is kept for call-site clarity)
@@ -1086,12 +1208,24 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, reg *client.Regi
 	go func() {
 		t := time.NewTicker(time.Duration(interval) * time.Second)
 		defer t.Stop()
+		var lastBytes int64 = -1 // sentinel: first tick only records the byte count
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
 				refreshWorkerRegistration(runCtx, c, reg)
+				// awaiting-input fail-fast: a prompt sits at the output tail AND no new output
+				// has arrived since the previous tick — the agent printed a question and stalled
+				// on stdin. Report awaiting_input; the CP applies the §10.6 clean fast-path
+				// (-> ready, no attempt burned) in the same heartbeat, then we stop the agent.
+				if b, matched := elic.snapshot(); matched && b == lastBytes {
+					_, _, _ = c.HeartbeatWith(runCtx, jobID, epoch, client.HeartbeatObs{AwaitingInput: true})
+					cancel()
+					return
+				} else {
+					lastBytes = b
+				}
 				// act on the CP's verdict: a `cancel` directive (over-budget / two-rung kill)
 				// or a stale-epoch 409 means the lease is GONE — stop the now-orphaned agent
 				// at once and free the worker, instead of finishing reassigned work.
