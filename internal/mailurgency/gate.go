@@ -2,6 +2,7 @@ package mailurgency
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/mail"
 	"strings"
@@ -21,6 +22,15 @@ const (
 
 	EventMessageReceived = "message.received"
 	EventStage3Completed = "stage3.completed"
+)
+
+var (
+	ErrMissingAttentionStore      = errors.New("mail urgency: missing attention store")
+	ErrMissingNeedStore           = errors.New("mail urgency: missing need store")
+	ErrMissingNeedEventPublisher  = errors.New("mail urgency: missing need event publisher")
+	ErrMissingMessageLoader       = errors.New("mail urgency: missing message loader")
+	ErrMissingComprehensionLoader = errors.New("mail urgency: missing comprehension loader")
+	ErrMissingComprehensionQueue  = errors.New("mail urgency: missing comprehension queue")
 )
 
 type Message struct {
@@ -78,6 +88,42 @@ type NeedItem struct {
 	ThreadID        string
 	Priority        string
 	ComprehensionID string
+}
+
+type Event struct {
+	Type            string
+	TenantID        string
+	UserID          string
+	MessageID       string
+	ComprehensionID string
+	Priority        string
+}
+
+type AttentionStore interface {
+	InsertMailAttention(context.Context, AttentionItem) error
+}
+
+type NeedStore interface {
+	InsertEmailNeed(context.Context, NeedItem) error
+}
+
+type NeedEventPublisher interface {
+	PublishEmailNeedDerivation(context.Context, Event) error
+}
+
+type MessageLoader func(context.Context, Event) (Message, error)
+
+type ComprehensionLoader func(context.Context, Event) (*Comprehension, error)
+
+type ComprehensionQueue interface {
+	EnqueueComprehension(context.Context, Message) error
+}
+
+type Deriver struct {
+	LoadMessage       MessageLoader
+	LoadComprehension ComprehensionLoader
+	Store             NeedStore
+	Observer          Observer
 }
 
 type Observer interface {
@@ -223,6 +269,51 @@ func ClassifyMailImpact(ctx context.Context, msg Message, comp *Comprehension, c
 	}, decision
 }
 
+func ClassifyAndPersistMailImpact(ctx context.Context, store AttentionStore, msg Message, comp *Comprehension, candidate RegexCandidate, obs Observer) (Decision, error) {
+	item, decision := ClassifyMailImpact(ctx, msg, comp, candidate, obs)
+	if item == nil {
+		return decision, nil
+	}
+	if store == nil {
+		return decision, ErrMissingAttentionStore
+	}
+	if err := store.InsertMailAttention(ctx, *item); err != nil {
+		return decision, err
+	}
+	return decision, nil
+}
+
+func PublishEmailNeedDerivation(ctx context.Context, publisher NeedEventPublisher, event Event, msg Message, comp *Comprehension, priority string, obs Observer) (Decision, error) {
+	if event.Type != EventStage3Completed {
+		decision := Decision{Eligible: false, Reason: ReasonMissingLLMVerdict, RequiresComprehension: true}
+		recordSkip(obs, "deriver", decision, msg)
+		return decision, nil
+	}
+	decision := AuthorizeUserVisibleUrgency(ctx, msg, comp, priority, false)
+	if !decision.Eligible {
+		recordSkip(obs, "deriver", decision, msg)
+		return decision, nil
+	}
+	if !hasCompletedPersonalAsk(comp) {
+		decision = Decision{Eligible: false, Reason: ReasonLLMRejectedUrgency, VerdictID: verdictID(comp)}
+		recordSkip(obs, "deriver", decision, msg)
+		return decision, nil
+	}
+	event.Type = EventStage3Completed
+	event.TenantID = msg.TenantID
+	event.UserID = msg.UserID
+	event.MessageID = msg.MessageID
+	event.ComprehensionID = decision.VerdictID
+	event.Priority = normalizedPriority(priority)
+	if publisher == nil {
+		return decision, ErrMissingNeedEventPublisher
+	}
+	if err := publisher.PublishEmailNeedDerivation(ctx, event); err != nil {
+		return decision, err
+	}
+	return decision, nil
+}
+
 func DeriveEmailNeed(ctx context.Context, eventType string, msg Message, comp *Comprehension, priority string, obs Observer) (*NeedItem, Decision) {
 	if eventType != EventStage3Completed {
 		decision := Decision{Eligible: false, Reason: ReasonMissingLLMVerdict, RequiresComprehension: true}
@@ -249,6 +340,54 @@ func DeriveEmailNeed(ctx context.Context, eventType string, msg Message, comp *C
 		Priority:        normalizedPriority(priority),
 		ComprehensionID: decision.VerdictID,
 	}, decision
+}
+
+func EmailNeedDerivationEventTypes() []string {
+	return []string{EventStage3Completed}
+}
+
+func (d Deriver) SubscribedEvents() []string {
+	return EmailNeedDerivationEventTypes()
+}
+
+func (d Deriver) HandleEvent(ctx context.Context, event Event) (Decision, error) {
+	if event.Type != EventStage3Completed {
+		decision := Decision{Eligible: false, Reason: ReasonMissingLLMVerdict, RequiresComprehension: true}
+		recordSkip(d.Observer, "deriver", decision, Message{TenantID: event.TenantID, UserID: event.UserID, MessageID: event.MessageID})
+		return decision, nil
+	}
+	if d.LoadMessage == nil {
+		return Decision{}, ErrMissingMessageLoader
+	}
+	if d.LoadComprehension == nil {
+		return Decision{}, ErrMissingComprehensionLoader
+	}
+	msg, err := d.LoadMessage(ctx, event)
+	if err != nil {
+		return Decision{}, err
+	}
+	comp, err := d.LoadComprehension(ctx, event)
+	if err != nil {
+		return Decision{}, err
+	}
+	need, decision := DeriveEmailNeed(ctx, event.Type, msg, comp, event.Priority, d.Observer)
+	if need == nil {
+		return decision, nil
+	}
+	if d.Store == nil {
+		return decision, ErrMissingNeedStore
+	}
+	if err := d.Store.InsertEmailNeed(ctx, *need); err != nil {
+		return decision, err
+	}
+	return decision, nil
+}
+
+func IngestBackfillMessage(ctx context.Context, queue ComprehensionQueue, msg Message) error {
+	if queue == nil {
+		return ErrMissingComprehensionQueue
+	}
+	return queue.EnqueueComprehension(ctx, msg)
 }
 
 func recordSkip(obs Observer, stage string, decision Decision, msg Message) {

@@ -144,6 +144,119 @@ func TestDeriverBulkNewsletterRejectedBeforeAndAfterComprehension(t *testing.T) 
 	}
 }
 
+func TestClassifierPersistenceBoundaryRequiresGate(t *testing.T) {
+	ctx := context.Background()
+	store := &memoryAttentionStore{}
+	msg := Message{TenantID: "t", UserID: "u", MessageID: "m", Status: "received", SenderEmail: "vendor@example.com"}
+	candidate := RegexCandidate{Priority: "p1", ImpactStatement: "urgent invoice renewal pricing"}
+
+	decision, err := ClassifyAndPersistMailImpact(ctx, store, msg, nil, candidate, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Reason != ReasonMissingLLMVerdict {
+		t.Fatalf("regex-only urgent decision=%+v", decision)
+	}
+	if len(store.items) != 0 {
+		t.Fatalf("regex-only classifier wrote user-visible attention: %+v", store.items)
+	}
+
+	decision, err = ClassifyAndPersistMailImpact(ctx, store, msg, goodComprehension("verdict-persist", "p1"), candidate, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Eligible || len(store.items) != 1 {
+		t.Fatalf("LLM-confirmed classifier did not write exactly one row: decision=%+v items=%+v", decision, store.items)
+	}
+	if got := store.items[0].ComprehensionID; got != "verdict-persist" {
+		t.Fatalf("persisted attention row missing verdict reference %q", got)
+	}
+}
+
+func TestNeedDerivationPublishesOnlyAfterStage3Gate(t *testing.T) {
+	ctx := context.Background()
+	publisher := &memoryNeedPublisher{}
+	msg := Message{TenantID: "t", UserID: "u", MessageID: "m", Status: "received", SenderEmail: "vendor@example.com"}
+
+	decision, err := PublishEmailNeedDerivation(ctx, publisher, Event{Type: EventMessageReceived}, msg, nil, "p1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Reason != ReasonMissingLLMVerdict || len(publisher.events) != 0 {
+		t.Fatalf("message.received published need derivation: decision=%+v events=%+v", decision, publisher.events)
+	}
+
+	decision, err = PublishEmailNeedDerivation(ctx, publisher, Event{Type: EventStage3Completed}, msg, goodComprehension("verdict-event", "p1"), "p1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Eligible || len(publisher.events) != 1 {
+		t.Fatalf("stage3.completed did not publish: decision=%+v events=%+v", decision, publisher.events)
+	}
+	if got := publisher.events[0].ComprehensionID; got != "verdict-event" {
+		t.Fatalf("published event missing verdict reference %q", got)
+	}
+}
+
+func TestDeriverHandleEventLoadsPersistedComprehensionBeforeWritingNeed(t *testing.T) {
+	ctx := context.Background()
+	store := &memoryNeedStore{}
+	msg := Message{TenantID: "t", UserID: "u", MessageID: "m", ThreadID: "th", Status: "received", SenderEmail: "vendor@example.com"}
+	deriver := Deriver{
+		LoadMessage: func(context.Context, Event) (Message, error) {
+			return msg, nil
+		},
+		LoadComprehension: func(context.Context, Event) (*Comprehension, error) {
+			return goodComprehension("verdict-handle", "p1"), nil
+		},
+		Store: store,
+	}
+
+	decision, err := deriver.HandleEvent(ctx, Event{Type: EventMessageReceived, TenantID: "t", UserID: "u", MessageID: "m", Priority: "p1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Reason != ReasonMissingLLMVerdict || len(store.items) != 0 {
+		t.Fatalf("message.received handler wrote need: decision=%+v items=%+v", decision, store.items)
+	}
+
+	decision, err = deriver.HandleEvent(ctx, Event{Type: EventStage3Completed, TenantID: "t", UserID: "u", MessageID: "m", Priority: "p1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Eligible || len(store.items) != 1 {
+		t.Fatalf("stage3 handler did not write need: decision=%+v items=%+v", decision, store.items)
+	}
+	if got := store.items[0].ComprehensionID; got != "verdict-handle" {
+		t.Fatalf("need missing verdict reference %q", got)
+	}
+}
+
+func TestEmailNeedDeriverSubscribesOnlyToStage3Completed(t *testing.T) {
+	events := (Deriver{}).SubscribedEvents()
+	if len(events) != 1 || events[0] != EventStage3Completed {
+		t.Fatalf("email need deriver events=%v, want only %s", events, EventStage3Completed)
+	}
+	for _, event := range events {
+		if event == EventMessageReceived {
+			t.Fatalf("email need deriver must not subscribe to %s", EventMessageReceived)
+		}
+	}
+}
+
+func TestBackfillOnlyQueuesComprehension(t *testing.T) {
+	ctx := context.Background()
+	queue := &memoryComprehensionQueue{}
+	msg := Message{TenantID: "t", MessageID: "backfill", Status: "received", SenderEmail: "news@example.com"}
+
+	if err := IngestBackfillMessage(ctx, queue, msg); err != nil {
+		t.Fatal(err)
+	}
+	if len(queue.messages) != 1 || queue.messages[0].MessageID != "backfill" {
+		t.Fatalf("backfill did not queue comprehension: %+v", queue.messages)
+	}
+}
+
 func goodComprehension(id string, allowed ...string) *Comprehension {
 	return &Comprehension{
 		ID:                     id,
@@ -154,4 +267,40 @@ func goodComprehension(id string, allowed ...string) *Comprehension {
 		ImpactStatement:        "LLM-confirmed impact",
 		ImpactStatementAllowed: true,
 	}
+}
+
+type memoryAttentionStore struct {
+	items []AttentionItem
+}
+
+func (s *memoryAttentionStore) InsertMailAttention(_ context.Context, item AttentionItem) error {
+	s.items = append(s.items, item)
+	return nil
+}
+
+type memoryNeedStore struct {
+	items []NeedItem
+}
+
+func (s *memoryNeedStore) InsertEmailNeed(_ context.Context, item NeedItem) error {
+	s.items = append(s.items, item)
+	return nil
+}
+
+type memoryNeedPublisher struct {
+	events []Event
+}
+
+func (p *memoryNeedPublisher) PublishEmailNeedDerivation(_ context.Context, event Event) error {
+	p.events = append(p.events, event)
+	return nil
+}
+
+type memoryComprehensionQueue struct {
+	messages []Message
+}
+
+func (q *memoryComprehensionQueue) EnqueueComprehension(_ context.Context, msg Message) error {
+	q.messages = append(q.messages, msg)
+	return nil
 }
