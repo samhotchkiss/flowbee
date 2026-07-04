@@ -48,7 +48,7 @@ func listLoadError(err error) error {
 	if strings.Contains(err.Error(), "no such table") {
 		return fmt.Errorf("no initialized flowbee database; start the control plane (`flowbee serve`) first, or point FLOWBEE_CONFIG / database_url at the live DB")
 	}
-	return fmt.Errorf("load jobs: %w", err)
+	return fmt.Errorf("could not load jobs; check that FLOWBEE_CONFIG / database_url points at a readable Flowbee database")
 }
 
 func printList(w io.Writer, jobs []store.BoardJob, now time.Time) error {

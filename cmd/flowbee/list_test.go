@@ -106,3 +106,16 @@ func TestListLoadErrorHidesRawSQLiteNoTable(t *testing.T) {
 		t.Fatalf("database URL details leaked to user: %q", msg)
 	}
 }
+
+func TestListLoadErrorHidesRawBackendError(t *testing.T) {
+	err := listLoadError(errors.New("pq: password authentication failed for postgres://flowbee:secret@example.test/flowbee"))
+	msg := err.Error()
+	if !strings.Contains(msg, "could not load jobs") || !strings.Contains(msg, "FLOWBEE_CONFIG") {
+		t.Fatalf("expected concise load guidance, got %q", msg)
+	}
+	for _, leaked := range []string{"pq:", "password", "secret@example.test"} {
+		if strings.Contains(msg, leaked) {
+			t.Fatalf("raw backend detail %q leaked to user: %q", leaked, msg)
+		}
+	}
+}
