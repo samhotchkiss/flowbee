@@ -35,7 +35,7 @@ func runList(args []string) error {
 
 	jobs, err := listJobs(ctx, st)
 	if err != nil {
-		return listLoadError(cfg.DatabaseURL, err)
+		return listLoadError(err)
 	}
 	return printList(os.Stdout, jobs, time.Now())
 }
@@ -44,10 +44,9 @@ func listJobs(ctx context.Context, st *store.Store) ([]store.BoardJob, error) {
 	return st.BoardSnapshot(ctx)
 }
 
-func listLoadError(dbURL string, err error) error {
+func listLoadError(err error) error {
 	if strings.Contains(err.Error(), "no such table") {
-		return fmt.Errorf("no initialized flowbee database at %q; start the control plane (`flowbee serve`) first, or point FLOWBEE_CONFIG / database_url at the live DB (standard location: ~/.flowbee/flowbee.db)",
-			dbURL)
+		return fmt.Errorf("no initialized flowbee database; start the control plane (`flowbee serve`) first, or point FLOWBEE_CONFIG / database_url at the live DB")
 	}
 	return fmt.Errorf("load jobs: %w", err)
 }

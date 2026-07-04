@@ -93,12 +93,16 @@ func TestListJobsReadsBoardSnapshot(t *testing.T) {
 }
 
 func TestListLoadErrorHidesRawSQLiteNoTable(t *testing.T) {
-	err := listLoadError("/tmp/missing.db", errors.New("no such table: jobs"))
+	secretDBURL := "postgres://flowbee:secret@example.test/flowbee"
+	err := listLoadError(errors.New("no such table: jobs"))
 	msg := err.Error()
 	if !strings.Contains(msg, "no initialized flowbee database") || !strings.Contains(msg, "flowbee serve") {
 		t.Fatalf("expected actionable initialized-DB message, got %q", msg)
 	}
 	if strings.Contains(msg, "no such table") {
 		t.Fatalf("raw SQLite table error leaked to user: %q", msg)
+	}
+	if strings.Contains(msg, secretDBURL) || strings.Contains(msg, "secret@example.test") {
+		t.Fatalf("database URL details leaked to user: %q", msg)
 	}
 }
