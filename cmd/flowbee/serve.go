@@ -449,7 +449,7 @@ func runServe(args []string) error {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					runAdvisorPass(ctx, logger, st, adv)
+					runAdvisorPass(ctx, logger, st, adv, cfg.AutoCancelExhausted)
 				}
 			}
 		}()
@@ -902,10 +902,10 @@ func githubPushURL() string {
 // error is treated as STOP by CLIAdvisor, and the consult is still recorded so the model is
 // not re-hammered at the same signature). Kept small + bounded — the advisor is the rare,
 // expensive tail, not a steady-state cost.
-func runAdvisorPass(ctx context.Context, logger *slog.Logger, st *store.Store, adv advisor.Advisor) {
+func runAdvisorPass(ctx context.Context, logger *slog.Logger, st *store.Store, adv advisor.Advisor, autoCancel bool) {
 	const (
 		minUnblock        = 2 // == JanitorConfig.MaxUnblockAttempts default: only jobs the janitor gave up on
-		advisorCap        = 3 // per-job consult ceiling -> converges to a permanent human park
+		advisorCap        = 3 // per-job consult ceiling -> the ladder's terminal backstop takes over
 		advisorMaxPerPass = 2
 		cooldown          = 10 * time.Minute
 	)
@@ -940,6 +940,17 @@ func runAdvisorPass(ctx context.Context, logger *slog.Logger, st *store.Store, a
 			logger.Info("advisor left job parked", "job", c.JobID, "action", v.Action)
 		}
 		n++
+	}
+	// terminal backstop: a job the advisor has exhausted (consulted its cap of times and
+	// still parked) is auto-cancelled so the board self-clears instead of accumulating. The
+	// ledger trail is the post-mortem; `flowbee requeue` reopens it. Opt-in.
+	if autoCancel {
+		if rep, err := st.AutoCancelExhausted(ctx, advisorCap, time.Now()); err != nil {
+			logger.Error("auto-cancel exhausted", "err", err)
+		} else if len(rep.Cancelled) > 0 {
+			logger.Warn("🗑️  auto-cancelled jobs the autonomous ladder could not land (reversible via requeue)",
+				"jobs", rep.Cancelled)
+		}
 	}
 }
 

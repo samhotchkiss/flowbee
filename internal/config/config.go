@@ -127,6 +127,14 @@ type Config struct {
 	AdvisorEnabled bool   `yaml:"advisor_enabled"`
 	AdvisorCmd     string `yaml:"advisor_cmd"`
 
+	// AutoCancelExhausted is the ladder's terminal backstop: when the advisor has been
+	// consulted its per-job cap of times on a repeated-failure job and it is STILL parked,
+	// auto-cancel it (with the full ledger trail as the post-mortem) so the board self-clears
+	// instead of accumulating forever. Reversible via `flowbee requeue`. OFF by default —
+	// abandoning a task unattended is deliberate; enable via FLOWBEE_AUTO_CANCEL_EXHAUSTED=on
+	// once you trust the ladder. Requires the advisor (nothing exhausts the cap without it).
+	AutoCancelExhausted bool `yaml:"auto_cancel_exhausted"`
+
 	// GithubOwner / GithubRepo are the single-repo coordinates `flowbee init`
 	// prefills from the git remote (F13). They are the config-file form of the
 	// legacy FLOWBEE_GITHUB_OWNER/REPO env path: when Repos is empty, serve uses
@@ -351,6 +359,14 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("FLOWBEE_ADVISOR_CMD"); v != "" {
 		c.AdvisorCmd = v
+	}
+	if v := os.Getenv("FLOWBEE_AUTO_CANCEL_EXHAUSTED"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on", "yes", "enable", "enabled":
+			c.AutoCancelExhausted = true
+		default:
+			c.AutoCancelExhausted = false
+		}
 	}
 	if v := os.Getenv("FLOWBEE_GITHUB_OWNER"); v != "" {
 		c.GithubOwner = v

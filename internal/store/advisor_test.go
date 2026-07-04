@@ -70,6 +70,43 @@ func TestAdvisorFirstResponderForFailures(t *testing.T) {
 	assertFoldMatchesProjection(t, st, "j")
 }
 
+// TestAutoCancelExhausted: the terminal backstop cancels a job the advisor has exhausted
+// (consulted its cap of times, still parked for an advisable reason) so the board
+// self-clears — but never a job still under the cap, nor a non-advisable park.
+func TestAutoCancelExhausted(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+
+	seedNeedsHuman(t, st, "exhausted", string(job.EscalationBounces), now)
+	seedNeedsHuman(t, st, "still-trying", string(job.EscalationBounces), now)
+	seedNeedsHuman(t, st, "semantic", string(job.EscalationProjectOut), now)
+	// advisor_attempts is projection-only bookkeeping; set it directly for the gate test.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=3 WHERE id IN ('exhausted','semantic')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=2 WHERE id='still-trying'`); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := st.AutoCancelExhausted(ctx, 3, now)
+	if err != nil {
+		t.Fatalf("auto-cancel: %v", err)
+	}
+	if len(rep.Cancelled) != 1 || rep.Cancelled[0] != "exhausted" {
+		t.Fatalf("Cancelled=%v, want [exhausted]", rep.Cancelled)
+	}
+	if j, _ := st.GetJob(ctx, "exhausted"); j.State != job.StateCancelled {
+		t.Fatalf("exhausted state=%s, want cancelled (board self-clears)", j.State)
+	}
+	if j, _ := st.GetJob(ctx, "still-trying"); j.State != job.StateNeedsHuman {
+		t.Fatalf("still-trying state=%s, want needs_human (under the cap — keep trying)", j.State)
+	}
+	if j, _ := st.GetJob(ctx, "semantic"); j.State != job.StateNeedsHuman {
+		t.Fatalf("semantic state=%s, want needs_human (project_out needs external action, never auto-cancel)", j.State)
+	}
+}
+
 // TestAdvisorCandidatesGating: only stalls the mechanical janitor gave up on, under the
 // advisor cap, and not already consulted at this signature are eligible.
 func TestAdvisorCandidatesGating(t *testing.T) {

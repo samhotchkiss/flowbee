@@ -328,6 +328,91 @@ func (s *Store) ApplyAdvisorVerdict(ctx context.Context, jobID, action, note, ha
 	return rearmed, err
 }
 
+// AutoCancelReport summarizes one terminal-backstop pass.
+type AutoCancelReport struct {
+	Cancelled []string // job ids the ladder gave up on and auto-cancelled
+}
+
+// AutoCancelExhausted is the ladder's TERMINAL backstop: a job the autonomous ladder tried
+// its hardest on — a repeated-failure reason that the advisor has been consulted on
+// advisorCap times and that is STILL parked in needs_human — is auto-cancelled rather than
+// left to sit forever. This is what lets the board self-clear: the only terminal states
+// become `done` (success) and `cancelled` (the system genuinely could not land it, after
+// diverse guided attempts). The full trail — every escalation event, each advisor note
+// (stuck_hint) — stays in the ledger as the post-mortem; cancellation is reversible via
+// `flowbee requeue`, so a human who disagrees can always re-open. Event-sourced; only fires
+// for advisable reasons (never a project_out/pr_closed/design park, which need real external
+// action, not abandonment). Deterministic id order.
+func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, now time.Time) (AutoCancelReport, error) {
+	var rep AutoCancelReport
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, COALESCE(escalation_reason,'')
+		  FROM jobs
+		 WHERE state='needs_human'
+		   AND COALESCE(advisor_attempts,0) >= ?
+		 ORDER BY id`, advisorCap)
+	if err != nil {
+		return rep, err
+	}
+	var targets []string
+	for rows.Next() {
+		var id, reason string
+		if err := rows.Scan(&id, &reason); err != nil {
+			rows.Close()
+			return rep, err
+		}
+		if advisableReasons[reason] {
+			targets = append(targets, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return rep, err
+	}
+	for _, id := range targets {
+		err := s.tx(ctx, func(tx *sql.Tx) error {
+			cur, seq, err := loadJobTx(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			if cur.State != job.StateNeedsHuman { // race: someone moved it
+				return nil
+			}
+			ev := ledger.Event{
+				JobID: id, JobSeq: seq + 1, Kind: ledger.KindStateChanged,
+				FromState: cur.State, ToState: job.StateCancelled, LeaseEpoch: cur.LeaseEpoch + 1,
+				Actor: "auto-cancel-exhausted", CreatedAt: now,
+			}
+			if err := appendEvent(ctx, tx, ev); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE jobs
+				   SET state = 'cancelled',
+				       lease_epoch = lease_epoch + 1,
+				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
+				       lease_hb_due = NULL, lease_deadline = NULL, updated_at = datetime('now')
+				 WHERE id = ?`, id); err != nil {
+				return fmt.Errorf("auto-cancel: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE leases SET ended_at = datetime('now'), end_reason = 'auto_cancel_exhausted'
+				 WHERE job_id = ? AND ended_at IS NULL`, id); err != nil {
+				return err
+			}
+			if err := setJobSeq(ctx, tx, id, seq+1); err != nil {
+				return err
+			}
+			rep.Cancelled = append(rep.Cancelled, id)
+			return nil
+		})
+		if err != nil {
+			return rep, err
+		}
+	}
+	return rep, nil
+}
+
 // mechanicalUnblockCandidates loads the needs_human jobs whose escalation reason is
 // mechanically recoverable, in deterministic id order.
 func (s *Store) mechanicalUnblockCandidates(ctx context.Context) ([]unblockCandidate, error) {
