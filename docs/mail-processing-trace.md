@@ -1,14 +1,15 @@
 # Per-Message Mail Processing Trace
 
-Review status: implementation contract captured; runtime implementation belongs
-in the Russell mail application that owns `email_message`, `mail_item_score`,
-`email_message_comprehension`, `email_message_comprehension_heavy`,
-`model_invocation`, `model_invocation_payload`, and the superadmin mail UI.
+Review status: implemented as the reusable `internal/mailtrace` runtime package
+plus the authenticated `GET /admin/mail/messages/{messageId}/trace` private API.
+The assembler expects the mail application tables named below and intentionally
+uses only exact `model_invocation.message_id` correlation for prompt payloads.
 
-This repository does not currently contain those tables, write paths, or
-controllers. Do not add heuristic joins or synthetic trace data here. The trace
-feature is specified below so the mail application can implement the exact API
-shape without rediscovering the contract.
+Flowbee's own SQLite store does not own the Russell mail tables, so the package
+keeps the production Postgres DDL as `mailtrace.PostgresMigrationSQL` and tests
+the runtime against fixture tables. Callers that create mail LLM invocations
+should use the same `message_id` + stage write contract, or the helper
+`mailtrace.CreateCorrelatedInvocation`, inside their metadata transaction.
 
 ## Purpose
 

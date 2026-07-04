@@ -415,6 +415,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.Handle("POST /v1/jobs/{job}/cancel", op(s.cancel))
 	mux.Handle("POST /v1/specs", op(s.specCreate))
 	mux.Handle("POST /v1/epics", op(s.epicCreate))
+	mux.Handle("GET /admin/mail/messages/{messageId}/trace", op(s.mailTrace))
 	// the board's machine-readable snapshot (HTML clients hit the web UI's "/"; a
 	// JSON client uses this stable endpoint instead of content-negotiating "/").
 	mux.HandleFunc("GET /v1/board", s.boardJSON)
