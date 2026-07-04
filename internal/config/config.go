@@ -356,7 +356,22 @@ func applyEnv(c *Config) {
 			c.SelfUnblockDisabled = false
 		}
 	}
-	// Rung-E advisor is opt-in: any truthy value enables it.
+	// FLOWBEE_AUTONOMOUS is the master switch for the full self-clearing ladder: it turns ON
+	// the advisor, the terminal auto-cancel backstop, and the merge-fixer in one flag, so the
+	// system drives every issue to completion without a human. Processed BEFORE the individual
+	// flags so any of them can still override (e.g. FLOWBEE_AUTONOMOUS=on FLOWBEE_MERGE_FIXER=off
+	// keeps the merge as a human gate). Needs an agent CLI on the serve box for the advisor.
+	if v := os.Getenv("FLOWBEE_AUTONOMOUS"); v != "" {
+		on := false
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on", "yes", "enable", "enabled":
+			on = true
+		}
+		c.AdvisorEnabled = on
+		c.AutoCancelExhausted = on
+		c.MergeFixer = on
+	}
+	// Rung-E advisor is opt-in: any truthy value enables it (overrides the master switch).
 	if v := os.Getenv("FLOWBEE_ADVISOR"); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "1", "true", "on", "yes", "enable", "enabled":
