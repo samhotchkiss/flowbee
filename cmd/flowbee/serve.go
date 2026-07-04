@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/advisor"
 	"github.com/samhotchkiss/flowbee/internal/alarm"
 	"github.com/samhotchkiss/flowbee/internal/api"
 	"github.com/samhotchkiss/flowbee/internal/auth"
@@ -405,9 +406,55 @@ func runServe(args []string) error {
 					logger.Warn("🩹 forward-progress watchdog acted",
 						"resynced_projection", rep.Resynced, "escalated_to_human", rep.Escalated)
 				}
+				// self-unblock janitor (0025): the sibling that moves MECHANICALLY-recoverable
+				// jobs BACK OUT of the needs_human sink — bounded, cooled-down, breaker-gated —
+				// so a transient stall no longer needs an operator to run `flowbee requeue`. Only
+				// `stall` is auto-recovered today; semantic dead-ends stay parked for a human.
+				// Reversible via FLOWBEE_SELF_UNBLOCK=off (the per-rung kill-switch).
+				if cfg.SelfUnblockDisabled {
+					continue
+				}
+				jrep, err := st.JanitorUnblock(ctx, time.Now(), staleHB, store.JanitorConfig{})
+				if err != nil {
+					logger.Error("self-unblock janitor", "err", err)
+					continue
+				}
+				if jrep.Unblocked > 0 {
+					logger.Warn("🔓 self-unblock janitor re-armed stuck jobs", "unblocked", jrep.Unblocked)
+				}
+				if len(jrep.StoodDown) > 0 {
+					// correlated-failure breaker tripped: a shared root cause is likelier than N
+					// independent stalls. Surface it — this is a fix-once page, not an auto-retry.
+					logger.Warn("🛑 self-unblock janitor stood down (correlated failures — fix the shared cause, then requeue)",
+						"reasons", jrep.StoodDown)
+				}
 			}
 		}
 	}()
+
+	// Rung-E advisor (0024): the LAST resort before a human. Consulted (opt-in) for a job
+	// the deterministic janitor could not rescue — a stall past its mechanical unblock cap.
+	// A read-only, single-shot model call NOMINATES {PLAN,CORRECTION,REPROMPT,STOP}; the
+	// store re-authorizes (PLAN/CORRECTION/REPROMPT re-arm ONCE with the note injected as
+	// fresh-context; STOP or any failure leaves it parked). Runs on its OWN slow ticker in
+	// its OWN goroutine so a multi-second model call never stalls the fast forward-progress
+	// watchdog. Enable with FLOWBEE_ADVISOR=on (+ FLOWBEE_ADVISOR_CMD for the codex form).
+	if cfg.AdvisorEnabled {
+		adv := advisor.NewCLIAdvisor(cfg.AdvisorCmd, 0)
+		go func() {
+			t := time.NewTicker(2 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					runAdvisorPass(ctx, logger, st, adv)
+				}
+			}
+		}()
+		logger.Info("🧭 Rung-E stuck-job advisor enabled", "cmd_is_default", cfg.AdvisorCmd == "")
+	}
 
 	// epic fan-out drain (§F4): once an epic's barrier review passes, its child issues
 	// are released from backlog into their own spec flows. Review and fan-out are kept
@@ -852,6 +899,52 @@ func githubPushURL() string {
 // review + CI at the integrated head and the rebased commit is force-pushed to the
 // issue branch so the PR + CI track it; a real conflict diverts the job to a
 // conflict_resolver. Best-effort: a single job's failure never blocks the others.
+// runAdvisorPass consults the Rung-E advisor for up to advisorMaxPerPass jobs the
+// deterministic janitor could not rescue, and applies each verdict (fail-safe: an advisor
+// error is treated as STOP by CLIAdvisor, and the consult is still recorded so the model is
+// not re-hammered at the same signature). Kept small + bounded — the advisor is the rare,
+// expensive tail, not a steady-state cost.
+func runAdvisorPass(ctx context.Context, logger *slog.Logger, st *store.Store, adv advisor.Advisor) {
+	const (
+		minUnblock        = 2 // == JanitorConfig.MaxUnblockAttempts default: only jobs the janitor gave up on
+		advisorCap        = 3 // per-job consult ceiling -> converges to a permanent human park
+		advisorMaxPerPass = 2
+		cooldown          = 10 * time.Minute
+	)
+	cands, err := st.AdvisorCandidates(ctx, minUnblock, advisorCap)
+	if err != nil {
+		logger.Error("advisor candidates", "err", err)
+		return
+	}
+	n := 0
+	for _, c := range cands {
+		if n >= advisorMaxPerPass {
+			break
+		}
+		v, cerr := adv.Consult(ctx, advisor.StuckJob{
+			JobID: c.JobID, Reason: c.Reason, Kind: c.Kind, HeadSHA: c.HeadSHA,
+			Task: c.TaskText, Acceptance: c.Acceptance,
+			LastReviewNotes: c.LastReviewNotes, LastCIFailures: c.LastCIFailures,
+			Attempts: c.Attempts, MaxAttempts: c.MaxAttempts, UnblockAttempts: c.UnblockAttempts,
+		})
+		if cerr != nil {
+			// fail-safe: v.Action is STOP here; record it so we don't re-consult, then log.
+			logger.Warn("advisor unavailable — leaving job parked", "job", c.JobID, "err", cerr)
+		}
+		rearmed, aerr := st.ApplyAdvisorVerdict(ctx, c.JobID, string(v.Action), v.Note, c.TriggerHash, time.Now(), cooldown)
+		if aerr != nil {
+			logger.Error("apply advisor verdict", "job", c.JobID, "err", aerr)
+			continue
+		}
+		if rearmed {
+			logger.Warn("🧭 advisor re-armed a stuck job", "job", c.JobID, "action", v.Action, "note", v.Note)
+		} else {
+			logger.Info("advisor left job parked", "job", c.JobID, "action", v.Action)
+		}
+		n++
+	}
+}
+
 func rebaseStaleReviews(ctx context.Context, logger *slog.Logger, st *store.Store, repoID, mirrorPath, pushURL, branch string) {
 	mirror := gitops.Open(mirrorPath)
 	// the local mirror lags after a sibling's API merge, so fetch main FIRST — else the

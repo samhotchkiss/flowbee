@@ -151,6 +151,9 @@ type LeaseContext struct {
 	// e.g. "Architecture and guardrail lints\ngolangci-lint"), carried to a rebuild so the
 	// brief tells the agent the exact gate to re-run + fix rather than rebuilding blind.
 	CIFailures string `json:"ci_failures,omitempty"`
+	// StuckHint is the Rung-E advisor's note (0024) carried into a build re-armed out of
+	// needs_human by the advisor — "what was tried / try this" for fresh-context re-entry.
+	StuckHint string `json:"stuck_hint,omitempty"`
 	// Diff is the eng_worker's build patch, shipped to a code_reviewer so its agent
 	// can judge the actual change (the review harness writes it to .flowbee/diff.patch
 	// + $FLOWBEE_DIFF). Empty for non-review roles.
