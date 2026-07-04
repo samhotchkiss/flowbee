@@ -43,6 +43,14 @@
 
 {{define "board-card"}}
 <article class="card t-{{.TimerClass}}{{if eq .TimerClass ""}}gray{{end}}" data-job="{{.JobID}}" style="--proj:{{.ProjectColor}}">
+  {{if .ShowTrace}}
+  <div class="card-menu" data-card-menu>
+    <button class="card-menu-button" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="card actions">⋮</button>
+    <div class="card-menu-list" role="menu">
+      <button class="card-menu-item" type="button" role="menuitem" data-trace-job="{{.JobID}}">View trace</button>
+    </div>
+  </div>
+  {{end}}
   <div class="ttl">
     <span class="flag" title="{{if .Repo}}{{.Repo}}{{else}}flowbee{{end}}">{{.ProjectEmoji}}</span>
     <span>{{.Title}}</span>

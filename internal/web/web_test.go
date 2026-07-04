@@ -44,6 +44,17 @@ func getBody(t *testing.T, h http.Handler, path string) (int, string) {
 	return rec.Code, rec.Body.String()
 }
 
+func getBodyAs(t *testing.T, h http.Handler, path, role string) (int, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if role != "" {
+		req.Header.Set("X-Flowbee-Role", role)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec.Code, rec.Body.String()
+}
+
 // TestF12DashboardsRenderOffRealStore is the F12 acceptance test (build-list §G):
 // /board, /fleet, /dashboard render off REAL store data (a temp-file SQLite DB),
 // the board surfaces the Backlog + ⚠ Needs-you lanes + the yellow flowbee marker +
@@ -274,7 +285,7 @@ func TestBoardRepoFilter(t *testing.T) {
 	}
 }
 
-func TestBoardDoesNotExposeRejectedTraceSurface(t *testing.T) {
+func TestBoardTraceMenuIsSuperadminOnly(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
 	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
@@ -286,25 +297,85 @@ func TestBoardDoesNotExposeRejectedTraceSurface(t *testing.T) {
 	}
 	h := mountUI(t, st, fixedClock{t: now})
 
-	req := httptest.NewRequest(http.MethodGet, "/board", nil)
-	req.Header.Set("X-Flowbee-Role", "superadmin")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("superadmin-looking /board status = %d", rec.Code)
+	code, body := getBodyAs(t, h, "/board", "superadmin")
+	if code != http.StatusOK {
+		t.Fatalf("superadmin /board status = %d", code)
 	}
-	body := rec.Body.String()
-	if strings.Contains(body, "View trace") || strings.Contains(body, "data-trace-job") || strings.Contains(body, "card-menu") {
-		t.Fatalf("board must not expose the rejected job-card trace surface:\n%s", body)
+	for _, want := range []string{
+		"class=\"card-menu\"",
+		"aria-label=\"card actions\"",
+		"data-trace-job=\"trace-1\"",
+		"View trace",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("superadmin board missing %q\n---\n%s", want, body)
+		}
 	}
 
-	code, body := getBody(t, h, "/board/trace?job=trace-1")
+	code, body = getBody(t, h, "/board")
 	if code != http.StatusOK {
-		t.Fatalf("/board/trace status = %d, body:\n%s", code, body)
+		t.Fatalf("non-superadmin /board status = %d", code)
 	}
-	if strings.Contains(body, "View trace") || strings.Contains(body, "data-trace-job") ||
-		strings.Contains(body, "Stages") || strings.Contains(body, "Build history") {
-		t.Fatalf("/board/trace must not serve the rejected trace drawer surface:\n%s", body)
+	for _, forbidden := range []string{"View trace", "data-trace-job", "card-menu", "card actions"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("non-superadmin board must hide trace affordance %q\n---\n%s", forbidden, body)
+		}
+	}
+}
+
+func TestBoardTraceEndpointRequiresSuperadminAndReusesDrawer(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "trace-1", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, TaskText: "Trace this card", Now: now,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.ClaimReadyJob(ctx, store.ClaimParams{
+		JobID: "trace-1", LeaseID: "trace-lease", Identity: "box-a", ModelFamily: "claude",
+		Role: job.RoleEngWorker, Attested: []string{"role:eng_worker", "model_family:claude"},
+		TTL: time.Hour, Now: now,
+	}); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	h := mountUI(t, st, fixedClock{t: now})
+
+	code, body := getBody(t, h, "/board/trace?job=trace-1")
+	if code != http.StatusForbidden {
+		t.Fatalf("non-superadmin /board/trace status = %d, body:\n%s", code, body)
+	}
+	if strings.Contains(body, "Stages") || strings.Contains(body, "Build history") || strings.Contains(body, "Lease claimed") {
+		t.Fatalf("forbidden trace response must not disclose drawer contents:\n%s", body)
+	}
+
+	code, body = getBodyAs(t, h, "/board/trace?job=trace-1", "superadmin")
+	if code != http.StatusOK {
+		t.Fatalf("superadmin /board/trace status = %d, body:\n%s", code, body)
+	}
+	for _, want := range []string{
+		"Trace this card",
+		"trace-1",
+		"Stages",
+		"ENTERED",
+		"LEFT",
+		"Build history",
+		"Lease claimed",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("superadmin trace drawer missing %q\n---\n%s", want, body)
+		}
+	}
+
+	code, js := getBody(t, h, "/assets/board.js")
+	if code != http.StatusOK {
+		t.Fatalf("/assets/board.js status = %d", code)
+	}
+	for _, want := range []string{"data-trace-job", "/board/trace", "openTraceDrawer"} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("board.js missing trace menu wiring %q\n---\n%s", want, js)
+		}
 	}
 }
 
