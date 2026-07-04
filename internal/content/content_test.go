@@ -403,3 +403,62 @@ func TestSecretScanNoFalsePositiveOnOrdinaryStrings(t *testing.T) {
 		}
 	}
 }
+
+// TestSecretScanNoFalsePositiveOnStructLiteralTokenFields is the regression for a confirmed
+// live false positive: russ PRs #3648 and #3793 were both blocked from self-merge because an
+// ordinary Go struct-literal field initializer whose field name happens to contain "Token"
+// (extremely common in this codebase — config structs are full of *MaxTokens fields) scored
+// >=3.5 bits/char entropy on its RHS identifier, indistinguishable by entropy alone from a
+// real random secret (camelCase Go identifiers routinely land ~3.9-4.1 bits/char, overlapping
+// real secrets' range). Go cannot express a string literal without quotes, so an UNQUOTED
+// colon-separated RHS is syntactically guaranteed to be a reference/identifier, never
+// credential material — that syntactic fact, not entropy, is what must gate this.
+func TestSecretScanNoFalsePositiveOnStructLiteralTokenFields(t *testing.T) {
+	for _, line := range []string{
+		"OpenRouterChatMaxTokens:                   openRouterChatMaxTokens,",
+		"OpenRouterMaxCumulativePromptTokens:       openRouterMaxCumulativePromptTokens,",
+		"EllieExtractionMaxSingleMsgTokens:         ellieExtractionMaxSingleMsgTokens,",
+	} {
+		d := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1 +1,2 @@\n package config\n+\t\t" + line + "\n"
+		r := Check(Patch{Diff: d, Declared: BlastRadius{Paths: []string{"config.go"}}}, Limits{})
+		if !r.StaticChecksPass {
+			t.Errorf("struct-literal field %q must NOT trip the secret-scan; failures=%v", line, r.StaticFailures)
+		}
+	}
+
+	// the exemption must NOT swallow a real secret assigned via `:` with quotes (Go CAN
+	// express a string literal WITH quotes — that's exactly where a real secret would live).
+	quoted := `Token:                              "AKIAIOSFODNN7EXAMPLE",`
+	d := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1 +1,2 @@\n package config\n+\t\t" + quoted + "\n"
+	if r := Check(Patch{Diff: d, Declared: BlastRadius{Paths: []string{"config.go"}}}, Limits{}); r.StaticChecksPass {
+		t.Errorf("a QUOTED secret literal after `:` must still trip the secret-scan: %+v", r)
+	}
+
+	// nor a flat-case (non-camelCase) unquoted colon value — a hex/snake_case secret pasted
+	// in unquoted must still be caught; only the camelCase-identifier shape is exempted.
+	flat := "token:                              deadbeefcafefeedfacefeeddeadbeef,"
+	d2 := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1 +1,2 @@\n package config\n+\t\t" + flat + "\n"
+	if r := Check(Patch{Diff: d2, Declared: BlastRadius{Paths: []string{"config.go"}}}, Limits{}); r.StaticChecksPass {
+		t.Errorf("a flat-case unquoted colon value must still trip the secret-scan: %+v", r)
+	}
+}
+
+// TestDenylistExemptsEnvExampleTemplate is the regression for the OTHER half of the same live
+// incident: .env.example is the conventional SAFE, git-committed placeholder counterpart to the
+// real (gitignored) .env, and was blanket-denylisted identically to it — routing every PR that
+// merely documents a new env var (both blocked PRs only ADDED empty/boolean config keys) to a
+// human merge gate on filename alone. Recognized template suffixes are exempted; anything else
+// prefixed .env. (.env.local, .env.production — likely to hold real per-environment secrets)
+// stays denylisted, as does .env itself.
+func TestDenylistExemptsEnvExampleTemplate(t *testing.T) {
+	for _, p := range []string{".env.example", ".env.sample", ".env.template", ".env.dist", "backend/.env.example"} {
+		if IsDenylisted(p) {
+			t.Errorf("IsDenylisted(%q) = true, want false (safe template file)", p)
+		}
+	}
+	for _, p := range []string{".env", ".env.local", ".env.production", ".env.development"} {
+		if !IsDenylisted(p) {
+			t.Errorf("IsDenylisted(%q) = false, want true (real env file, still denylisted)", p)
+		}
+	}
+}

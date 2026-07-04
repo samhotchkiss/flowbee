@@ -247,8 +247,25 @@ var denyMatchers = []struct {
 	// secrets / credential material / signing keys — exfiltration or substitution.
 	{"secret_material", func(p string) bool {
 		base := baseName(p)
-		if base == ".env" || strings.HasPrefix(base, ".env.") || strings.HasSuffix(base, ".env") {
+		if base == ".env" || strings.HasSuffix(base, ".env") {
 			return true
+		}
+		if strings.HasPrefix(base, ".env.") {
+			// .env.example / .env.sample / .env.template / .env.dist are the conventional
+			// SAFE, git-committed placeholder counterpart to the real (gitignored) .env —
+			// no real secrets by convention; that's the whole point of the naming pattern.
+			// Blanket-denylisting them defeats it: confirmed live, two PRs (russ #3648,
+			// #3793) that only ADDED new empty/boolean config keys to .env.example got
+			// routed to a human merge gate purely because of the filename. Exempt the
+			// recognized template suffixes; anything else prefixed .env. (.env.local,
+			// .env.production, ...) often DOES hold real per-environment secrets and stays
+			// denylisted.
+			switch strings.TrimPrefix(base, ".env.") {
+			case "example", "sample", "template", "dist":
+				// not denylisted — fall through to the checks below.
+			default:
+				return true
+			}
 		}
 		switch {
 		case strings.HasSuffix(base, ".pem"), strings.HasSuffix(base, ".key"),
@@ -550,14 +567,53 @@ func scanSecret(line string) string {
 	return ""
 }
 
-var assignRe = regexp.MustCompile(`(?i)(secret|token|key|password|passwd|credential)\w*\s*[=:]\s*["']?([A-Za-z0-9/+_\-]{20,})`)
+var assignRe = regexp.MustCompile(`(?i)(secret|token|key|password|passwd|credential)\w*\s*([=:])\s*(["']?)([A-Za-z0-9/+_\-]{20,})`)
+
+// camelOrPascalIdent matches a bare identifier shape with at least one internal
+// case transition (camelCase/PascalCase) and none of the symbols (/+_-) real
+// secrets commonly carry — i.e. it looks like a language identifier, not credential
+// material.
+var camelOrPascalIdent = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]*$`)
 
 func looksLikeAssignedSecret(line string) bool {
 	m := assignRe.FindStringSubmatch(line)
 	if m == nil {
 		return false
 	}
-	return shannonEntropy(m[2]) >= 3.5
+	sep, quote, val := m[2], m[3], m[4]
+	// A COLON-separated, UNQUOTED match assigned to a value that reads as a bare
+	// camelCase/PascalCase identifier is a Go (or YAML/JSON) struct-literal field
+	// initializer referencing another symbol (`OpenRouterChatMaxTokens:
+	// openRouterChatMaxTokens,`) — never a literal secret. Go in particular cannot
+	// express a string literal without quotes, so an unquoted colon-RHS is
+	// syntactically guaranteed to be a reference/identifier/const, not credential
+	// material. Confirmed false-positive live: two PRs (russ #3648, #3793) blocked
+	// from self-merge because ordinary "...Tokens: someVarName," struct fields
+	// scored >=3.5 bits/char (camelCase identifiers routinely land ~3.9-4.1, same
+	// range as real random secrets — entropy alone can't discriminate them; the
+	// syntactic quote/separator distinction can). Still catches a flat-case token
+	// (hex/base64/snake_case) even when unquoted+colon-separated, and anything
+	// carrying `/`, `+`, `_`, or `-` (real secrets commonly do; identifiers in this
+	// exempted shape by definition don't).
+	if sep == ":" && quote == "" && camelOrPascalIdent.MatchString(val) && hasCaseTransition(val) {
+		return false
+	}
+	return shannonEntropy(val) >= 3.5
+}
+
+// hasCaseTransition reports whether s contains an internal lower->upper or
+// upper->lower transition (the camelCase/PascalCase signature). A flat-case run
+// (all lower, e.g. a hex secret, or all upper) returns false.
+func hasCaseTransition(s string) bool {
+	for i := 1; i < len(s); i++ {
+		a, b := s[i-1], s[i]
+		aLower, bLower := a >= 'a' && a <= 'z', b >= 'a' && b <= 'z'
+		aUpper, bUpper := a >= 'A' && a <= 'Z', b >= 'A' && b <= 'Z'
+		if (aLower && bUpper) || (aUpper && bLower) {
+			return true
+		}
+	}
+	return false
 }
 
 // shannonEntropy returns the Shannon entropy (bits/char) of s.
