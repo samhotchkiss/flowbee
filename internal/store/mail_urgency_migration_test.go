@@ -36,6 +36,12 @@ func TestMailUrgencyCleanupRunsThroughMigrationFramework(t *testing.T) {
 	insertMailUrgencyMigrationAttention(t, db, "a-bulk", "bulk", "p1", "bad", "", "regex")
 	insertMailUrgencyMigrationAttention(t, db, "a-missing", "missing", "p1", "bad", "", "regex")
 	insertMailUrgencyMigrationAttention(t, db, "a-valid", "valid", "p1", "real", "c-valid", "llm")
+	insertMailUrgencyMigrationNeed(t, db, "n-sent", "sent", "p0", "bad", "", "message.received")
+	insertMailUrgencyMigrationNeed(t, db, "n-draft", "draft", "p1", "bad", "", "message.received")
+	insertMailUrgencyMigrationNeed(t, db, "n-first", "first", "p1", "bad", "", "legacy_regex")
+	insertMailUrgencyMigrationNeed(t, db, "n-bulk", "bulk", "p1", "bad", "", "message.received")
+	insertMailUrgencyMigrationNeed(t, db, "n-missing", "missing", "p1", "bad", "", "regex")
+	insertMailUrgencyMigrationNeed(t, db, "n-valid", "valid", "p1", "real", "c-valid", "stage3.completed")
 
 	if err := MigrateUp(ctx, db); err != nil {
 		t.Fatal(err)
@@ -59,6 +65,24 @@ func TestMailUrgencyCleanupRunsThroughMigrationFramework(t *testing.T) {
 			t.Fatalf("%s not neutralized: priority=%v impact=%v visible=%d reason=%q", id, priority, impact, visible, reason)
 		}
 	}
+	wantNeedReasons := map[string]string{
+		"n-sent":    "sent_or_draft",
+		"n-draft":   "sent_or_draft",
+		"n-first":   "first_party_sender",
+		"n-bulk":    "bulk_without_personal_ask",
+		"n-missing": "missing_llm_verdict",
+	}
+	for id, want := range wantNeedReasons {
+		var priority, impact sql.NullString
+		var visible int
+		var reason string
+		if err := db.QueryRowContext(ctx, `SELECT priority, impact_statement, user_visible, invalidated_reason FROM mail_need_items WHERE id = ?`, id).Scan(&priority, &impact, &visible, &reason); err != nil {
+			t.Fatal(err)
+		}
+		if priority.Valid || impact.Valid || visible != 0 || reason != want {
+			t.Fatalf("%s not neutralized: priority=%v impact=%v visible=%d reason=%q", id, priority, impact, visible, reason)
+		}
+	}
 
 	var visible int
 	var reason sql.NullString
@@ -67,6 +91,12 @@ func TestMailUrgencyCleanupRunsThroughMigrationFramework(t *testing.T) {
 	}
 	if visible != 1 || reason.Valid {
 		t.Fatalf("valid LLM-confirmed row changed: visible=%d reason=%v", visible, reason)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT user_visible, invalidated_reason FROM mail_need_items WHERE id = 'n-valid'`).Scan(&visible, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if visible != 1 || reason.Valid {
+		t.Fatalf("valid LLM-confirmed need changed: visible=%d reason=%v", visible, reason)
 	}
 
 	if err := MigrateUp(ctx, db); err != nil {
@@ -136,6 +166,18 @@ func createMailUrgencyMigrationSchema(t *testing.T, db *sql.DB) {
 		tenant_id TEXT NOT NULL,
 		domain TEXT NOT NULL
 	)`)
+	execMailUrgencyMigrationSQL(t, db, `CREATE TABLE mail_need_items (
+		id TEXT PRIMARY KEY,
+		tenant_id TEXT NOT NULL,
+		message_id TEXT NOT NULL,
+		source TEXT NOT NULL,
+		priority TEXT NULL,
+		impact_statement TEXT NULL,
+		llm_verdict_id TEXT NULL,
+		derivation_source TEXT NULL,
+		user_visible INTEGER NOT NULL DEFAULT 1,
+		invalidated_reason TEXT NULL
+	)`)
 }
 
 func insertMailUrgencyMigrationMessage(t *testing.T, db *sql.DB, id, status, senderEmail, senderDomain, headers string) {
@@ -147,6 +189,12 @@ func insertMailUrgencyMigrationMessage(t *testing.T, db *sql.DB, id, status, sen
 func insertMailUrgencyMigrationAttention(t *testing.T, db *sql.DB, id, messageID, priority, impact, verdictID, source string) {
 	t.Helper()
 	execMailUrgencyMigrationSQL(t, db, `INSERT INTO mail_attention_items (id, tenant_id, message_id, source, priority, impact_statement, llm_verdict_id, classification_source, user_visible) VALUES (?, 't', ?, 'mail', ?, ?, ?, ?, 1)`,
+		id, messageID, priority, impact, verdictID, source)
+}
+
+func insertMailUrgencyMigrationNeed(t *testing.T, db *sql.DB, id, messageID, priority, impact, verdictID, source string) {
+	t.Helper()
+	execMailUrgencyMigrationSQL(t, db, `INSERT INTO mail_need_items (id, tenant_id, message_id, source, priority, impact_statement, llm_verdict_id, derivation_source, user_visible) VALUES (?, 't', ?, 'email', ?, ?, ?, ?, 1)`,
 		id, messageID, priority, impact, verdictID, source)
 }
 

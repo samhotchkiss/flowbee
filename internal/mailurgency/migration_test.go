@@ -35,13 +35,19 @@ func TestCleanupLegacyUrgencyNeutralizesInvalidRowsAndIsIdempotent(t *testing.T)
 	insertAttention(t, db, "a-bulk", "bulk", "p1", "bad", "", "regex")
 	insertAttention(t, db, "a-missing", "missing", "p1", "bad", "", "regex")
 	insertAttention(t, db, "a-valid", "valid", "p1", "real", "c-valid", "llm")
+	insertNeed(t, db, "n-sent", "sent", "p0", "bad", "", "message.received")
+	insertNeed(t, db, "n-draft", "draft", "p1", "bad", "", "message.received")
+	insertNeed(t, db, "n-first", "first", "p1", "bad", "", "legacy_regex")
+	insertNeed(t, db, "n-bulk", "bulk", "p1", "bad", "", "message.received")
+	insertNeed(t, db, "n-missing", "missing", "p1", "bad", "", "regex")
+	insertNeed(t, db, "n-valid", "valid", "p1", "real", "c-valid", "stage3.completed")
 
 	n, err := CleanupLegacyUrgency(ctx, db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 5 {
-		t.Fatalf("neutralized rows=%d want 5", n)
+	if n != 10 {
+		t.Fatalf("neutralized rows=%d want 10", n)
 	}
 
 	wantReasons := map[string]string{
@@ -62,6 +68,24 @@ func TestCleanupLegacyUrgencyNeutralizesInvalidRowsAndIsIdempotent(t *testing.T)
 			t.Fatalf("%s not neutralized correctly: priority=%v impact=%v visible=%d reason=%q", id, priority, impact, visible, reason)
 		}
 	}
+	wantNeedReasons := map[string]string{
+		"n-sent":    ReasonSentOrDraft,
+		"n-draft":   ReasonSentOrDraft,
+		"n-first":   ReasonFirstPartySender,
+		"n-bulk":    ReasonBulkWithoutPersonalAsk,
+		"n-missing": ReasonMissingLLMVerdict,
+	}
+	for id, want := range wantNeedReasons {
+		var priority, impact sql.NullString
+		var visible int
+		var reason string
+		if err := db.QueryRowContext(ctx, `SELECT priority, impact_statement, user_visible, invalidated_reason FROM mail_need_items WHERE id = ?`, id).Scan(&priority, &impact, &visible, &reason); err != nil {
+			t.Fatal(err)
+		}
+		if priority.Valid || impact.Valid || visible != 0 || reason != want {
+			t.Fatalf("%s not neutralized correctly: priority=%v impact=%v visible=%d reason=%q", id, priority, impact, visible, reason)
+		}
+	}
 
 	var visible int
 	var reason sql.NullString
@@ -70,6 +94,12 @@ func TestCleanupLegacyUrgencyNeutralizesInvalidRowsAndIsIdempotent(t *testing.T)
 	}
 	if visible != 1 || reason.Valid {
 		t.Fatalf("valid LLM-confirmed row was changed: visible=%d reason=%v", visible, reason)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT user_visible, invalidated_reason FROM mail_need_items WHERE id = 'n-valid'`).Scan(&visible, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if visible != 1 || reason.Valid {
+		t.Fatalf("valid LLM-confirmed need was changed: visible=%d reason=%v", visible, reason)
 	}
 
 	n, err = CleanupLegacyUrgency(ctx, db)
@@ -116,6 +146,18 @@ func createMailCleanupSchema(t *testing.T, db *sql.DB) {
 		tenant_id TEXT NOT NULL,
 		domain TEXT NOT NULL
 	)`)
+	exec(t, db, `CREATE TABLE mail_need_items (
+		id TEXT PRIMARY KEY,
+		tenant_id TEXT NOT NULL,
+		message_id TEXT NOT NULL,
+		source TEXT NOT NULL,
+		priority TEXT NULL,
+		impact_statement TEXT NULL,
+		llm_verdict_id TEXT NULL,
+		derivation_source TEXT NULL,
+		user_visible INTEGER NOT NULL DEFAULT 1,
+		invalidated_reason TEXT NULL
+	)`)
 }
 
 func insertMessage(t *testing.T, db *sql.DB, id, status, senderEmail, senderDomain, headers string) {
@@ -127,6 +169,12 @@ func insertMessage(t *testing.T, db *sql.DB, id, status, senderEmail, senderDoma
 func insertAttention(t *testing.T, db *sql.DB, id, messageID, priority, impact, verdictID, source string) {
 	t.Helper()
 	exec(t, db, `INSERT INTO mail_attention_items (id, tenant_id, message_id, source, priority, impact_statement, llm_verdict_id, classification_source, user_visible) VALUES (?, 't', ?, 'mail', ?, ?, ?, ?, 1)`,
+		id, messageID, priority, impact, verdictID, source)
+}
+
+func insertNeed(t *testing.T, db *sql.DB, id, messageID, priority, impact, verdictID, source string) {
+	t.Helper()
+	exec(t, db, `INSERT INTO mail_need_items (id, tenant_id, message_id, source, priority, impact_statement, llm_verdict_id, derivation_source, user_visible) VALUES (?, 't', ?, 'email', ?, ?, ?, ?, 1)`,
 		id, messageID, priority, impact, verdictID, source)
 }
 
