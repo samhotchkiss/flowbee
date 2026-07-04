@@ -971,7 +971,7 @@ func runAdvisorPass(ctx context.Context, logger *slog.Logger, st *store.Store, a
 	// still parked) is auto-cancelled so the board self-clears instead of accumulating. The
 	// ledger trail is the post-mortem; `flowbee requeue` reopens it. Opt-in.
 	if autoCancel {
-		if rep, err := st.AutoCancelExhausted(ctx, advisorCap, time.Now()); err != nil {
+		if rep, err := st.AutoCancelExhausted(ctx, advisorCap, 24*time.Hour, time.Now()); err != nil {
 			logger.Error("auto-cancel exhausted", "err", err)
 		} else if len(rep.Cancelled) > 0 {
 			logger.Warn("🗑️  auto-cancelled jobs the autonomous ladder could not land (reversible via requeue)",

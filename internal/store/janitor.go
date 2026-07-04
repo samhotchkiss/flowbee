@@ -425,34 +425,51 @@ type AutoCancelReport struct {
 }
 
 // AutoCancelExhausted is the ladder's TERMINAL backstop: a job the autonomous ladder tried
-// its hardest on — a repeated-failure reason that the advisor has been consulted on
-// advisorCap times and that is STILL parked in needs_human — is auto-cancelled rather than
-// left to sit forever. This is what lets the board self-clear: the only terminal states
-// become `done` (success) and `cancelled` (the system genuinely could not land it, after
-// diverse guided attempts). The full trail — every escalation event, each advisor note
-// (stuck_hint) — stays in the ledger as the post-mortem; cancellation is reversible via
-// `flowbee requeue`, so a human who disagrees can always re-open. Event-sourced; only fires
-// for advisable reasons (never a project_out/pr_closed/design park, which need real external
-// action, not abandonment). Deterministic id order.
-func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, now time.Time) (AutoCancelReport, error) {
+// its hardest on is auto-cancelled rather than left to sit forever. This is what lets the
+// board self-clear: the only terminal states become `done` (success) and `cancelled` (the
+// system genuinely could not land it, after diverse guided attempts). Two triggers, either
+// sufficient (both scoped to advisable reasons — never a project_out/pr_closed/design park,
+// which need real external action, not abandonment):
+//
+//	(1) advisor_attempts >= advisorCap — the advisor was consulted its cap of times.
+//	(2) parked (updated_at) longer than maxParkedAge — the TIME backstop. This closes the
+//	    hole where the advisor's SHA-anchored dedup blocks a re-consult (the re-armed build
+//	    produced no new head) so advisor_attempts stalls below the cap: without a time bound
+//	    such a job would park forever. updated_at is touched on every re-arm, so only a
+//	    genuinely-idle park ages into this. maxParkedAge <= 0 disables the time trigger.
+//
+// The full trail — every escalation event, each advisor note (stuck_hint) — stays in the
+// ledger as the post-mortem; cancellation is reversible via `flowbee requeue`. Event-sourced,
+// deterministic id order.
+func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, maxParkedAge time.Duration, now time.Time) (AutoCancelReport, error) {
 	var rep AutoCancelReport
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, COALESCE(escalation_reason,'')
+		SELECT id, COALESCE(escalation_reason,''), COALESCE(advisor_attempts,0), updated_at
 		  FROM jobs
 		 WHERE state='needs_human'
-		   AND COALESCE(advisor_attempts,0) >= ?
-		 ORDER BY id`, advisorCap)
+		 ORDER BY id`)
 	if err != nil {
 		return rep, err
 	}
 	var targets []string
 	for rows.Next() {
-		var id, reason string
-		if err := rows.Scan(&id, &reason); err != nil {
+		var id, reason, updated string
+		var tries int
+		if err := rows.Scan(&id, &reason, &tries, &updated); err != nil {
 			rows.Close()
 			return rep, err
 		}
-		if advisableReasons[reason] {
+		if !advisableReasons[reason] {
+			continue
+		}
+		exhausted := tries >= advisorCap
+		aged := false
+		if maxParkedAge > 0 {
+			if ts, perr := time.Parse(rfc3339, updated); perr == nil && now.Sub(ts) > maxParkedAge {
+				aged = true
+			}
+		}
+		if exhausted || aged {
 			targets = append(targets, id)
 		}
 	}

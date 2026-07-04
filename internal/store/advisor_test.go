@@ -148,7 +148,8 @@ func TestAutoCancelExhausted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep, err := st.AutoCancelExhausted(ctx, 3, now)
+	// maxParkedAge=0 disables the time trigger, isolating the advisor-cap trigger.
+	rep, err := st.AutoCancelExhausted(ctx, 3, 0, now)
 	if err != nil {
 		t.Fatalf("auto-cancel: %v", err)
 	}
@@ -163,6 +164,36 @@ func TestAutoCancelExhausted(t *testing.T) {
 	}
 	if j, _ := st.GetJob(ctx, "semantic"); j.State != job.StateNeedsHuman {
 		t.Fatalf("semantic state=%s, want needs_human (project_out needs external action, never auto-cancel)", j.State)
+	}
+}
+
+// TestAutoCancelTimeBackstop: a job stuck BELOW the advisor cap (e.g. the advisor deduped
+// out because the re-armed build produced no new head) must still clear via the time
+// backstop — nothing parks forever. A recently-touched park is NOT cancelled.
+func TestAutoCancelTimeBackstop(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(2_000_000_000, 0)
+
+	seedNeedsHuman(t, st, "aged", string(job.EscalationBounces), now)
+	seedNeedsHuman(t, st, "fresh", string(job.EscalationBounces), now)
+	// both under the advisor cap; only "aged" is past maxParkedAge.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=1, updated_at='2020-01-01T00:00:00Z' WHERE id='aged'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=1, updated_at=? WHERE id='fresh'`, now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := st.AutoCancelExhausted(ctx, 3, 24*time.Hour, now)
+	if err != nil {
+		t.Fatalf("auto-cancel: %v", err)
+	}
+	if len(rep.Cancelled) != 1 || rep.Cancelled[0] != "aged" {
+		t.Fatalf("Cancelled=%v, want [aged] (time backstop)", rep.Cancelled)
+	}
+	if j, _ := st.GetJob(ctx, "fresh"); j.State != job.StateNeedsHuman {
+		t.Fatalf("fresh state=%s, want needs_human (recently active — keep trying)", j.State)
 	}
 }
 
