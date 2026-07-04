@@ -143,6 +143,12 @@ type Config struct {
 	// merge path); enable via FLOWBEE_MERGE_FIXER=on. flowbee-source PRs stay a human gate.
 	MergeFixer bool `yaml:"merge_fixer"`
 
+	// AutonomousShadow logs what the self-clearing ladder WOULD do — which stuck jobs the
+	// janitor would requeue and the advisor would engage — WITHOUT mutating anything or making
+	// model calls. The safe on-ramp: turn it on, watch it engage the real backlog correctly
+	// for a while, then flip FLOWBEE_AUTONOMOUS=on. Set via FLOWBEE_AUTONOMOUS_SHADOW=on.
+	AutonomousShadow bool `yaml:"autonomous_shadow"`
+
 	// GithubOwner / GithubRepo are the single-repo coordinates `flowbee init`
 	// prefills from the git remote (F13). They are the config-file form of the
 	// legacy FLOWBEE_GITHUB_OWNER/REPO env path: when Repos is empty, serve uses
@@ -397,6 +403,14 @@ func applyEnv(c *Config) {
 			c.MergeFixer = true
 		default:
 			c.MergeFixer = false
+		}
+	}
+	if v := os.Getenv("FLOWBEE_AUTONOMOUS_SHADOW"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on", "yes", "enable", "enabled":
+			c.AutonomousShadow = true
+		default:
+			c.AutonomousShadow = false
 		}
 	}
 	if v := os.Getenv("FLOWBEE_GITHUB_OWNER"); v != "" {

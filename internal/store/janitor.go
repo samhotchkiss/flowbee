@@ -457,6 +457,52 @@ func (s *Store) EscalateStuckMergeHandoff(ctx context.Context, minAge time.Durat
 	return rep, nil
 }
 
+// AdvisorPreview is one job the advisor would engage, with its reason.
+type AdvisorPreview struct {
+	JobID  string
+	Reason string
+}
+
+// AutonomyPreview is a READ-ONLY snapshot of what the ladder WOULD do right now — the
+// shadow-mode signal. It mutates nothing and makes no model calls (the advisor list is who
+// it would consult, not the verdicts), so an operator can watch it engage the real backlog
+// before flipping autonomy on.
+type AutonomyPreview struct {
+	LiveWorkers       int
+	MechanicalUnblock []string         // stall jobs the janitor would requeue (cheap, no LLM)
+	AdvisorEngage     []AdvisorPreview // jobs the advisor would consult (id + reason)
+}
+
+// AutonomyPreview computes the shadow snapshot by reusing the SAME read-only candidate
+// selection the live rungs use, so the preview can't drift from the real behavior.
+func (s *Store) AutonomyPreview(ctx context.Context, now time.Time, staleHB time.Duration, minUnblock, advisorCap, maxUnblockAttempts int) (AutonomyPreview, error) {
+	var p AutonomyPreview
+	if roster, err := s.Roster(ctx, now, staleHB); err == nil {
+		for _, w := range roster {
+			if !w.StaleHB {
+				p.LiveWorkers++
+			}
+		}
+	}
+	mech, err := s.mechanicalUnblockCandidates(ctx)
+	if err != nil {
+		return p, err
+	}
+	for _, c := range mech {
+		if c.unblockTries < maxUnblockAttempts {
+			p.MechanicalUnblock = append(p.MechanicalUnblock, c.id)
+		}
+	}
+	adv, err := s.AdvisorCandidates(ctx, minUnblock, advisorCap)
+	if err != nil {
+		return p, err
+	}
+	for _, c := range adv {
+		p.AdvisorEngage = append(p.AdvisorEngage, AdvisorPreview{JobID: c.JobID, Reason: c.Reason})
+	}
+	return p, nil
+}
+
 // AutoCancelReport summarizes one terminal-backstop pass.
 type AutoCancelReport struct {
 	Cancelled []string // job ids the ladder gave up on and auto-cancelled

@@ -432,6 +432,35 @@ func runServe(args []string) error {
 		}
 	}()
 
+	// autonomy shadow mode: log what the self-clearing ladder WOULD do without mutating —
+	// the safe pre-flight so an operator can watch it engage the real backlog before enabling
+	// FLOWBEE_AUTONOMOUS. Read-only, no model calls.
+	if cfg.AutonomousShadow {
+		go func() {
+			t := time.NewTicker(2 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					pv, err := st.AutonomyPreview(ctx, time.Now(), staleHB, 2, 3, 2)
+					if err != nil {
+						logger.Error("autonomy shadow", "err", err)
+						continue
+					}
+					if len(pv.MechanicalUnblock) > 0 || len(pv.AdvisorEngage) > 0 {
+						logger.Info("👻 autonomy SHADOW — would act (set FLOWBEE_AUTONOMOUS=on to enable)",
+							"live_workers", pv.LiveWorkers,
+							"janitor_would_unblock", pv.MechanicalUnblock,
+							"advisor_would_engage", pv.AdvisorEngage)
+					}
+				}
+			}
+		}()
+		logger.Info("👻 autonomy shadow mode ON (read-only preview; nothing is mutated)")
+	}
+
 	// Rung-E advisor (0024): the LAST resort before a human. Consulted (opt-in) for a job
 	// the deterministic janitor could not rescue — a stall past its mechanical unblock cap.
 	// A read-only, single-shot model call NOMINATES {PLAN,CORRECTION,REPROMPT,STOP}; the

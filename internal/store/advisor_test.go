@@ -202,6 +202,43 @@ func TestAutoCancelFoldConsistent(t *testing.T) {
 	assertFoldMatchesProjection(t, st, "j")
 }
 
+// TestAutonomyPreview: the read-only shadow snapshot lists what the janitor and advisor
+// would engage, without mutating anything.
+func TestAutonomyPreview(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(2_000_000_000, 0)
+	seedWorker(t, st, "live", now)
+
+	seedNeedsHuman(t, st, "rej", string(job.EscalationReviewerRejections), now)
+	seedNeedsHuman(t, st, "att", string(job.EscalationAttempts), now)
+	seedNeedsHuman(t, st, "gone", string(job.EscalationProjectOut), now) // not advisable
+
+	pv, err := st.AutonomyPreview(ctx, now, time.Hour, 2, 3, 2)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if pv.LiveWorkers != 1 {
+		t.Fatalf("LiveWorkers=%d, want 1", pv.LiveWorkers)
+	}
+	engaged := map[string]string{}
+	for _, e := range pv.AdvisorEngage {
+		engaged[e.JobID] = e.Reason
+	}
+	if len(engaged) != 2 || engaged["rej"] == "" || engaged["att"] == "" {
+		t.Fatalf("advisor would engage %v, want {rej,att}", pv.AdvisorEngage)
+	}
+	if _, ok := engaged["gone"]; ok {
+		t.Fatal("project_out must NOT be engaged (not advisable)")
+	}
+	// preview must be READ-ONLY: nothing moved.
+	for _, id := range []string{"rej", "att", "gone"} {
+		if j, _ := st.GetJob(ctx, id); j.State != job.StateNeedsHuman {
+			t.Fatalf("%s moved to %s — preview must not mutate", id, j.State)
+		}
+	}
+}
+
 // TestNoEligibleWorkerConverges: a no_eligible_worker park (a capability dead-end the
 // advisor can't fix) must still self-clear via the TIME backstop — not park forever — while
 // a genuinely-external park (project_out) is never auto-cancelled.
