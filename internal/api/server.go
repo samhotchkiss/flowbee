@@ -27,6 +27,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/lease"
 	"github.com/samhotchkiss/flowbee/internal/liveness"
+	"github.com/samhotchkiss/flowbee/internal/mailtrace"
 	"github.com/samhotchkiss/flowbee/internal/scheduler"
 	"github.com/samhotchkiss/flowbee/internal/spec"
 	"github.com/samhotchkiss/flowbee/internal/store"
@@ -123,6 +124,10 @@ type Server struct {
 	// authn is the worker-transport authenticator (§7.6). Nil = loopback-only dev
 	// (no mutual auth); set for a non-loopback listener (bearer token / mTLS).
 	authn auth.Authenticator
+	// mailTraceDB points at the Russell mail application's database, not Flowbee's
+	// SQLite job store. Nil means the optional mail trace surface is not configured.
+	mailTraceDB      mailtrace.DBTX
+	mailTraceDialect mailtrace.Dialect
 	// ui is the F12 web UI (internal/web): the productionized Fleet/Board/Dashboard
 	// panes served off the same live store read-models, embedded via go:embed.
 	ui *web.UI
@@ -146,6 +151,8 @@ type RunningConfig struct {
 	SourceWarning         string              `json:"source_warning,omitempty"`
 	ConfigPath            string              `json:"config_path,omitempty"`
 	DatabaseURL           string              `json:"database_url"`
+	MailTraceConfigured   bool                `json:"mail_trace_configured"`
+	MailTraceDBDriver     string              `json:"mail_trace_db_driver,omitempty"`
 	PrivateAddr           string              `json:"private_addr"`
 	HealthAddr            string              `json:"health_addr"`
 	WebhookAddr           string              `json:"webhook_addr"`
@@ -238,7 +245,12 @@ type Config struct {
 	// `flowbee pause` creates it; `flowbee resume` removes it. Empty disables
 	// the check (dev/test with no DB-backed file path).
 	PauseMarkerPath string
-	RunningConfig   RunningConfig
+	// MailTraceDB owns the Russell mail tables. It is separate from Store.DB because
+	// Flowbee's control-plane SQLite store does not contain email_message or
+	// model_invocation in production.
+	MailTraceDB      mailtrace.DBTX
+	MailTraceDialect mailtrace.Dialect
+	RunningConfig    RunningConfig
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -290,6 +302,8 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		workerGitSSH:       cfg.WorkerGitSSH,
 		staleHB:            staleHB,
 		authn:              cfg.Authenticator,
+		mailTraceDB:        cfg.MailTraceDB,
+		mailTraceDialect:   cfg.MailTraceDialect,
 		ui:                 ui,
 		pauseMarkerPath:    cfg.PauseMarkerPath,
 		reviewAccounts:     parseReviewAccounts(os.Getenv("FLOWBEE_REVIEW_ACCOUNTS")),
@@ -415,6 +429,8 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.Handle("POST /v1/jobs/{job}/cancel", op(s.cancel))
 	mux.Handle("POST /v1/specs", op(s.specCreate))
 	mux.Handle("POST /v1/epics", op(s.epicCreate))
+	mux.Handle("GET /admin/mail/messages", op(s.mailTraceMessages))
+	mux.Handle("GET /admin/mail/messages/{messageId}/trace", op(s.mailTrace))
 	// the board's machine-readable snapshot (HTML clients hit the web UI's "/"; a
 	// JSON client uses this stable endpoint instead of content-negotiating "/").
 	mux.HandleFunc("GET /v1/board", s.boardJSON)

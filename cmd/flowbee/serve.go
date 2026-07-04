@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/samhotchkiss/flowbee/internal/alarm"
 	"github.com/samhotchkiss/flowbee/internal/api"
 	"github.com/samhotchkiss/flowbee/internal/auth"
@@ -23,6 +25,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/mailtrace"
 	"github.com/samhotchkiss/flowbee/internal/multirepo"
 	"github.com/samhotchkiss/flowbee/internal/project"
 	"github.com/samhotchkiss/flowbee/internal/store"
@@ -158,6 +161,15 @@ func runServe(args []string) error {
 	}
 	logger.Info("migrations applied")
 
+	mailTraceDB, mailTraceDialect, err := openMailTraceDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	if mailTraceDB != nil {
+		defer mailTraceDB.Close()
+		logger.Info("mail trace database configured", "driver", mailTraceDriver(cfg))
+	}
+
 	// self-provision the control-plane mirror from the GitHub token if it's
 	// configured but absent — so the operator need not pre-clone it, and a PRIVATE
 	// repo works (a plain `git clone` would fail for lack of credentials).
@@ -222,6 +234,8 @@ func runServe(args []string) error {
 		// Flowbee performs every git write (apply + push + PR-open, R4/§8).
 		BundleProvisioning: os.Getenv("FLOWBEE_BUNDLE_PROVISIONING") != "",
 		Authenticator:      authn,
+		MailTraceDB:        mailTraceDB,
+		MailTraceDialect:   mailTraceDialect,
 		// THE ONE DECISION (§14, F2): Branch B (autonomous merge) when
 		// FLOWBEE_ALLOW_SELF_MERGE is set; default false = Branch A (handoff).
 		Policy:        job.Policy{AllowSelfMerge: cfg.AllowSelfMerge, RequiredReviewers: cfg.RequiredReviewers},
@@ -658,6 +672,43 @@ func runServe(args []string) error {
 	return bindErr
 }
 
+func openMailTraceDB(ctx context.Context, cfg config.Config) (*sql.DB, mailtrace.Dialect, error) {
+	dsn := strings.TrimSpace(cfg.MailTraceDatabaseURL)
+	if dsn == "" {
+		return nil, "", nil
+	}
+	driver := mailTraceDriver(cfg)
+	dialect := mailtrace.DialectQuestion
+	if driver == "pgx" || driver == "postgres" || driver == "postgresql" {
+		driver = "pgx"
+		dialect = mailtrace.DialectPostgres
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		return nil, "", fmt.Errorf("open mail trace db: %w", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, "", fmt.Errorf("ping mail trace db: %w", err)
+	}
+	return db, dialect, nil
+}
+
+func mailTraceDriver(cfg config.Config) string {
+	driver := strings.TrimSpace(cfg.MailTraceDBDriver)
+	if driver != "" {
+		return driver
+	}
+	dsn := strings.ToLower(strings.TrimSpace(cfg.MailTraceDatabaseURL))
+	if dsn == "" {
+		return ""
+	}
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		return "pgx"
+	}
+	return "sqlite"
+}
+
 func runningConfigSnapshot(cfg config.Config) api.RunningConfig {
 	prov := currentProvenance(context.Background(), true)
 	rc := api.RunningConfig{
@@ -670,6 +721,8 @@ func runningConfigSnapshot(cfg config.Config) api.RunningConfig {
 		SourceWarning:         prov.Warning,
 		ConfigPath:            runningConfigPath(),
 		DatabaseURL:           cfg.DatabaseURL,
+		MailTraceConfigured:   cfg.MailTraceDatabaseURL != "",
+		MailTraceDBDriver:     mailTraceDriver(cfg),
 		PrivateAddr:           cfg.PrivateAddr,
 		HealthAddr:            cfg.HealthAddr,
 		WebhookAddr:           cfg.WebhookAddr,
