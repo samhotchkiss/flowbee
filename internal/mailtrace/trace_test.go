@@ -143,8 +143,13 @@ func TestTraceLegacyParsedComprehensionDoesNotGuessInvocation(t *testing.T) {
 
 func TestCreateCorrelatedInvocationPersistsMessageAndStage(t *testing.T) {
 	db := testDB(t)
-	if err := CreateCorrelatedInvocation(context.Background(), db, CorrelatedInvocationParams{
-		ID: "i-write", MessageID: "m-write", Stage: StageLight, RequestID: "r", Provider: "p", Model: "m", Status: "pending",
+	if err := CreateLightComprehensionInvocation(context.Background(), db, CorrelatedInvocationParams{
+		ID: "i-write", MessageID: "m-write", Stage: "ignored", RequestID: "r", Provider: "p", Model: "m", Status: "pending",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateHeavyComprehensionInvocation(context.Background(), db, CorrelatedInvocationParams{
+		ID: "i-heavy-write", MessageID: "m-write", RequestID: "r2", Provider: "p", Model: "m2",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +159,12 @@ func TestCreateCorrelatedInvocationPersistsMessageAndStage(t *testing.T) {
 	}
 	if messageID != "m-write" || stage != StageLight {
 		t.Fatalf("message_id/stage = %s/%s", messageID, stage)
+	}
+	if err := db.QueryRow(`SELECT message_id, stage FROM model_invocation WHERE id='i-heavy-write'`).Scan(&messageID, &stage); err != nil {
+		t.Fatal(err)
+	}
+	if messageID != "m-write" || stage != StageHeavy {
+		t.Fatalf("heavy message_id/stage = %s/%s", messageID, stage)
 	}
 }
 

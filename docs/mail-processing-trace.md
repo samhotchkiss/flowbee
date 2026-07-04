@@ -5,11 +5,18 @@ plus the authenticated `GET /admin/mail/messages/{messageId}/trace` private API.
 The assembler expects the mail application tables named below and intentionally
 uses only exact `model_invocation.message_id` correlation for prompt payloads.
 
-Flowbee's own SQLite store does not own the Russell mail tables, so the package
+Flowbee's own SQLite store does not own the Russell mail tables, so the runtime
+trace endpoint reads an explicitly configured mail trace database instead of
+`Store.DB`. Set `mail_trace_database_url` / `FLOWBEE_MAIL_TRACE_DATABASE_URL`
+for `flowbee serve`; Postgres URLs use pgx and Postgres placeholders. The package
 keeps the production Postgres DDL as `mailtrace.PostgresMigrationSQL` and tests
-the runtime against fixture tables. Callers that create mail LLM invocations
-should use the same `message_id` + stage write contract, or the helper
-`mailtrace.CreateCorrelatedInvocation`, inside their metadata transaction.
+the runtime against fixture tables.
+
+Mail LLM write paths should call the stage-specific helpers
+`mailtrace.CreateLightComprehensionInvocation` and
+`mailtrace.CreateHeavyComprehensionInvocation`, or their `WithDialect` variants,
+inside the same transaction that creates invocation metadata. Those helpers force
+the exact `message_id` + stage correlation required by the trace API.
 
 ## Purpose
 
@@ -328,8 +335,14 @@ preferably:
 /admin/mail/messages/:messageId/trace
 ```
 
-Entry points should exist from the superadmin message list or detail page. The
-page should render:
+Flowbee also exposes a minimal internal message list at:
+
+```text
+/admin/mail/messages
+```
+
+Each row links to the message-centric trace page so operators can click from the
+internal mail surface into the full cascade. The trace page should render:
 
 1. message header,
 2. deterministic Stage 1,

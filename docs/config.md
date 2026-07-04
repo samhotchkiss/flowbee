@@ -32,6 +32,8 @@ single-repo keys are ignored.
 | key | env override | default | meaning |
 |-----|--------------|---------|---------|
 | `database_url` | `FLOWBEE_DATABASE_URL` | `~/.flowbee/flowbee.db` | SQLite file (WAL). No database server. Gitignored + litestream'd. (The default is the absolute `~/.flowbee/flowbee.db`, not a cwd-relative path, so CLI queries find the live DB from any directory.) |
+| `mail_trace_database_url` | `FLOWBEE_MAIL_TRACE_DATABASE_URL` | — | Optional Russell mail database for the internal mail trace endpoints. This is separate from Flowbee's job store because the mail tables live in the product database. Postgres URLs use pgx. |
+| `mail_trace_db_driver` | `FLOWBEE_MAIL_TRACE_DB_DRIVER` | inferred | Optional driver override for `mail_trace_database_url`; use `pgx`/`postgres` for Postgres or `sqlite` for local fixtures. |
 | `private_addr` | `FLOWBEE_PRIVATE_ADDR` | `:7070` | the worker API — keep it on loopback / Tailscale |
 | `health_addr` | `FLOWBEE_HEALTH_ADDR` | `:7001` | `/healthz` |
 | `webhook_addr` | `FLOWBEE_WEBHOOK_ADDR` | `:8443` | GitHub webhooks |

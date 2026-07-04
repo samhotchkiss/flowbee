@@ -28,15 +28,17 @@ func defaultDBPath() string {
 }
 
 type Config struct {
-	DatabaseURL        string `yaml:"database_url"`
-	PrivateAddr        string `yaml:"private_addr"`
-	HealthAddr         string `yaml:"health_addr"`
-	WebhookAddr        string `yaml:"webhook_addr"`
-	LeaseTTLS          int    `yaml:"lease_ttl_s"`
-	HeartbeatIntervalS int    `yaml:"heartbeat_interval_s"`
-	LongPollWaitS      int    `yaml:"long_poll_wait_s"`
-	RiverMaxWorkers    int    `yaml:"river_max_workers"`
-	LogLevel           string `yaml:"log_level"`
+	DatabaseURL          string `yaml:"database_url"`
+	MailTraceDatabaseURL string `yaml:"mail_trace_database_url"`
+	MailTraceDBDriver    string `yaml:"mail_trace_db_driver"`
+	PrivateAddr          string `yaml:"private_addr"`
+	HealthAddr           string `yaml:"health_addr"`
+	WebhookAddr          string `yaml:"webhook_addr"`
+	LeaseTTLS            int    `yaml:"lease_ttl_s"`
+	HeartbeatIntervalS   int    `yaml:"heartbeat_interval_s"`
+	LongPollWaitS        int    `yaml:"long_poll_wait_s"`
+	RiverMaxWorkers      int    `yaml:"river_max_workers"`
+	LogLevel             string `yaml:"log_level"`
 	// NoEligibleWorkerS is how long a `ready` job may sit with no compliant
 	// worker before the no_eligible_worker alarm fires (I-6, §6.6).
 	NoEligibleWorkerS int `yaml:"no_eligible_worker_s"`
@@ -246,6 +248,12 @@ func Load() (Config, error) {
 func applyEnv(c *Config) {
 	if v := os.Getenv("FLOWBEE_DATABASE_URL"); v != "" {
 		c.DatabaseURL = v
+	}
+	if v := os.Getenv("FLOWBEE_MAIL_TRACE_DATABASE_URL"); v != "" {
+		c.MailTraceDatabaseURL = v
+	}
+	if v := os.Getenv("FLOWBEE_MAIL_TRACE_DB_DRIVER"); v != "" {
+		c.MailTraceDBDriver = v
 	}
 	if v := os.Getenv("FLOWBEE_PRIVATE_ADDR"); v != "" {
 		c.PrivateAddr = v

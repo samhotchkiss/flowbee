@@ -11,13 +11,11 @@ import (
 )
 
 func (s *Server) mailTrace(w http.ResponseWriter, r *http.Request) {
-	if s.authn == nil {
-		if !requestFromLoopback(r) {
-			http.Error(w, "mail trace is available only from loopback unless worker auth is configured", http.StatusForbidden)
-			return
-		}
-	} else if id, ok := auth.IdentityFrom(r); !ok || !isInternalMailTraceIdentity(id) {
-		http.Error(w, "forbidden: mail trace requires an internal or superadmin identity", http.StatusForbidden)
+	if !s.authorizeMailTrace(w, r) {
+		return
+	}
+	if s.mailTraceDB == nil {
+		http.Error(w, "mail trace database is not configured", http.StatusServiceUnavailable)
 		return
 	}
 	messageID := strings.TrimSpace(r.PathValue("messageId"))
@@ -25,7 +23,7 @@ func (s *Server) mailTrace(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing message id", http.StatusBadRequest)
 		return
 	}
-	trace, err := mailtrace.NewService(s.store.DB).Trace(r.Context(), messageID)
+	trace, err := mailtrace.NewServiceWithDialect(s.mailTraceDB, s.mailTraceDialect).Trace(r.Context(), messageID)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			http.Error(w, "message not found", http.StatusNotFound)
@@ -41,12 +39,64 @@ func (s *Server) mailTrace(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, trace)
 }
 
+func (s *Server) mailTraceMessages(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeMailTrace(w, r) {
+		return
+	}
+	if s.mailTraceDB == nil {
+		http.Error(w, "mail trace database is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	items, err := mailtrace.NewServiceWithDialect(s.mailTraceDB, s.mailTraceDialect).ListMessages(r.Context(), 100)
+	if err != nil {
+		http.Error(w, "mail trace message list error", http.StatusInternalServerError)
+		return
+	}
+	if !strings.Contains(r.Header.Get("Accept"), "text/html") {
+		writeJSON(w, http.StatusOK, map[string]any{"messages": items})
+		return
+	}
+	renderMailTraceMessageListHTML(w, items)
+}
+
+func (s *Server) authorizeMailTrace(w http.ResponseWriter, r *http.Request) bool {
+	if s.authn == nil {
+		if !requestFromLoopback(r) {
+			http.Error(w, "mail trace is available only from loopback unless worker auth is configured", http.StatusForbidden)
+			return false
+		}
+		return true
+	}
+	if id, ok := auth.IdentityFrom(r); !ok || !isInternalMailTraceIdentity(id) {
+		http.Error(w, "forbidden: mail trace requires an internal or superadmin identity", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
 func isInternalMailTraceIdentity(id string) bool {
 	return id == "superadmin" || id == "internal" ||
 		strings.HasPrefix(id, "superadmin.") ||
 		strings.HasPrefix(id, "internal.") ||
 		strings.HasSuffix(id, ".superadmin") ||
 		strings.HasSuffix(id, ".internal")
+}
+
+func renderMailTraceMessageListHTML(w http.ResponseWriter, items []mailtrace.MessageListItem) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	var b strings.Builder
+	b.WriteString(`<!doctype html><html><head><meta charset="utf-8"><title>Mail Messages</title><style>`)
+	b.WriteString(`body{font:14px system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#0f1218;color:#e7eaf0}main{max-width:1180px;margin:0 auto;padding:28px}a{color:#93c5fd}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #28303c;padding:8px;text-align:left;vertical-align:top}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.muted{color:#9ca3af}`)
+	b.WriteString(`</style></head><body><main><h1>Mail Messages</h1><table><thead><tr><th>Received</th><th>Subject</th><th>From</th><th>Status</th><th>Trace</th></tr></thead><tbody>`)
+	for _, item := range items {
+		received := ""
+		if item.ReceivedAt != nil {
+			received = *item.ReceivedAt
+		}
+		b.WriteString(`<tr><td class="muted">` + html.EscapeString(received) + `</td><td>` + html.EscapeString(item.Subject) + `<div class="mono muted">` + html.EscapeString(item.ID) + `</div></td><td>` + html.EscapeString(item.From) + `</td><td>` + html.EscapeString(item.ProcessingStatus) + `</td><td><a href="` + html.EscapeString(item.TraceURL) + `">Open trace</a></td></tr>`)
+	}
+	b.WriteString(`</tbody></table></main></body></html>`)
+	_, _ = w.Write([]byte(b.String()))
 }
 
 func renderMailTraceHTML(w http.ResponseWriter, tr mailtrace.Trace) {

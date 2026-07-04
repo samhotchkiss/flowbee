@@ -50,11 +50,28 @@ type DBTX interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+type Dialect string
+
+const (
+	DialectQuestion Dialect = "question"
+	DialectPostgres Dialect = "postgres"
+)
+
 type Service struct {
-	db DBTX
+	db      DBTX
+	dialect Dialect
 }
 
-func NewService(db DBTX) *Service { return &Service{db: db} }
+func NewService(db DBTX) *Service { return NewServiceWithDialect(db, DialectQuestion) }
+
+func NewPostgresService(db DBTX) *Service { return NewServiceWithDialect(db, DialectPostgres) }
+
+func NewServiceWithDialect(db DBTX, dialect Dialect) *Service {
+	if dialect == "" {
+		dialect = DialectQuestion
+	}
+	return &Service{db: db, dialect: dialect}
+}
 
 type Trace struct {
 	MessageID     string             `json:"message_id"`
@@ -160,6 +177,20 @@ type CorrelatedInvocationParams struct {
 }
 
 func CreateCorrelatedInvocation(ctx context.Context, db DBTX, p CorrelatedInvocationParams) error {
+	return CreateCorrelatedInvocationWithDialect(ctx, db, DialectQuestion, p)
+}
+
+func CreateLightComprehensionInvocation(ctx context.Context, db DBTX, p CorrelatedInvocationParams) error {
+	p.Stage = StageLight
+	return CreateCorrelatedInvocation(ctx, db, p)
+}
+
+func CreateHeavyComprehensionInvocation(ctx context.Context, db DBTX, p CorrelatedInvocationParams) error {
+	p.Stage = StageHeavy
+	return CreateCorrelatedInvocation(ctx, db, p)
+}
+
+func CreateCorrelatedInvocationWithDialect(ctx context.Context, db DBTX, dialect Dialect, p CorrelatedInvocationParams) error {
 	if strings.TrimSpace(p.ID) == "" || strings.TrimSpace(p.MessageID) == "" || strings.TrimSpace(p.Stage) == "" {
 		return errors.New("id, message_id, and stage are required")
 	}
@@ -167,16 +198,28 @@ func CreateCorrelatedInvocation(ctx context.Context, db DBTX, p CorrelatedInvoca
 	if status == "" {
 		status = "pending"
 	}
-	_, err := db.ExecContext(ctx, `
+	q := placeholders(dialect)
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO model_invocation (
 			id, message_id, stage, request_id, provider, model, model_version, status, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+		) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)`,
+		q(1), q(2), q(3), q(4), q(5), q(6), q(7), q(8)),
 		p.ID, p.MessageID, p.Stage, nullable(p.RequestID), nullable(p.Provider),
 		nullable(p.Model), nullable(p.ModelVersion), status)
 	if err != nil {
 		return fmt.Errorf("create correlated model invocation: %w", err)
 	}
 	return nil
+}
+
+func CreateLightComprehensionInvocationWithDialect(ctx context.Context, db DBTX, dialect Dialect, p CorrelatedInvocationParams) error {
+	p.Stage = StageLight
+	return CreateCorrelatedInvocationWithDialect(ctx, db, dialect, p)
+}
+
+func CreateHeavyComprehensionInvocationWithDialect(ctx context.Context, db DBTX, dialect Dialect, p CorrelatedInvocationParams) error {
+	p.Stage = StageHeavy
+	return CreateCorrelatedInvocationWithDialect(ctx, db, dialect, p)
 }
 
 func (s *Service) Trace(ctx context.Context, messageID string) (Trace, error) {
@@ -220,10 +263,10 @@ type messageRow struct {
 
 func (s *Service) message(ctx context.Context, id string) (MessageHeader, error) {
 	var subject, from, toJSON, ccJSON, receivedAt, status sql.NullString
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT subject, from_address, to_addresses, cc_addresses, received_at, processing_status
 		  FROM email_message
-		 WHERE id = ?`, id).Scan(&subject, &from, &toJSON, &ccJSON, &receivedAt, &status)
+		 WHERE id = %s`, s.placeholder(1)), id).Scan(&subject, &from, &toJSON, &ccJSON, &receivedAt, &status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MessageHeader{}, fmt.Errorf("message %s not found", id)
 	}
@@ -250,10 +293,10 @@ type scoreRow struct {
 
 func (s *Service) score(ctx context.Context, messageID string) (scoreRow, error) {
 	var band, prompt, details, rationale sql.NullString
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT stage1_band, stage2_prompt_key, details, rank_rationale
 		  FROM mail_item_score
-		 WHERE message_id = ?`, messageID).Scan(&band, &prompt, &details, &rationale)
+		 WHERE message_id = %s`, s.placeholder(1)), messageID).Scan(&band, &prompt, &details, &rationale)
 	if errors.Is(err, sql.ErrNoRows) {
 		return scoreRow{}, nil
 	}
@@ -275,11 +318,11 @@ type lightRow struct {
 func (s *Service) light(ctx context.Context, messageID string) (lightRow, error) {
 	var promptVersion, contentClass, scores, summary, keyPoints, quickReply, openLoop, escalateReason, parsedJSON sql.NullString
 	var escalate sql.NullBool
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT prompt_version, content_class, scores, summary, key_points, quick_reply,
 		       open_loop, escalate, escalate_reason, parsed_json
 		  FROM email_message_comprehension
-		 WHERE message_id = ?`, messageID).Scan(&promptVersion, &contentClass, &scores, &summary, &keyPoints, &quickReply, &openLoop, &escalate, &escalateReason, &parsedJSON)
+		 WHERE message_id = %s`, s.placeholder(1)), messageID).Scan(&promptVersion, &contentClass, &scores, &summary, &keyPoints, &quickReply, &openLoop, &escalate, &escalateReason, &parsedJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return lightRow{fields: lightDefaults()}, nil
 	}
@@ -318,11 +361,11 @@ type heavyRow struct {
 
 func (s *Service) heavy(ctx context.Context, messageID string) (heavyRow, error) {
 	var draft, options, beliefDelta, pushVerdict, manifest, escalationReason, outputJSON sql.NullString
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT draft, options, belief_delta, push_verdict, context_bundle_manifest,
 		       escalation_reason, output_json
 		  FROM email_message_comprehension_heavy
-		 WHERE message_id = ?`, messageID).Scan(&draft, &options, &beliefDelta, &pushVerdict, &manifest, &escalationReason, &outputJSON)
+		 WHERE message_id = %s`, s.placeholder(1)), messageID).Scan(&draft, &options, &beliefDelta, &pushVerdict, &manifest, &escalationReason, &outputJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return heavyRow{fields: heavyDefaults()}, nil
 	}
@@ -343,15 +386,15 @@ func (s *Service) heavy(ctx context.Context, messageID string) (heavyRow, error)
 }
 
 func (s *Service) invocations(ctx context.Context, messageID string) ([]InvocationTrace, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT mi.id, mi.request_id, mi.stage, mi.provider, mi.model, mi.model_version,
 		       mi.started_at, mi.completed_at, mi.latency_ms, mi.cost_amount,
 		       COALESCE(mi.cost_currency, 'USD'), mi.status, mi.error, mi.created_at,
 		       mip.request_text, mip.response_text
 		  FROM model_invocation mi
 		  LEFT JOIN model_invocation_payload mip ON mip.model_invocation_id = mi.id
-		 WHERE mi.message_id = ?
-		 ORDER BY mi.created_at DESC, mi.id DESC`, messageID)
+		 WHERE mi.message_id = %s
+		 ORDER BY mi.created_at DESC, mi.id DESC`, s.placeholder(1)), messageID)
 	if err != nil {
 		return nil, fmt.Errorf("load model_invocation: %w", err)
 	}
@@ -387,6 +430,56 @@ func (s *Service) invocations(ctx context.Context, messageID string) ([]Invocati
 		out = append(out, it)
 	}
 	return out, rows.Err()
+}
+
+type MessageListItem struct {
+	ID               string  `json:"id"`
+	Subject          string  `json:"subject"`
+	From             string  `json:"from"`
+	ReceivedAt       *string `json:"received_at"`
+	ProcessingStatus string  `json:"processing_status,omitempty"`
+	TraceURL         string  `json:"trace_url"`
+}
+
+func (s *Service) ListMessages(ctx context.Context, limit int) ([]MessageListItem, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT id, subject, from_address, received_at, processing_status
+		  FROM email_message
+		 ORDER BY received_at DESC, id DESC
+		 LIMIT %s`, s.placeholder(1)), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list email_message: %w", err)
+	}
+	defer rows.Close()
+	var out []MessageListItem
+	for rows.Next() {
+		var id, subject, from, receivedAt, status sql.NullString
+		if err := rows.Scan(&id, &subject, &from, &receivedAt, &status); err != nil {
+			return nil, fmt.Errorf("scan email_message list: %w", err)
+		}
+		item := MessageListItem{
+			ID:               id.String,
+			Subject:          subject.String,
+			From:             from.String,
+			ReceivedAt:       stringPtr(receivedAt),
+			ProcessingStatus: status.String,
+			TraceURL:         "/admin/mail/messages/" + id.String + "/trace",
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Service) placeholder(n int) string { return placeholders(s.dialect)(n) }
+
+func placeholders(dialect Dialect) func(int) string {
+	if dialect == DialectPostgres {
+		return func(n int) string { return fmt.Sprintf("$%d", n) }
+	}
+	return func(int) string { return "?" }
 }
 
 func deterministic(score scoreRow) DeterministicTrace {

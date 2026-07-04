@@ -36,7 +36,7 @@ func TestMailTraceEndpointRequiresAuthAndReturnsTrace(t *testing.T) {
 		VALUES ('i-api','PROMPT','RESPONSE')`)
 
 	authn := auth.NewBearer([]byte("server-secret"), []string{"superadmin", "builder"}, false)
-	srv := api.New(st, clock.NewFake(time.Unix(1000, 0)), ulid.NewMinter(nil), api.Config{Authenticator: authn}, "v")
+	srv := api.New(st, clock.NewFake(time.Unix(1000, 0)), ulid.NewMinter(nil), api.Config{Authenticator: authn, MailTraceDB: st.DB}, "v")
 	h := srv.PrivateHandler()
 
 	rec := httptest.NewRecorder()
@@ -65,6 +65,41 @@ func TestMailTraceEndpointRequiresAuthAndReturnsTrace(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("trace response missing %s: %s", want, body)
 		}
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/admin/mail/messages", nil)
+	req.Header.Set("Authorization", "Bearer "+authn.Mint("superadmin"))
+	req.Header.Set("Accept", "text/html")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("message list status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `/admin/mail/messages/m-api/trace`) || !strings.Contains(body, "Open trace") {
+		t.Fatalf("message list missing trace link: %s", body)
+	}
+}
+
+func TestMailTraceEndpointRequiresConfiguredMailDatabase(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir()+"/flowbee.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
+		t.Fatal(err)
+	}
+	authn := auth.NewBearer([]byte("server-secret"), []string{"superadmin"}, false)
+	srv := api.New(st, clock.NewFake(time.Unix(1000, 0)), ulid.NewMinter(nil), api.Config{Authenticator: authn}, "v")
+	h := srv.PrivateHandler()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/mail/messages/m-api/trace", nil)
+	req.Header.Set("Authorization", "Bearer "+authn.Mint("superadmin"))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unconfigured trace status=%d, want 503", rec.Code)
 	}
 }
 
