@@ -202,6 +202,39 @@ func TestAutoCancelFoldConsistent(t *testing.T) {
 	assertFoldMatchesProjection(t, st, "j")
 }
 
+// TestNoEligibleWorkerConverges: a no_eligible_worker park (a capability dead-end the
+// advisor can't fix) must still self-clear via the TIME backstop — not park forever — while
+// a genuinely-external park (project_out) is never auto-cancelled.
+func TestNoEligibleWorkerConverges(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(2_000_000_000, 0)
+
+	seedNeedsHuman(t, st, "no-worker", string(job.EscalationNoEligibleWorker), now)
+	seedNeedsHuman(t, st, "fresh-no-worker", string(job.EscalationNoEligibleWorker), now)
+	seedNeedsHuman(t, st, "project-out", string(job.EscalationProjectOut), now)
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at='2020-01-01 00:00:00' WHERE id IN ('no-worker','project-out')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at=? WHERE id='fresh-no-worker'`, now.UTC().Format("2006-01-02 15:04:05")); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := st.AutoCancelExhausted(ctx, 3, 24*time.Hour, now)
+	if err != nil {
+		t.Fatalf("auto-cancel: %v", err)
+	}
+	if len(rep.Cancelled) != 1 || rep.Cancelled[0] != "no-worker" {
+		t.Fatalf("Cancelled=%v, want [no-worker] (time backstop clears the dead-end)", rep.Cancelled)
+	}
+	if j, _ := st.GetJob(ctx, "fresh-no-worker"); j.State != job.StateNeedsHuman {
+		t.Fatalf("fresh-no-worker state=%s, want needs_human (not yet aged)", j.State)
+	}
+	if j, _ := st.GetJob(ctx, "project-out"); j.State != job.StateNeedsHuman {
+		t.Fatalf("project-out state=%s, want needs_human (external action — never auto-cancel)", j.State)
+	}
+}
+
 // TestAutoCancelTimeBackstop: a job stuck BELOW the advisor cap (e.g. the advisor deduped
 // out because the re-armed build produced no new head) must still clear via the time
 // backstop — nothing parks forever. A recently-touched park is NOT cancelled.

@@ -497,10 +497,16 @@ func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, maxPark
 			rows.Close()
 			return rep, err
 		}
-		if !advisableReasons[reason] {
+		advisable := advisableReasons[reason]
+		// no_eligible_worker can't be fixed by a retry (same caps → same dead-end) so the
+		// advisor never touches it — but it must still self-clear rather than park forever, so
+		// the TIME backstop covers it. The genuinely-external parks (project_out / pr_closed /
+		// cost / design) are excluded from both: they need a human/GitHub action, not abandonment.
+		timeCancelable := advisable || reason == string(job.EscalationNoEligibleWorker)
+		if !timeCancelable {
 			continue
 		}
-		exhausted := tries >= advisorCap
+		exhausted := advisable && tries >= advisorCap // count trigger: advisable reasons only
 		aged := false
 		if maxParkedAge > 0 {
 			if ts, ok := parseDBTime(updated); ok && now.Sub(ts) > maxParkedAge {

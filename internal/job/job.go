@@ -211,6 +211,14 @@ const (
 	// spec needs human design input. It deposits into the needs_design surface (not
 	// the needs_human chokepoint) — a deliberate "the machine should not decide this".
 	EscalationDesign EscalationReason = "design"
+	// EscalationNoEligibleWorker is the forward-progress backstop's reason for a job that is
+	// leasable and re-folds clean but has sat unclaimed past the stall window WHILE the fleet
+	// is live — a capability/routing dead-end (unsatisfiable required_capabilities or review
+	// anti-affinity, a single-provider fleet). A retry cannot fix it (same caps → same
+	// no-eligible-worker), so it is NOT advisable; but it must not park silently forever, so
+	// the self-clear time-backstop eventually auto-cancels it (legibly) if no capable worker
+	// ever appears. Distinct from the transient no_eligible_worker ALARM (which only observes).
+	EscalationNoEligibleWorker EscalationReason = "no_eligible_worker"
 )
 
 // Default counters a job is created with. These are the single source of truth: the

@@ -201,6 +201,10 @@ func TestWatchdogEscalatesStalledWithLiveFleet(t *testing.T) {
 	if j.State != job.StateNeedsHuman {
 		t.Fatalf("stalled job state=%s, want needs_human", j.State)
 	}
+	// the backstop must stamp a LEGIBLE reason (not blank) so it self-clears + tells why.
+	if j.EscalationReason != string(job.EscalationNoEligibleWorker) {
+		t.Fatalf("escalation_reason=%q, want no_eligible_worker (a blank reason parks forever)", j.EscalationReason)
+	}
 }
 
 // TestWatchdogLeavesFreshJobsAlone: a leasable job in sync with its ledger and
