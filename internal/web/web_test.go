@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/capacity"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/store"
@@ -26,11 +27,25 @@ func (c fixedClock) Now() time.Time { return c.t }
 // mountUI builds the F12 web UI over a real store and returns an http.Handler.
 func mountUI(t *testing.T, st *store.Store, clk fixedClock) http.Handler {
 	t.Helper()
-	ui := web.New(st, clk, web.Config{
+	return mountUIWithConfig(t, st, clk, web.Config{
 		StaleHB:    90 * time.Second,
 		StageAmber: 10 * time.Minute,
 		StageRed:   30 * time.Minute,
 	})
+}
+
+func mountUIWithConfig(t *testing.T, st *store.Store, clk fixedClock, cfg web.Config) http.Handler {
+	t.Helper()
+	if cfg.StaleHB == 0 {
+		cfg.StaleHB = 90 * time.Second
+	}
+	if cfg.StageAmber == 0 {
+		cfg.StageAmber = 10 * time.Minute
+	}
+	if cfg.StageRed == 0 {
+		cfg.StageRed = 30 * time.Minute
+	}
+	ui := web.New(st, clk, cfg)
 	mux := http.NewServeMux()
 	ui.Mount(mux)
 	return mux
@@ -49,6 +64,17 @@ func getBodyAs(t *testing.T, h http.Handler, path, role string) (int, string) {
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	if role != "" {
 		req.Header.Set("X-Flowbee-Role", role)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec.Code, rec.Body.String()
+}
+
+func getBodyWithToken(t *testing.T, h http.Handler, path, token string) (int, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -295,9 +321,13 @@ func TestBoardTraceMenuIsSuperadminOnly(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	h := mountUI(t, st, fixedClock{t: now})
+	authn := auth.NewBearer([]byte("server-secret"), []string{"admin", "viewer"}, false)
+	h := mountUIWithConfig(t, st, fixedClock{t: now}, web.Config{
+		Authenticator:        authn,
+		SuperadminIdentities: []string{"admin"},
+	})
 
-	code, body := getBodyAs(t, h, "/board", "superadmin")
+	code, body := getBodyWithToken(t, h, "/board", authn.Mint("admin"))
 	if code != http.StatusOK {
 		t.Fatalf("superadmin /board status = %d", code)
 	}
@@ -312,13 +342,23 @@ func TestBoardTraceMenuIsSuperadminOnly(t *testing.T) {
 		}
 	}
 
-	code, body = getBody(t, h, "/board")
+	code, body = getBodyWithToken(t, h, "/board", authn.Mint("viewer"))
 	if code != http.StatusOK {
 		t.Fatalf("non-superadmin /board status = %d", code)
 	}
 	for _, forbidden := range []string{"View trace", "data-trace-job", "card-menu", "card actions"} {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("non-superadmin board must hide trace affordance %q\n---\n%s", forbidden, body)
+		}
+	}
+
+	code, body = getBodyAs(t, h, "/board", "superadmin")
+	if code != http.StatusOK {
+		t.Fatalf("spoofed-header /board status = %d", code)
+	}
+	for _, forbidden := range []string{"View trace", "data-trace-job", "card-menu", "card actions"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("spoofed header must not reveal trace affordance %q\n---\n%s", forbidden, body)
 		}
 	}
 }
@@ -340,9 +380,29 @@ func TestBoardTraceEndpointRequiresSuperadminAndReusesDrawer(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	h := mountUI(t, st, fixedClock{t: now})
+	authn := auth.NewBearer([]byte("server-secret"), []string{"admin", "viewer"}, false)
+	h := mountUIWithConfig(t, st, fixedClock{t: now}, web.Config{
+		Authenticator:        authn,
+		SuperadminIdentities: []string{"admin"},
+	})
 
 	code, body := getBody(t, h, "/board/trace?job=trace-1")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /board/trace status = %d, body:\n%s", code, body)
+	}
+	if strings.Contains(body, "Stages") || strings.Contains(body, "Build history") || strings.Contains(body, "Lease claimed") {
+		t.Fatalf("forbidden trace response must not disclose drawer contents:\n%s", body)
+	}
+
+	code, body = getBodyAs(t, h, "/board/trace?job=trace-1", "superadmin")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("spoofed-header /board/trace status = %d, want 401; body:\n%s", code, body)
+	}
+	if strings.Contains(body, "Stages") || strings.Contains(body, "Build history") || strings.Contains(body, "Lease claimed") {
+		t.Fatalf("spoofed trace response must not disclose drawer contents:\n%s", body)
+	}
+
+	code, body = getBodyWithToken(t, h, "/board/trace?job=trace-1", authn.Mint("viewer"))
 	if code != http.StatusForbidden {
 		t.Fatalf("non-superadmin /board/trace status = %d, body:\n%s", code, body)
 	}
@@ -350,7 +410,7 @@ func TestBoardTraceEndpointRequiresSuperadminAndReusesDrawer(t *testing.T) {
 		t.Fatalf("forbidden trace response must not disclose drawer contents:\n%s", body)
 	}
 
-	code, body = getBodyAs(t, h, "/board/trace?job=trace-1", "superadmin")
+	code, body = getBodyWithToken(t, h, "/board/trace?job=trace-1", authn.Mint("admin"))
 	if code != http.StatusOK {
 		t.Fatalf("superadmin /board/trace status = %d, body:\n%s", code, body)
 	}

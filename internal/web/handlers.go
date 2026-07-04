@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
@@ -158,7 +159,7 @@ func projectColor(repo string) template.CSS {
 
 func (u *UI) board(w http.ResponseWriter, r *http.Request) {
 	now := u.clock.Now()
-	showTrace := isSuperadmin(r)
+	showTrace := u.isSuperadmin(r)
 	cards, err := u.data.BoardCards(r.Context(), now)
 	if err != nil {
 		http.Error(w, "board error", http.StatusInternalServerError)
@@ -290,14 +291,22 @@ func (u *UI) detail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (u *UI) trace(w http.ResponseWriter, r *http.Request) {
-	if !isSuperadmin(r) {
+	if !u.isSuperadmin(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	u.renderDrawer(w, r)
+	u.renderTraceDrawer(w, r)
 }
 
 func (u *UI) renderDrawer(w http.ResponseWriter, r *http.Request) {
+	u.renderJobDrawer(w, r, "drawer.html")
+}
+
+func (u *UI) renderTraceDrawer(w http.ResponseWriter, r *http.Request) {
+	u.renderJobDrawer(w, r, "drawer.html")
+}
+
+func (u *UI) renderJobDrawer(w http.ResponseWriter, r *http.Request, templateName string) {
 	jobID := r.URL.Query().Get("job")
 	if jobID == "" {
 		http.Error(w, "missing job", http.StatusBadRequest)
@@ -309,13 +318,14 @@ func (u *UI) renderDrawer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := u.tmpl.ExecuteTemplate(w, "drawer.html", drawerView{Detail: d}); err != nil {
+	if err := u.tmpl.ExecuteTemplate(w, templateName, drawerView{Detail: d}); err != nil {
 		http.Error(w, "render error", http.StatusInternalServerError)
 	}
 }
 
-func isSuperadmin(r *http.Request) bool {
-	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Flowbee-Role")), "superadmin")
+func (u *UI) isSuperadmin(r *http.Request) bool {
+	id, ok := auth.IdentityFrom(r)
+	return ok && u.admin[id]
 }
 
 // ── FLEET ──

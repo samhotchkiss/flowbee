@@ -146,6 +146,7 @@ Empty `worker_auth_secret` = loopback-only dev (the listener must stay on
 | `worker_auth_secret` | `FLOWBEE_WORKER_AUTH_SECRET` | — | HMAC key signing per-worker bearer tokens (DESIGN §7.6) |
 | `enrolled_identities` | `FLOWBEE_ENROLLED_IDENTITIES` (CSV) | — | allowlist of worker identities permitted to authenticate |
 | `auth_loopback_bypass` | `FLOWBEE_AUTH_LOOPBACK_BYPASS` | `true` | same-box (127.0.0.1) workers may skip the token |
+| `superadmin_identities` | `FLOWBEE_SUPERADMIN_IDENTITIES` (CSV) | — | authenticated identities allowed to open privileged trace drawers |
 
 ## Multiple repos (F9)
 

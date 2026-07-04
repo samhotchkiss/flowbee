@@ -220,8 +220,9 @@ func runServe(args []string) error {
 		// FLOWBEE_BUNDLE_PROVISIONING is set. Workers then hold NO GitHub credential
 		// and NO mirror path — they fetch a read-only bundle, return a diff, and
 		// Flowbee performs every git write (apply + push + PR-open, R4/§8).
-		BundleProvisioning: os.Getenv("FLOWBEE_BUNDLE_PROVISIONING") != "",
-		Authenticator:      authn,
+		BundleProvisioning:   os.Getenv("FLOWBEE_BUNDLE_PROVISIONING") != "",
+		Authenticator:        authn,
+		SuperadminIdentities: cfg.SuperadminIdentities,
 		// THE ONE DECISION (§14, F2): Branch B (autonomous merge) when
 		// FLOWBEE_ALLOW_SELF_MERGE is set; default false = Branch A (handoff).
 		Policy:        job.Policy{AllowSelfMerge: cfg.AllowSelfMerge, RequiredReviewers: cfg.RequiredReviewers},
