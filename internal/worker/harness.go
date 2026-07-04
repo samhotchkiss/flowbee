@@ -42,6 +42,12 @@ func writeTaskContext(wsDir string, grant client.LeaseGrant) ([]string, error) {
 		c = &client.LeaseContext{Role: grant.Role, BaseSHA: grant.BaseSHA}
 	}
 
+	if d := strings.TrimSpace(c.Diff); d != "" {
+		// Always written (cheap) so renderTaskMarkdown's oversized-diff fallback reference
+		// (.flowbee/original-diff.patch) is valid whether or not it ends up needing it.
+		_ = os.WriteFile(filepath.Join(dir, "original-diff.patch"), []byte(d), 0o644)
+	}
+
 	md := renderTaskMarkdown(grant.JobID, c)
 	taskFile := filepath.Join(dir, "task.md")
 	if err := os.WriteFile(taskFile, []byte(md), 0o644); err != nil {
@@ -154,10 +160,28 @@ func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
 			"to find them all; none may remain. If there are NO markers, your change applied cleanly and is already " +
 			"present — verify it is correct and make no further edits. Do NOT discard the sibling's change, and do NOT " +
 			"revert your own.\n")
-		if strings.TrimSpace(c.Diff) != "" {
-			b.WriteString("\n### Your original intended change, for reference (already applied above)\n\n```diff\n")
-			b.WriteString(strings.TrimSpace(c.Diff))
-			b.WriteString("\n```\n")
+		if d := strings.TrimSpace(c.Diff); d != "" {
+			// Budget against the TOTAL brief so far (task/spec/acceptance-criteria already
+			// written above), not the diff alone — see maxTotalBriefBytes' doc in review.go.
+			// This path previously embedded the diff UNCONDITIONALLY (no size check at all),
+			// guaranteeing an exec argv-limit failure on every attempt for any moderately
+			// large conflict diff (`sh: 1: codex: Argument list too long`) — the conflict_resolver
+			// analogue of the review-brief bug, and the reason the lease-release fix in commit
+			// 7b5cc91 alone couldn't stop these from exhausting all attempts and escalating to
+			// needs_human. writeTaskContext always writes the diff to
+			// .flowbee/original-diff.patch, so the file-reference fallback below is always valid.
+			if b.Len()+len(d) <= maxTotalBriefBytes {
+				b.WriteString("\n### Your original intended change, for reference (already applied above)\n\n```diff\n")
+				b.WriteString(d)
+				b.WriteString("\n```\n")
+			} else {
+				fmt.Fprintf(&b, "\n### Your original intended change, for reference (already applied above)\n\n"+
+					"This diff is %d bytes — too large to embed inline safely (it would blow the OS's exec "+
+					"argument-length limit and make this agent invocation fail to even launch). It is written "+
+					"to .flowbee/original-diff.patch in this working directory — read it if you need the "+
+					"original intent. The conflict markers already applied in the files above are the primary "+
+					"source of truth; the diff is reference only.\n", len(d))
+			}
 		}
 	}
 	b.WriteString("\n## How to complete this\n\nMake the change by creating or editing files in THIS working directory. " +

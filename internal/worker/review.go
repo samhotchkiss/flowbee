@@ -428,20 +428,28 @@ func readVerdict(path string) (reviewVerdict, error) {
 	return v, nil
 }
 
-// maxInlineDiffBytes caps the diff renderReviewBrief will embed INLINE in the code_reviewer
-// brief. The rendered brief is what gets passed as a SINGLE shell argv element to the review
-// agent (`codex exec "$(cat "$FLOWBEE_TASK_FILE")"` / the claude equivalent — see
+// maxTotalBriefBytes caps the TOTAL rendered brief (task/spec/acceptance-criteria text
+// PLUS diff) that renderReviewBrief/renderTaskMarkdown will embed INLINE in an agent brief.
+// The rendered brief is what gets passed as a SINGLE shell argv element to the agent
+// (`codex exec "$(cat "$FLOWBEE_TASK_FILE")"` / the claude equivalent — see
 // cmd/flowbee/fleet.go's codexReviewTmpl/reviewAgentTmpl), and Linux enforces MAX_ARG_STRLEN
 // — a hard ~128KiB cap on any SINGLE argv string, independent of the much larger total
-// ARG_MAX (2MiB) most people check. A diff at or beyond that blows the exec call before the
+// ARG_MAX (2MiB) most people check. A brief at or beyond that blows the exec call before the
 // agent even starts: reproduced live against a real 269,705-byte review brief on the feller
 // fleet box while diagnosing russ #3388's chronic needs_human bounce (`sh: 1: /bin/true:
 // Argument list too long`, exit 126) — the review-path sibling of the conflict_resolver argv
-// bug fixed for the build harnesses in commit 7b5cc91. Cap comfortably under the 128KiB wall
-// (a brief's task/spec/acceptance-criteria text adds a few more KB on top of the diff) so an
-// oversized diff falls back to the $FLOWBEE_DIFF_FILE reference instead of making every
-// single review attempt fail to launch, forever.
-const maxInlineDiffBytes = 100 * 1024
+// bug fixed for the build harnesses in commit 7b5cc91.
+//
+// An EARLIER version of this cap (maxInlineDiffBytes = 100KiB) checked only the diff's own
+// size in isolation, on the assumption task/spec/acceptance-criteria text added "a few more
+// KB on top". That assumption broke live: job 01KWMSKDKAV3WC9QZ4Q20B0N8E (diff_bytes=96559,
+// under the 100KiB diff-only cap) still hit "Argument list too long" on EVERY reviewer across
+// all three fleet boxes simultaneously, because task_bytes=20934 + spec_bytes=20934 +
+// ac_bytes=662 pushed the TOTAL brief past the ~128KiB wall even with the "capped" diff.
+// Budget against the total instead: callers check `b.Len()+len(diff) <= maxTotalBriefBytes`
+// (b.Len() already reflects everything rendered before the diff decision), so oversized
+// task/spec text correctly eats into the diff's inline budget rather than being ignored.
+const maxTotalBriefBytes = 110 * 1024
 
 // renderReviewBrief writes the role-specific instructions + the EXACT verdict
 // schema the agent must emit to $FLOWBEE_VERDICT_FILE, so an operator's generic
@@ -504,11 +512,12 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 		// diff in the prompt the agent ALWAYS sees the actual change. (File is still written for
 		// agents that prefer it.)
 		//
-		// EXCEPT past maxInlineDiffBytes: inlining then would make the agent invocation blow the
-		// OS's per-argument exec limit and fail to launch on EVERY attempt (see the constant's
-		// doc). Fall back to a forceful file-read instruction instead — a review that requires
-		// reading a file beats one that can never even start.
-		if d := strings.TrimSpace(c.Diff); d != "" && len(d) <= maxInlineDiffBytes {
+		// EXCEPT past maxTotalBriefBytes (checked against the TOTAL brief so far, not the
+		// diff alone — see the constant's doc): inlining then would make the agent invocation
+		// blow the OS's per-argument exec limit and fail to launch on EVERY attempt. Fall back
+		// to a forceful file-read instruction instead — a review that requires reading a file
+		// beats one that can never even start.
+		if d := strings.TrimSpace(c.Diff); d != "" && b.Len()+len(d) <= maxTotalBriefBytes {
 			b.WriteString("## The change to review (full unified diff)\n\n" +
 				"Review EXACTLY this diff — it is reproduced IN FULL below; you do not need to open any file:\n\n")
 			b.WriteString("```diff\n")

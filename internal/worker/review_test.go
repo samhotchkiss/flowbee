@@ -63,7 +63,7 @@ func TestRenderReviewBriefCodeReviewer(t *testing.T) {
 // ARG_MAX — confirmed live: a real 269,705-byte review brief for PR #3396 (a large doc-sweep
 // diff) made every single reviewer's `codex exec` invocation fail at exec() with "Argument
 // list too long" (exit 126), night after night, before the agent ever ran. A diff at/above
-// maxInlineDiffBytes must fall back to the $FLOWBEE_DIFF_FILE reference (with an explicit
+// maxTotalBriefBytes must fall back to the $FLOWBEE_DIFF_FILE reference (with an explicit
 // "you must read this file" instruction) instead of being embedded, so the review can still
 // launch; a diff comfortably under the cap stays inline (the original spurious-bounce fix).
 func TestRenderReviewBriefCapsOversizedDiff(t *testing.T) {
@@ -73,14 +73,36 @@ func TestRenderReviewBriefCapsOversizedDiff(t *testing.T) {
 		t.Fatalf("a small diff (%d bytes, well under the cap) must stay inline\n%s", len(small), fb)
 	}
 
-	huge := strings.Repeat("x", maxInlineDiffBytes+1)
+	huge := strings.Repeat("x", maxTotalBriefBytes+1)
 	fb = renderReviewBrief("job-1", "code_reviewer", &client.LeaseContext{Diff: huge})
 	if strings.Contains(fb, huge) {
-		t.Fatalf("a diff over maxInlineDiffBytes (%d) must NOT be embedded inline — it would "+
+		t.Fatalf("a diff over maxTotalBriefBytes (%d) must NOT be embedded inline — it would "+
 			"blow the OS exec argv-string limit and fail every review attempt", len(huge))
 	}
 	if !strings.Contains(fb, "$FLOWBEE_DIFF_FILE") || !strings.Contains(fb, "MUST open and read") {
 		t.Fatalf("an oversized diff must fall back to a forceful $FLOWBEE_DIFF_FILE read instruction\n%s", fb)
+	}
+}
+
+// TestRenderReviewBriefCapsOnTotalBudgetNotDiffAlone is the regression for the escaped case
+// that TestRenderReviewBriefCapsOversizedDiff's diff-only accounting missed live: job
+// 01KWMSKDKAV3WC9QZ4Q20B0N8E had diff_bytes=96559 (comfortably under a 100KiB diff-only cap)
+// but task_bytes=20934 + spec_bytes=20934 + ac_bytes=662 pushed the TOTAL rendered brief past
+// the ~128KiB exec argv wall anyway — "Argument list too long" on every reviewer across all
+// three fleet boxes despite the diff being "capped". The inline decision must budget against
+// the brief rendered SO FAR (task+spec+acceptance-criteria+boilerplate), not the diff in
+// isolation, so oversized surrounding text correctly eats into the diff's inline allowance.
+func TestRenderReviewBriefCapsOnTotalBudgetNotDiffAlone(t *testing.T) {
+	bigText := strings.Repeat("y", 30*1024)
+	diff := strings.Repeat("x", 90*1024) // under maxTotalBriefBytes alone, but not combined
+	c := &client.LeaseContext{Task: bigText, Spec: bigText, AcceptanceCriteria: bigText, Diff: diff}
+	fb := renderReviewBrief("job-1", "code_reviewer", c)
+	if strings.Contains(fb, diff) {
+		t.Fatalf("a diff that fits alone but blows the TOTAL brief budget (task+spec+ac=%d, diff=%d) "+
+			"must NOT be embedded inline", 3*len(bigText), len(diff))
+	}
+	if !strings.Contains(fb, "$FLOWBEE_DIFF_FILE") || !strings.Contains(fb, "MUST open and read") {
+		t.Fatalf("must fall back to the forceful $FLOWBEE_DIFF_FILE read instruction\n(brief omitted for size)")
 	}
 }
 
