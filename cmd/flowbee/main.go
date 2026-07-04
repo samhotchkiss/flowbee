@@ -84,6 +84,8 @@ func main() {
 		err = runDoctor(args)
 	case "board":
 		err = runBoard(args)
+	case "list":
+		err = runList(args)
 	case "status":
 		err = runStatus(args)
 	case "reservations":
@@ -144,5 +146,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|retry-outbox|backup|build|restore|pause|resume|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|list|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|retry-outbox|backup|build|restore|pause|resume|seed|version>")
 }
