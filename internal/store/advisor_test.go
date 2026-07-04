@@ -197,6 +197,61 @@ func TestAutoCancelTimeBackstop(t *testing.T) {
 	}
 }
 
+// TestLadderConverges is the composition test: a job that KEEPS failing must climb the whole
+// ladder and TERMINATE — never park forever. It simulates the real loop: the advisor engages
+// while under its cap (each cycle a fresh head, so dedup doesn't block), and once the cap is
+// spent the terminal backstop cancels it. This is the "the board self-clears" guarantee
+// exercised end-to-end at the store layer.
+func TestLadderConverges(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(2_000_000_000, 0)
+	const advisorCap = 3
+
+	// a real needs_human(attempts) job (consistent ledger).
+	ep := claimedBuildAt(t, st, "j", 4, now)
+	if err := st.Release(ctx, store.ReleaseParams{JobID: "j", Epoch: ep, Now: now}); err != nil {
+		t.Fatalf("exhaust: %v", err)
+	}
+
+	// the advisor engages exactly advisorCap times, each on a distinct head (a real rebuild
+	// would produce a new commit), then is capped out.
+	for i := 0; i < advisorCap; i++ {
+		cands, err := st.AdvisorCandidates(ctx, 2, advisorCap)
+		if err != nil {
+			t.Fatalf("candidates round %d: %v", i, err)
+		}
+		if len(cands) != 1 {
+			t.Fatalf("round %d: want 1 candidate, got %d (advisor should keep engaging under the cap)", i, len(cands))
+		}
+		rearmed, err := st.ApplyAdvisorVerdict(ctx, "j", "CORRECTION", "try approach", cands[0].TriggerHash, now, 0)
+		if err != nil || !rearmed {
+			t.Fatalf("round %d: apply rearmed=%v err=%v", i, rearmed, err)
+		}
+		// simulate the guided build failing again: back to needs_human(attempts) at a NEW head.
+		if _, err := st.DB.ExecContext(ctx,
+			`UPDATE jobs SET state='needs_human', escalation_reason='attempts', head_sha=? WHERE id='j'`,
+			"h"+string(rune('a'+i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// capped out: the advisor no longer engages.
+	if cands, _ := st.AdvisorCandidates(ctx, 2, advisorCap); len(cands) != 0 {
+		t.Fatalf("after %d consults the advisor must be capped, still got %d candidates", advisorCap, len(cands))
+	}
+	// terminal backstop closes it out — the board self-clears.
+	rep, err := st.AutoCancelExhausted(ctx, advisorCap, 24*time.Hour, now)
+	if err != nil {
+		t.Fatalf("auto-cancel: %v", err)
+	}
+	if len(rep.Cancelled) != 1 || rep.Cancelled[0] != "j" {
+		t.Fatalf("Cancelled=%v, want [j] (ladder must terminate)", rep.Cancelled)
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateCancelled {
+		t.Fatalf("final state=%s, want cancelled — the ladder converged", j.State)
+	}
+}
+
 // TestAdvisorCandidatesGating: only stalls the mechanical janitor gave up on, under the
 // advisor cap, and not already consulted at this signature are eligible.
 func TestAdvisorCandidatesGating(t *testing.T) {
