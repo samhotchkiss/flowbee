@@ -125,8 +125,13 @@ func (s *Store) ReconcileStuck(ctx context.Context, now time.Time, staleHB, stal
 			if err := tx.QueryRowContext(ctx, `SELECT updated_at FROM jobs WHERE id=?`, id).Scan(&updated); err != nil {
 				return err
 			}
-			ts, perr := time.Parse(rfc3339, updated)
-			if perr != nil || now.Sub(ts) < stallAfter {
+			// updated_at is stored via datetime('now') (SQLite "2006-01-02 15:04:05" form), NOT
+			// RFC3339 — parseDBTime handles both. Parsing it with rfc3339 used to always error,
+			// so this whole escalation backstop was INERT in production: a leasable job no worker
+			// could claim never escalated to needs_human, silently sitting forever (the exact
+			// "permanently stuck" case this guard exists to prevent).
+			ts, ok := parseDBTime(updated)
+			if !ok || now.Sub(ts) < stallAfter {
 				return nil // still within the generous window: a real build/review/CI cycle
 			}
 			reason := ""

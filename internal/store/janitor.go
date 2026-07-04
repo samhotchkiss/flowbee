@@ -11,16 +11,14 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
 
-// sqliteDatetime is the format SQLite's datetime('now') writes into updated_at et al.:
-// "2006-01-02 15:04:05" (space-separated, UTC, no zone) — NOT RFC3339. Parsing it with
-// rfc3339 silently errors, which had made the janitor's age gates inert in production.
-const sqliteDatetime = "2006-01-02 15:04:05"
-
 // parseDBTime parses a timestamp column that may be either SQLite's datetime('now') form
-// (updated_at, created_at) or an RFC3339 value the code writes elsewhere (enqueued_at,
-// unblock_next_at). Both resolve to UTC. Returns ok=false only if neither layout matches.
+// (updated_at, created_at — "2006-01-02 15:04:05", space-separated UTC, the sqliteTS const)
+// or an RFC3339 value the code writes elsewhere (enqueued_at, unblock_next_at). Both resolve
+// to UTC. Returns ok=false only if neither layout matches. Parsing updated_at with rfc3339
+// alone silently errored, which had made the age gates here (and ReconcileStuck's escalation
+// backstop) inert in production.
 func parseDBTime(s string) (time.Time, bool) {
-	for _, layout := range []string{sqliteDatetime + ".999999999", sqliteDatetime, rfc3339} {
+	for _, layout := range []string{sqliteTS + ".999999999", sqliteTS, rfc3339} {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t.UTC(), true
 		}
