@@ -126,8 +126,13 @@ func TestMergeFixerEscalatesFixable(t *testing.T) {
 	if p, _ := st.GetJob(ctx, "policy"); p.State != job.StateMergeHandoff {
 		t.Fatalf("policy state=%s, want merge_handoff (source denial stays a human gate)", p.State)
 	}
-	if c, _ := st.GetJob(ctx, "capped"); c.State != job.StateMergeHandoff {
-		t.Fatalf("capped state=%s, want merge_handoff (stopped looping)", c.State)
+	// the capped fixable handoff — the fixer rebuilt it `cap` times and it still won't merge —
+	// is auto-cancelled (a genuinely un-landable change), NOT left to loop or park forever.
+	if len(rep.Cancelled) != 1 || rep.Cancelled[0] != "capped" {
+		t.Fatalf("Cancelled=%v, want [capped]", rep.Cancelled)
+	}
+	if c, _ := st.GetJob(ctx, "capped"); c.State != job.StateCancelled {
+		t.Fatalf("capped state=%s, want cancelled (fixer exhausted — terminal, not a forever-park)", c.State)
 	}
 }
 

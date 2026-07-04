@@ -364,6 +364,7 @@ var mergeFixableReasons = map[string]bool{
 // MergeFixReport summarizes one merge-fixer pass.
 type MergeFixReport struct {
 	Escalated []string // merge_handoff job ids re-armed to a fixer
+	Cancelled []string // fixable handoffs the fixer exhausted -> auto-cancelled (terminal)
 }
 
 // EscalateStuckMergeHandoff is the "a PR can't merge -> hand it to an agent who can figure
@@ -394,6 +395,7 @@ func (s *Store) EscalateStuckMergeHandoff(ctx context.Context, minAge time.Durat
 		tries      int
 	}
 	var cands []cand
+	var giveUp []string // fixable handoffs the fixer has exhausted -> auto-cancel (terminal)
 	for rows.Next() {
 		var id, updated, reason string
 		var tries int
@@ -401,7 +403,16 @@ func (s *Store) EscalateStuckMergeHandoff(ctx context.Context, minAge time.Durat
 			rows.Close()
 			return rep, err
 		}
-		if !mergeFixableReasons[reason] || tries >= cap {
+		if !mergeFixableReasons[reason] {
+			continue // policy/source/unknown reason — stays parked (the human gate)
+		}
+		if tries >= cap {
+			// the fixer rebuilt+re-reviewed this PR `cap` times and it STILL can't merge — a
+			// genuinely un-landable approved change. Auto-cancel it (the trail is the
+			// post-mortem) so it doesn't park in merge_handoff forever. This is scoped to
+			// FIXABLE reasons the fixer actually tried; a policy-parked handoff has tries=0 and
+			// is never reached here, so the flowbee-source human gate is untouched.
+			giveUp = append(giveUp, id)
 			continue
 		}
 		if ts, ok := parseDBTime(updated); ok && now.Sub(ts) < minAge {
@@ -412,6 +423,12 @@ func (s *Store) EscalateStuckMergeHandoff(ctx context.Context, minAge time.Durat
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return rep, err
+	}
+	for _, id := range giveUp {
+		if err := s.cancelJobTerminal(ctx, id, job.StateMergeHandoff, "merge_unfixable", now); err != nil {
+			return rep, err
+		}
+		rep.Cancelled = append(rep.Cancelled, id)
 	}
 	for _, c := range cands {
 		brief := "This PR was approved but could NOT be merged (reason: " + c.reason +
@@ -499,50 +516,52 @@ func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, maxPark
 		return rep, err
 	}
 	for _, id := range targets {
-		err := s.tx(ctx, func(tx *sql.Tx) error {
-			cur, seq, err := loadJobTx(ctx, tx, id)
-			if err != nil {
-				return err
-			}
-			if cur.State != job.StateNeedsHuman { // race: someone moved it
-				return nil
-			}
-			ev := ledger.Event{
-				JobID: id, JobSeq: seq + 1, Kind: ledger.KindStateChanged,
-				FromState: cur.State, ToState: job.StateCancelled, LeaseEpoch: cur.LeaseEpoch + 1,
-				Actor: "auto-cancel-exhausted", CreatedAt: now,
-			}
-			if err := appendEvent(ctx, tx, ev); err != nil {
-				return err
-			}
-			// clear escalation_reason/over_budget too: the Fold's terminal-state post-step
-			// zeroes them for `cancelled`, so mirror it here or projection != Fold on a rebuild
-			// (the reason lives on in the ledger trail as the post-mortem, not this column).
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE jobs
-				   SET state = 'cancelled', escalation_reason = '', over_budget = 0,
-				       lease_epoch = lease_epoch + 1,
-				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
-				       lease_hb_due = NULL, lease_deadline = NULL, updated_at = datetime('now')
-				 WHERE id = ?`, id); err != nil {
-				return fmt.Errorf("auto-cancel: %w", err)
-			}
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE leases SET ended_at = datetime('now'), end_reason = 'auto_cancel_exhausted'
-				 WHERE job_id = ? AND ended_at IS NULL`, id); err != nil {
-				return err
-			}
-			if err := setJobSeq(ctx, tx, id, seq+1); err != nil {
-				return err
-			}
-			rep.Cancelled = append(rep.Cancelled, id)
-			return nil
-		})
-		if err != nil {
+		if err := s.cancelJobTerminal(ctx, id, job.StateNeedsHuman, "auto_cancel_exhausted", now); err != nil {
 			return rep, err
 		}
+		rep.Cancelled = append(rep.Cancelled, id)
 	}
 	return rep, nil
+}
+
+// cancelJobTerminal cancels a job event-sourced, IFF it is still in fromState (a no-op on a
+// race). It is the shared terminal-cancel both the needs_human backstop and the merge-fixer
+// give-up path use. Clears escalation_reason/over_budget to match the Fold's cancelled
+// post-step (projection == Fold); the reason survives in the ledger trail. endReason is the
+// lease audit disposition.
+func (s *Store) cancelJobTerminal(ctx context.Context, id string, fromState job.State, endReason string, now time.Time) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		cur, seq, err := loadJobTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if cur.State != fromState { // race: someone moved it
+			return nil
+		}
+		ev := ledger.Event{
+			JobID: id, JobSeq: seq + 1, Kind: ledger.KindStateChanged,
+			FromState: cur.State, ToState: job.StateCancelled, LeaseEpoch: cur.LeaseEpoch + 1,
+			Actor: endReason, CreatedAt: now,
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs
+			   SET state = 'cancelled', escalation_reason = '', over_budget = 0,
+			       lease_epoch = lease_epoch + 1,
+			       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
+			       lease_hb_due = NULL, lease_deadline = NULL, updated_at = datetime('now')
+			 WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("terminal cancel: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE leases SET ended_at = datetime('now'), end_reason = ?
+			 WHERE job_id = ? AND ended_at IS NULL`, endReason, id); err != nil {
+			return err
+		}
+		return setJobSeq(ctx, tx, id, seq+1)
+	})
 }
 
 // mechanicalUnblockCandidates loads the needs_human jobs whose escalation reason is
