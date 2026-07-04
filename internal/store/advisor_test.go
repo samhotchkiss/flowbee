@@ -167,6 +167,34 @@ func TestAutoCancelExhausted(t *testing.T) {
 	}
 }
 
+// TestAutoCancelFoldConsistent: auto-cancel must fold to exactly the projection — the
+// cancelled row clears escalation_reason/over_budget just as the Fold's terminal post-step
+// does, so a DR rebuild reproduces it.
+func TestAutoCancelFoldConsistent(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(2_000_000_000, 0)
+
+	// real needs_human(attempts) ledger.
+	ep := claimedBuildAt(t, st, "j", 4, now)
+	if err := st.Release(ctx, store.ReleaseParams{JobID: "j", Epoch: ep, Now: now}); err != nil {
+		t.Fatalf("exhaust: %v", err)
+	}
+	// advisor_attempts is projection-only bookkeeping (not folded); set it to trip the cap.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=3 WHERE id='j'`); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := st.AutoCancelExhausted(ctx, 3, 0, now)
+	if err != nil || len(rep.Cancelled) != 1 {
+		t.Fatalf("auto-cancel rep=%+v err=%v", rep, err)
+	}
+	j, _ := st.GetJob(ctx, "j")
+	if j.State != job.StateCancelled || j.EscalationReason != "" {
+		t.Fatalf("want cancelled with cleared reason, got %s/%q", j.State, j.EscalationReason)
+	}
+	assertFoldMatchesProjection(t, st, "j")
+}
+
 // TestAutoCancelTimeBackstop: a job stuck BELOW the advisor cap (e.g. the advisor deduped
 // out because the re-armed build produced no new head) must still clear via the time
 // backstop — nothing parks forever. A recently-touched park is NOT cancelled.

@@ -494,9 +494,12 @@ func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, maxPark
 			if err := appendEvent(ctx, tx, ev); err != nil {
 				return err
 			}
+			// clear escalation_reason/over_budget too: the Fold's terminal-state post-step
+			// zeroes them for `cancelled`, so mirror it here or projection != Fold on a rebuild
+			// (the reason lives on in the ledger trail as the post-mortem, not this column).
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE jobs
-				   SET state = 'cancelled',
+				   SET state = 'cancelled', escalation_reason = '', over_budget = 0,
 				       lease_epoch = lease_epoch + 1,
 				       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 				       lease_hb_due = NULL, lease_deadline = NULL, updated_at = datetime('now')
