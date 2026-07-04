@@ -21,10 +21,20 @@ and every rung is bounded so nothing loops forever.
 | — | PR approved but **can't merge** (head moved after review, unverifiable merge) | **Merge-fixer** re-arms it to a fixer worker: "fetch the branch, rebase onto main, resolve conflicts, fix failing checks, make it mergeable." The normal merge gate then ships it. | `Store.EscalateStuckMergeHandoff` |
 | — | Agent blocks on an interactive prompt | **Elicitation fail-fast**: report `awaiting_input`, clean re-dispatch in one heartbeat instead of the ~4-min stale reap. | `internal/worker` `promptDetector` |
 
-**Never auto-retried** (these genuinely need external action, not a blind retry, and stay
-parked): `project_out` (a permanent GitHub 4xx — fix the GitHub state), `pr_closed` (a
-human closed it), `cost` (over the $ ceiling — raise it), `needs_design` (a deliberate
-product decision).
+**Never auto-retried, but always legible** (these need external/human action, not a blind
+retry): `project_out` (a permanent GitHub 4xx — fix the GitHub state), `pr_closed` (a human
+closed it), `cost` (over the $ ceiling — raise it), `ci_stalled` (CI is wedged — fix the
+runner), `needs_design` (a deliberate product decision). They park with a clear reason
+visible in the needs-human view — not silently.
+
+**`no_eligible_worker`** (a leasable job no worker can claim — an unsatisfiable capability
+or review anti-affinity, a single-provider fleet) can't be fixed by a retry, so the advisor
+skips it — but it still **self-clears**: the 24h time-backstop auto-cancels it (legibly) if
+no capable worker ever appears, so it never parks forever silently. Add the missing
+capability and `flowbee requeue` to bring it back.
+
+The result: every escalation either **converges** (`done` | `cancelled`) or is a **legible,
+deliberate** park on a genuine external/human decision. No silent forever-parks.
 
 ## The one remaining human touch
 
