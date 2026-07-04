@@ -48,11 +48,19 @@ post-merge health-check + auto-revert net).
 ## Turning it on
 
 The ladder is **opt-in** — it makes LLM calls (the advisor needs an agent CLI on the serve
-box) and can cancel/re-drive work, so it doesn't switch on silently. One master flag turns
-on the whole thing:
+box) and can cancel/re-drive work, so it doesn't switch on silently.
+
+**Recommended on-ramp — shadow first.** Turn on shadow mode and watch it engage the real
+backlog correctly (it logs what it *would* do, mutates nothing, makes no model calls):
 
 ```
-FLOWBEE_AUTONOMOUS=on        # advisor + auto-cancel backstop + merge-fixer
+FLOWBEE_AUTONOMOUS_SHADOW=on   # read-only preview in the serve log every 2 min
+```
+
+Once the shadow log looks right, flip the master switch:
+
+```
+FLOWBEE_AUTONOMOUS=on          # advisor + auto-cancel backstop + merge-fixer
 ```
 
 Or enable the rungs individually (each also acts as an override of the master switch):
