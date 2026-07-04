@@ -405,41 +405,53 @@ func TestSecretScanNoFalsePositiveOnOrdinaryStrings(t *testing.T) {
 }
 
 // TestSecretScanNoFalsePositiveOnStructLiteralTokenFields is the regression for a confirmed
-// live false positive: russ PRs #3648 and #3793 were both blocked from self-merge because an
-// ordinary Go struct-literal field initializer whose field name happens to contain "Token"
-// (extremely common in this codebase — config structs are full of *MaxTokens fields) scored
-// >=3.5 bits/char entropy on its RHS identifier, indistinguishable by entropy alone from a
-// real random secret (camelCase Go identifiers routinely land ~3.9-4.1 bits/char, overlapping
-// real secrets' range). Go cannot express a string literal without quotes, so an UNQUOTED
-// colon-separated RHS is syntactically guaranteed to be a reference/identifier, never
-// credential material — that syntactic fact, not entropy, is what must gate this.
+// live false positive on THREE independent PRs, two separators: russ #3648/#3793 (Go
+// struct-literal fields like `OpenRouterChatMaxTokens: openRouterChatMaxTokens,`, `:`
+// separator) and #3811 (a TS `const key = normalizedAddressKey(address)` local-variable
+// assignment, `=` separator). Both scored >=3.5 bits/char entropy on the RHS identifier,
+// indistinguishable by entropy alone from a real random secret (camelCase identifiers
+// routinely land ~3.9-4.1 bits/char, overlapping real secrets' range). Go/TS/JS cannot
+// express a string literal without quotes, so an UNQUOTED RHS is syntactically guaranteed
+// to be a reference/identifier, never credential material — that syntactic fact, not
+// entropy, is what must gate this, regardless of which separator (`:` or `=`) matched.
 func TestSecretScanNoFalsePositiveOnStructLiteralTokenFields(t *testing.T) {
 	for _, line := range []string{
 		"OpenRouterChatMaxTokens:                   openRouterChatMaxTokens,",
 		"OpenRouterMaxCumulativePromptTokens:       openRouterMaxCumulativePromptTokens,",
 		"EllieExtractionMaxSingleMsgTokens:         ellieExtractionMaxSingleMsgTokens,",
+		"const key = normalizedAddressKey(address)",
 	} {
 		d := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1 +1,2 @@\n package config\n+\t\t" + line + "\n"
 		r := Check(Patch{Diff: d, Declared: BlastRadius{Paths: []string{"config.go"}}}, Limits{})
 		if !r.StaticChecksPass {
-			t.Errorf("struct-literal field %q must NOT trip the secret-scan; failures=%v", line, r.StaticFailures)
+			t.Errorf("identifier-referencing assignment %q must NOT trip the secret-scan; failures=%v", line, r.StaticFailures)
 		}
 	}
 
-	// the exemption must NOT swallow a real secret assigned via `:` with quotes (Go CAN
-	// express a string literal WITH quotes — that's exactly where a real secret would live).
-	quoted := `Token:                              "AKIAIOSFODNN7EXAMPLE",`
-	d := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1 +1,2 @@\n package config\n+\t\t" + quoted + "\n"
-	if r := Check(Patch{Diff: d, Declared: BlastRadius{Paths: []string{"config.go"}}}, Limits{}); r.StaticChecksPass {
-		t.Errorf("a QUOTED secret literal after `:` must still trip the secret-scan: %+v", r)
+	// the exemption must NOT swallow a real secret assigned WITH quotes, `:` or `=` alike
+	// (Go/TS CAN express a string literal with quotes — that's exactly where a real secret
+	// would live).
+	for _, quoted := range []string{
+		`Token:                              "AKIAIOSFODNN7EXAMPLE",`,
+		`const token = "AKIAIOSFODNN7EXAMPLE"`,
+	} {
+		d := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1 +1,2 @@\n package config\n+\t\t" + quoted + "\n"
+		if r := Check(Patch{Diff: d, Declared: BlastRadius{Paths: []string{"config.go"}}}, Limits{}); r.StaticChecksPass {
+			t.Errorf("a QUOTED secret literal %q must still trip the secret-scan: %+v", quoted, r)
+		}
 	}
 
-	// nor a flat-case (non-camelCase) unquoted colon value — a hex/snake_case secret pasted
-	// in unquoted must still be caught; only the camelCase-identifier shape is exempted.
-	flat := "token:                              deadbeefcafefeedfacefeeddeadbeef,"
-	d2 := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1 +1,2 @@\n package config\n+\t\t" + flat + "\n"
-	if r := Check(Patch{Diff: d2, Declared: BlastRadius{Paths: []string{"config.go"}}}, Limits{}); r.StaticChecksPass {
-		t.Errorf("a flat-case unquoted colon value must still trip the secret-scan: %+v", r)
+	// nor a flat-case (non-camelCase) unquoted value, either separator — a hex/snake_case
+	// secret pasted in unquoted must still be caught; only the camelCase-identifier shape
+	// (never a real secret's shape) is exempted.
+	for _, flat := range []string{
+		"token:                              deadbeefcafefeedfacefeeddeadbeef,",
+		"token = deadbeefcafefeedfacefeeddeadbeef",
+	} {
+		d := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1 +1,2 @@\n package config\n+\t\t" + flat + "\n"
+		if r := Check(Patch{Diff: d, Declared: BlastRadius{Paths: []string{"config.go"}}}, Limits{}); r.StaticChecksPass {
+			t.Errorf("a flat-case unquoted value %q must still trip the secret-scan: %+v", flat, r)
+		}
 	}
 }
 

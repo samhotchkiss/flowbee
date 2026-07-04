@@ -580,22 +580,25 @@ func looksLikeAssignedSecret(line string) bool {
 	if m == nil {
 		return false
 	}
-	sep, quote, val := m[2], m[3], m[4]
-	// A COLON-separated, UNQUOTED match assigned to a value that reads as a bare
-	// camelCase/PascalCase identifier is a Go (or YAML/JSON) struct-literal field
-	// initializer referencing another symbol (`OpenRouterChatMaxTokens:
-	// openRouterChatMaxTokens,`) — never a literal secret. Go in particular cannot
-	// express a string literal without quotes, so an unquoted colon-RHS is
-	// syntactically guaranteed to be a reference/identifier/const, not credential
-	// material. Confirmed false-positive live: two PRs (russ #3648, #3793) blocked
-	// from self-merge because ordinary "...Tokens: someVarName," struct fields
-	// scored >=3.5 bits/char (camelCase identifiers routinely land ~3.9-4.1, same
-	// range as real random secrets — entropy alone can't discriminate them; the
-	// syntactic quote/separator distinction can). Still catches a flat-case token
-	// (hex/base64/snake_case) even when unquoted+colon-separated, and anything
+	_, quote, val := m[2], m[3], m[4]
+	// An UNQUOTED match assigned to a value that reads as a bare camelCase/PascalCase
+	// identifier is source code referencing another symbol — a Go struct-literal field
+	// (`OpenRouterChatMaxTokens: openRouterChatMaxTokens,`), a local variable/const
+	// (`const key = normalizedAddressKey(address)` — the regex captures the identifier
+	// prefix before the call parens), a YAML/JSON field, etc. — never a literal secret.
+	// Source languages here (Go/TS/JS) cannot express a string literal without quotes,
+	// so an unquoted RHS is syntactically guaranteed to be a reference/identifier/const,
+	// not credential material. Confirmed false-positive live on THREE independent PRs:
+	// russ #3648/#3793 (Go struct fields, `:` separator) and #3811 (a TS `const key =
+	// normalizedAddressKey(...)` call, `=` separator) — camelCase identifiers routinely
+	// score ~3.9-4.1 bits/char, the SAME range as real random secrets (measured
+	// ~3.5-4.7), so entropy alone can't discriminate them; the syntactic quote
+	// distinction can, regardless of which separator introduced the match. Still catches
+	// a flat-case token (hex/base64/snake_case) even when unquoted, and anything
 	// carrying `/`, `+`, `_`, or `-` (real secrets commonly do; identifiers in this
-	// exempted shape by definition don't).
-	if sep == ":" && quote == "" && camelOrPascalIdent.MatchString(val) && hasCaseTransition(val) {
+	// exempted shape by definition don't) — including a real .env-style `KEY=<secret>`,
+	// which is never camelCase-English-word-shaped.
+	if quote == "" && camelOrPascalIdent.MatchString(val) && hasCaseTransition(val) {
 		return false
 	}
 	return shannonEntropy(val) >= 3.5
