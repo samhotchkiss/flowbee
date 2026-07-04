@@ -20,6 +20,56 @@ func markMechanicallyExhausted(t *testing.T, st *store.Store, id string, n int) 
 	}
 }
 
+// TestAdvisorFirstResponderForFailures: the repeated-failure reasons (bounces / attempts /
+// reviewer_rejections) go STRAIGHT to the advisor — no mechanical unblock_attempts needed —
+// so the system's first response to "build keeps failing review" is a guided correction,
+// not a park. And the guided retry earns a FRESH attempts+bounces budget (folded), because a
+// blind rebuild with the budget already spent would immediately re-exhaust.
+func TestAdvisorFirstResponderForFailures(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+
+	// drive a build to a REAL needs_human(attempts) through penalty releases (consistent
+	// ledger): 4 warm-up cycles leave attempts=4, the 5th release exhausts max_attempts=5.
+	ep := claimedBuildAt(t, st, "j", 4, now)
+	if err := st.Release(ctx, store.ReleaseParams{JobID: "j", Epoch: ep, Now: now}); err != nil {
+		t.Fatalf("exhausting release: %v", err)
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateNeedsHuman || j.Attempts != 5 {
+		t.Fatalf("setup: want needs_human/attempts=5, got %s/%d", j.State, j.Attempts)
+	}
+
+	// advisor is the FIRST responder for `attempts` — no mechanical stage to wait on.
+	cands, err := st.AdvisorCandidates(ctx, 2, 3)
+	if err != nil {
+		t.Fatalf("candidates: %v", err)
+	}
+	if len(cands) != 1 || cands[0].JobID != "j" || cands[0].Reason != string(job.EscalationAttempts) {
+		t.Fatalf("want [j/attempts] as an advisor candidate, got %+v", cands)
+	}
+
+	rearmed, err := st.ApplyAdvisorVerdict(ctx, "j", "CORRECTION", "the arch-lint failed; run it locally and fix the import cycle", cands[0].TriggerHash, now, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !rearmed {
+		t.Fatal("CORRECTION must re-arm")
+	}
+	j, _ := st.GetJob(ctx, "j")
+	if j.State != job.StateReady {
+		t.Fatalf("state=%s, want ready", j.State)
+	}
+	if j.Attempts != 0 {
+		t.Fatalf("attempts=%d, want 0 (advisor-guided retry earns a fresh budget)", j.Attempts)
+	}
+	if j.StuckHint == "" {
+		t.Fatal("advisor correction must be carried as stuck_hint for the guided rebuild")
+	}
+	// the reset must FOLD — a DR rebuild has to reproduce the fresh budget.
+	assertFoldMatchesProjection(t, st, "j")
+}
+
 // TestAdvisorCandidatesGating: only stalls the mechanical janitor gave up on, under the
 // advisor cap, and not already consulted at this signature are eligible.
 func TestAdvisorCandidatesGating(t *testing.T) {

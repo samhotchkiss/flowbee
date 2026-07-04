@@ -327,6 +327,13 @@ func Fold(events []Event) (job.Job, error) {
 			j.HeadSHA = ""
 			j.Verdict = nil
 			j.StuckHint = e.Payload.StuckHint // advisor note (empty on a plain mechanical unblock)
+			// an advisor-guided retry (ResetCounters) earns a fresh budget; a plain mechanical
+			// unblock preserves attempts/bounces. Mirror the projection UPDATE exactly.
+			if e.Payload.ResetCounters {
+				j.Attempts = 0
+				j.Bounces = 0
+				j.StallRevocations = 0
+			}
 			if e.ToState == job.StateSpecAuthoring {
 				j.Stage = "spec"
 			} else {

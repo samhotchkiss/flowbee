@@ -184,12 +184,30 @@ func (s *Store) JanitorUnblock(ctx context.Context, now time.Time, staleHB time.
 	return rep, nil
 }
 
-// AdvisableReasons are the needs_human reasons the Rung-E advisor may be consulted on:
-// a `stall` the mechanical janitor already gave up on (its unblock budget is spent). Kept
-// deliberately narrow — the advisor NOMINATES, Go re-authorizes, and semantic dead-ends
-// (project_out / pr_closed / cost / …) are never even shown to it.
+// advisableReasons are the needs_human reasons the Rung-E advisor may be consulted on.
+// The goal is a system that drives EVERY issue to completion itself, so the advisor is the
+// first responder for the "repeated failure" reasons — it reads the actual review findings /
+// CI failures and re-arms with a concrete correction + a fresh budget, which is what makes a
+// guided retry succeed where a blind one just re-fails:
+//
+//	stall               — worker went quiet; mechanical janitor tries first, advisor after.
+//	bounces             — build bounced off review max times; advisor reads the findings.
+//	attempts            — build failed its attempts; advisor reads the CI failures.
+//	reviewer_rejections — one reviewer keeps rejecting; advisor judges + re-routes.
+//
+// Still EXCLUDED — the ones a retry genuinely can't fix without external action:
+//
+//	project_out — a permanent GitHub 4xx (deleted branch/PR); needs the GitHub state fixed.
+//	pr_closed   — a human closed the PR; re-opening fights that.
+//	cost        — over the $ ceiling; a retry just spends more (raise the ceiling instead).
+//	design      — needs_design, a deliberate product decision (surfaced separately).
+//
+// project_out/pr_closed/cost are handled by their own reconcilers, not blind retries.
 var advisableReasons = map[string]bool{
-	string(job.EscalationStall): true,
+	string(job.EscalationStall):              true,
+	string(job.EscalationBounces):            true,
+	string(job.EscalationAttempts):           true,
+	string(job.EscalationReviewerRejections): true,
 }
 
 // AdvisorCandidate is a stuck job the advisor may weigh in on, with its full re-entry
@@ -215,10 +233,13 @@ type AdvisorCandidate struct {
 }
 
 // AdvisorCandidates returns the jobs eligible for a Rung-E advisor consult: parked in
-// needs_human for an advisable reason, the MECHANICAL janitor already exhausted
-// (unblock_attempts >= minUnblock), under the advisor's per-job cap, and NOT already
+// needs_human for an advisable reason, under the advisor's per-job cap, and NOT already
 // consulted at this exact stuck signature (trigger_hash != advisor_last_hash — a SHA that
-// moved is genuinely new work worth another look). Deterministic id order.
+// moved is genuinely new work worth another look). For `stall` ONLY, the cheap mechanical
+// janitor is given first crack: it is skipped until unblock_attempts >= minUnblock. The
+// repeated-failure reasons (bounces/attempts/reviewer_rejections) have no mechanical stage —
+// a blind requeue just re-fails — so the advisor is their FIRST responder. Deterministic id
+// order.
 func (s *Store) AdvisorCandidates(ctx context.Context, minUnblock, advisorCap int) ([]AdvisorCandidate, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT id, kind, COALESCE(escalation_reason,''),
@@ -230,9 +251,8 @@ func (s *Store) AdvisorCandidates(ctx context.Context, minUnblock, advisorCap in
 		       COALESCE(advisor_last_hash,'')
 		  FROM jobs
 		 WHERE state='needs_human'
-		   AND COALESCE(unblock_attempts,0) >= ?
 		   AND COALESCE(advisor_attempts,0) < ?
-		 ORDER BY id`, minUnblock, advisorCap)
+		 ORDER BY id`, advisorCap)
 	if err != nil {
 		return nil, err
 	}
@@ -248,6 +268,10 @@ func (s *Store) AdvisorCandidates(ctx context.Context, minUnblock, advisorCap in
 			return nil, err
 		}
 		if !advisableReasons[c.Reason] {
+			continue
+		}
+		// `stall` defers to the mechanical janitor until it has exhausted its cheap requeues.
+		if mechanicalUnblockReasons[c.Reason] && c.UnblockAttempts < minUnblock {
 			continue
 		}
 		c.TriggerHash = c.JobID + ":" + c.Reason + ":" + c.HeadSHA
@@ -283,7 +307,9 @@ func (s *Store) ApplyAdvisorVerdict(ctx context.Context, jobID, action, note, ha
 			if note == "" {
 				note = "advisor: retry with fresh context" // never empty — the empty hint is the mechanical path's signal
 			}
-			if err := rearmFromNeedsHumanTx(ctx, tx, cur, seq, snapshot, note, now, cooldown); err != nil {
+			// advisor-guided retry earns a fresh attempts+bounces budget (new guidance), bounded
+			// by the per-job advisor cap.
+			if err := rearmFromNeedsHumanTx(ctx, tx, cur, seq, snapshot, note, true, now, cooldown); err != nil {
 				return err
 			}
 			rearmed = true
@@ -352,7 +378,8 @@ func (s *Store) unblockOne(ctx context.Context, jobID, snapshot, hint string, no
 		if hint == "" && !mechanicalUnblockReasons[cur.EscalationReason] {
 			return nil
 		}
-		if err := rearmFromNeedsHumanTx(ctx, tx, cur, seq, snapshot, hint, now, cooldown); err != nil {
+		// mechanical unblock preserves the budget (bounded, no new information).
+		if err := rearmFromNeedsHumanTx(ctx, tx, cur, seq, snapshot, hint, false, now, cooldown); err != nil {
 			return err
 		}
 		acted = true
@@ -367,7 +394,7 @@ func (s *Store) unblockOne(ctx context.Context, jobID, snapshot, hint string, no
 // projection == Fold(events). Factoring it out means the two callers can never drift from
 // the fold (a divergence there silently corrupts a DR rebuild). hint is the advisor's note
 // ("" for a plain mechanical unblock); it is carried on the event AND the projection.
-func rearmFromNeedsHumanTx(ctx context.Context, tx *sql.Tx, cur job.Job, seq int, snapshot, hint string, now time.Time, cooldown time.Duration) error {
+func rearmFromNeedsHumanTx(ctx context.Context, tx *sql.Tx, cur job.Job, seq int, snapshot, hint string, resetBudget bool, now time.Time, cooldown time.Duration) error {
 	// Re-arm to the job's OWN entry stage (spec restarts authoring; build restarts ready),
 	// mirroring RequeueJob's routing. role/caps/escalation-clear are state-derived by Fold.
 	target, role, stage, cap := job.StateReady, string(job.RoleEngWorker), "build", "role:eng_worker"
@@ -382,20 +409,29 @@ func rearmFromNeedsHumanTx(ctx context.Context, tx *sql.Tx, cur job.Job, seq int
 		JobID: cur.ID, JobSeq: seq + 1, Kind: ledger.KindJanitorUnblocked,
 		FromState: cur.State, ToState: target, LeaseEpoch: cur.LeaseEpoch + 1,
 		Actor: actor, CreatedAt: now,
-		Payload: ledger.Payload{UnblockSHA: snapshot, StuckHint: hint},
+		// ResetCounters marks an advisor-guided retry: the advisor supplied NEW guidance
+		// (a correction / plan), so the guided attempt earns a fresh attempts+bounces budget
+		// rather than re-arming into an immediately-re-exhausted state. The whole loop stays
+		// bounded by the per-job advisor cap, so this cannot thrash forever.
+		Payload: ledger.Payload{UnblockSHA: snapshot, StuckHint: hint, ResetCounters: resetBudget},
 	}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return err
 	}
 	// Mirror the Fold (KindJanitorUnblocked) EXACTLY:
 	//   - clear the prior attempt's artifacts (fresh candidate), like requeue
-	//   - PRESERVE attempts/bounces/stall_revocations (bounded, not a budget reset)
 	//   - clear escalation_reason + over_budget (no longer a human-gate state)
 	//   - bump the epoch (fence any lingering worker), clear the lease columns
 	//   - bump unblock_attempts, stamp last_progress_sha + the cooldown gate + the hint
+	//   - reset attempts/bounces/stall_revocations IFF resetBudget (advisor-guided retry);
+	//     the plain mechanical unblock PRESERVES them (bounded, not a budget reset).
 	enq := ""
 	if target == job.StateReady {
 		enq = now.Format(rfc3339)
+	}
+	reset := 0
+	if resetBudget {
+		reset = 1
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE jobs
@@ -404,6 +440,9 @@ func rearmFromNeedsHumanTx(ctx context.Context, tx *sql.Tx, cur job.Job, seq int
 		       patch_diff = '', declared_blast_radius = '',
 		       reservation_paths = '', reservation_wide = 0,
 		       over_budget = 0, escalation_reason = '',
+		       attempts = CASE WHEN ?=1 THEN 0 ELSE attempts END,
+		       bounces = CASE WHEN ?=1 THEN 0 ELSE bounces END,
+		       stall_revocations = CASE WHEN ?=1 THEN 0 ELSE stall_revocations END,
 		       lease_epoch = lease_epoch + 1,
 		       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
 		       lease_hb_due = NULL, lease_deadline = NULL,
@@ -415,6 +454,7 @@ func rearmFromNeedsHumanTx(ctx context.Context, tx *sql.Tx, cur job.Job, seq int
 		       updated_at = datetime('now')
 		 WHERE id = ?`,
 		string(target), role, stage, marshalStrings([]string{cap}),
+		reset, reset, reset,
 		snapshot, hint, now.Add(cooldown).Format(rfc3339),
 		enq, enq, cur.ID); err != nil {
 		return fmt.Errorf("janitor unblock: %w", err)
