@@ -323,7 +323,18 @@ func (s *Store) ApplyAdvisorVerdict(ctx context.Context, jobID, action, note, ha
 		if err != nil {
 			return err
 		}
-		if cur.State != job.StateNeedsHuman || !advisableReasons[cur.EscalationReason] {
+		// Match AdvisorCandidates' selection EXACTLY: use the EFFECTIVE reason, not the raw
+		// column. A gate bounce-exhaustion leaves escalation_reason blank; the raw check made
+		// this no-op (so the advisor consulted the job — burning a model call — then discarded
+		// the verdict, never bumped advisor_attempts, never deduped, and re-consulted it every
+		// pass forever). classifyEscalation derives `bounces` from the counters so the verdict
+		// actually applies.
+		over := 0
+		if cur.OverBudget {
+			over = 1
+		}
+		effReason := classifyEscalation(cur.EscalationReason, over, cur.Attempts, cur.MaxAttempts, cur.Bounces, cur.MaxBounces, cur.StallRevocations)
+		if cur.State != job.StateNeedsHuman || !advisableReasons[effReason] {
 			return nil // race: no longer an advisable park
 		}
 		rearm := action == "PLAN" || action == "CORRECTION" || action == "REPROMPT"

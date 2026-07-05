@@ -232,6 +232,28 @@ func TestAdvisorEngagesBlankBounceExhaustion(t *testing.T) {
 	if len(cands) != 1 || cands[0].JobID != "blank" || cands[0].Reason != string(job.EscalationBounces) {
 		t.Fatalf("blank-column bounce-exhaustion must be engaged as bounces, got %+v", cands)
 	}
+	// ApplyAdvisorVerdict must ACT on it (not no-op on the raw blank reason): a PLAN re-arms it.
+	// This is the regression for the prod bug where the advisor consulted blank jobs every pass
+	// but silently discarded the verdict (raw-reason guard), burning model calls forever.
+	rearmed, err := st.ApplyAdvisorVerdict(ctx, "blank", "PLAN", "decompose the change", cands[0].TriggerHash, now, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !rearmed {
+		t.Fatal("advisor PLAN must re-arm a blank-column bounce-exhaustion job, not no-op")
+	}
+	if j, _ := st.GetJob(ctx, "blank"); j.State != job.StateReady {
+		t.Fatalf("blank job must be re-armed to ready by the advisor, got state=%s", j.State)
+	}
+	var advTries int
+	_ = st.DB.QueryRowContext(ctx, `SELECT advisor_attempts FROM jobs WHERE id='blank'`).Scan(&advTries)
+	if advTries < 1 {
+		t.Fatalf("advisor_attempts must be bumped (was the verdict silently discarded?), got %d", advTries)
+	}
+	// re-park it for the terminal-exit check below.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='needs_human', escalation_reason='', bounces=max_bounces WHERE id='blank'`); err != nil {
+		t.Fatal(err)
+	}
 	// and it must have a terminal exit once the advisor has TRIED it (advisor_attempts>0) and
 	// it then went idle — not before (the advisor gets first crack). Simulate an advisor
 	// attempt + age it, then the time backstop cancels it.
