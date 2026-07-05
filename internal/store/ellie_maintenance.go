@@ -50,6 +50,10 @@ func (s *Store) MaintenanceCheckCompleted(ctx context.Context, storeID string, s
 	return maintenance.ContentHashesMatch(candidate, completed), nil
 }
 
+func (s *Store) FilterEligibleMaintenanceCandidates(ctx context.Context, storeID string, sweep maintenance.SweepType, candidates []maintenance.Candidate) ([]maintenance.Candidate, maintenance.GateStats, error) {
+	return maintenance.FilterEligible(ctx, s, storeID, sweep, candidates)
+}
+
 func (s *Store) RecordEllieMaintenanceCheck(ctx context.Context, check EllieMaintenanceCheck) (bool, error) {
 	if check.StoreID == "" {
 		return false, errors.New("maintenance check store_id is required")

@@ -146,3 +146,10 @@ durations change.
 | `flowbee_cost_micro_usd_total` | counter | none | Cumulative metered agent spend in micro-USD. One USD is `1,000,000` micro-USD. | Alert on spend burn rate using `rate()` or `increase()`, such as hourly or daily spend above budget or historical baseline. Do not alert on the raw cumulative total. |
 | `flowbee_jobs_over_budget` | gauge | none | Current count of jobs whose recorded cost breached their configured budget. | Alert on sustained non-zero values or sudden increases. This can indicate mis-sized budgets, runaway work, model/tool failures, or unexpected workload changes. This is a gauge in the handler, not a counter. |
 | `flowbee_outbox_abandoned` | gauge | `action` | Current count of actionable abandoned, dead-lettered GitHub writes grouped by outbox action. The handler uses the `action` label; action values come from stored outbox actions and are not enumerated by the handler. | Alert on any sustained non-zero value or increase for the same action. Abandoned outbox work usually means automation failed permanently or exceeded retry policy. This is a gauge in the handler, not a counter. |
+
+Ellie LLM-backed maintenance sweeps also emit one structured log line per run:
+`ellie maintenance sweep stats`, with `sweep_type`, `candidates_generated`,
+`skipped_unchanged`, `sent_to_llm`, `llm_calls`, `completed_persisted`, and
+`failed_not_persisted`. These logs are the guardrail for spotting repeated
+unchanged contradiction, dedup, reground, or reflection work before it reaches an
+LLM-priced operation.

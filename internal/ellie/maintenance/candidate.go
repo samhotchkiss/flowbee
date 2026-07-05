@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"time"
 )
@@ -240,17 +241,30 @@ type CompletedLedger interface {
 }
 
 type JudgeFunc func(ctx context.Context, candidate Candidate) (ResultStatus, error)
+type CandidateSource func(ctx context.Context) ([]Candidate, error)
 
 type RunOptions struct {
-	StoreID    string
-	SweepType  SweepType
-	Candidates []Candidate
-	Judge      JudgeFunc
-	Now        func() time.Time
-	SweepRunID string
+	StoreID         string
+	SweepType       SweepType
+	Candidates      []Candidate
+	CandidateSource CandidateSource
+	Judge           JudgeFunc
+	Now             func() time.Time
+	SweepRunID      string
 }
 
-func RunLLMSweep(ctx context.Context, ledger CompletedLedger, opts RunOptions) (GateStats, error) {
+func StaticCandidateSource(candidates []Candidate) CandidateSource {
+	return func(context.Context) ([]Candidate, error) {
+		return candidates, nil
+	}
+}
+
+func RunLLMSweep(ctx context.Context, ledger CompletedLedger, opts RunOptions) (stats GateStats, err error) {
+	defer func() {
+		if stats.SweepType != "" {
+			logGateStats(stats)
+		}
+	}()
 	if ledger == nil {
 		return GateStats{}, errors.New("maintenance sweep ledger is required")
 	}
@@ -263,12 +277,22 @@ func RunLLMSweep(ctx context.Context, ledger CompletedLedger, opts RunOptions) (
 	if opts.Judge == nil {
 		return GateStats{}, errors.New("maintenance sweep judge is required")
 	}
+	if opts.CandidateSource != nil && opts.Candidates != nil {
+		return GateStats{}, errors.New("maintenance sweep must use either candidates or candidate source, not both")
+	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
 	}
+	candidates := opts.Candidates
+	if opts.CandidateSource != nil {
+		candidates, err = opts.CandidateSource(ctx)
+		if err != nil {
+			return GateStats{SweepType: opts.SweepType}, fmt.Errorf("generate %s maintenance candidates: %w", opts.SweepType, err)
+		}
+	}
 
-	eligible, stats, err := FilterEligible(ctx, ledger, opts.StoreID, opts.SweepType, opts.Candidates)
+	eligible, stats, err := FilterEligible(ctx, ledger, opts.StoreID, opts.SweepType, candidates)
 	if err != nil {
 		return stats, err
 	}
@@ -301,6 +325,17 @@ func RunLLMSweep(ctx context.Context, ledger CompletedLedger, opts RunOptions) (
 		}
 	}
 	return stats, nil
+}
+
+func logGateStats(stats GateStats) {
+	log.Printf("ellie maintenance sweep stats: sweep_type=%s candidates_generated=%d skipped_unchanged=%d sent_to_llm=%d llm_calls=%d completed_persisted=%d failed_not_persisted=%d",
+		stats.SweepType,
+		stats.CandidatesGenerated,
+		stats.SkippedUnchanged,
+		stats.SentToLLM,
+		stats.LLMCalls,
+		stats.CompletedPersisted,
+		stats.FailedNotPersisted)
 }
 
 func RequireCandidateKinds(sweep SweepType, candidates []Candidate, allowed ...CandidateKind) error {

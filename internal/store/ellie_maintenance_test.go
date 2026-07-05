@@ -240,6 +240,31 @@ func TestEllieMaintenanceChangedMemberOnlyReopensAffectedCandidates(t *testing.T
 	}
 }
 
+func TestStoreFilterEligibleMaintenanceCandidatesUsesDurableLedger(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	at := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	ab := mustMaintPair(t, maintenance.Member{ID: "a", ContentHash: "ha"}, maintenance.Member{ID: "b", ContentHash: "hb"})
+	ac := mustMaintPair(t, maintenance.Member{ID: "a", ContentHash: "ha"}, maintenance.Member{ID: "c", ContentHash: "hc"})
+	if _, err := st.RecordEllieMaintenanceCheck(ctx, store.EllieMaintenanceCheck{
+		StoreID: "tenant-1", SweepType: maintenance.SweepContradiction, Candidate: ab,
+		ResultStatus: maintenance.ResultSuccess, CheckedAt: at,
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	eligible, stats, err := st.FilterEligibleMaintenanceCandidates(ctx, "tenant-1", maintenance.SweepContradiction, []maintenance.Candidate{ab, ac})
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+	if len(eligible) != 1 || eligible[0].Key != ac.Key {
+		t.Fatalf("eligible=%+v, want only ac", eligible)
+	}
+	if stats.CandidatesGenerated != 2 || stats.SkippedUnchanged != 1 || stats.SentToLLM != 1 {
+		t.Fatalf("stats=%+v, want one durable skip and one LLM candidate", stats)
+	}
+}
+
 func candidatesForSweep(sweep maintenance.SweepType, candidates []maintenance.Candidate) []maintenance.Candidate {
 	var out []maintenance.Candidate
 	for _, c := range candidates {
