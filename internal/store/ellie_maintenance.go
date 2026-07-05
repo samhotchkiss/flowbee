@@ -27,8 +27,12 @@ func (s *Store) MaintenanceCheckCompleted(ctx context.Context, storeID string, s
 	if !maintenance.ValidSweepType(sweep) {
 		return false, fmt.Errorf("unknown maintenance sweep type %q", sweep)
 	}
+	candidate, err := maintenance.NormalizeCandidate(candidate)
+	if err != nil {
+		return false, err
+	}
 	var hashes string
-	err := s.DB.QueryRowContext(ctx, `
+	err = s.DB.QueryRowContext(ctx, `
 		SELECT candidate_content_hashes
 		  FROM ellie_maintenance_checks
 		 WHERE store_id = ? AND sweep_type = ? AND candidate_key = ?`,
@@ -53,24 +57,25 @@ func (s *Store) RecordEllieMaintenanceCheck(ctx context.Context, check EllieMain
 	if !maintenance.ValidSweepType(check.SweepType) {
 		return false, fmt.Errorf("unknown maintenance sweep type %q", check.SweepType)
 	}
-	if check.Candidate.Key == "" {
-		return false, errors.New("maintenance check candidate key is required")
-	}
 	if check.CheckedAt.IsZero() {
 		return false, errors.New("maintenance check checked_at is required")
 	}
 	if !maintenance.IsCompletedStatus(check.ResultStatus) {
 		return false, nil
 	}
+	candidate, err := maintenance.NormalizeCandidate(check.Candidate)
+	if err != nil {
+		return false, err
+	}
 	members := make([]string, 0, len(check.Candidate.Members))
-	for _, m := range check.Candidate.Members {
+	for _, m := range candidate.Members {
 		members = append(members, m.ID)
 	}
 	memberJSON, err := json.Marshal(members)
 	if err != nil {
 		return false, fmt.Errorf("encode ellie maintenance members: %w", err)
 	}
-	hashJSON, err := json.Marshal(check.Candidate.Members)
+	hashJSON, err := json.Marshal(candidate.Members)
 	if err != nil {
 		return false, fmt.Errorf("encode ellie maintenance hashes: %w", err)
 	}
@@ -91,8 +96,8 @@ func (s *Store) RecordEllieMaintenanceCheck(ctx context.Context, check EllieMain
 		    updated_at = datetime('now')`,
 		check.StoreID,
 		string(check.SweepType),
-		string(check.Candidate.Kind),
-		check.Candidate.Key,
+		string(candidate.Kind),
+		candidate.Key,
 		string(memberJSON),
 		string(hashJSON),
 		string(check.ResultStatus),

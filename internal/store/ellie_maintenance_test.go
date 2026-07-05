@@ -51,6 +51,42 @@ func TestEllieMaintenanceLedgerSkipsSameHashesAndReopensChangedHashes(t *testing
 	}
 }
 
+func TestEllieMaintenanceLedgerCanonicalizesDirectCandidates(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	at := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	raw := maintenance.Candidate{
+		Kind: maintenance.CandidatePair,
+		Members: []maintenance.Member{
+			{ID: "b", ContentHash: "hb"},
+			{ID: "a", ContentHash: "ha"},
+		},
+	}
+
+	persisted, err := st.RecordEllieMaintenanceCheck(ctx, store.EllieMaintenanceCheck{
+		StoreID:      "tenant-1",
+		SweepType:    maintenance.SweepContradiction,
+		Candidate:    raw,
+		ResultStatus: maintenance.ResultSuccess,
+		CheckedAt:    at,
+	})
+	if err != nil {
+		t.Fatalf("record raw candidate: %v", err)
+	}
+	if !persisted {
+		t.Fatal("raw completed candidate should be persisted")
+	}
+
+	canonical := mustMaintPair(t, maintenance.Member{ID: "a", ContentHash: "ha"}, maintenance.Member{ID: "b", ContentHash: "hb"})
+	done, err := st.MaintenanceCheckCompleted(ctx, "tenant-1", maintenance.SweepContradiction, canonical)
+	if err != nil {
+		t.Fatalf("completed canonical: %v", err)
+	}
+	if !done {
+		t.Fatal("canonical candidate should be skipped after raw candidate was persisted")
+	}
+}
+
 func TestEllieMaintenanceLedgerTreatsRefusalAndNoOpAsCompleted(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.NewStore(t)

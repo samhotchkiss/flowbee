@@ -73,6 +73,20 @@ func NewCandidate(kind CandidateKind, members []Member) (Candidate, error) {
 	return Candidate{Kind: kind, Key: key, Members: canon}, nil
 }
 
+func NormalizeCandidate(candidate Candidate) (Candidate, error) {
+	if err := validKind(candidate.Kind); err != nil {
+		return Candidate{}, err
+	}
+	normalized, err := NewCandidate(candidate.Kind, candidate.Members)
+	if err != nil {
+		return Candidate{}, err
+	}
+	if candidate.Key != "" && candidate.Key != normalized.Key {
+		return Candidate{}, fmt.Errorf("maintenance candidate key %q does not match canonical key %q", candidate.Key, normalized.Key)
+	}
+	return normalized, nil
+}
+
 func Pair(a, b Member) (Candidate, error) {
 	return NewCandidate(CandidatePair, []Member{a, b})
 }
@@ -189,7 +203,11 @@ func FilterEligible(ctx context.Context, checker CompletedChecker, storeID strin
 	stats := GateStats{SweepType: sweep, CandidatesGenerated: len(candidates)}
 	eligible := make([]Candidate, 0, len(candidates))
 	for _, c := range candidates {
-		done, err := checker.MaintenanceCheckCompleted(ctx, storeID, sweep, c)
+		candidate, err := NormalizeCandidate(c)
+		if err != nil {
+			return nil, stats, err
+		}
+		done, err := checker.MaintenanceCheckCompleted(ctx, storeID, sweep, candidate)
 		if err != nil {
 			return nil, stats, err
 		}
@@ -197,7 +215,7 @@ func FilterEligible(ctx context.Context, checker CompletedChecker, storeID strin
 			stats.SkippedUnchanged++
 			continue
 		}
-		eligible = append(eligible, c)
+		eligible = append(eligible, candidate)
 	}
 	stats.SentToLLM = len(eligible)
 	return eligible, stats, nil

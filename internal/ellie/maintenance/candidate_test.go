@@ -92,6 +92,41 @@ type mapChecker struct {
 	done map[string]bool
 }
 
+func TestNormalizeCandidateCanonicalizesDirectCandidates(t *testing.T) {
+	raw := Candidate{
+		Kind: CandidatePair,
+		Members: []Member{
+			{ID: "b", ContentHash: "hb"},
+			{ID: "a", ContentHash: "ha"},
+		},
+	}
+	got, err := NormalizeCandidate(raw)
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	want := mustPair(t, Member{ID: "a", ContentHash: "ha"}, Member{ID: "b", ContentHash: "hb"})
+	if got.Key != want.Key {
+		t.Fatalf("key=%q, want %q", got.Key, want.Key)
+	}
+	if got.Members[0].ID != "a" || got.Members[1].ID != "b" {
+		t.Fatalf("members not canonical: %+v", got.Members)
+	}
+}
+
+func TestNormalizeCandidateRejectsMismatchedKey(t *testing.T) {
+	_, err := NormalizeCandidate(Candidate{
+		Kind: CandidatePair,
+		Key:  `pair:["x","y"]`,
+		Members: []Member{
+			{ID: "a", ContentHash: "ha"},
+			{ID: "b", ContentHash: "hb"},
+		},
+	})
+	if err == nil {
+		t.Fatal("mismatched direct candidate key should fail")
+	}
+}
+
 func (m mapChecker) MaintenanceCheckCompleted(_ context.Context, _ string, _ SweepType, candidate Candidate) (bool, error) {
 	return m.done[candidate.Key], nil
 }

@@ -68,6 +68,47 @@ func TestRunLLMSweepDoesNotPersistJudgeErrors(t *testing.T) {
 	}
 }
 
+func TestRunLLMSweepNormalizesCandidateBeforeJudgeAndLedger(t *testing.T) {
+	ctx := context.Background()
+	ledger := &memoryLedger{completed: map[string]Candidate{}}
+	raw := Candidate{
+		Kind: CandidatePair,
+		Members: []Member{
+			{ID: "b", ContentHash: "hb"},
+			{ID: "a", ContentHash: "ha"},
+		},
+	}
+
+	stats, err := RunLLMSweep(ctx, ledger, RunOptions{
+		StoreID:    "tenant-1",
+		SweepType:  SweepContradiction,
+		Candidates: []Candidate{raw},
+		Judge: func(_ context.Context, candidate Candidate) (ResultStatus, error) {
+			if candidate.Key != `pair:["a","b"]` {
+				t.Fatalf("judge saw non-canonical key %q", candidate.Key)
+			}
+			if candidate.Members[0].ID != "a" || candidate.Members[1].ID != "b" {
+				t.Fatalf("judge saw non-canonical members %+v", candidate.Members)
+			}
+			return ResultSuccess, nil
+		},
+		Now: func() time.Time { return time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC) },
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if stats.LLMCalls != 1 || stats.CompletedPersisted != 1 {
+		t.Fatalf("stats=%+v, want one judged and persisted candidate", stats)
+	}
+	done, err := ledger.MaintenanceCheckCompleted(ctx, "tenant-1", SweepContradiction, mustPair(t, Member{ID: "a", ContentHash: "ha"}, Member{ID: "b", ContentHash: "hb"}))
+	if err != nil {
+		t.Fatalf("completed: %v", err)
+	}
+	if !done {
+		t.Fatal("canonical candidate should be completed after raw input was judged")
+	}
+}
+
 type memoryLedger struct {
 	completed map[string]Candidate
 }
