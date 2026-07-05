@@ -23,6 +23,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/llm"
 	"github.com/samhotchkiss/flowbee/internal/multirepo"
 	"github.com/samhotchkiss/flowbee/internal/project"
 	"github.com/samhotchkiss/flowbee/internal/store"
@@ -156,6 +157,7 @@ func runServe(args []string) error {
 	if err := store.MigrateUp(ctx, st.DB); err != nil {
 		return err
 	}
+	llm.UseDatabaseAsDefaultRouter(st.DB)
 	logger.Info("migrations applied")
 
 	// self-provision the control-plane mirror from the GitHub token if it's

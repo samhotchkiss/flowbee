@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/client"
+	"github.com/samhotchkiss/flowbee/internal/llm"
+	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
 
 // TestHungAgentKilledOnContextEnd is the regression for a fleet-availability wedge: a
@@ -19,6 +21,10 @@ import (
 // both reduce to run-context cancellation. Here we cancel the context while a `sleep`
 // agent is running and assert the helper returns promptly instead of waiting it out.
 func TestHungAgentKilledOnContextEnd(t *testing.T) {
+	st := testutil.NewStore(t)
+	llm.UseDatabaseAsDefaultRouter(st.DB)
+	t.Cleanup(func() { llm.SetDefaultRouter(nil) })
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"directive":"continue"}`))
@@ -52,6 +58,10 @@ func TestHungAgentKilledOnContextEnd(t *testing.T) {
 }
 
 func TestAgentHeartbeatRefreshesRegistration(t *testing.T) {
+	st := testutil.NewStore(t)
+	llm.UseDatabaseAsDefaultRouter(st.DB)
+	t.Cleanup(func() { llm.SetDefaultRouter(nil) })
+
 	oldMin, oldMax := agentHeartbeatMinS, agentHeartbeatMaxS
 	agentHeartbeatMinS, agentHeartbeatMaxS = 1, 1
 	t.Cleanup(func() {

@@ -10,12 +10,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
-	"time"
 
 	"github.com/samhotchkiss/flowbee/client"
 	"github.com/samhotchkiss/flowbee/internal/content"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
+	"github.com/samhotchkiss/flowbee/internal/llm"
 )
 
 // TaskFileRel is the worktree-relative path the harness writes the resolved task
@@ -1040,71 +1039,34 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, reg *client.Regi
 	if agentCmd == "" {
 		return "", nil
 	}
-	// Bound the agent by the lease's absolute cap (+margin). The CP revokes a lease at
-	// lease_ttl_s EVEN while heartbeating (the un-gameable cap), so an agent that outruns
-	// it is a zombie working a job the CP already reassigned. A hung/slow agent must NEVER
-	// block the worker loop forever — cmd.Wait would never return, silently removing the
-	// worker from the fleet. Kill it when the deadline passes OR when the CP revokes.
-	runCtx, cancel := context.WithTimeout(ctx, time.Duration(ttlS+30)*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(runCtx, "sh", "-c", agentCmd)
-	cmd.Dir = dir
-	cmd.Env = env
-	// Run the agent in its OWN process group, and on cancel/timeout kill the WHOLE
-	// group — not just `sh`. A real agent forks children (the model CLI, git, …) that
-	// INHERIT the stdout/stderr pipe; killing only the direct child leaves those orphans
-	// holding the pipe open, so cmd.Wait() blocks until THEY exit (up to the full agent
-	// run) — re-wedging the worker the timeout was meant to free. Setpgid + a group-kill
-	// Cancel closes the pipe at once; WaitDelay force-closes it as a backstop. (This is
-	// also what made the unit test pass locally but hang in CI: a shell that exec-optimized
-	// `sh -c "cmd"` into one process vs one that forked a pipe-holding child.)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // -pid = the whole group
+	_ = capture // (capture is now always on; the param is kept for call-site clarity)
+
+	if err := llm.EnsureDefaultAgentRouter(ctx); err != nil {
+		return "", fmt.Errorf("llm router: %w", err)
+	}
+	slot := llm.SlotDraftingComplex
+	for _, kv := range env {
+		if kv == "FLOWBEE_ROLE=code_reviewer" || kv == "FLOWBEE_ROLE=spec_reviewer" {
+			slot = llm.SlotJudge
+			break
 		}
-		return nil
 	}
-	cmd.WaitDelay = 10 * time.Second
-	// BOUNDED capture: the agent CLI is an untrusted black box, so its stdout/stderr must
-	// NOT buffer without limit — a chatty or runaway agent (or one dumping a file to
-	// stdout) would OOM the worker, and for review/author roles the whole stdout is
-	// submitted as the artifact when the verdict/spec file is absent. Cap both; the writer
-	// keeps consuming past the cap so the child's pipe never blocks.
-	errb, outb := newBoundedWriter(maxAgentStderrBytes), newBoundedWriter(maxAgentStdoutBytes)
-	cmd.Stderr = errb
-	cmd.Stdout = outb // capture: needed to parse the agent's reported cost/usage
-	_ = capture       // (capture is now always on; the param is kept for call-site clarity)
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("agent start: %w", err)
-	}
-	// heartbeat well under the soft rungs (phase budget ~TTL/2, stale threshold
-	// ~3×heartbeat) so the lease never lapses mid-build — cap at 60s so a long TTL
-	// doesn't stretch the interval past those thresholds (#40).
-	interval := agentHeartbeatIntervalS(ttlS)
-	done := make(chan struct{})
-	go func() {
-		t := time.NewTicker(time.Duration(interval) * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
+	resp, err := llm.Call(ctx, slot, llm.Request{
+		Prompt: "run Flowbee agent command",
+		Input: llm.AgentCommand{
+			Command:    agentCmd,
+			Dir:        dir,
+			Env:        env,
+			TTLSeconds: ttlS,
+			Heartbeat: func(runCtx context.Context) bool {
 				refreshWorkerRegistration(runCtx, c, reg)
-				// act on the CP's verdict: a `cancel` directive (over-budget / two-rung kill)
-				// or a stale-epoch 409 means the lease is GONE — stop the now-orphaned agent
-				// at once and free the worker, instead of finishing reassigned work.
-				if hbDir, st, _ := c.Heartbeat(runCtx, jobID, epoch); hbDir == "cancel" || st == 409 {
-					cancel()
-					return
-				}
-			}
-		}
-	}()
-	werr := cmd.Wait()
-	close(done)
-	out := outb.String()
+				hbDir, st, _ := c.Heartbeat(runCtx, jobID, epoch)
+				return hbDir != "cancel" && st != 409
+			},
+		},
+		Metadata: map[string]string{"job_id": jobID},
+	})
+	out := resp.Text
 	// report the agent's metered cost (claude --output-format json prints total_cost_usd
 	// + usage) in a final heartbeat: the server folds the delta into the per-job meter,
 	// and a delta that crosses the ceiling escalates the job to needs_human (I-15). A
@@ -1118,13 +1080,8 @@ func runAgentHeartbeatIO(ctx context.Context, c *client.Client, reg *client.Regi
 	// "usage limit" / claude rate-limit / 429), report the account as rate-limited so
 	// dispatch gates it OUT until it clears — the per-account ceiling the operator wanted.
 	reportAccountLimit(ctx, c, out)
-	if werr != nil {
-		// distinguish a deadline/revoke kill (the lease is gone — the caller releases and
-		// loops to fresh work) from a genuine agent failure, so the log isn't misleading.
-		if runCtx.Err() != nil {
-			return out, fmt.Errorf("agent aborted (lease revoked or exceeded lease_ttl): %w", runCtx.Err())
-		}
-		return out, fmt.Errorf("agent cmd: %v: %s", werr, strings.TrimSpace(errb.String()))
+	if err != nil {
+		return out, err
 	}
 	return out, nil
 }

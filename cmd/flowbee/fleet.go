@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/auth"
+	"github.com/samhotchkiss/flowbee/internal/llm"
 )
 
 // runFleet is the "fungible worker box" command: it starts one worker per pipeline
@@ -470,20 +471,28 @@ func smokeAgent(buildCmd string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", buildCmd)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"FLOWBEE_TASK_FILE="+taskFile,
-		"FLOWBEE_TASK=Create a file named ok.txt containing ok.",
-	)
-	out, runErr := cmd.CombinedOutput()
+	if err := llm.EnsureDefaultAgentRouter(ctx); err != nil {
+		return fmt.Errorf("llm router: %w", err)
+	}
+	resp, runErr := llm.Call(ctx, llm.SlotDraftingComplex, llm.Request{
+		Prompt: "smoke-test build agent",
+		Input: llm.AgentCommand{
+			Command: buildCmd,
+			Dir:     dir,
+			Env: append(os.Environ(),
+				"FLOWBEE_TASK_FILE="+taskFile,
+				"FLOWBEE_TASK=Create a file named ok.txt containing ok.",
+			),
+			TTLSeconds: 120,
+		},
+	})
 	if _, statErr := os.Stat(filepath.Join(dir, "ok.txt")); statErr == nil {
 		return nil // the agent wrote the file — it works
 	}
 	if runErr != nil {
-		return fmt.Errorf("agent exited with error (is it installed + authed?): %v: %s", runErr, trunc(string(out), 300))
+		return fmt.Errorf("agent exited with error (is it installed + authed?): %v: %s", runErr, trunc(resp.Text, 300))
 	}
-	return fmt.Errorf("agent ran but wrote no file — likely not authed, rate-limited, or wrong --build-agent-cmd: %s", trunc(string(out), 300))
+	return fmt.Errorf("agent ran but wrote no file — likely not authed, rate-limited, or wrong --build-agent-cmd: %s", trunc(resp.Text, 300))
 }
 
 // smokeReviewAgent runs the REVIEW agent command on a trivial prompt and confirms it
@@ -504,18 +513,26 @@ func smokeReviewAgent(reviewCmd string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", reviewCmd)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"FLOWBEE_TASK_FILE="+taskFile,
-		"FLOWBEE_TASK=Reply with ok.",
-	)
-	out, runErr := cmd.CombinedOutput()
-	if runErr != nil {
-		return fmt.Errorf("review agent exited with error (is the review model available + authed?): %v: %s", runErr, trunc(string(out), 300))
+	if err := llm.EnsureDefaultAgentRouter(ctx); err != nil {
+		return fmt.Errorf("llm router: %w", err)
 	}
-	if strings.TrimSpace(string(out)) == "" {
-		return fmt.Errorf("review agent ran but produced no output — likely not authed or wrong --agent-cmd: %s", trunc(string(out), 300))
+	resp, runErr := llm.Call(ctx, llm.SlotJudge, llm.Request{
+		Prompt: "smoke-test review agent",
+		Input: llm.AgentCommand{
+			Command: reviewCmd,
+			Dir:     dir,
+			Env: append(os.Environ(),
+				"FLOWBEE_TASK_FILE="+taskFile,
+				"FLOWBEE_TASK=Reply with ok.",
+			),
+			TTLSeconds: 120,
+		},
+	})
+	if runErr != nil {
+		return fmt.Errorf("review agent exited with error (is the review model available + authed?): %v: %s", runErr, trunc(resp.Text, 300))
+	}
+	if strings.TrimSpace(resp.Text) == "" {
+		return fmt.Errorf("review agent ran but produced no output — likely not authed or wrong --agent-cmd: %s", trunc(resp.Text, 300))
 	}
 	return nil
 }
