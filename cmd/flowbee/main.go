@@ -104,8 +104,6 @@ func main() {
 		err = runMigrate(args)
 	case "seed":
 		err = runSeed(args)
-	case "mail-stage1":
-		err = runMailStage1(args)
 	case "token":
 		err = runToken(args)
 	case "work":
@@ -148,5 +146,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|list|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|retry-outbox|backup|build|restore|pause|resume|seed|mail-stage1|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|list|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|cancel|retry-outbox|backup|build|restore|pause|resume|seed|version>")
 }

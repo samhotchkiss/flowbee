@@ -66,7 +66,7 @@ func NewProcessor() Stage1Processor {
 }
 
 func (Processor) Score(m Message) Result {
-	return ScoreStage1(m)
+	return scoreStage1(m)
 }
 
 func (Processor) Classify(m Message) Classification {
@@ -110,6 +110,10 @@ type Result struct {
 // keeps the historical senderLean behavior, then applies a late composite floor
 // only when content or thread context proves the message is substantive.
 func ScoreStage1(m Message) Result {
+	return scoreStage1(m)
+}
+
+func scoreStage1(m Message) Result {
 	classification := ClassifyContent(m)
 	senderHighStakes := m.Sender.HighStakes()
 	senderLean := 0.0
