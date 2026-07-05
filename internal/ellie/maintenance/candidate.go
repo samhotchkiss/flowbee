@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 )
 
 type SweepType string
@@ -176,6 +177,7 @@ type GateStats struct {
 	CandidatesGenerated int
 	SkippedUnchanged    int
 	SentToLLM           int
+	LLMCalls            int
 	CompletedPersisted  int
 	FailedNotPersisted  int
 }
@@ -199,4 +201,102 @@ func FilterEligible(ctx context.Context, checker CompletedChecker, storeID strin
 	}
 	stats.SentToLLM = len(eligible)
 	return eligible, stats, nil
+}
+
+type CheckRecord struct {
+	StoreID      string
+	SweepType    SweepType
+	Candidate    Candidate
+	ResultStatus ResultStatus
+	CheckedAt    time.Time
+	SweepRunID   string
+}
+
+type CompletedRecorder interface {
+	RecordMaintenanceCheck(ctx context.Context, check CheckRecord) (bool, error)
+}
+
+type CompletedLedger interface {
+	CompletedChecker
+	CompletedRecorder
+}
+
+type JudgeFunc func(ctx context.Context, candidate Candidate) (ResultStatus, error)
+
+type RunOptions struct {
+	StoreID    string
+	SweepType  SweepType
+	Candidates []Candidate
+	Judge      JudgeFunc
+	Now        func() time.Time
+	SweepRunID string
+}
+
+func RunLLMSweep(ctx context.Context, ledger CompletedLedger, opts RunOptions) (GateStats, error) {
+	if ledger == nil {
+		return GateStats{}, errors.New("maintenance sweep ledger is required")
+	}
+	if opts.StoreID == "" {
+		return GateStats{}, errors.New("maintenance sweep store_id is required")
+	}
+	if !ValidSweepType(opts.SweepType) {
+		return GateStats{}, fmt.Errorf("unknown maintenance sweep type %q", opts.SweepType)
+	}
+	if opts.Judge == nil {
+		return GateStats{}, errors.New("maintenance sweep judge is required")
+	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+
+	eligible, stats, err := FilterEligible(ctx, ledger, opts.StoreID, opts.SweepType, opts.Candidates)
+	if err != nil {
+		return stats, err
+	}
+	for _, candidate := range eligible {
+		stats.LLMCalls++
+		status, err := opts.Judge(ctx, candidate)
+		if err != nil {
+			stats.FailedNotPersisted++
+			return stats, fmt.Errorf("%s maintenance judge for %s: %w", opts.SweepType, candidate.Key, err)
+		}
+		if !IsCompletedStatus(status) {
+			stats.FailedNotPersisted++
+			continue
+		}
+		persisted, err := ledger.RecordMaintenanceCheck(ctx, CheckRecord{
+			StoreID:      opts.StoreID,
+			SweepType:    opts.SweepType,
+			Candidate:    candidate,
+			ResultStatus: status,
+			CheckedAt:    now(),
+			SweepRunID:   opts.SweepRunID,
+		})
+		if err != nil {
+			return stats, fmt.Errorf("record %s maintenance check for %s: %w", opts.SweepType, candidate.Key, err)
+		}
+		if persisted {
+			stats.CompletedPersisted++
+		} else {
+			stats.FailedNotPersisted++
+		}
+	}
+	return stats, nil
+}
+
+func RequireCandidateKinds(sweep SweepType, candidates []Candidate, allowed ...CandidateKind) error {
+	ok := make(map[CandidateKind]bool, len(allowed))
+	for _, kind := range allowed {
+		if err := validKind(kind); err != nil {
+			return err
+		}
+		ok[kind] = true
+	}
+	for _, candidate := range candidates {
+		if !ok[candidate.Kind] {
+			return fmt.Errorf("%s sweep candidate %s has unsupported kind %q", sweep, candidate.Key, candidate.Kind)
+		}
+	}
+	return nil
 }

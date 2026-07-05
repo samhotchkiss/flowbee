@@ -103,3 +103,14 @@ func (s *Store) RecordEllieMaintenanceCheck(ctx context.Context, check EllieMain
 	}
 	return true, nil
 }
+
+func (s *Store) RecordMaintenanceCheck(ctx context.Context, check maintenance.CheckRecord) (bool, error) {
+	return s.RecordEllieMaintenanceCheck(ctx, EllieMaintenanceCheck{
+		StoreID:      check.StoreID,
+		SweepType:    check.SweepType,
+		Candidate:    check.Candidate,
+		ResultStatus: check.ResultStatus,
+		CheckedAt:    check.CheckedAt,
+		SweepRunID:   check.SweepRunID,
+	})
+}
