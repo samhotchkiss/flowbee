@@ -232,8 +232,10 @@ func TestAdvisorEngagesBlankBounceExhaustion(t *testing.T) {
 	if len(cands) != 1 || cands[0].JobID != "blank" || cands[0].Reason != string(job.EscalationBounces) {
 		t.Fatalf("blank-column bounce-exhaustion must be engaged as bounces, got %+v", cands)
 	}
-	// and it must have a terminal exit (auto-cancel by time), not park forever.
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at='2020-01-01 00:00:00' WHERE id='blank'`); err != nil {
+	// and it must have a terminal exit once the advisor has TRIED it (advisor_attempts>0) and
+	// it then went idle — not before (the advisor gets first crack). Simulate an advisor
+	// attempt + age it, then the time backstop cancels it.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=1, updated_at='2020-01-01 00:00:00' WHERE id='blank'`); err != nil {
 		t.Fatal(err)
 	}
 	rep, err := st.AutoCancelExhausted(ctx, 3, 24*time.Hour, now)
@@ -241,7 +243,7 @@ func TestAdvisorEngagesBlankBounceExhaustion(t *testing.T) {
 		t.Fatalf("auto-cancel: %v", err)
 	}
 	if len(rep.Cancelled) != 1 || rep.Cancelled[0] != "blank" {
-		t.Fatalf("blank bounce-exhaustion must be time-cancelable, got %v", rep.Cancelled)
+		t.Fatalf("blank bounce-exhaustion must be time-cancelable after the advisor tried, got %v", rep.Cancelled)
 	}
 }
 
@@ -325,13 +327,18 @@ func TestAutoCancelTimeBackstop(t *testing.T) {
 
 	seedNeedsHuman(t, st, "aged", string(job.EscalationBounces), now)
 	seedNeedsHuman(t, st, "fresh", string(job.EscalationBounces), now)
-	// both under the advisor cap; only "aged" is past maxParkedAge. Use the REAL SQLite
-	// datetime('now') format (space-separated) — an RFC3339 literal here would let the parse
-	// bug hide, which is exactly how this shipped inert once.
+	seedNeedsHuman(t, st, "aged-untried", string(job.EscalationBounces), now)
+	// "aged": the advisor HAS tried it (advisor_attempts=1) and it went idle → time-cancel.
 	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=1, updated_at='2020-01-01 00:00:00' WHERE id='aged'`); err != nil {
 		t.Fatal(err)
 	}
+	// "fresh": advisor tried, recently active → keep trying.
 	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=1, updated_at=? WHERE id='fresh'`, now.UTC().Format("2006-01-02 15:04:05")); err != nil {
+		t.Fatal(err)
+	}
+	// "aged-untried": old (from before autonomy) but advisor_attempts=0 — the advisor must get
+	// FIRST crack, so it must NOT be time-cancelled out from under the advisor.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET advisor_attempts=0, updated_at='2020-01-01 00:00:00' WHERE id='aged-untried'`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -340,10 +347,13 @@ func TestAutoCancelTimeBackstop(t *testing.T) {
 		t.Fatalf("auto-cancel: %v", err)
 	}
 	if len(rep.Cancelled) != 1 || rep.Cancelled[0] != "aged" {
-		t.Fatalf("Cancelled=%v, want [aged] (time backstop)", rep.Cancelled)
+		t.Fatalf("Cancelled=%v, want [aged] (time backstop fires only after the advisor tried)", rep.Cancelled)
 	}
 	if j, _ := st.GetJob(ctx, "fresh"); j.State != job.StateNeedsHuman {
 		t.Fatalf("fresh state=%s, want needs_human (recently active — keep trying)", j.State)
+	}
+	if j, _ := st.GetJob(ctx, "aged-untried"); j.State != job.StateNeedsHuman {
+		t.Fatalf("aged-untried state=%s, want needs_human (advisor gets first crack, not a premature cancel)", j.State)
 	}
 }
 

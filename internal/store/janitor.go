@@ -565,8 +565,15 @@ func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, maxPark
 			continue
 		}
 		exhausted := advisable && tries >= advisorCap // count trigger: advisable reasons only
+		// aged (time backstop): the advisor must get FIRST crack at every advisable job — even a
+		// long-stale one from before autonomy was enabled — so the time trigger fires for an
+		// advisable reason ONLY after the advisor has actually tried it (advisor_attempts>0) and
+		// it then went idle/deduped. Otherwise a stale backlog gets cancelled out from under the
+		// advisor before a single guided retry (the "clear by cancelling" antipattern). A
+		// no_eligible_worker park can't be advisor-fixed, so it ages immediately (tries==0).
+		agedEligible := reason == string(job.EscalationNoEligibleWorker) || (advisable && tries > 0)
 		aged := false
-		if maxParkedAge > 0 {
+		if agedEligible && maxParkedAge > 0 {
 			if ts, ok := parseDBTime(updated); ok && now.Sub(ts) > maxParkedAge {
 				aged = true
 			}
