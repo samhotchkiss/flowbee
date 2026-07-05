@@ -38,6 +38,32 @@ func TestProductionEllieJudgeCallsStayBehindLedgerGate(t *testing.T) {
 	}
 }
 
+func TestProductionSweepPackagesUseSharedLedgerRunner(t *testing.T) {
+	root := ellieRoot(t)
+	for _, pkg := range []string{"contradiction", "dedup", "reground", "reflection"} {
+		path := filepath.Join(root, pkg, pkg+".go")
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		found := false
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if isMaintenanceRunLLMSweepCall(call.Fun) {
+				found = true
+				return false
+			}
+			return true
+		})
+		if !found {
+			t.Fatalf("%s sweep production entrypoint must call maintenance.RunLLMSweep", pkg)
+		}
+	}
+}
+
 func TestProductionEllieDoesNotReintroduceWallClockSweepCursor(t *testing.T) {
 	root := ellieRoot(t)
 	var offenders []string
@@ -59,6 +85,15 @@ func TestProductionEllieDoesNotReintroduceWallClockSweepCursor(t *testing.T) {
 	if len(offenders) > 0 {
 		t.Fatalf("wall-clock cursor sweep markers reintroduced in production Ellie code: %s", strings.Join(offenders, ", "))
 	}
+}
+
+func isMaintenanceRunLLMSweepCall(expr ast.Expr) bool {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "RunLLMSweep" {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	return ok && ident.Name == "maintenance"
 }
 
 func isJudgeCall(expr ast.Expr) bool {
