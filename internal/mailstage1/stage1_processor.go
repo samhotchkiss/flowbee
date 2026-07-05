@@ -47,12 +47,21 @@ func (s SenderIntel) HighStakes() bool {
 	return s.VIP || s.KnownInvestor || s.MoneyStakeholder || s.SecurityStakeholder || s.HighStakesContact
 }
 
-// Processor is the production Stage1 processor boundary. Keep callers wired
+// Stage1Processor is the production Stage1 mail scoring contract. Mail ingest
+// should call this interface after the existing contact/Layer 2 resolver has
+// populated Message.Sender; measurement tools are adapters over the same
+// contract, not a second scoring path.
+type Stage1Processor interface {
+	Score(Message) Result
+	Classify(Message) Classification
+}
+
+// Processor is the default production Stage1 processor. Keep callers wired
 // through this type so content classification, scoring, and diagnostics stay in
 // one path instead of drifting into report-only helpers.
 type Processor struct{}
 
-func NewProcessor() Processor {
+func NewProcessor() Stage1Processor {
 	return Processor{}
 }
 

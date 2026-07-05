@@ -40,6 +40,30 @@ func TestProcessorEntryPointUsesStage1ScoringPolicy(t *testing.T) {
 	}
 }
 
+func TestProductionProcessorContractUsesResolvedSenderIntelligence(t *testing.T) {
+	var processor Stage1Processor = NewProcessor()
+
+	got := processor.Score(Message{
+		SenderEmail: "drew@nmangels.com",
+		Subject:     "Fwd: Special Invitation: Investing in NM",
+		Body:        "Sam, please review this investment opportunity before the diligence meeting.",
+		Sender:      SenderIntel{KnownInvestor: true},
+	})
+
+	if got.Composite < ImportantThreshold {
+		t.Fatalf("production processor contract buried high-stakes VIP mail: %+v", got)
+	}
+	if got.Label != LabelActionRequired {
+		t.Fatalf("label=%q want %q", got.Label, LabelActionRequired)
+	}
+	if !got.SenderHighStakes || !got.VIPSubstantiveBoost {
+		t.Fatalf("resolved sender intelligence did not drive the VIP substantive floor: %+v", got)
+	}
+	if got.PreBoostComposite >= ImportantThreshold {
+		t.Fatalf("fixture should prove late floor behavior, pre-boost=%0.2f", got.PreBoostComposite)
+	}
+}
+
 func TestVIPForwardedHighStakesAskSurfacesDespiteForwardShape(t *testing.T) {
 	got := ScoreStage1(Message{
 		SenderEmail: "drew@nmangels.com",
