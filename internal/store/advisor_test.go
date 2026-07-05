@@ -202,6 +202,49 @@ func TestAutoCancelFoldConsistent(t *testing.T) {
 	assertFoldMatchesProjection(t, st, "j")
 }
 
+// TestAdvisorEngagesBlankBounceExhaustion is the regression for a gap found running the
+// autonomy preview against live data: a gate bounce-exhaustion routes to needs_human WITHOUT
+// stamping escalation_reason (the column is blank), so the advisor — which keyed on the
+// column — silently missed it, and a blank reason has no exit → it would park forever. The
+// ladder now derives the EFFECTIVE reason from the counters (classifyEscalation), so a
+// blank-column job whose bounces are exhausted is correctly engaged as `bounces`.
+func TestAdvisorEngagesBlankBounceExhaustion(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(2_000_000_000, 0)
+
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "blank", Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+		BaseSHA: "b0", RequiredCapabilities: []string{"role:eng_worker"}, Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// needs_human with a BLANK escalation_reason but the bounce budget spent (bounces>=max).
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET state='needs_human', escalation_reason='', bounces=max_bounces WHERE id='blank'`); err != nil {
+		t.Fatal(err)
+	}
+
+	cands, err := st.AdvisorCandidates(ctx, 2, 3)
+	if err != nil {
+		t.Fatalf("candidates: %v", err)
+	}
+	if len(cands) != 1 || cands[0].JobID != "blank" || cands[0].Reason != string(job.EscalationBounces) {
+		t.Fatalf("blank-column bounce-exhaustion must be engaged as bounces, got %+v", cands)
+	}
+	// and it must have a terminal exit (auto-cancel by time), not park forever.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at='2020-01-01 00:00:00' WHERE id='blank'`); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := st.AutoCancelExhausted(ctx, 3, 24*time.Hour, now)
+	if err != nil {
+		t.Fatalf("auto-cancel: %v", err)
+	}
+	if len(rep.Cancelled) != 1 || rep.Cancelled[0] != "blank" {
+		t.Fatalf("blank bounce-exhaustion must be time-cancelable, got %v", rep.Cancelled)
+	}
+}
+
 // TestAutonomyPreview: the read-only shadow snapshot lists what the janitor and advisor
 // would engage, without mutating anything.
 func TestAutonomyPreview(t *testing.T) {

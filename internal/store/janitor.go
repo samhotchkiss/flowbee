@@ -264,7 +264,7 @@ func (s *Store) AdvisorCandidates(ctx context.Context, minUnblock, advisorCap in
 		       COALESCE(head_sha,''), COALESCE(base_sha,''),
 		       COALESCE(task_text,''), COALESCE(spec_text,''), COALESCE(acceptance_criteria,''),
 		       COALESCE(last_review_notes,''), COALESCE(last_ci_failures,''),
-		       attempts, max_attempts, bounces, max_bounces,
+		       attempts, max_attempts, bounces, max_bounces, over_budget, stall_revocations,
 		       COALESCE(unblock_attempts,0), COALESCE(advisor_attempts,0),
 		       COALESCE(advisor_last_hash,'')
 		  FROM jobs
@@ -278,13 +278,20 @@ func (s *Store) AdvisorCandidates(ctx context.Context, minUnblock, advisorCap in
 	var out []AdvisorCandidate
 	for rows.Next() {
 		var c AdvisorCandidate
-		var lastHash string
-		if err := rows.Scan(&c.JobID, &c.Kind, &c.Reason, &c.HeadSHA, &c.BaseSHA,
+		var lastHash, rawReason string
+		var over, stall int
+		if err := rows.Scan(&c.JobID, &c.Kind, &rawReason, &c.HeadSHA, &c.BaseSHA,
 			&c.TaskText, &c.SpecText, &c.Acceptance, &c.LastReviewNotes, &c.LastCIFailures,
-			&c.Attempts, &c.MaxAttempts, &c.Bounces, &c.MaxBounces,
+			&c.Attempts, &c.MaxAttempts, &c.Bounces, &c.MaxBounces, &over, &stall,
 			&c.UnblockAttempts, &c.AdvisorAttempts, &lastHash); err != nil {
 			return nil, err
 		}
+		// Use the EFFECTIVE reason: a gate bounce-exhaustion routes to needs_human WITHOUT
+		// stamping escalation_reason (the column is blank), so the advisor would miss it — but
+		// its counters say `bounces`. classifyEscalation derives that the same way the
+		// operator NeedsHumanView does; the explicitly-stamped external reasons
+		// (project_out/pr_closed/cost/ci_stalled) are returned verbatim and stay excluded.
+		c.Reason = classifyEscalation(rawReason, over, c.Attempts, c.MaxAttempts, c.Bounces, c.MaxBounces, stall)
 		if !advisableReasons[c.Reason] {
 			continue
 		}
@@ -528,7 +535,8 @@ type AutoCancelReport struct {
 func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, maxParkedAge time.Duration, now time.Time) (AutoCancelReport, error) {
 	var rep AutoCancelReport
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, COALESCE(escalation_reason,''), COALESCE(advisor_attempts,0), updated_at
+		SELECT id, COALESCE(escalation_reason,''), COALESCE(advisor_attempts,0), updated_at,
+		       attempts, max_attempts, bounces, max_bounces, over_budget, stall_revocations
 		  FROM jobs
 		 WHERE state='needs_human'
 		 ORDER BY id`)
@@ -537,12 +545,16 @@ func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, maxPark
 	}
 	var targets []string
 	for rows.Next() {
-		var id, reason, updated string
-		var tries int
-		if err := rows.Scan(&id, &reason, &tries, &updated); err != nil {
+		var id, rawReason, updated string
+		var tries, attempts, maxA, bounces, maxB, over, stall int
+		if err := rows.Scan(&id, &rawReason, &tries, &updated,
+			&attempts, &maxA, &bounces, &maxB, &over, &stall); err != nil {
 			rows.Close()
 			return rep, err
 		}
+		// effective reason (same derivation as the advisor): a blank-column bounce-exhaustion
+		// must be recognized as `bounces`, or it would evade every self-clear trigger.
+		reason := classifyEscalation(rawReason, over, attempts, maxA, bounces, maxB, stall)
 		advisable := advisableReasons[reason]
 		// no_eligible_worker can't be fixed by a retry (same caps → same dead-end) so the
 		// advisor never touches it — but it must still self-clear rather than park forever, so
