@@ -171,8 +171,10 @@ func TestWatchdogEscalatesStalledWithLiveFleet(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// stall it: updated_at an hour in the past, no lease.
-	stale := now.Add(-1 * time.Hour).Format(time.RFC3339Nano)
+	// stall it: updated_at an hour in the past, no lease. Use the REAL datetime('now') form
+	// (space-separated) production writes — an RFC3339 literal here masks the parse bug that
+	// once made this whole escalation inert.
+	stale := now.Add(-1 * time.Hour).UTC().Format("2006-01-02 15:04:05")
 	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at=? WHERE id='s'`, stale); err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +201,10 @@ func TestWatchdogEscalatesStalledWithLiveFleet(t *testing.T) {
 	if j.State != job.StateNeedsHuman {
 		t.Fatalf("stalled job state=%s, want needs_human", j.State)
 	}
+	// the backstop must stamp a LEGIBLE reason (not blank) so it self-clears + tells why.
+	if j.EscalationReason != string(job.EscalationNoEligibleWorker) {
+		t.Fatalf("escalation_reason=%q, want no_eligible_worker (a blank reason parks forever)", j.EscalationReason)
+	}
 }
 
 // TestWatchdogLeavesFreshJobsAlone: a leasable job in sync with its ledger and
@@ -216,8 +222,8 @@ func TestWatchdogLeavesFreshJobsAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedWorker(t, st, "feller-builder-1", now)
-	// updated_at is fresh (within the window).
-	fresh := now.Add(-2 * time.Minute).Format(time.RFC3339Nano)
+	// updated_at is fresh (within the window). Real datetime('now') form (see above).
+	fresh := now.Add(-2 * time.Minute).UTC().Format("2006-01-02 15:04:05")
 	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET updated_at=? WHERE id='f'`, fresh); err != nil {
 		t.Fatal(err)
 	}

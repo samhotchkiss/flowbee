@@ -125,11 +125,21 @@ func (s *Store) ReconcileStuck(ctx context.Context, now time.Time, staleHB, stal
 			if err := tx.QueryRowContext(ctx, `SELECT updated_at FROM jobs WHERE id=?`, id).Scan(&updated); err != nil {
 				return err
 			}
-			ts, perr := time.Parse(rfc3339, updated)
-			if perr != nil || now.Sub(ts) < stallAfter {
+			// updated_at is stored via datetime('now') (SQLite "2006-01-02 15:04:05" form), NOT
+			// RFC3339 — parseDBTime handles both. Parsing it with rfc3339 used to always error,
+			// so this whole escalation backstop was INERT in production: a leasable job no worker
+			// could claim never escalated to needs_human, silently sitting forever (the exact
+			// "permanently stuck" case this guard exists to prevent).
+			ts, ok := parseDBTime(updated)
+			if !ok || now.Sub(ts) < stallAfter {
 				return nil // still within the generous window: a real build/review/CI cycle
 			}
-			reason := ""
+			// Always stamp a LEGIBLE reason. A CI-wedged review is ci_stalled; anything else
+			// this backstop catches is a leasable-but-unclaimed job with a live fleet — a
+			// no-eligible-worker capability/routing dead-end. A blank reason used to leak here,
+			// which matched no self-clear exit and parked forever with no legible cause; naming
+			// it lets the time-backstop eventually auto-cancel it and tells the operator why.
+			reason := string(job.EscalationNoEligibleWorker)
 			if ciWedged {
 				reason = string(job.EscalationCIStalled)
 			}
@@ -137,8 +147,6 @@ func (s *Store) ReconcileStuck(ctx context.Context, now time.Time, staleHB, stal
 				JobID: id, JobSeq: seq + 1, Kind: ledger.KindStateChanged,
 				FromState: cur.State, ToState: job.StateNeedsHuman, LeaseEpoch: cur.LeaseEpoch,
 				Actor: "watchdog", CreatedAt: now,
-				// reason is "ci_stalled" for a CI-wedged review, else "" (the live UPDATE's
-				// CASE keeps the prior reason; on entry from an active state that is "").
 				Payload: ledger.Payload{EscalationReason: reason},
 			}
 			if err := appendEvent(ctx, tx, ev); err != nil {

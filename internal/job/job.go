@@ -211,6 +211,14 @@ const (
 	// spec needs human design input. It deposits into the needs_design surface (not
 	// the needs_human chokepoint) — a deliberate "the machine should not decide this".
 	EscalationDesign EscalationReason = "design"
+	// EscalationNoEligibleWorker is the forward-progress backstop's reason for a job that is
+	// leasable and re-folds clean but has sat unclaimed past the stall window WHILE the fleet
+	// is live — a capability/routing dead-end (unsatisfiable required_capabilities or review
+	// anti-affinity, a single-provider fleet). A retry cannot fix it (same caps → same
+	// no-eligible-worker), so it is NOT advisable; but it must not park silently forever, so
+	// the self-clear time-backstop eventually auto-cancels it (legibly) if no capable worker
+	// ever appears. Distinct from the transient no_eligible_worker ALARM (which only observes).
+	EscalationNoEligibleWorker EscalationReason = "no_eligible_worker"
 )
 
 // Default counters a job is created with. These are the single source of truth: the
@@ -371,6 +379,21 @@ type Job struct {
 	Bounces          int
 	MaxBounces       int
 	StallRevocations int
+
+	// self-unblock janitor bookkeeping (0023). UnblockAttempts counts how many times the
+	// forward-progress janitor has AUTO-requeued this job out of the needs_human sink for a
+	// mechanical reason (distinct from Attempts, which counts worker build attempts and is
+	// NEVER reset by the janitor). LastProgressSHA is the head||base snapshot taken at the
+	// last auto-unblock; the janitor compares the job's current SHA against it to tell a job
+	// that made real progress (SHA moved) from a churn plateau (SHA static). Both are FOLDED
+	// from the janitor_unblocked event so projection == Fold(events) survives a DR rebuild.
+	UnblockAttempts int
+	LastProgressSHA string
+
+	// StuckHint is the Rung-E advisor's note (0024), injected into the eng_worker lease
+	// context so a re-armed build re-enters with "here is what was tried / try this" rather
+	// than a polluted transcript. FOLDED from the janitor_unblocked event's payload.
+	StuckHint string
 
 	// cost meter (§6.7, I-15). The dollar meter is exact integer MICRO-USD
 	// ($1.00 = 1_000_000) so the ceiling comparison is never a float. A nil

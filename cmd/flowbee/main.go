@@ -132,6 +132,8 @@ func main() {
 		err = runPause(args)
 	case "resume":
 		err = runResume(args)
+	case "autonomy":
+		err = runAutonomy(args)
 	case "version", "-v", "--version":
 		err = runVersion(args)
 	default:

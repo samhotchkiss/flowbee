@@ -984,6 +984,10 @@ type LeaseContext struct {
 	// carried to a rebuild so the agent re-runs the named gate + fixes the real violation
 	// instead of rebuilding blind and re-failing the same check (§F compounding memory).
 	CIFailures string `json:"ci_failures,omitempty"`
+	// StuckHint is the Rung-E advisor's note (0024) when this job was re-armed out of the
+	// needs_human sink by the advisor: "here is what was tried / try this", so the rebuild
+	// re-enters with fresh direction instead of blindly repeating the stalled attempt.
+	StuckHint string `json:"stuck_hint,omitempty"`
 	// Diff is the eng_worker's build patch, shipped to a code_reviewer so its agent
 	// judges the actual change (the review harness writes .flowbee/diff.patch).
 	Diff string `json:"diff,omitempty"`
@@ -1325,6 +1329,7 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 		AcceptanceCriteria:  j.AcceptanceCriteria,
 		PriorVerdict:        j.Verdict,
 		PriorReviewFindings: j.LastReviewNotes,
+		StuckHint:           j.StuckHint,
 	}
 	// the per-issue branch the node commits to (worker-push): builds + reviews
 	// both target it. Resolved from the job's bound issue (adopted) or its spec

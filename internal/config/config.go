@@ -110,6 +110,45 @@ type Config struct {
 	// FLOWBEE_BACKUP_KEEP.
 	BackupKeep int `yaml:"backup_keep"`
 
+	// SelfUnblockDisabled is the kill-switch for the self-unblock janitor (0023): the
+	// forward-progress watchdog's sibling that auto-requeues MECHANICALLY-stuck jobs
+	// (currently `stall`) out of the needs_human sink, bounded + breaker-gated, so a
+	// transient stall no longer needs an operator to run `flowbee requeue`. Default false
+	// (enabled). Set FLOWBEE_SELF_UNBLOCK to a falsey value (0/false/off/no) to disable and
+	// restore the old operator-only behavior — the reversible switch every rung ships with.
+	SelfUnblockDisabled bool `yaml:"self_unblock_disabled"`
+
+	// AdvisorEnabled turns on Rung E: the read-only, single-shot LLM advisor consulted for a
+	// job the deterministic janitor could not rescue (a stall past its mechanical unblock
+	// cap). It NOMINATES an action {PLAN,CORRECTION,REPROMPT,STOP}; the store re-authorizes.
+	// OFF by default (it spends model budget + needs an agent CLI on the serve box). Enable
+	// via FLOWBEE_ADVISOR=on. AdvisorCmd overrides the CLI (default `claude -p`, or set the
+	// codex form on a codex box) via FLOWBEE_ADVISOR_CMD.
+	AdvisorEnabled bool   `yaml:"advisor_enabled"`
+	AdvisorCmd     string `yaml:"advisor_cmd"`
+
+	// AutoCancelExhausted is the ladder's terminal backstop: when the advisor has been
+	// consulted its per-job cap of times on a repeated-failure job and it is STILL parked,
+	// auto-cancel it (with the full ledger trail as the post-mortem) so the board self-clears
+	// instead of accumulating forever. Reversible via `flowbee requeue`. OFF by default —
+	// abandoning a task unattended is deliberate; enable via FLOWBEE_AUTO_CANCEL_EXHAUSTED=on
+	// once you trust the ladder. Requires the advisor (nothing exhausts the cap without it).
+	AutoCancelExhausted bool `yaml:"auto_cancel_exhausted"`
+
+	// MergeFixer turns on the "a PR can't merge -> escalate to an agent who fixes it" path:
+	// a job parked in merge_handoff for a FIXABLE reason (head moved after review, or an
+	// unverifiable merge — never a policy/source denial) is re-armed back through the
+	// build->review->merge pipeline with a "make this PR mergeable" brief, so a fixer worker
+	// rebases, resolves conflicts, and fixes failing checks. OFF by default (it re-drives the
+	// merge path); enable via FLOWBEE_MERGE_FIXER=on. flowbee-source PRs stay a human gate.
+	MergeFixer bool `yaml:"merge_fixer"`
+
+	// AutonomousShadow logs what the self-clearing ladder WOULD do — which stuck jobs the
+	// janitor would requeue and the advisor would engage — WITHOUT mutating anything or making
+	// model calls. The safe on-ramp: turn it on, watch it engage the real backlog correctly
+	// for a while, then flip FLOWBEE_AUTONOMOUS=on. Set via FLOWBEE_AUTONOMOUS_SHADOW=on.
+	AutonomousShadow bool `yaml:"autonomous_shadow"`
+
 	// GithubOwner / GithubRepo are the single-repo coordinates `flowbee init`
 	// prefills from the git remote (F13). They are the config-file form of the
 	// legacy FLOWBEE_GITHUB_OWNER/REPO env path: when Repos is empty, serve uses
@@ -312,6 +351,67 @@ func applyEnv(c *Config) {
 	}
 	if v := envInt("FLOWBEE_BACKUP_KEEP"); v > 0 {
 		c.BackupKeep = v
+	}
+	// self-unblock kill-switch: any falsey value disables the janitor (a truthy/empty value
+	// leaves it enabled, the default). Parsed as a string so "off" is expressible.
+	if v := os.Getenv("FLOWBEE_SELF_UNBLOCK"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "0", "false", "off", "no", "disable", "disabled":
+			c.SelfUnblockDisabled = true
+		default:
+			c.SelfUnblockDisabled = false
+		}
+	}
+	// FLOWBEE_AUTONOMOUS is the master switch for the full self-clearing ladder: it turns ON
+	// the advisor, the terminal auto-cancel backstop, and the merge-fixer in one flag, so the
+	// system drives every issue to completion without a human. Processed BEFORE the individual
+	// flags so any of them can still override (e.g. FLOWBEE_AUTONOMOUS=on FLOWBEE_MERGE_FIXER=off
+	// keeps the merge as a human gate). Needs an agent CLI on the serve box for the advisor.
+	if v := os.Getenv("FLOWBEE_AUTONOMOUS"); v != "" {
+		on := false
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on", "yes", "enable", "enabled":
+			on = true
+		}
+		c.AdvisorEnabled = on
+		c.AutoCancelExhausted = on
+		c.MergeFixer = on
+	}
+	// Rung-E advisor is opt-in: any truthy value enables it (overrides the master switch).
+	if v := os.Getenv("FLOWBEE_ADVISOR"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on", "yes", "enable", "enabled":
+			c.AdvisorEnabled = true
+		default:
+			c.AdvisorEnabled = false
+		}
+	}
+	if v := os.Getenv("FLOWBEE_ADVISOR_CMD"); v != "" {
+		c.AdvisorCmd = v
+	}
+	if v := os.Getenv("FLOWBEE_AUTO_CANCEL_EXHAUSTED"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on", "yes", "enable", "enabled":
+			c.AutoCancelExhausted = true
+		default:
+			c.AutoCancelExhausted = false
+		}
+	}
+	if v := os.Getenv("FLOWBEE_MERGE_FIXER"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on", "yes", "enable", "enabled":
+			c.MergeFixer = true
+		default:
+			c.MergeFixer = false
+		}
+	}
+	if v := os.Getenv("FLOWBEE_AUTONOMOUS_SHADOW"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on", "yes", "enable", "enabled":
+			c.AutonomousShadow = true
+		default:
+			c.AutonomousShadow = false
+		}
 	}
 	if v := os.Getenv("FLOWBEE_GITHUB_OWNER"); v != "" {
 		c.GithubOwner = v

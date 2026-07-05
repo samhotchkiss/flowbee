@@ -1,0 +1,769 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"sort"
+	"time"
+
+	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/ledger"
+)
+
+// parseDBTime parses a timestamp column that may be either SQLite's datetime('now') form
+// (updated_at, created_at — "2006-01-02 15:04:05", space-separated UTC, the sqliteTS const)
+// or an RFC3339 value the code writes elsewhere (enqueued_at, unblock_next_at). Both resolve
+// to UTC. Returns ok=false only if neither layout matches. Parsing updated_at with rfc3339
+// alone silently errored, which had made the age gates here (and ReconcileStuck's escalation
+// backstop) inert in production.
+func parseDBTime(s string) (time.Time, bool) {
+	for _, layout := range []string{sqliteTS + ".999999999", sqliteTS, rfc3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
+// mechanicalUnblockReasons are the needs_human escalation reasons the janitor is allowed
+// to auto-requeue. A "mechanical" reason is one whose fix is a retry, not a decision:
+//
+//   - stall: the worker made real progress then went quiet (the two-rung ladder never
+//     confirmed a kill, so it aged out to needs_human). A fresh lease usually finishes it.
+//
+// DELIBERATELY EXCLUDED — these are semantic dead-ends that a blind retry makes worse and
+// must stay parked for a human (this list is the safety contract, not a TODO):
+//
+//	project_out          — a permanent GitHub 4xx (deleted branch/PR, 422/404); a retry
+//	                       re-runs straight into the same error, burning a build+review.
+//	pr_closed            — a human rejected the PR; requeuing fights that decision.
+//	reviewer_rejections  — a genuine standoff with one reviewer; needs a human call.
+//	cost                 — over the $ ceiling; a retry just spends more.
+//	attempts / bounces   — out of build/review budget; the escalation IS the backstop.
+//	design               — needs_design, a deliberate "the machine must not decide this".
+var mechanicalUnblockReasons = map[string]bool{
+	string(job.EscalationStall): true,
+}
+
+// JanitorConfig tunes the self-unblock watchdog. Zero values fall back to the defaults
+// below (so a caller can pass JanitorConfig{} for stock behavior).
+type JanitorConfig struct {
+	// MaxUnblockAttempts caps how many times the janitor will auto-requeue ONE job before
+	// it gives up and leaves it parked for a human. This is the per-job convergence
+	// guarantee: a job that keeps re-stalling escalates for good after this many tries.
+	MaxUnblockAttempts int
+	// Cooldown is the minimum wall-clock gap between two auto-unblocks of the SAME job, so
+	// a fast re-stall can't burn the whole attempt budget in one minute.
+	Cooldown time.Duration
+	// CorrelatedThreshold is the Rung-0 correlated-failure breaker: when at least this many
+	// parked jobs share ONE mechanical reason, the janitor stands DOWN on that reason for
+	// the pass (a shared root cause — a disk-full builder, a bad base, a broken dep — should
+	// be fixed once, not fanned into N simultaneous requeues that all re-fail identically).
+	CorrelatedThreshold int
+	// MaxUnblocksPerPass bounds how many jobs the janitor moves in a single 60s tick, so
+	// even absent a correlated signature it can never mass-requeue the backlog at once.
+	MaxUnblocksPerPass int
+}
+
+func (c JanitorConfig) withDefaults() JanitorConfig {
+	if c.MaxUnblockAttempts <= 0 {
+		c.MaxUnblockAttempts = 2
+	}
+	if c.Cooldown <= 0 {
+		c.Cooldown = 10 * time.Minute
+	}
+	if c.CorrelatedThreshold <= 0 {
+		c.CorrelatedThreshold = 5
+	}
+	if c.MaxUnblocksPerPass <= 0 {
+		c.MaxUnblocksPerPass = 3
+	}
+	return c
+}
+
+// JanitorReport summarizes one self-unblock pass.
+type JanitorReport struct {
+	Unblocked int      // jobs auto-requeued out of needs_human this pass
+	StoodDown []string // reasons skipped because the correlated-failure breaker tripped
+}
+
+// unblockCandidate is one parked-but-mechanically-recoverable job.
+type unblockCandidate struct {
+	id           string
+	kind         job.Kind
+	reason       string
+	headSHA      string
+	baseSHA      string
+	unblockTries int
+	lastProgress string
+	nextAt       string
+}
+
+// JanitorUnblock is the automatic exit from the needs_human sink (0023). It is the
+// forward-progress watchdog's sibling: where ReconcileStuck ESCALATES a wedged job TO
+// needs_human, the janitor moves the MECHANICALLY-recoverable ones back OUT — bounded,
+// cooled-down, breaker-gated, and signal-preserving — so a transient stall no longer needs
+// an operator (or an always-watching model) to run `flowbee requeue` at 2am.
+//
+// The ladder, cheapest-and-safest first:
+//
+//	Rung 0 — correlated-failure breaker: if many parked jobs share one reason, a shared
+//	         root cause is likelier than N independent transient stalls; stand down on that
+//	         reason (surface it as a page instead of fanning N doomed requeues).
+//	Rung C — per-job cap + cooldown + SHA-progress: a job that has already been auto-unblocked
+//	         MaxUnblockAttempts times, or whose SHA has not moved since the last unblock (the
+//	         retry accomplished nothing), stays parked. This is the anti-thrash backbone —
+//	         every rung burns bounded budget, so a spinning job converges back to needs_human.
+//	Rung B — the actual re-arm: append janitor_unblocked, routing the job to its entry stage
+//	         (ready / spec_authoring) WITHOUT resetting attempts/bounces.
+//
+// A down fleet is left alone (nothing to unblock ONTO); ReconcileStuck / fleet-health own
+// that. Only reasons in mechanicalUnblockReasons are ever touched.
+func (s *Store) JanitorUnblock(ctx context.Context, now time.Time, staleHB time.Duration, cfg JanitorConfig) (JanitorReport, error) {
+	cfg = cfg.withDefaults()
+	var rep JanitorReport
+
+	// liveness gate: unblocking to `ready` while no worker can claim it just relocates the
+	// job. Require a live fleet, exactly like ReconcileStuck's escalation gate.
+	live := 0
+	if roster, err := s.Roster(ctx, now, staleHB); err == nil {
+		for _, w := range roster {
+			if !w.StaleHB {
+				live++
+			}
+		}
+	}
+	if live == 0 {
+		return rep, nil
+	}
+
+	cands, err := s.mechanicalUnblockCandidates(ctx)
+	if err != nil {
+		return rep, err
+	}
+
+	// Rung 0: correlated-failure breaker. Count parked jobs per mechanical reason; a reason
+	// at/over the threshold is a probable shared root cause — stand down on it for this pass.
+	perReason := map[string]int{}
+	for _, c := range cands {
+		perReason[c.reason]++
+	}
+	stoodDown := map[string]bool{}
+	for reason, n := range perReason {
+		if n >= cfg.CorrelatedThreshold {
+			stoodDown[reason] = true
+		}
+	}
+	if len(stoodDown) > 0 {
+		reasons := make([]string, 0, len(stoodDown))
+		for r := range stoodDown {
+			reasons = append(reasons, r)
+		}
+		sort.Strings(reasons)
+		rep.StoodDown = reasons
+	}
+
+	for _, c := range cands {
+		if rep.Unblocked >= cfg.MaxUnblocksPerPass {
+			break
+		}
+		if stoodDown[c.reason] {
+			continue
+		}
+		// Rung C: per-job cap.
+		if c.unblockTries >= cfg.MaxUnblockAttempts {
+			continue
+		}
+		// Rung C: cooldown gate.
+		if c.nextAt != "" {
+			if t, perr := time.Parse(rfc3339, c.nextAt); perr == nil && now.Before(t) {
+				continue
+			}
+		}
+		snapshot := c.headSHA + "|" + c.baseSHA
+		// Rung C: SHA-progress. If we have already auto-unblocked this job (tries>0) and its
+		// head||base is IDENTICAL to the snapshot taken at that unblock, the retry moved
+		// nothing — a churn plateau. Leave it parked rather than spend another attempt.
+		// EXCEPT an empty head (worker died before pushing anything): that is not a churn
+		// plateau, it is a job that never got off the ground, so a fresh worker is worth a
+		// real retry — keep its full mechanical budget (still capped by MaxUnblockAttempts).
+		if c.unblockTries > 0 && snapshot == c.lastProgress && c.headSHA != "" {
+			continue
+		}
+		did, err := s.unblockOne(ctx, c.id, snapshot, "", now, cfg.Cooldown)
+		if err != nil {
+			return rep, err
+		}
+		if did {
+			rep.Unblocked++
+		}
+	}
+	return rep, nil
+}
+
+// advisableReasons are the needs_human reasons the Rung-E advisor may be consulted on.
+// The goal is a system that drives EVERY issue to completion itself, so the advisor is the
+// first responder for the "repeated failure" reasons — it reads the actual review findings /
+// CI failures and re-arms with a concrete correction + a fresh budget, which is what makes a
+// guided retry succeed where a blind one just re-fails:
+//
+//	stall               — worker went quiet; mechanical janitor tries first, advisor after.
+//	bounces             — build bounced off review max times; advisor reads the findings.
+//	attempts            — build failed its attempts; advisor reads the CI failures.
+//	reviewer_rejections — one reviewer keeps rejecting; advisor judges + re-routes.
+//
+// Still EXCLUDED — the ones a retry genuinely can't fix without external action:
+//
+//	project_out — a permanent GitHub 4xx (deleted branch/PR); needs the GitHub state fixed.
+//	pr_closed   — a human closed the PR; re-opening fights that.
+//	cost        — over the $ ceiling; a retry just spends more (raise the ceiling instead).
+//	design      — needs_design, a deliberate product decision (surfaced separately).
+//
+// project_out/pr_closed/cost are handled by their own reconcilers, not blind retries.
+var advisableReasons = map[string]bool{
+	string(job.EscalationStall):              true,
+	string(job.EscalationBounces):            true,
+	string(job.EscalationAttempts):           true,
+	string(job.EscalationReviewerRejections): true,
+}
+
+// AdvisorCandidate is a stuck job the advisor may weigh in on, with its full re-entry
+// context and the SHA-anchored trigger hash used for dedup.
+type AdvisorCandidate struct {
+	JobID           string
+	Kind            string
+	Reason          string
+	HeadSHA         string
+	BaseSHA         string
+	TaskText        string
+	SpecText        string
+	Acceptance      string
+	LastReviewNotes string
+	LastCIFailures  string
+	Attempts        int
+	MaxAttempts     int
+	Bounces         int
+	MaxBounces      int
+	UnblockAttempts int
+	AdvisorAttempts int
+	TriggerHash     string
+}
+
+// AdvisorCandidates returns the jobs eligible for a Rung-E advisor consult: parked in
+// needs_human for an advisable reason, under the advisor's per-job cap, and NOT already
+// consulted at this exact stuck signature (trigger_hash != advisor_last_hash — a SHA that
+// moved is genuinely new work worth another look). For `stall` ONLY, the cheap mechanical
+// janitor is given first crack: it is skipped until unblock_attempts >= minUnblock. The
+// repeated-failure reasons (bounces/attempts/reviewer_rejections) have no mechanical stage —
+// a blind requeue just re-fails — so the advisor is their FIRST responder. Deterministic id
+// order.
+func (s *Store) AdvisorCandidates(ctx context.Context, minUnblock, advisorCap int) ([]AdvisorCandidate, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, kind, COALESCE(escalation_reason,''),
+		       COALESCE(head_sha,''), COALESCE(base_sha,''),
+		       COALESCE(task_text,''), COALESCE(spec_text,''), COALESCE(acceptance_criteria,''),
+		       COALESCE(last_review_notes,''), COALESCE(last_ci_failures,''),
+		       attempts, max_attempts, bounces, max_bounces, over_budget, stall_revocations,
+		       COALESCE(unblock_attempts,0), COALESCE(advisor_attempts,0),
+		       COALESCE(advisor_last_hash,'')
+		  FROM jobs
+		 WHERE state='needs_human'
+		   AND COALESCE(advisor_attempts,0) < ?
+		 ORDER BY id`, advisorCap)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AdvisorCandidate
+	for rows.Next() {
+		var c AdvisorCandidate
+		var lastHash, rawReason string
+		var over, stall int
+		if err := rows.Scan(&c.JobID, &c.Kind, &rawReason, &c.HeadSHA, &c.BaseSHA,
+			&c.TaskText, &c.SpecText, &c.Acceptance, &c.LastReviewNotes, &c.LastCIFailures,
+			&c.Attempts, &c.MaxAttempts, &c.Bounces, &c.MaxBounces, &over, &stall,
+			&c.UnblockAttempts, &c.AdvisorAttempts, &lastHash); err != nil {
+			return nil, err
+		}
+		// Use the EFFECTIVE reason: a gate bounce-exhaustion routes to needs_human WITHOUT
+		// stamping escalation_reason (the column is blank), so the advisor would miss it — but
+		// its counters say `bounces`. classifyEscalation derives that the same way the
+		// operator NeedsHumanView does; the explicitly-stamped external reasons
+		// (project_out/pr_closed/cost/ci_stalled) are returned verbatim and stay excluded.
+		c.Reason = classifyEscalation(rawReason, over, c.Attempts, c.MaxAttempts, c.Bounces, c.MaxBounces, stall)
+		if !advisableReasons[c.Reason] {
+			continue
+		}
+		// `stall` defers to the mechanical janitor until it has exhausted its cheap requeues.
+		if mechanicalUnblockReasons[c.Reason] && c.UnblockAttempts < minUnblock {
+			continue
+		}
+		c.TriggerHash = c.JobID + ":" + c.Reason + ":" + c.HeadSHA
+		if c.TriggerHash == lastHash {
+			continue // already consulted at this exact stuck signature — don't re-run the model
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ApplyAdvisorVerdict applies a Rung-E advisor decision to a parked job, event-sourced and
+// fail-safe. A re-arm action (PLAN / CORRECTION / REPROMPT) re-arms the job ONCE with the
+// advisor's note carried into the next lease context (StuckHint); STOP (or an unknown/empty
+// action — the fail-safe) leaves the job parked for a human. Either way it records the
+// advisor bookkeeping (advisor_attempts++, advisor_last_hash) so the model is never
+// re-consulted at the same signature and converges to a permanent park. Returns whether it
+// re-armed the job. No-ops (without recording) if the job is no longer an advisable park —
+// a concurrent operator/reconcile won the race.
+func (s *Store) ApplyAdvisorVerdict(ctx context.Context, jobID, action, note, hash string, now time.Time, cooldown time.Duration) (bool, error) {
+	rearmed := false
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		cur, seq, err := loadJobTx(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		if cur.State != job.StateNeedsHuman || !advisableReasons[cur.EscalationReason] {
+			return nil // race: no longer an advisable park
+		}
+		rearm := action == "PLAN" || action == "CORRECTION" || action == "REPROMPT"
+		if rearm {
+			snapshot := cur.HeadSHA + "|" + cur.BaseSHA
+			if note == "" {
+				note = "advisor: retry with fresh context" // never empty — the empty hint is the mechanical path's signal
+			}
+			// advisor-guided retry earns a fresh attempts+bounces budget (new guidance), bounded
+			// by the per-job advisor cap.
+			if err := rearmFromNeedsHumanTx(ctx, tx, cur, seq, snapshot, note, true, now, cooldown); err != nil {
+				return err
+			}
+			rearmed = true
+		}
+		// record advisor bookkeeping regardless (projection-only; not folded — a DR rebuild
+		// re-consulting once more is bounded + safe). On a re-arm this UPDATE lands on the
+		// already-re-armed row; on STOP it is the only change (state stays needs_human).
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs SET advisor_attempts = advisor_attempts + 1, advisor_last_hash = ?,
+			                updated_at = datetime('now')
+			 WHERE id = ?`, hash, jobID); err != nil {
+			return fmt.Errorf("advisor bookkeeping: %w", err)
+		}
+		return nil
+	})
+	return rearmed, err
+}
+
+// mergeFixableReasons are the merge_handoff reasons a fixer agent can autonomously resolve
+// by rebuilding/re-reviewing the PR — the head moved, or the merge could not be verified.
+// It is an ALLOWLIST on purpose: an unknown or policy reason (a denylist/source-protection
+// hit — e.g. flowbee merging its OWN source) is NOT here, so it stays parked for a human
+// rather than looping into the same denial. A blank reason is also excluded (unclassified).
+// These are reasons a REBUILD/RE-REVIEW resolves. Deliberately NOT included: heartbeat_stale
+// (a merge-DISPATCH-layer stall, not a PR-content problem — a rebuild is the wrong tool and
+// on a flowbee-source PR it just burns a cycle before re-denying), and any blank/unknown
+// reason, and every denylist/source policy reason (those stay the human gate).
+var mergeFixableReasons = map[string]bool{
+	"head_modified_after_review":               true, // review is stale at the new head — re-review
+	"self_merge_unverifiable":                  true, // no mirror to SHA-pin — rebuild re-establishes it
+	"self_merge_unverifiable_head_unreachable": true,
+}
+
+// MergeFixReport summarizes one merge-fixer pass.
+type MergeFixReport struct {
+	Escalated []string // merge_handoff job ids re-armed to a fixer
+	Cancelled []string // fixable handoffs the fixer exhausted -> auto-cancelled (terminal)
+}
+
+// EscalateStuckMergeHandoff is the "a PR can't merge -> hand it to an agent who can figure
+// out why and fix it" path. A job parked in merge_handoff for a FIXABLE reason (the head
+// moved, or the merge was unverifiable — never a policy/source denial) is re-armed back into
+// the build->review->merge pipeline with a "make this PR mergeable" brief, so a fixer worker
+// rebases onto main, resolves conflicts, fixes failing checks, and the normal merge gate
+// takes it from there. It reuses the SAME fold-consistent re-arm as the advisor. Bounded by
+// unblock_attempts (< cap) so a PR that genuinely can't be made mergeable stops looping;
+// gated on a minimum parked age so the cheaper UnstickAll branch-refresh gets first crack.
+func (s *Store) EscalateStuckMergeHandoff(ctx context.Context, minAge time.Duration, cap int, now time.Time) (MergeFixReport, error) {
+	var rep MergeFixReport
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT j.id, j.updated_at, COALESCE(j.unblock_attempts,0),
+		       COALESCE((SELECT json_extract(e.payload,'$.RevokeReason') FROM job_events e
+		                  WHERE e.job_id = j.id
+		                    AND json_extract(e.payload,'$.RevokeReason') IS NOT NULL
+		                    AND json_extract(e.payload,'$.RevokeReason') != ''
+		                  ORDER BY e.job_seq DESC LIMIT 1),'') AS reason
+		  FROM jobs j
+		 WHERE j.state = 'merge_handoff'
+		 ORDER BY j.id`)
+	if err != nil {
+		return rep, err
+	}
+	type cand struct {
+		id, reason string
+		tries      int
+	}
+	var cands []cand
+	var giveUp []string // fixable handoffs the fixer has exhausted -> auto-cancel (terminal)
+	for rows.Next() {
+		var id, updated, reason string
+		var tries int
+		if err := rows.Scan(&id, &updated, &tries, &reason); err != nil {
+			rows.Close()
+			return rep, err
+		}
+		if !mergeFixableReasons[reason] {
+			continue // policy/source/unknown reason — stays parked (the human gate)
+		}
+		if tries >= cap {
+			// the fixer rebuilt+re-reviewed this PR `cap` times and it STILL can't merge — a
+			// genuinely un-landable approved change. Auto-cancel it (the trail is the
+			// post-mortem) so it doesn't park in merge_handoff forever. This is scoped to
+			// FIXABLE reasons the fixer actually tried; a policy-parked handoff has tries=0 and
+			// is never reached here, so the flowbee-source human gate is untouched.
+			giveUp = append(giveUp, id)
+			continue
+		}
+		if ts, ok := parseDBTime(updated); ok && now.Sub(ts) < minAge {
+			continue // give the cheap branch-refresh unstick a chance first
+		}
+		cands = append(cands, cand{id: id, reason: reason, tries: tries})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return rep, err
+	}
+	for _, id := range giveUp {
+		if err := s.cancelJobTerminal(ctx, id, job.StateMergeHandoff, "merge_unfixable", now); err != nil {
+			return rep, err
+		}
+		rep.Cancelled = append(rep.Cancelled, id)
+	}
+	for _, c := range cands {
+		brief := "This PR was approved but could NOT be merged (reason: " + c.reason +
+			"). Diagnose why and FIX it so it merges: fetch the PR's branch, rebase onto the " +
+			"latest main, resolve any conflicts, run and fix any failing CI checks, and push. " +
+			"Do not change unrelated behavior — just make the approved change mergeable."
+		err := s.tx(ctx, func(tx *sql.Tx) error {
+			cur, seq, err := loadJobTx(ctx, tx, c.id)
+			if err != nil {
+				return err
+			}
+			if cur.State != job.StateMergeHandoff { // race
+				return nil
+			}
+			snapshot := cur.HeadSHA + "|" + cur.BaseSHA
+			if err := rearmFromNeedsHumanTx(ctx, tx, cur, seq, snapshot, brief, true, now, 0); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			return rep, err
+		}
+		rep.Escalated = append(rep.Escalated, c.id)
+	}
+	return rep, nil
+}
+
+// AdvisorPreview is one job the advisor would engage, with its reason.
+type AdvisorPreview struct {
+	JobID  string
+	Reason string
+}
+
+// AutonomyPreview is a READ-ONLY snapshot of what the ladder WOULD do right now — the
+// shadow-mode signal. It mutates nothing and makes no model calls (the advisor list is who
+// it would consult, not the verdicts), so an operator can watch it engage the real backlog
+// before flipping autonomy on.
+type AutonomyPreview struct {
+	LiveWorkers       int
+	MechanicalUnblock []string         // stall jobs the janitor would requeue (cheap, no LLM)
+	AdvisorEngage     []AdvisorPreview // jobs the advisor would consult (id + reason)
+}
+
+// AutonomyPreview computes the shadow snapshot by reusing the SAME read-only candidate
+// selection the live rungs use, so the preview can't drift from the real behavior.
+func (s *Store) AutonomyPreview(ctx context.Context, now time.Time, staleHB time.Duration, minUnblock, advisorCap, maxUnblockAttempts int) (AutonomyPreview, error) {
+	var p AutonomyPreview
+	if roster, err := s.Roster(ctx, now, staleHB); err == nil {
+		for _, w := range roster {
+			if !w.StaleHB {
+				p.LiveWorkers++
+			}
+		}
+	}
+	mech, err := s.mechanicalUnblockCandidates(ctx)
+	if err != nil {
+		return p, err
+	}
+	for _, c := range mech {
+		if c.unblockTries < maxUnblockAttempts {
+			p.MechanicalUnblock = append(p.MechanicalUnblock, c.id)
+		}
+	}
+	adv, err := s.AdvisorCandidates(ctx, minUnblock, advisorCap)
+	if err != nil {
+		return p, err
+	}
+	for _, c := range adv {
+		p.AdvisorEngage = append(p.AdvisorEngage, AdvisorPreview{JobID: c.JobID, Reason: c.Reason})
+	}
+	return p, nil
+}
+
+// AutoCancelReport summarizes one terminal-backstop pass.
+type AutoCancelReport struct {
+	Cancelled []string // job ids the ladder gave up on and auto-cancelled
+}
+
+// AutoCancelExhausted is the ladder's TERMINAL backstop: a job the autonomous ladder tried
+// its hardest on is auto-cancelled rather than left to sit forever. This is what lets the
+// board self-clear: the only terminal states become `done` (success) and `cancelled` (the
+// system genuinely could not land it, after diverse guided attempts). Two triggers, either
+// sufficient (both scoped to advisable reasons — never a project_out/pr_closed/design park,
+// which need real external action, not abandonment):
+//
+//	(1) advisor_attempts >= advisorCap — the advisor was consulted its cap of times.
+//	(2) parked (updated_at) longer than maxParkedAge — the TIME backstop. This closes the
+//	    hole where the advisor's SHA-anchored dedup blocks a re-consult (the re-armed build
+//	    produced no new head) so advisor_attempts stalls below the cap: without a time bound
+//	    such a job would park forever. updated_at is touched on every re-arm, so only a
+//	    genuinely-idle park ages into this. maxParkedAge <= 0 disables the time trigger.
+//
+// The full trail — every escalation event, each advisor note (stuck_hint) — stays in the
+// ledger as the post-mortem; cancellation is reversible via `flowbee requeue`. Event-sourced,
+// deterministic id order.
+func (s *Store) AutoCancelExhausted(ctx context.Context, advisorCap int, maxParkedAge time.Duration, now time.Time) (AutoCancelReport, error) {
+	var rep AutoCancelReport
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, COALESCE(escalation_reason,''), COALESCE(advisor_attempts,0), updated_at,
+		       attempts, max_attempts, bounces, max_bounces, over_budget, stall_revocations
+		  FROM jobs
+		 WHERE state='needs_human'
+		 ORDER BY id`)
+	if err != nil {
+		return rep, err
+	}
+	var targets []string
+	for rows.Next() {
+		var id, rawReason, updated string
+		var tries, attempts, maxA, bounces, maxB, over, stall int
+		if err := rows.Scan(&id, &rawReason, &tries, &updated,
+			&attempts, &maxA, &bounces, &maxB, &over, &stall); err != nil {
+			rows.Close()
+			return rep, err
+		}
+		// effective reason (same derivation as the advisor): a blank-column bounce-exhaustion
+		// must be recognized as `bounces`, or it would evade every self-clear trigger.
+		reason := classifyEscalation(rawReason, over, attempts, maxA, bounces, maxB, stall)
+		advisable := advisableReasons[reason]
+		// no_eligible_worker can't be fixed by a retry (same caps → same dead-end) so the
+		// advisor never touches it — but it must still self-clear rather than park forever, so
+		// the TIME backstop covers it. The genuinely-external parks (project_out / pr_closed /
+		// cost / design) are excluded from both: they need a human/GitHub action, not abandonment.
+		timeCancelable := advisable || reason == string(job.EscalationNoEligibleWorker)
+		if !timeCancelable {
+			continue
+		}
+		exhausted := advisable && tries >= advisorCap // count trigger: advisable reasons only
+		aged := false
+		if maxParkedAge > 0 {
+			if ts, ok := parseDBTime(updated); ok && now.Sub(ts) > maxParkedAge {
+				aged = true
+			}
+		}
+		if exhausted || aged {
+			targets = append(targets, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return rep, err
+	}
+	for _, id := range targets {
+		if err := s.cancelJobTerminal(ctx, id, job.StateNeedsHuman, "auto_cancel_exhausted", now); err != nil {
+			return rep, err
+		}
+		rep.Cancelled = append(rep.Cancelled, id)
+	}
+	return rep, nil
+}
+
+// cancelJobTerminal cancels a job event-sourced, IFF it is still in fromState (a no-op on a
+// race). It is the shared terminal-cancel both the needs_human backstop and the merge-fixer
+// give-up path use. Clears escalation_reason/over_budget to match the Fold's cancelled
+// post-step (projection == Fold); the reason survives in the ledger trail. endReason is the
+// lease audit disposition.
+func (s *Store) cancelJobTerminal(ctx context.Context, id string, fromState job.State, endReason string, now time.Time) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		cur, seq, err := loadJobTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if cur.State != fromState { // race: someone moved it
+			return nil
+		}
+		ev := ledger.Event{
+			JobID: id, JobSeq: seq + 1, Kind: ledger.KindStateChanged,
+			FromState: cur.State, ToState: job.StateCancelled, LeaseEpoch: cur.LeaseEpoch + 1,
+			Actor: endReason, CreatedAt: now,
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs
+			   SET state = 'cancelled', escalation_reason = '', over_budget = 0,
+			       lease_epoch = lease_epoch + 1,
+			       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
+			       lease_hb_due = NULL, lease_deadline = NULL, updated_at = datetime('now')
+			 WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("terminal cancel: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE leases SET ended_at = datetime('now'), end_reason = ?
+			 WHERE job_id = ? AND ended_at IS NULL`, endReason, id); err != nil {
+			return err
+		}
+		return setJobSeq(ctx, tx, id, seq+1)
+	})
+}
+
+// mechanicalUnblockCandidates loads the needs_human jobs whose escalation reason is
+// mechanically recoverable, in deterministic id order.
+func (s *Store) mechanicalUnblockCandidates(ctx context.Context) ([]unblockCandidate, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, kind, COALESCE(escalation_reason,''),
+		       COALESCE(head_sha,''), COALESCE(base_sha,''),
+		       COALESCE(unblock_attempts,0), COALESCE(last_progress_sha,''),
+		       COALESCE(unblock_next_at,'')
+		  FROM jobs
+		 WHERE state='needs_human'
+		 ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []unblockCandidate
+	for rows.Next() {
+		var c unblockCandidate
+		var kind string
+		if err := rows.Scan(&c.id, &kind, &c.reason, &c.headSHA, &c.baseSHA,
+			&c.unblockTries, &c.lastProgress, &c.nextAt); err != nil {
+			return nil, err
+		}
+		if !mechanicalUnblockReasons[c.reason] {
+			continue
+		}
+		c.kind = job.Kind(kind)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// unblockOne re-arms a single needs_human job, event-sourced. Re-reads the job inside the
+// tx and no-ops if it is no longer parked (a concurrent operator requeue / reconcile won
+// the race), so the janitor can never double-move a job. Returns whether it acted.
+func (s *Store) unblockOne(ctx context.Context, jobID, snapshot, hint string, now time.Time, cooldown time.Duration) (bool, error) {
+	acted := false
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		cur, seq, err := loadJobTx(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		if cur.State != job.StateNeedsHuman {
+			return nil // race: someone else moved it — leave it be
+		}
+		// the mechanical path only touches mechanical reasons; the advisor path (hint != "")
+		// has already gated eligibility, so it may re-arm any parked reason it was consulted on.
+		if hint == "" && !mechanicalUnblockReasons[cur.EscalationReason] {
+			return nil
+		}
+		// mechanical unblock preserves the budget (bounded, no new information).
+		if err := rearmFromNeedsHumanTx(ctx, tx, cur, seq, snapshot, hint, false, now, cooldown); err != nil {
+			return err
+		}
+		acted = true
+		return nil
+	})
+	return acted, err
+}
+
+// rearmFromNeedsHumanTx is the shared re-arm both the mechanical janitor and the Rung-E
+// advisor use to move a parked job back into its flow, event-sourced. It appends the
+// janitor_unblocked event and mirrors the Fold (KindJanitorUnblocked) EXACTLY so
+// projection == Fold(events). Factoring it out means the two callers can never drift from
+// the fold (a divergence there silently corrupts a DR rebuild). hint is the advisor's note
+// ("" for a plain mechanical unblock); it is carried on the event AND the projection.
+func rearmFromNeedsHumanTx(ctx context.Context, tx *sql.Tx, cur job.Job, seq int, snapshot, hint string, resetBudget bool, now time.Time, cooldown time.Duration) error {
+	// Re-arm to the job's OWN entry stage (spec restarts authoring; build restarts ready),
+	// mirroring RequeueJob's routing. role/caps/escalation-clear are state-derived by Fold.
+	target, role, stage, cap := job.StateReady, string(job.RoleEngWorker), "build", "role:eng_worker"
+	if cur.Kind == job.KindSpec {
+		target, role, stage, cap = job.StateSpecAuthoring, string(job.RoleSpecAuthor), "spec", "role:spec_author"
+	}
+	actor := "janitor"
+	if hint != "" {
+		actor = "advisor"
+	}
+	ev := ledger.Event{
+		JobID: cur.ID, JobSeq: seq + 1, Kind: ledger.KindJanitorUnblocked,
+		FromState: cur.State, ToState: target, LeaseEpoch: cur.LeaseEpoch + 1,
+		Actor: actor, CreatedAt: now,
+		// ResetCounters marks an advisor-guided retry: the advisor supplied NEW guidance
+		// (a correction / plan), so the guided attempt earns a fresh attempts+bounces budget
+		// rather than re-arming into an immediately-re-exhausted state. The whole loop stays
+		// bounded by the per-job advisor cap, so this cannot thrash forever.
+		Payload: ledger.Payload{UnblockSHA: snapshot, StuckHint: hint, ResetCounters: resetBudget},
+	}
+	if err := appendEvent(ctx, tx, ev); err != nil {
+		return err
+	}
+	// Mirror the Fold (KindJanitorUnblocked) EXACTLY:
+	//   - clear the prior attempt's artifacts (fresh candidate), like requeue
+	//   - clear escalation_reason + over_budget (no longer a human-gate state)
+	//   - bump the epoch (fence any lingering worker), clear the lease columns
+	//   - bump unblock_attempts, stamp last_progress_sha + the cooldown gate + the hint
+	//   - reset attempts/bounces/stall_revocations IFF resetBudget (advisor-guided retry);
+	//     the plain mechanical unblock PRESERVES them (bounded, not a budget reset).
+	enq := ""
+	if target == job.StateReady {
+		enq = now.Format(rfc3339)
+	}
+	reset := 0
+	if resetBudget {
+		reset = 1
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs
+		   SET state = ?, role = ?, stage = ?, required_capabilities = ?,
+		       head_sha = '', verdict = NULL,
+		       patch_diff = '', declared_blast_radius = '',
+		       reservation_paths = '', reservation_wide = 0,
+		       over_budget = 0, escalation_reason = '',
+		       attempts = CASE WHEN ?=1 THEN 0 ELSE attempts END,
+		       bounces = CASE WHEN ?=1 THEN 0 ELSE bounces END,
+		       stall_revocations = CASE WHEN ?=1 THEN 0 ELSE stall_revocations END,
+		       lease_epoch = lease_epoch + 1,
+		       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,
+		       lease_hb_due = NULL, lease_deadline = NULL,
+		       unblock_attempts = unblock_attempts + 1,
+		       last_progress_sha = ?,
+		       stuck_hint = ?,
+		       unblock_next_at = ?,
+		       enqueued_at = CASE WHEN ? <> '' THEN ? ELSE enqueued_at END,
+		       updated_at = datetime('now')
+		 WHERE id = ?`,
+		string(target), role, stage, marshalStrings([]string{cap}),
+		reset, reset, reset,
+		snapshot, hint, now.Add(cooldown).Format(rfc3339),
+		enq, enq, cur.ID); err != nil {
+		return fmt.Errorf("janitor unblock: %w", err)
+	}
+	// close any stale lease audit row (defensive; needs_human holds no active lease).
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE leases SET ended_at = datetime('now'), end_reason = 'janitor_unblock'
+		 WHERE job_id = ? AND ended_at IS NULL`, cur.ID); err != nil {
+		return err
+	}
+	return setJobSeq(ctx, tx, cur.ID, seq+1)
+}
