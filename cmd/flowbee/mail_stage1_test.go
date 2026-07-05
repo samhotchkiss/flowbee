@@ -78,13 +78,13 @@ func TestMailStage1ReportKeepsVIPRSVPLogisticsRoutine(t *testing.T) {
 	}
 }
 
-func decodeOneMailStage1Report(t *testing.T, raw []byte) mailStage1Report {
+func decodeOneMailStage1Report(t *testing.T, raw []byte) mailstage1.Output {
 	t.Helper()
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	if len(lines) != 1 {
 		t.Fatalf("got %d report lines, want 1: %s", len(lines), raw)
 	}
-	var report mailStage1Report
+	var report mailstage1.Output
 	if err := json.Unmarshal([]byte(lines[0]), &report); err != nil {
 		t.Fatalf("decode report: %v\n%s", err, raw)
 	}

@@ -64,6 +64,30 @@ func TestProductionProcessorContractUsesResolvedSenderIntelligence(t *testing.T)
 	}
 }
 
+func TestProcessInputProjectsResolvedSenderSignalsIntoCanonicalScorer(t *testing.T) {
+	got := ProcessInput(NewProcessor(), Input{
+		ID:            "flat-drew-investing-nm",
+		Message:       Message{SenderEmail: "drew@nmangels.com", Subject: "Fwd: Special Invitation: Investing in NM", Body: "Sam, please review this investment opportunity and decide whether to join the diligence meeting."},
+		KnownInvestor: true,
+	})
+
+	if got.Composite < ImportantThreshold {
+		t.Fatalf("Stage1 input boundary buried high-stakes VIP mail: %+v", got)
+	}
+	if got.Label != LabelActionRequired {
+		t.Fatalf("label=%q want %q", got.Label, LabelActionRequired)
+	}
+	if !got.SenderHighStakes || !got.VIPSubstantiveBoost {
+		t.Fatalf("flat sender intelligence did not drive canonical VIP floor: %+v", got)
+	}
+	if !hasSignal(got.SubstanceSignals, "investment_ask") {
+		t.Fatalf("missing investment_ask signal: %+v", got)
+	}
+	if got.Result.Composite != got.Composite || got.Content.Importance != got.ContentImportance {
+		t.Fatalf("flattened diagnostics drifted from canonical result: %+v", got)
+	}
+}
+
 func TestVIPForwardedHighStakesAskSurfacesDespiteForwardShape(t *testing.T) {
 	got := ScoreStage1(Message{
 		SenderEmail: "drew@nmangels.com",
