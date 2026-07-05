@@ -522,18 +522,24 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KWC4PG2W4ACQ31YJ9HR9FGYS`](./01KWC4PG2W4ACQ31YJ9HR9FGYS.md) | inputflow/adapter: email_inbound Adapter | done | — | #3366 | 2026-06-30T12:19:16Z |
 | [`01KWC8DE79GTDCR2DTACTD43D8`](./01KWC8DE79GTDCR2DTACTD43D8.md) | inputflow: F8 clock-correctness + out-of-band partition create-ahead | done | — | #3369 | 2026-06-30T12:46:48Z |
 | [`01KWC8DE7CN23HFQ4QVZ4XYBY3`](./01KWC8DE7CN23HFQ4QVZ4XYBY3.md) | inputflow: failure router — bounded-retry + dead-letter-with-alert | done | — | #3368 | 2026-06-30T13:25:04Z |
+| [`01KWC8DE7E923QPBJGKEH1TS7R`](./01KWC8DE7E923QPBJGKEH1TS7R.md) | inputflow: stuck-walk reaper (lease/reclaim/epoch fence) | done | — | #3370 | 2026-07-03T10:45:53Z |
 | [`01KWC8DE7MZC54EB1JM5RT1FHC`](./01KWC8DE7MZC54EB1JM5RT1FHC.md) | inputflow: gate.Run — admission dedup/floor + per-action Decide + one-transaction sink dispatch | done | — | #3367 | 2026-06-30T12:57:18Z |
 | [`01KWC8DE7VC61TSK4KYCVX2PNN`](./01KWC8DE7VC61TSK4KYCVX2PNN.md) | inputflow: Engine.Process walk loop | done | — | #3371 | 2026-06-30T12:55:49Z |
+| [`01KWCB929KMPECXJM64J0SGCAH`](./01KWCB929KMPECXJM64J0SGCAH.md) | inputflow: F2/F7 hardening — ctx.Deadline into every call + structured error taxonomy | done | — | #3372 | 2026-07-03T08:47:23Z |
 | [`01KWCCCR3JEC37X45SWXYKE4A0`](./01KWCCCR3JEC37X45SWXYKE4A0.md) | inputflow: source-deletion cascade ENGINE | done | — | #3373 | 2026-06-30T14:43:04Z |
+| [`01KWCE51YE9EQ4F8FT30GHHX6M`](./01KWCE51YE9EQ4F8FT30GHHX6M.md) | inputflow: one input-flow consumer on ConsumerQueueStore (shadow) | done | — | #3375 | 2026-07-02T23:15:53Z |
 | [`01KWCE51YJQ46FB3WMR5HC5TXX`](./01KWCE51YJQ46FB3WMR5HC5TXX.md) | inputflow/jobliveness: heartbeat dead-man-switch + catch-up-on-resume harness | done | — | #3374 | 2026-06-30T14:22:49Z |
 | [`01KWCMHR2CFFQ0CAKBEAKXTBPB`](./01KWCMHR2CFFQ0CAKBEAKXTBPB.md) | runtime: reconcile dispatcher docs around claude -p and harness paths | done | — | #3391 | 2026-06-30T16:10:03Z |
+| [`01KWCMHR30WW2MBZG85SXE0NGA`](./01KWCMHR30WW2MBZG85SXE0NGA.md) | docs: refresh onboarding docs to match current architecture and operations | done | — | #3396 | 2026-07-03T00:32:22Z |
 | [`01KWCMHR3DDDV7XW0T628BYZ8S`](./01KWCMHR3DDDV7XW0T628BYZ8S.md) | dx: make root build and dev commands deterministic on a fresh checkout | done | — | #3402 | 2026-06-30T16:36:20Z |
 | [`01KWCMHR4BTMEGZN1FEWHY42EW`](./01KWCMHR4BTMEGZN1FEWHY42EW.md) | frontend: code-split route surfaces out of the initial bundle | done | — | #3403 | 2026-06-30T16:43:49Z |
 | [`01KWCMHR4MT2TBHC4795XQBW3X`](./01KWCMHR4MT2TBHC4795XQBW3X.md) | a11y: trap keyboard focus inside the shared Drawer modal | done | — | #3392 | 2026-06-30T16:17:34Z |
 | [`01KWCMHR4X3G3YB06Q5K4T9ENC`](./01KWCMHR4X3G3YB06Q5K4T9ENC.md) | chat: selecting an older search result should load and scroll to the message | done | — | #3404 | 2026-06-30T19:00:19Z |
+| [`01KWCMHR50W8MXJPTH1QW17W9A`](./01KWCMHR50W8MXJPTH1QW17W9A.md) | security: avoid raw secret-store handles in operational logs | done | — | #3394 | 2026-07-03T08:47:23Z |
 | [`01KWCMHR5G2T3ZEYD1PRHDSKG0`](./01KWCMHR5G2T3ZEYD1PRHDSKG0.md) | security: scope missing/null Origin allowance to token-backed auth flows | done | — | #3401 | 2026-06-30T17:01:04Z |
 | [`01KWCMHR5Q19F7TDG20WG8XX1T`](./01KWCMHR5Q19F7TDG20WG8XX1T.md) | security: keep unsubscribe bearer tokens out of paths and access logs | done | — | #3397 | 2026-06-30T16:48:19Z |
 | [`01KWCMHR5WZ358VGT4N8J7BYNB`](./01KWCMHR5WZ358VGT4N8J7BYNB.md) | security: cap multipart upload request bodies before parsing | done | — | #3399 | 2026-06-30T16:26:34Z |
+| [`01KWCMHR630GGS1XA34HWC43ZV`](./01KWCMHR630GGS1XA34HWC43ZV.md) | security: clear frontend and superadmin npm audit findings | done | — | #3393 | 2026-07-03T08:47:23Z |
 | [`01KWCMHR6C6A19D5P81W72EA7P`](./01KWCMHR6C6A19D5P81W72EA7P.md) | inputflow: define retention semantics for source deletion hard purges | done | — | #3395 | 2026-06-30T16:36:20Z |
 | [`01KWCMHR6FT1AHRHKY9WNXKK0T`](./01KWCMHR6FT1AHRHKY9WNXKK0T.md) | inputflow: fence receipt terminal writes with a claim lease | done | — | #3400 | 2026-06-30T16:52:50Z |
 | [`01KWCMHR6Y5DKAZW0YETCECYM0`](./01KWCMHR6Y5DKAZW0YETCECYM0.md) | ci: refresh schema golden after inputflow migrations | done | — | #3398 | 2026-06-30T18:58:05Z |
@@ -544,6 +550,7 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KWDV5K3C3SAXJY4RRE7AW1CR`](./01KWDV5K3C3SAXJY4RRE7AW1CR.md) | Topbar: chip/popover copy still says 'Waiting on you', spec wants 'Needs your judgment' | done | — | #3429 | 2026-07-01T03:25:03Z |
 | [`01KWDV8BQH6H68CKJ9YHXYK5XX`](./01KWDV8BQH6H68CKJ9YHXYK5XX.md) | Notifications: empty popover copy 'You're all caught up' should be stability-framed per attention contract | done | — | #3430 | 2026-07-01T03:29:33Z |
 | [`01KWDVGMHB8DNX2DCDAJEFF22X`](./01KWDVGMHB8DNX2DCDAJEFF22X.md) | Mail: ProactiveEmptyPanel uses decision-style 'waiting on you' copy for non-decision reply-owed rows | done | — | #3433 | 2026-07-01T03:34:03Z |
+| [`01KWDVHZ5A1B1DKDS4A1755D5K`](./01KWDVHZ5A1B1DKDS4A1755D5K.md) | Mail: NeedsYouStrip header stays 'Needs you' + shows raw inbox-unread count even with zero prepared decisions | done | — | #3436 | 2026-07-02T21:25:37Z |
 | [`01KWDVQF0G8X8CZ7SQCC613198`](./01KWDVQF0G8X8CZ7SQCC613198.md) | Chat: message actions + first reaction are hover-only, unreachable on touch | done | — | #3437 | 2026-07-01T03:37:48Z |
 | [`01KWDVRTX8BSWEPJPZRPPZDB8G`](./01KWDVRTX8BSWEPJPZRPPZDB8G.md) | Mail: classic-inbox row triage (archive/snooze/trash) is hover-only, unreachable on touch | done | — | #3439 | 2026-07-01T03:39:19Z |
 | [`01KWDVWZQRH4EWYAJRMP89NSSJ`](./01KWDVWZQRH4EWYAJRMP89NSSJ.md) | Sidebar Brief badge still excludes quick tasks — now a 3-way count mismatch with the just-fixed Topbar/Brief | done | — | #3442 | 2026-07-01T03:45:18Z |
@@ -562,9 +569,11 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KWEY688T1YF56KGVACFDB2EB`](./01KWEY688T1YF56KGVACFDB2EB.md) | Contacts: organizations/drawer/enrichment fetch failures silently degrade instead of using this file's own error+retry pattern | done | — | #3471 | 2026-07-01T13:40:48Z |
 | [`01KWEY7MM8SR4KXZ0Q8FAAYHEW`](./01KWEY7MM8SR4KXZ0Q8FAAYHEW.md) | CallDock: no in-dock retry when the staff-side call connection fatally ends | done | — | #3473 | 2026-07-01T13:41:33Z |
 | [`01KWEY8ZFGA6QDM3118XNK7QT6`](./01KWEY8ZFGA6QDM3118XNK7QT6.md) | Datastore: OR-filter groups invisible in filter-chip UI; every error state lacks the app's standard Retry button | done | — | #3488 | 2026-07-01T13:49:48Z |
+| [`01KWEYBQX2AS9QE54KD3VRQ3AG`](./01KWEYBQX2AS9QE54KD3VRQ3AG.md) | Chat composer: slash-command no-match state missing, drag-drop lacks preventDefault safety + zero drag-over feedback | done | — | #3483 | 2026-07-02T18:45:27Z |
 | [`01KWEYBQX6YX71XA2YNT24G6EH`](./01KWEYBQX6YX71XA2YNT24G6EH.md) | Datastore: mobile has no way to navigate views once one exists (auto-redirect + fully-hidden nav); confirm/reject can misattribute reload failures | done | — | #3485 | 2026-07-01T23:59:35Z |
 | [`01KWEYD4WRPE2A06B7AVKJWM4F`](./01KWEYD4WRPE2A06B7AVKJWM4F.md) | Mail compose: can silently send with a dropped failed attachment; AI-request unmount race; silent quote-enrichment failure; duplicate attachment key collision | done | — | #3484 | 2026-07-01T13:55:49Z |
 | [`01KWEYEGJFSNJPW9TBTFM6J9XY`](./01KWEYEGJFSNJPW9TBTFM6J9XY.md) | Documents: 5 save-status/suggestion state-machine gaps — silent suggestion-accept data loss, stuck error states, destructive remounts, untracked title edits | done | — | #3491 | 2026-07-01T14:00:19Z |
+| [`01KWEYFVAMN6YTC57QV2GZKVSY`](./01KWEYFVAMN6YTC57QV2GZKVSY.md) | DocumentsListPage: load-failure banner has no retry; template picker has no loading indicator | done | — | #3489 | 2026-07-02T21:14:23Z |
 | [`01KWEYH8GRAG0JWTRB71MVGM1P`](./01KWEYH8GRAG0JWTRB71MVGM1P.md) | QuietHoursEditor: load-failure terminal state has no retry, form unreachable until reload | done | — | #3486 | 2026-07-01T13:47:35Z |
 | [`01KWEYH8GT0PD3CBE248FNY0KV`](./01KWEYH8GT0PD3CBE248FNY0KV.md) | WebPushEnroll: false enable/disable failures after the underlying action already succeeded; no load-retry | done | — | #3493 | 2026-07-01T23:53:34Z |
 | [`01KWEYJJQBFV9B6ZN88V4TFK02`](./01KWEYJJQBFV9B6ZN88V4TFK02.md) | Notification settings: save/error status text has no aria-live across 4 sibling files | done | — | #3492 | 2026-07-01T13:52:49Z |
@@ -575,6 +584,7 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KWEZZXNV37GH1JTNENMG38TM`](./01KWEZZXNV37GH1JTNENMG38TM.md) | Momentum: listOwnerMembers swallows tenant-member fetch errors with zero logging, masking as 'Owner unavailable' | done | — | #3502 | 2026-07-01T14:09:19Z |
 | [`01KWF0196YABQQ2CXRXTWY0M30`](./01KWF0196YABQQ2CXRXTWY0M30.md) | Knowledge: load failure contradicts the empty-state copy; detail-drawer error has no retry/announcement; pagination errors unclear | done | — | #3510 | 2026-07-01T14:13:49Z |
 | [`01KWF02N8S0VZENHKQ9E8TD11K`](./01KWF02N8S0VZENHKQ9E8TD11K.md) | PacketWorkbench: keyboard shortcuts bypass the busy guard (duplicate approve requests), errors invisible with zero items, stale status after partial sync failure | done | — | #3516 | 2026-07-01T14:16:50Z |
+| [`01KWF02N8XVGVEWXX8B28BCETW`](./01KWF02N8XVGVEWXX8B28BCETW.md) | PacketPage: detail load-error has no retry, inconsistent with PacketListPage/PacketMount's own pattern | done | — | #3511 | 2026-07-03T00:20:22Z |
 | [`01KWF042A6ZCYXG9GHG5ZG3W1A`](./01KWF042A6ZCYXG9GHG5ZG3W1A.md) | PacketMount: failed detail/hydration fetches silently fall back to stale data with no error indicator | done | — | #3514 | 2026-07-01T14:16:50Z |
 | [`01KWF05EGSW8TSCF9P6FBEDJZ9`](./01KWF05EGSW8TSCF9P6FBEDJZ9.md) | Activity: 'Try again' after a failed Load-more discards already-loaded pages and reloads from scratch | done | — | #3517 | 2026-07-01T14:15:19Z |
 | [`01KWF05EGVGEGXAR7MKREG75W1`](./01KWF05EGVGEGXAR7MKREG75W1.md) | Activity: filtered-to-zero-results looks identical to genuinely-no-activity, no clear-filters affordance | done | — | #3512 | 2026-07-01T14:13:49Z |
@@ -584,14 +594,22 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KWF09GRYC9PXA6W3T12NNPQF`](./01KWF09GRYC9PXA6W3T12NNPQF.md) | Settings Model Activity: table rows keyboard-unreachable, false 'expired payload' flash, silent clipboard-copy failures | done | — | #3525 | 2026-07-01T14:21:19Z |
 | [`01KWF0AX09SFRD9AY8N3C4ERTY`](./01KWF0AX09SFRD9AY8N3C4ERTY.md) | SettingsExternals: a failed approve/reject discards the draft and hides the action buttons, leaving no way to retry the decision | done | — | #3523 | 2026-07-01T23:02:34Z |
 | [`01KWF0CAD239QV2NMESS6CATHS`](./01KWF0CAD239QV2NMESS6CATHS.md) | LoginSentPage: decorative checkmark glyph missing aria-hidden, announced redundantly by screen readers | done | — | #3522 | 2026-07-01T14:17:33Z |
+| [`01KWF0CAD80KMTH8RFXTYMDXFF`](./01KWF0CAD80KMTH8RFXTYMDXFF.md) | Login: invite link with missing email param locks the field empty (unvalidated, submittable); error text lacks role=alert | done | — | #3524 | 2026-07-02T21:21:53Z |
 | [`01KWF1SMXN40AQFVAX9FPM9HYD`](./01KWF1SMXN40AQFVAX9FPM9HYD.md) | Superadmin: Tenants/Users/Audit/Health pages have no loading/empty-state distinction, most lack retry | done | — | #3545 | 2026-07-01T23:35:36Z |
 | [`01KWF1TZRZ6TAXJMHNT1SV2MCC`](./01KWF1TZRZ6TAXJMHNT1SV2MCC.md) | Superadmin: self-revoke safeguard fails open on identity-check failure; mutation/refresh conflation; SettingsPage dead-end; no double-submit guards | done | — | #3538 | 2026-07-01T14:55:51Z |
+| [`01KWF1WCQZXB8CQNEZHJDFZT5N`](./01KWF1WCQZXB8CQNEZHJDFZT5N.md) | Superadmin: a network error during session probe is indistinguishable from real logout, silently redirects | done | — | #3542 | 2026-07-03T11:09:53Z |
+| [`01KWF1XQM7KQQ1CXF296ER9X8W`](./01KWF1XQM7KQQ1CXF296ER9X8W.md) | chat.ListParticipants has no LIMIT on the hot realtime-dispatch fan-out path | done | — | #3539 | 2026-07-02T20:09:52Z |
+| [`01KWF1Z3F69NC4ZZQZNZDQ4A9V`](./01KWF1Z3F69NC4ZZQZNZDQ4A9V.md) | CalDAV outbound/inbound flows construct a fresh throwaway http.Client on every call instead of reusing one | done | — | #3544 | 2026-07-02T21:15:53Z |
 | [`01KWF1Z3FY0H5X6DAPTXFF33RT`](./01KWF1Z3FY0H5X6DAPTXFF33RT.md) | newCalDAVHTTPClient's Transport never sets IdleConnTimeout | done | — | #3536 | 2026-07-01T14:43:04Z |
+| [`01KWF20F1FHN074H3BYYZ05Y9H`](./01KWF20F1FHN074H3BYYZ05Y9H.md) | HireReviewPage: load-error state has no retry, only a link away from the approval flow | done | — | #3540 | 2026-07-02T21:12:08Z |
 | [`01KWF20F1M1FR5PM6343ZW6SJC`](./01KWF20F1M1FR5PM6343ZW6SJC.md) | Onboarding: terminal success-screen error handler is unreachable dead code; silent avatar-gen failures; discovery answers can be lost silently | done | — | #3555 | 2026-07-01T23:22:03Z |
 | [`01KWF21TA8WK21B8T6EKGQ7NH7`](./01KWF21TA8WK21B8T6EKGQ7NH7.md) | realtimeSocket: teardown doesn't null handlers, heartbeat can't detect a half-open connection, reconnect backoff has no jitter | done | — | #3557 | 2026-07-01T15:04:04Z |
+| [`01KWF237293JG01GX2JC4D6BEQ`](./01KWF237293JG01GX2JC4D6BEQ.md) | useNotifications passes an unstable onEvent closure, causing a resubscribe on every notification | done | — | #3550 | 2026-07-02T21:25:37Z |
 | [`01KWF2372K3P3BZ7TNGJ4JANFJ`](./01KWF2372K3P3BZ7TNGJ4JANFJ.md) | RealtimeSocketProvider: every subscriber app-wide unsubscribes/resubscribes on each connection-status change | done | — | #3552 | 2026-07-01T14:52:05Z |
+| [`01KWF24M5VH82K2R6CC3CJP7B8`](./01KWF24M5VH82K2R6CC3CJP7B8.md) | QuickTaskBriefList: markDone failures are swallowed, bypassing FanOutPreviewCard's existing error UI | done | — | #3553 | 2026-07-02T19:18:53Z |
 | [`01KWF24M6VDF07KCWDHPSG9SYJ`](./01KWF24M6VDF07KCWDHPSG9SYJ.md) | QuickCaptureBar: a failed capture submit silently discards the user's typed note (crown-jewel capture surface) | done | — | #3551 | 2026-07-01T14:47:34Z |
 | [`01KWF262HPFK6B8HYHPWW96M7S`](./01KWF262HPFK6B8HYHPWW96M7S.md) | OnItStrip: silent undo failures, false empty-state during loading, error state has no retry | done | — | #3558 | 2026-07-01T23:31:49Z |
+| [`01KWF27CFGE1ATSMWVY66M4YK7`](./01KWF27CFGE1ATSMWVY66M4YK7.md) | QuickTaskCard: truncated raw_note has no title fallback at all, unlike the sibling OnItStrip component | done | — | #3554 | 2026-07-02T19:42:52Z |
 | [`01KWF27CFMCSDDME7NEC5VXVCZ`](./01KWF27CFMCSDDME7NEC5VXVCZ.md) | QuickTasksDropdown: error state has no retry despite reload being available in scope | done | — | #3556 | 2026-07-01T14:49:03Z |
 | [`01KWF28QANVCHZB6WM383HS80Q`](./01KWF28QANVCHZB6WM383HS80Q.md) | InlineUndo: blast_radius risk warning for a potentially-irreversible action is hover-only, invisible to touch/keyboard users | done | — | #3559 | 2026-07-01T14:55:04Z |
 | [`01KWF42DNKFE122TQN5JKZV5FB`](./01KWF42DNKFE122TQN5JKZV5FB.md) | Settings Audio/Video: no loading indicator on enumeration, mic errors have no local retry, silently-frozen camera/mic on play()/resume() rejection | done | — | #3567 | 2026-07-02T05:31:57Z |
@@ -600,9 +618,11 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KWF457HVYKY2EK2G3WY4HSDE`](./01KWF457HVYKY2EK2G3WY4HSDE.md) | Topbar: approval trigger unlabeled on mobile, approval dialog has no focus trap or initial focus | done | — | #3572 | 2026-07-01T15:26:34Z |
 | [`01KWF457J5EZ9CHA489YDWN714`](./01KWF457J5EZ9CHA489YDWN714.md) | WorkspaceDropdown: workspace-switch items break the roving-tabindex pattern; menu doesn't close on keyboard focus-out | done | — | #3569 | 2026-07-01T15:22:49Z |
 | [`01KWF46KBCNB7CGA0AXYA25Y15`](./01KWF46KBCNB7CGA0AXYA25Y15.md) | AppShell: unhandled rejection on pin creation, silent pin-list/push-registration failures, mobile nav drawer missing focus management | done | — | #3573 | 2026-07-01T23:07:04Z |
+| [`01KWF47XWRXZFJ3Z0Y3ZXTT1E3`](./01KWF47XWRXZFJ3Z0Y3ZXTT1E3.md) | SettingsNotifications: page-level loading/error states have no aria-live, unlike the composed children (companion to #3482) | done | — | #3571 | 2026-07-02T18:40:57Z |
 | [`01KWF5XH07PB7XRYM3HZ733THG`](./01KWF5XH07PB7XRYM3HZ733THG.md) | Brief page: escalation card title/chip overflow past screen edge on mobile (align-items:stretch override lost to compact-mode specificity) | done | — | #3576 | 2026-07-01T15:52:05Z |
 | [`01KWF5XH1DV02DFQ7095QA1KGR`](./01KWF5XH1DV02DFQ7095QA1KGR.md) | Brief page: numbered badge overlaps title text on nearly every 'Needs your judgment' card (!important padding reset clobbers corner-badge gutter) | done | — | #3577 | 2026-07-01T15:52:05Z |
 | [`01KWFAAZKDB73R1MZQRPN4PEQR`](./01KWFAAZKDB73R1MZQRPN4PEQR.md) | Tasks page: task titles render completely invisible (zero-width) on mobile for most rows | done | — | #3583 | 2026-07-01T17:10:04Z |
+| [`01KWFAF29HY1TK98DK22EMBDTE`](./01KWFAF29HY1TK98DK22EMBDTE.md) | Digest sweeps abort the entire multi-tenant run on one recipient's error, dropping every other recipient's digest silently | done | — | #3591 | 2026-07-03T03:34:38Z |
 | [`01KWFAF2A788B57M9TPS184SJ7`](./01KWFAF2A788B57M9TPS184SJ7.md) | WebPushDeliverer never defaults its HTTP client timeout, unlike sibling APNs/FCM transports | done | — | #3587 | 2026-07-01T17:25:04Z |
 | [`01KWFAGEJNB8W2W5ZN1Q663TN7`](./01KWFAGEJNB8W2W5ZN1Q663TN7.md) | Document indexing sweep: unbounded per-tenant corpus load + abort-on-first-error blocks all other docs/tenants | done | — | #3598 | 2026-07-01T17:31:04Z |
 | [`01KWFAHTGAGVC4KFWAXN7R7RTD`](./01KWFAHTGAGVC4KFWAXN7R7RTD.md) | Project TasksTab: load error has no Retry button, unlike sibling project tabs | done | — | #3592 | 2026-07-01T17:17:08Z |
@@ -621,19 +641,26 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KWFQ1H61WM4QYC85ZRRBRRYE`](./01KWFQ1H61WM4QYC85ZRRBRRYE.md) | Interactive (pinged) needs: fast recovery after runtime death — the 15-minute claim lease is tuned for batch tasks and leaves a human waiting half an hour | done | — | #3616 | 2026-07-01T21:50:34Z |
 | [`01KWFQ1H6566E6XQAAY8A2H8G7`](./01KWFQ1H6566E6XQAAY8A2H8G7.md) | OpenRouter runtime: graceful drain on shutdown — release claimed needs on SIGTERM so a deploy doesn't orphan in-flight turns for the full 15-minute lease | done | — | #3618 | 2026-07-01T21:01:49Z |
 | [`01KWFQ2D846Y204FR4CPPGAVA6`](./01KWFQ2D846Y204FR4CPPGAVA6.md) | # Spec: Decouple OpenRouter Agent Runtime From App Deploys | done | #3633 | — | 2026-07-02T02:38:45Z |
+| [`01KWFQ2D846Y204FR4CPPGAVA6-build`](./01KWFQ2D846Y204FR4CPPGAVA6-build.md) | # Spec: Decouple OpenRouter Agent Runtime From App Deploys | done | — | #3646 | 2026-07-03T18:31:38Z |
 | [`01KWFQ53B5VK23NZD9N93NQQ0G`](./01KWFQ53B5VK23NZD9N93NQQ0G.md) | # Spec: Group Similar Work Review Items in Brief Needs-Your-Judgment Queue | done | #3634 | — | 2026-07-02T02:38:47Z |
+| [`01KWFQ53B5VK23NZD9N93NQQ0G-build`](./01KWFQ53B5VK23NZD9N93NQQ0G-build.md) | # Spec: Group Similar Work Review Items in Brief Needs-Your-Judgment Queue | done | — | #3644 | 2026-07-03T08:47:23Z |
 | [`01KWFQ53C5V0HDDJYD2JCCHJM3`](./01KWFQ53C5V0HDDJYD2JCCHJM3.md) | # Spec: Surface Dead-Lettered Agent Needs to the Owning Task | done | #3635 | — | 2026-07-02T02:38:49Z |
 | [`01KWFQ53C5V0HDDJYD2JCCHJM3-build`](./01KWFQ53C5V0HDDJYD2JCCHJM3-build.md) | # Spec: Surface Dead-Lettered Agent Needs to the Owning Task | done | — | #3647 | 2026-07-02T06:07:13Z |
 | [`01KWG4YCEBS2VANFXSNP720E47`](./01KWG4YCEBS2VANFXSNP720E47.md) | Instance switcher forces a re-login: no tenant→account session bridge, account host walls signed-in users (ADR-019 gap) | done | — | #3622 | 2026-07-02T01:16:04Z |
 | [`01KWG4YCEPR9EV6TGHWQ7967ED`](./01KWG4YCEPR9EV6TGHWQ7967ED.md) | Agent drawer composer placeholder doubles the agent name ("Message May Hornswaggle May Hornswaggle") | done | — | #3621 | 2026-07-02T00:55:04Z |
+| [`01KWG60V3Y5GW1NH2FH36T8ZBW`](./01KWG60V3Y5GW1NH2FH36T8ZBW.md) | P0: chat context recent_messages is newest-first → turn-desync guard rejects every message after a session's first (agents mute on all existing sessions) | done | — | #3624 | 2026-07-03T05:21:53Z |
 | [`01KWG6XASQ5WYKNN8KWRM5TVYC`](./01KWG6XASQ5WYKNN8KWRM5TVYC.md) | # Spec: Fast DM Triage for Agent Direct Messages | done | #3636 | — | 2026-07-02T02:38:50Z |
 | [`01KWG951MJQ928F5GBKCNR1JGP`](./01KWG951MJQ928F5GBKCNR1JGP.md) | agents: nothing instructs memory.remember — in-turn memory capture never happens (May wrote 0 memories from Sam's info paste) | done | — | #3628 | 2026-07-02T02:13:49Z |
 | [`01KWG96AYWFHCSVBX8J703E46Z`](./01KWG96AYWFHCSVBX8J703E46Z.md) | ellie extraction: dead consumer-queue entries permanently lost after provider outages (OpenRouter 403) — add transient-failure recovery | done | — | #3630 | 2026-07-02T02:24:19Z |
 | [`01KWG971R4DG449T4MBGV38VSG`](./01KWG971R4DG449T4MBGV38VSG.md) | # Spec: Memory Extraction Coverage, Cadence, and Small-Corpus Reflection | done | #3637 | — | 2026-07-02T02:38:52Z |
 | [`01KWG971R4DG449T4MBGV38VSG-build`](./01KWG971R4DG449T4MBGV38VSG-build.md) | # Spec: Memory Extraction Coverage, Cadence, and Small-Corpus Reflection | done | — | #3639 | 2026-07-02T02:43:14Z |
+| [`01KWG97P0T1ZQK2BYTJ1BV9NCK`](./01KWG97P0T1ZQK2BYTJ1BV9NCK.md) | ellie reflection: sleep-time scheduled trigger unbuilt (TriggerScheduled has zero callers) + zero-group runs invisible — reflection silently dormant | done | — | #3629 | 2026-07-02T14:13:57Z |
 | [`01KWGANZFTX69GPH5EFH0Q6Z68`](./01KWGANZFTX69GPH5EFH0Q6Z68.md) | # SSH Integration for Remote Server Operations | done | #3631 | — | 2026-07-02T02:34:17Z |
+| [`01KWGANZFTX69GPH5EFH0Q6Z68-build`](./01KWGANZFTX69GPH5EFH0Q6Z68-build.md) | # SSH Integration for Remote Server Operations | done | — | #3642 | 2026-07-03T09:29:22Z |
 | [`01KWGB2N57CHETPC2T3G6B01W2`](./01KWGB2N57CHETPC2T3G6B01W2.md) | Sidebar: replace Momentum with Documents | done | — | #3640 | 2026-07-02T02:43:58Z |
 | [`01KWGB38CZ5QS319D00SPJWXP8`](./01KWGB38CZ5QS319D00SPJWXP8.md) | # Spec: Inline Entity Cards and Consented Chat Navigation | done | #3638 | — | 2026-07-02T02:41:10Z |
+| [`01KWGB38CZ5QS319D00SPJWXP8-build`](./01KWGB38CZ5QS319D00SPJWXP8-build.md) | # Spec: Inline Entity Cards and Consented Chat Navigation | done | — | #3650 | 2026-07-03T16:39:08Z |
+| [`01KWGBB9PZ6D5MPKZPGQ8XGK1X`](./01KWGBB9PZ6D5MPKZPGQ8XGK1X.md) | ssh: replace permissions textarea with a 3-option dropdown (any read-only / read+write / only-these-commands with reveal) | done | — | #3649 | 2026-07-03T15:21:52Z |
 | [`01KWGBB9QDWBQ9KWVZFWZ27B4M`](./01KWGBB9QDWBQ9KWVZFWZ27B4M.md) | ssh: Create Connection 500s in prod — SECRETS_KEY unset wires the stub secret store ("ssh connection write failed") | done | — | #3645 | 2026-07-02T02:55:14Z |
 | [`01KWGCHVVVCH87CWHFXRAT8ST9`](./01KWGCHVVVCH87CWHFXRAT8ST9.md) | SSH: Test access button after key install | done | — | #3654 | 2026-07-02T05:54:27Z |
 | [`01KWGCVBEAJ7JJT55JNCQK92R2`](./01KWGCVBEAJ7JJT55JNCQK92R2.md) | SSH: agents can't discover granted connections — add ssh.list_connections | done | — | #3655 | 2026-07-02T03:39:28Z |
@@ -641,20 +668,98 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KWGDSJ8Z2AZX0S3JBQH96G18`](./01KWGDSJ8Z2AZX0S3JBQH96G18.md) | Email connect: rename Connection type → Email provider + preset list | done | — | #3658 | 2026-07-02T03:52:58Z |
 | [`01KWGEBNQTCPKK80NW6FZY5WRF`](./01KWGEBNQTCPKK80NW6FZY5WRF.md) | prompt(R3): russ-nav linking — L1 syntax reflex + link/hint in create-tool results | done | — | #3668 | 2026-07-02T04:13:58Z |
 | [`01KWGEBNR0JHVNND3ANAW315QX`](./01KWGEBNR0JHVNND3ANAW315QX.md) | prompt(R1): tool-failure budget block in systemStablePrefix — stop retry spirals, end every turn | done | — | #3666 | 2026-07-02T04:02:02Z |
+| [`01KWGECSGVBKA2WMW0RBHQXN5W`](./01KWGECSGVBKA2WMW0RBHQXN5W.md) | prompt(R2): task-kind needs have no chat anchor — corrected taskOrChatToolInstruction variant + drop chat.post from task manifests | done | — | #3667 | 2026-07-02T17:13:14Z |
 | [`01KWGEE7FA3NFAQHS2QF1FJ2KC`](./01KWGEE7FA3NFAQHS2QF1FJ2KC.md) | prompt(R4): brevity binds every user-visible message + no process narration (blocker reports exempt) | done | — | #3665 | 2026-07-02T04:27:28Z |
+| [`01KWGEGZJR49TG0PMYBTYY6J54`](./01KWGEGZJR49TG0PMYBTYY6J54.md) | IMAP initial sync: import most-recent-N (default 100), never full-history walk | done | — | #3670 | 2026-07-03T11:06:53Z |
+| [`01KWGN8ETVJBWNXQGPDJ66PHET`](./01KWGN8ETVJBWNXQGPDJ66PHET.md) | prompt(R3): run and report russ-nav linking eval results | done | — | #3677 | 2026-07-03T01:35:22Z |
 | [`01KWGN8EVA5VSSWW6XZTKZQH1Q`](./01KWGN8EVA5VSSWW6XZTKZQH1Q.md) | openrouterruntime: move typed-node fallback ownership fully into RunTypedNode | done | — | #3681 | 2026-07-02T05:57:28Z |
 | [`01KWGN9RPJJ4P2BKGC47BECRXG`](./01KWGN9RPJJ4P2BKGC47BECRXG.md) | notify: explicit morning-only digest slot is overridden by non-8 job default | done | — | #3680 | 2026-07-02T05:44:42Z |
+| [`01KWHA6PXJ5QFVC0NXJ89250XH`](./01KWHA6PXJ5QFVC0NXJ89250XH.md) | IMAP initial sync: import most-recent-N (default 100), never full-history walk | done | — | #3683 | 2026-07-03T09:52:37Z |
 | [`01KWHAVA6P8T3GTFAVE4M51M35`](./01KWHAVA6P8T3GTFAVE4M51M35.md) | Mail brief: same email rendered 3x on one page — Impact Watch + Needs You + Recent Actions take overlapping slices of one ledger array with no cross-section dedup | done | — | #3688 | 2026-07-02T12:01:57Z |
 | [`01KWHAWNQZR4ZT40DP1DYV9F6D`](./01KWHAWNQZR4ZT40DP1DYV9F6D.md) | Mail triage: marketing flash-sale email classified P1 'needs operational attention' by regex impact classifier; correct haiku verdict never reconciled | done | — | #3689 | 2026-07-02T12:14:42Z |
 | [`01KWHAWNS1HFNM01C7ZJW9JBHR`](./01KWHAWNS1HFNM01C7ZJW9JBHR.md) | Classic inbox rows: ~4 threads per screen on mobile — sender truncated, mailbox-name noise line on every row, raw 'Routine 53%' score badges | done | — | #3690 | 2026-07-02T12:13:57Z |
 | [`01KWHAWNSB81GH51RG9B9XYV1W`](./01KWHAWNSB81GH51RG9B9XYV1W.md) | Email ingest never captures the message's real date: sent_at NULL on all 150 imported messages — UI shows import time, 2-month-old mail renders as new | done | — | #3691 | 2026-07-02T12:13:57Z |
+| [`01KWHBTVHEK84WXTG77PY9CHPT`](./01KWHBTVHEK84WXTG77PY9CHPT.md) | web.search / research.task returned empty results in 26/26 prod calls — DDG scrape is bot-blocked and empty-parse reports as ok | done | — | #3702 | 2026-07-03T11:54:52Z |
+| [`01KWHBTVHQ0MSSCS19RM4MJAVW`](./01KWHBTVHQ0MSSCS19RM4MJAVW.md) | CRM is write-only for agents: guide mandates nonexistent person.search; crm read tools granted to no curated agent | done | — | #3701 | 2026-07-02T17:37:59Z |
+| [`01KWHBW6T9D81ZG3YTN4S3Y9XR`](./01KWHBW6T9D81ZG3YTN4S3Y9XR.md) | activity.timeline denied 105/105 — activity tools granted to no curated agent; grant reads to worker agents | done | — | #3700 | 2026-07-02T21:21:07Z |
+| [`01KWHBW6TDBVS9XEWJ5TE1RJQG`](./01KWHBW6TDBVS9XEWJ5TE1RJQG.md) | One failing timer poisons the whole conditional-followup queue: pass aborts on first error, failed head re-selected forever, no dead-letter | done | — | #3706 | 2026-07-03T02:04:39Z |
+| [`01KWHBW6V0P2YHD2DKRY28SG7T`](./01KWHBW6V0P2YHD2DKRY28SG7T.md) | Reminder/follow-up nudges always fail at fire time: spawner fails closed on shared-project resolution (franks share 0, staff share 2) | done | — | #3707 | 2026-07-02T13:30:28Z |
 | [`01KWHBXHJTN0W0P93T91TJ9BNG`](./01KWHBXHJTN0W0P93T91TJ9BNG.md) | Missing/invalid approval_packet returns generic 403 'tool denied' — indistinguishable from a policy deny; give it its own error code | done | — | #3703 | 2026-07-02T12:32:44Z |
 | [`01KWHBXJX9S9THF6RG2J00NR0H`](./01KWHBXJX9S9THF6RG2J00NR0H.md) | # Spec: Recipient-less conditional follow-ups become owner reminders | done | #3699 | — | 2026-07-02T12:14:50Z |
+| [`01KWHBXJX9S9THF6RG2J00NR0H-build`](./01KWHBXJX9S9THF6RG2J00NR0H-build.md) | # Spec: Recipient-less conditional follow-ups become owner reminders | done | — | #3708 | 2026-07-02T23:05:22Z |
 | [`01KWHBXY26SNT8ESFGYPFS2MC6`](./01KWHBXY26SNT8ESFGYPFS2MC6.md) | # Spec: Make `watch.create` Fire for Time-Based and Condition-Based Watches | done | #3710 | — | 2026-07-02T12:29:10Z |
+| [`01KWHBXY26SNT8ESFGYPFS2MC6-build`](./01KWHBXY26SNT8ESFGYPFS2MC6-build.md) | # Spec: Make `watch.create` Fire for Time-Based and Condition-Based Watches | done | — | #3726 | 2026-07-03T16:15:08Z |
 | [`01KWHBYCFX0NP8FVTHYQXR792M`](./01KWHBYCFX0NP8FVTHYQXR792M.md) | # Spec: Sending-Domain MCP Capability Gap Closure | done | #3698 | — | 2026-07-02T12:14:35Z |
+| [`01KWHBYCFX0NP8FVTHYQXR792M-build`](./01KWHBYCFX0NP8FVTHYQXR792M-build.md) | # Spec: Sending-Domain MCP Capability Gap Closure | done | — | #3709 | 2026-07-03T07:16:38Z |
+| [`01KWHCA14PH1KXMV00PGGHS53A`](./01KWHCA14PH1KXMV00PGGHS53A.md) | IMAP multi-folder sync: poll Sent + Archive with per-(account,folder) cursors — sent/sorted mail is invisible today | done | — | #3727 | 2026-07-03T08:17:23Z |
+| [`01KWHCA156QNS0QD6CD0M08DTF`](./01KWHCA156QNS0QD6CD0M08DTF.md) | Email thread stitching: replies sent from other clients + In-Reply-To-only replies must land in ONE thread (merge + subject fallback) | done | — | #3711 | 2026-07-02T13:08:42Z |
 | [`01KWHD0090QKXW5YAG4MR1RZG5`](./01KWHD0090QKXW5YAG4MR1RZG5.md) | # Email Per-Class Auto-Handling Policy Engine | done | #242 | — | 2026-07-02T12:35:08Z |
 | [`01KWHD0090QKXW5YAG4MR1RZG5-build`](./01KWHD0090QKXW5YAG4MR1RZG5-build.md) | # Email Per-Class Auto-Handling Policy Engine | done | — | #243 | 2026-07-02T12:43:55Z |
+| [`01KWHD1BWC5YZ5HF40QAHY1PWV`](./01KWHD1BWC5YZ5HF40QAHY1PWV.md) | email: money_obligation extractor — payment failures, receipts, renewals → structured obligations | done | — | #3724 | 2026-07-03T06:53:22Z |
+| [`01KWHD2PPX6Y1Q0GWZ3F8PDEPM`](./01KWHD2PPX6Y1Q0GWZ3F8PDEPM.md) | email triage learning loop: write user corrections into triage_labeled_decision and use them as a banding prior | done | — | #3728 | 2026-07-02T18:54:27Z |
+| [`01KWHD2PQ1MTVR22FVQJ3M32QS`](./01KWHD2PQ1MTVR22FVQJ3M32QS.md) | email comprehension: closed-enum dispatchable suggested_action + amount/spam-aware band calibration | done | — | #3722 | 2026-07-02T13:52:58Z |
 | [`01KWHD63CJ3HC1PBCSAF27MQMW`](./01KWHD63CJ3HC1PBCSAF27MQMW.md) | # Spec: Personal Tailscale Integration for SSH Connections | done | #3718 | — | 2026-07-02T12:37:25Z |
+| [`01KWHD63CJ3HC1PBCSAF27MQMW-build`](./01KWHD63CJ3HC1PBCSAF27MQMW-build.md) | # Spec: Personal Tailscale Integration for SSH Connections | done | — | #3773 | 2026-07-03T19:36:53Z |
+| [`01KWHDAYA6H0VPCMEG1AVNHSH4`](./01KWHDAYA6H0VPCMEG1AVNHSH4.md) | ellie.dedup.sweep poison-pair crash loop: merged-memory INSERT hits content-hash unique index — 1,308 terminal failures, dedup dead for weeks | done | — | #3723 | 2026-07-02T13:09:27Z |
+| [`01KWHDAYA93D3QXBZTH60B71F0`](./01KWHDAYA93D3QXBZTH60B71F0.md) | Weekly priorities ritual has never fired: adapter treats notify ErrNotFound as fatal, every Monday sweep aborts | done | — | #3725 | 2026-07-02T12:53:42Z |
+| [`01KWHDC9TPX0TZH9VTZV5XGTXC`](./01KWHDC9TPX0TZH9VTZV5XGTXC.md) | inputflow ops jobs failing in prod: receipt.drain 22P02 (RLS platform binding) + partition.maintenance permission denied — front edge DOA for #3375 | done | — | #3729 | 2026-07-02T15:21:29Z |
+| [`01KWHDC9VC3EV5H589AF95RFNK`](./01KWHDC9VC3EV5H589AF95RFNK.md) | Email tool grants ship without a mailbox: fresh tenants die at bare 'email: forbidden' and no UI can create one | done | — | #3730 | 2026-07-02T14:58:59Z |
+| [`01KWHDC9VYJHFDDHH2T9ACD3CZ`](./01KWHDC9VYJHFDDHH2T9ACD3CZ.md) | Approved outbound email that permanently fails vanishes: email.message.failed has no consumer and Mail never renders 'failed' | done | — | #3735 | 2026-07-02T14:31:57Z |
+| [`01KWHDDNR0F3MVQ51EM5HAW4EA`](./01KWHDDNR0F3MVQ51EM5HAW4EA.md) | Guide/grant split backfill: compose.check, conditional_followup.create, self.update_tuning, calendar reads (+calendar_access reader rows) unusable by the agents the guide instructs | done | — | #3731 | 2026-07-02T13:45:29Z |
+| [`01KWHF1HJ80AX7A1F0RN6DYQF9`](./01KWHF1HJ80AX7A1F0RN6DYQF9.md) | # Spec: Fix MCP Document Markdown Conversion and Empty Create Diagnostics | done | #3732 | — | 2026-07-02T13:09:45Z |
+| [`01KWHF1HJ80AX7A1F0RN6DYQF9-build`](./01KWHF1HJ80AX7A1F0RN6DYQF9-build.md) | # Spec: Fix MCP Document Markdown Conversion and Empty Create Diagnostics | done | — | #3747 | 2026-07-02T21:57:53Z |
+| [`01KWHF2FRFPTNZY2PAGWNBZW2E`](./01KWHF2FRFPTNZY2PAGWNBZW2E.md) | # Spec: Prevent Editor Autosave From Clobbering Agent-Written Document Markdown | done | #3733 | — | 2026-07-02T13:09:55Z |
+| [`01KWHF2FRFPTNZY2PAGWNBZW2E-build`](./01KWHF2FRFPTNZY2PAGWNBZW2E-build.md) | # Spec: Prevent Editor Autosave From Clobbering Agent-Written Document Markdown | done | — | #3736 | 2026-07-02T22:03:07Z |
+| [`01KWHFDQY8Z4BB0Z9GH5R3KXPW`](./01KWHFDQY8Z4BB0Z9GH5R3KXPW.md) | # Spec: Reply Hygiene Guardrails for Undiscovered Capabilities and Unverified Side Effects | done | #3734 | — | 2026-07-02T13:19:45Z |
+| [`01KWHFDQY8Z4BB0Z9GH5R3KXPW-build`](./01KWHFDQY8Z4BB0Z9GH5R3KXPW-build.md) | # Spec: Reply Hygiene Guardrails for Undiscovered Capabilities and Unverified Side Effects | done | — | #3737 | 2026-07-03T02:29:22Z |
+| [`01KWHHGWEZWPFHPJE2P4W0HS8H`](./01KWHHGWEZWPFHPJE2P4W0HS8H.md) | # Spec: Dedup Sweep Stale-Pair Handling and Judge Cost Recording | done | #3738 | — | 2026-07-02T13:52:05Z |
+| [`01KWHHGWEZWPFHPJE2P4W0HS8H-build`](./01KWHHGWEZWPFHPJE2P4W0HS8H-build.md) | # Spec: Dedup Sweep Stale-Pair Handling and Judge Cost Recording | done | — | #3741 | 2026-07-02T14:51:28Z |
+| [`01KWHJW0NB0DSXGKNKYQS9DRH8`](./01KWHJW0NB0DSXGKNKYQS9DRH8.md) | # Umbrella Email Urgency Policy Amendment | done | #3740 | — | 2026-07-02T14:17:53Z |
+| [`01KWHM5VCT815F3HEQS39F94HS`](./01KWHM5VCT815F3HEQS39F94HS.md) | # Spec: IMAP IDLE Fast Inbound Mail Detection | done | #3742 | — | 2026-07-02T14:39:38Z |
+| [`01KWHM5VCT815F3HEQS39F94HS-build`](./01KWHM5VCT815F3HEQS39F94HS-build.md) | # Spec: IMAP IDLE Fast Inbound Mail Detection | done | — | #3744 | 2026-07-03T10:28:39Z |
+| [`01KWJ2PXNY87JXTC6MBYNT5DFN`](./01KWJ2PXNY87JXTC6MBYNT5DFN.md) | # Spec: Comprehension Gate Expansion, Configurable Light-LLM Model, and Rollout Observability | done | #3748 | — | 2026-07-02T18:53:07Z |
+| [`01KWJ2PXNY87JXTC6MBYNT5DFN-build`](./01KWJ2PXNY87JXTC6MBYNT5DFN-build.md) | # Spec: Comprehension Gate Expansion, Configurable Light-LLM Model, and Rollout Observability | done | — | #3755 | 2026-07-03T08:46:38Z |
+| [`01KWJ2PXS48ZT2QK2592SD3FAH`](./01KWJ2PXS48ZT2QK2592SD3FAH.md) | # Spec: Phase-1 Mail Surface Data-Model Spine | done | #3749 | — | 2026-07-02T18:53:53Z |
+| [`01KWJ2PXS48ZT2QK2592SD3FAH-build`](./01KWJ2PXS48ZT2QK2592SD3FAH-build.md) | # Spec: Phase-1 Mail Surface Data-Model Spine | done | — | #3754 | 2026-07-03T08:40:37Z |
+| [`01KWJ2PXTYF9C38G4WVA6H4ZXE`](./01KWJ2PXTYF9C38G4WVA6H4ZXE.md) | # Spec: Synchronous Stage-1 Mail Ingest Processor | done | #3750 | — | 2026-07-02T18:54:15Z |
+| [`01KWJ2PXTYF9C38G4WVA6H4ZXE-build`](./01KWJ2PXTYF9C38G4WVA6H4ZXE-build.md) | # Spec: Synchronous Stage-1 Mail Ingest Processor | done | — | #3757 | 2026-07-03T18:43:37Z |
+| [`01KWJ2QP2NEY3WEJ3QB77ZJQV9`](./01KWJ2QP2NEY3WEJ3QB77ZJQV9.md) | # Spec: Mail Ranking Scorer and Gradient Read API | done | #3752 | — | 2026-07-02T18:55:30Z |
+| [`01KWJ2QP2NEY3WEJ3QB77ZJQV9-build`](./01KWJ2QP2NEY3WEJ3QB77ZJQV9-build.md) | # Spec: Mail Ranking Scorer and Gradient Read API | done | — | #3758 | 2026-07-03T19:12:17Z |
+| [`01KWJ2QP4PGKWD2ZZNGVDV2DHG`](./01KWJ2QP4PGKWD2ZZNGVDV2DHG.md) | # Spec: VIP Senders and User Rules CRUD Surfaces | done | #3751 | — | 2026-07-02T18:54:55Z |
+| [`01KWJ2QP4PGKWD2ZZNGVDV2DHG-build`](./01KWJ2QP4PGKWD2ZZNGVDV2DHG-build.md) | # Spec: VIP Senders and User Rules CRUD Surfaces | done | — | #3771 | 2026-07-03T14:36:52Z |
+| [`01KWJ2VC3JE1T8CVD41SPKYZE8`](./01KWJ2VC3JE1T8CVD41SPKYZE8.md) | # Stage-2 Mail Model Bake-Off Harness Spec | done | #3753 | — | 2026-07-02T18:56:51Z |
+| [`01KWJ8YTA930K6GXY7HJY2Q43M`](./01KWJ8YTA930K6GXY7HJY2Q43M.md) | app: top nav (Topbar) collides with iOS status bar — add env(safe-area-inset-top) | done | — | #3760 | 2026-07-02T20:44:23Z |
+| [`01KWJD5C2FSGSJBHCW0HQWSP14`](./01KWJD5C2FSGSJBHCW0HQWSP14.md) | docs: document ADR-027 memory extraction and reflection decisions | done | — | #3766 | 2026-07-02T22:05:23Z |
+| [`01KWJD5C30WR239EPH5BN9RZRQ`](./01KWJD5C30WR239EPH5BN9RZRQ.md) | memory: tune dense-dump extraction coverage to target | done | — | #3768 | 2026-07-03T13:23:23Z |
+| [`01KWJD5C33SC65X07NZRCBM8RP`](./01KWJD5C33SC65X07NZRCBM8RP.md) | memory: trigger async extraction soon after eligible chat messages | done | — | #3770 | 2026-07-03T10:43:38Z |
+| [`01KWJD5C36B4XG11VF3DZ1E87N`](./01KWJD5C36B4XG11VF3DZ1E87N.md) | ellie: make reflection grouping threshold corpus-size-aware | done | — | #3767 | 2026-07-02T22:27:08Z |
+| [`01KWJD5C3D1R9JNJQ7V8ZQSHVV`](./01KWJD5C3D1R9JNJQ7V8ZQSHVV.md) | memory: add dense-info extraction coverage eval | done | — | #3769 | 2026-07-02T23:36:52Z |
+| [`01KWJHWAYCR8EKJ5W87P8W11RH`](./01KWJHWAYCR8EKJ5W87P8W11RH.md) | inputflow: per-tenant per-lane queue-depth + oldest-age SLO metrics | done | — | #3772 | 2026-07-03T00:01:37Z |
+| [`01KWK19B2TZEAZ3RSNGDQ5XMYG`](./01KWK19B2TZEAZ3RSNGDQ5XMYG.md) | tasks: reap-ceiling loop fails at tick 1+ (previously hidden behind the parent_task_id P0 crash) | done | — | #3782 | 2026-07-03T04:45:52Z |
+| [`01KWMF6EMBG7B1A2S2DF8C3F4D`](./01KWMF6EMBG7B1A2S2DF8C3F4D.md) | # Email Comprehension Light Stage v4 Spec | done | #3787 | — | 2026-07-03T17:12:15Z |
+| [`01KWMF6EMBG7B1A2S2DF8C3F4D-build`](./01KWMF6EMBG7B1A2S2DF8C3F4D-build.md) | # Email Comprehension Light Stage v4 Spec | done | — | #3788 | 2026-07-03T19:58:38Z |
+| [`01KWMNWBZC4A9ZWBEKXH0JDNJ7`](./01KWMNWBZC4A9ZWBEKXH0JDNJ7.md) | # Spec: Restore Impact Rows in `ListMailProcessed` | done | #3789 | — | 2026-07-03T19:05:40Z |
+| [`01KWMNWBZC4A9ZWBEKXH0JDNJ7-build`](./01KWMNWBZC4A9ZWBEKXH0JDNJ7-build.md) | # Spec: Restore Impact Rows in `ListMailProcessed` | done | — | #3790 | 2026-07-03T19:11:25Z |
+| [`01KWMS9ZVVKAWPWC8BABKQXWGQ`](./01KWMS9ZVVKAWPWC8BABKQXWGQ.md) | # Spec: Data-Driven, Per-User Email Comprehension Prompts | done | #3791 | — | 2026-07-03T20:07:00Z |
+| [`01KWMS9ZVVKAWPWC8BABKQXWGQ-build`](./01KWMS9ZVVKAWPWC8BABKQXWGQ-build.md) | # Spec: Data-Driven, Per-User Email Comprehension Prompts | done | — | #3796 | 2026-07-03T22:49:38Z |
+| [`01KWMSKDKAV3WC9QZ4Q20B0N8E`](./01KWMSKDKAV3WC9QZ4Q20B0N8E.md) | # Layer 3: Per-User Adaptive Rule Loop | done | #3792 | — | 2026-07-03T20:11:30Z |
+| [`01KWMSKDKAV3WC9QZ4Q20B0N8E-build`](./01KWMSKDKAV3WC9QZ4Q20B0N8E-build.md) | # Layer 3: Per-User Adaptive Rule Loop | done | — | #3793 | 2026-07-04T16:38:46Z |
+| [`01KWMW0GRFBHV88P061Z83AK6H`](./01KWMW0GRFBHV88P061Z83AK6H.md) | # Per-User Importance Profile Derivation Engine | done | #3797 | — | 2026-07-03T20:54:30Z |
+| [`01KWMW0GRFBHV88P061Z83AK6H-build`](./01KWMW0GRFBHV88P061Z83AK6H-build.md) | # Per-User Importance Profile Derivation Engine | done | — | #3800 | 2026-07-04T02:58:05Z |
+| [`01KWMWS21RQTMXZ6389FF2NZEK`](./01KWMWS21RQTMXZ6389FF2NZEK.md) | # Spec: Fast-Path Heavy Routing + Proposed Actions + Per-User Push Policy | done | #3798 | — | 2026-07-03T21:07:30Z |
+| [`01KWN11E9RCK52SHCCAG2NJ43H`](./01KWN11E9RCK52SHCCAG2NJ43H.md) | # Spec: Make Priority Comprehension Enqueue Failures Non-Fatal to IMAP Sync | done | #244 | — | 2026-07-03T22:20:35Z |
+| [`01KWN1R3XFBR2JWVFVB5AMJV4D`](./01KWN1R3XFBR2JWVFVB5AMJV4D.md) | # Spec: Sync all IMAP folders, not just INBOX/Sent/Archive | done | #245 | — | 2026-07-03T22:33:20Z |
+| [`01KWN2TP2ZB7Y9YS7G44J8ZQ4N`](./01KWN2TP2ZB7Y9YS7G44J8ZQ4N.md) | # Spec: Substance-Gated VIP Boost and High-Stakes Content Classification for Stage1 Mail Scoring | done | #246 | — | 2026-07-03T22:52:25Z |
+| [`01KWNC1Q1R5TQ1MXKPM9HY641H`](./01KWNC1Q1R5TQ1MXKPM9HY641H.md) | # Spec: List Feature | done | #247 | — | 2026-07-04T01:32:50Z |
+| [`01KWNC1Q1R5TQ1MXKPM9HY641H-build`](./01KWNC1Q1R5TQ1MXKPM9HY641H-build.md) | # Spec: List Feature | done | — | #249 | 2026-07-05T01:04:50Z |
+| [`01KWNDKHE057JZXZF5CD6QC7GN`](./01KWNDKHE057JZXZF5CD6QC7GN.md) | # Spec: Make Priority Comprehension Enqueue Failures Non-Fatal to IMAP Sync | done | #248 | — | 2026-07-04T02:01:50Z |
+| [`01KWQ1FYNXHW71PEWPDH6MEMQP`](./01KWQ1FYNXHW71PEWPDH6MEMQP.md) | # Spec: Centralized LLM Model Router and Slot Bindings | done | #251 | — | 2026-07-04T17:08:15Z |
+| [`01KWQ5354ZNZW3P4PQ6XXK4PG7`](./01KWQ5354ZNZW3P4PQ6XXK4PG7.md) | Email P0: deliverability resume path (rolling complaint window) + unstick pending domain + surface bounces | done | — | #3817 | 2026-07-04T18:43:53Z |
+| [`01KWQ5355GCHWVAXPBWENFGSSB`](./01KWQ5355GCHWVAXPBWENFGSSB.md) | Email P0: ship AI Compose Copilot backend (draft/rewrite/check routes 404 today) | done | — | #3816 | 2026-07-04T18:28:53Z |
+| [`01KWQEA38GG77NQWTS60AG6BV6`](./01KWQEA38GG77NQWTS60AG6BV6.md) | # Mail Urgency Source-Gating Spec | done | #254 | — | 2026-07-04T20:51:35Z |
+| [`01KWQEAMNGXJAQDDPMNNVSS3D3`](./01KWQEAMNGXJAQDDPMNNVSS3D3.md) | # Spec: Implement Gradient Inbox Mail Page | done | #255 | — | 2026-07-04T20:51:55Z |
+| [`01KWQF3KTQ5RWFH4NQZ1025FSR`](./01KWQF3KTQ5RWFH4NQZ1025FSR.md) | # Per-Message Mail Processing Trace | done | #257 | — | 2026-07-04T21:05:50Z |
+| [`01KWQF4YETDV1F9CDQZ23W4321`](./01KWQF4YETDV1F9CDQZ23W4321.md) | # Spec: Superadmin Email Trace Entry in Mail Card Kebab Menu | done | #258 | — | 2026-07-04T21:06:10Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
