@@ -86,6 +86,26 @@ becomes a branch `flowbee/issue-N`; the pipeline builds → reviews → self-mer
 The branch's `git log` is the node-by-node history (build commit, reviewer's empty
 findings-commit, revisions); the merge is a merge commit, so `main` keeps the trail.
 
+**`POST /v1/specs` and `POST /v1/epics` require an explicit `"repo"` field once more than
+one repo is registered.** With two or more `repos:` entries configured, a repo-less ingest
+is now a hard `400` — the API will not guess which managed repo a raw idea/context dump
+belongs to. This isn't pedantry: an earlier version silently defaulted a repo-less ingest
+to "the primary registered repo (first by id)", and three specs for one managed repo's
+product feature (mail/inbox work meant for `russ`) got POSTed without `repo`, silently
+landed in a *different* managed repo's (`flowbee`'s own) pipeline, and were built, reviewed,
+and bounced there for days before anyone noticed — every worker correctly found nothing to
+change, because the spec described a different repo's files entirely. Always pass `repo`
+explicitly in a multi-repo setup:
+
+```bash
+curl -X POST http://<control-plane>:7070/v1/specs \
+  -d '{"repo":"app","task":"add request timeouts"}'
+```
+
+If you're deciding *which* managed repo a spec belongs to and the answer isn't obvious from
+the task text alone, that's a sign the idea needs to name the target file paths/feature area
+before it's specced — don't guess and let the spec_author sort it out.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -94,6 +114,8 @@ findings-commit, revisions); the merge is a merge commit, so `main` keeps the tr
 | worker HTTPS clone/auth fails | boxes are SSH-only | set `FLOWBEE_GIT_REMOTE=ssh` on the control plane |
 | job stuck in `needs_human` after a transient failure | attempt budget exhausted | `flowbee requeue <job-id>` (resets the budget, re-arms to ready) |
 | approved PR routes to `merge_handoff` not self-merge | `main` moved during review (verdict can't bind) | don't push to `main` manually while an issue is in review; let Flowbee own merges |
+| `POST /v1/specs`/`/v1/epics` returns 400 "multiple repos registered ... repo is required" | repo-less ingest with 2+ repos configured | pass `"repo": "<id>"` explicitly — see [Give it work](#4-give-it-work) |
+| a built issue's diff/PR doesn't match its repo at all (agent "found nothing to change") | a spec was ingested without `repo` and landed on the wrong managed repo (pre-fix silent default, or a caller still guessing) | close/redirect the issue to the correct repo; re-ingest with an explicit `repo` |
 
 ## Rule of thumb
 

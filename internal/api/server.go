@@ -1561,7 +1561,7 @@ func (s *Server) epicCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Title    string `json:"title"` // the epic goal / chat ref
 		Lens     string `json:"lens"`  // the lens that authored the decomposition (anti-affinity)
-		Repo     string `json:"repo"`
+		Repo     string `json:"repo"` // repos.id — REQUIRED whenever more than one repo is registered; see resolveIngestRepo
 		Priority int    `json:"priority"`
 		Issues   []struct {
 			Task       string `json:"task"`
@@ -1580,9 +1580,10 @@ func (s *Server) epicCreate(w http.ResponseWriter, r *http.Request) {
 	if lens == "" {
 		lens = "product_speccer"
 	}
-	repo := body.Repo
-	if repo == "" {
-		repo = s.defaultRepo(r.Context())
+	repo, err := s.resolveIngestRepo(r.Context(), body.Repo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	epicID := ulid.New()
 	issues := make([]store.EpicIssue, len(body.Issues))
@@ -1603,18 +1604,41 @@ func (s *Server) epicCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"epic_id": epicID, "issue_ids": ids})
 }
 
-// defaultRepo resolves the repo a repo-less ingest (POST /v1/specs or /v1/epics with no
-// "repo") belongs to: the primary registered repo (first by id in the F9 registry).
-// Falls back to "" — the legacy single-repo scope the non-repo-scoped sender drains —
-// when no repos are registered. It must NEVER be the literal "default": no per-repo
-// project-out sender drains a "default" repo, so the materialization outbox row (and the
-// whole spec flow after sign-off) would strand forever, never reaching a GitHub issue.
-func (s *Server) defaultRepo(ctx context.Context) string {
+// resolveIngestRepo resolves the repo a POST /v1/specs or /v1/epics ingest belongs
+// to. An explicit, non-empty repo is returned as-is (the caller's intent is
+// unambiguous). A repo-less ingest is resolved ONLY when there is no real
+// ambiguity to guess through: zero registered repos falls back to "" (the legacy
+// single-repo scope the non-repo-scoped sender drains), and exactly one registered
+// repo is used as the sole sensible default.
+//
+// With TWO OR MORE registered repos, a repo-less ingest is a HARD ERROR instead of
+// a silent guess. This replaced a prior silent default to "the primary registered
+// repo (first by id)", which caused a real incident: three raw context-dump specs
+// about the `russ` mail product (issues #254, #257, #258 — "Sam's mail surface
+// today shows...", "Sam is dialing in mail quality...") were POSTed to /v1/specs
+// without a `repo` field, silently landed in `flowbee`'s OWN pipeline (the
+// alphabetically/config-order-first registered repo) instead of `russ`, and were
+// built, reviewed, and bounced there for days before anyone noticed — every
+// eng_worker/reviewer correctly found nothing in flowbee's repo to fix, since the
+// spec described russ's `backend/internal/email/...` and
+// `frontend/src/features/mail/...` paths. A silent guess is never recoverable
+// after the fact as cheaply as an immediate, explicit rejection at ingest time.
+func (s *Server) resolveIngestRepo(ctx context.Context, explicit string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
 	repos, err := s.store.ListRepos(ctx, true)
 	if err != nil || len(repos) == 0 {
-		return ""
+		return "", nil
 	}
-	return repos[0].ID
+	if len(repos) == 1 {
+		return repos[0].ID, nil
+	}
+	ids := make([]string, len(repos))
+	for i, r := range repos {
+		ids[i] = r.ID
+	}
+	return "", fmt.Errorf("multiple repos registered (%s) — \"repo\" is required and must name one of them explicitly; a repo-less ingest cannot be safely guessed", strings.Join(ids, ", "))
 }
 
 // specCreate is the planner front-door (ingest): it seeds a spec-authoring job
@@ -1628,7 +1652,7 @@ func (s *Server) specCreate(w http.ResponseWriter, r *http.Request) {
 		Task       string `json:"task"`       // the work item the spec_author must spec ($FLOWBEE_TASK)
 		Acceptance string `json:"acceptance"` // optional done-when
 		Lens       string `json:"lens"`       // author lens (default product_speccer; distinct from the issue-reviewer lens)
-		Repo       string `json:"repo"`       // repos.id this work item belongs to (default: the primary registered repo)
+		Repo       string `json:"repo"`       // repos.id this work item belongs to — REQUIRED whenever more than one repo is registered; see resolveIngestRepo
 		Priority   int    `json:"priority"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1643,9 +1667,10 @@ func (s *Server) specCreate(w http.ResponseWriter, r *http.Request) {
 	if lens == "" {
 		lens = "product_speccer"
 	}
-	repo := body.Repo
-	if repo == "" {
-		repo = s.defaultRepo(r.Context())
+	repo, err := s.resolveIngestRepo(r.Context(), body.Repo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	// the task the author specs: prefer an explicit `task`, fall back to the title so
 	// a one-line "title only" ingest still gives the spec_author something to build.

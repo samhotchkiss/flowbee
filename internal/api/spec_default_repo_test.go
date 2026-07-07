@@ -46,14 +46,18 @@ func postSpec(t *testing.T, srv *api.Server, jsonBody string) string {
 	return resp.JobID
 }
 
-// TestSpecCreateRepoLessDefaultsToPrimaryRepo: a /v1/specs ingest with no "repo" must
-// land on the PRIMARY registered repo (first by id) — a real, project-out-drained repo —
-// not the literal "default", which no per-repo drain covers (so the materialization
-// outbox row, and the whole spec flow after sign-off, would strand forever).
-func TestSpecCreateRepoLessDefaultsToPrimaryRepo(t *testing.T) {
+// TestSpecCreateRepoLessWithMultipleReposIsRejected is the regression for a real
+// incident: a /v1/specs ingest with no "repo" used to silently default to "the
+// primary registered repo (first by id)". Three raw context-dump specs about the
+// `russ` mail product (issues #254, #257, #258) were POSTed without a `repo` field
+// and silently landed in flowbee's OWN pipeline instead — built, reviewed, and
+// bounced there for days before anyone noticed, since every eng_worker/reviewer
+// correctly found nothing in flowbee's repo matching a spec about russ's
+// backend/internal/email paths. With two or more repos registered, a repo-less
+// ingest must now be a hard 400 rejection instead of a silent guess.
+func TestSpecCreateRepoLessWithMultipleReposIsRejected(t *testing.T) {
 	ctx := context.Background()
 	st, srv := newSpecServer(t)
-	// register two repos; the primary is the first by id ("arepo" < "zrepo").
 	for _, r := range []store.Repo{
 		{ID: "zrepo", Owner: "o", Repo: "z", DefaultBranch: "main", Active: true},
 		{ID: "arepo", Owner: "o", Repo: "a", DefaultBranch: "main", Active: true},
@@ -63,13 +67,14 @@ func TestSpecCreateRepoLessDefaultsToPrimaryRepo(t *testing.T) {
 		}
 	}
 
-	jobID := postSpec(t, srv, `{"task":"add request timeouts"}`)
-	j, err := st.GetJob(ctx, jobID)
-	if err != nil {
-		t.Fatal(err)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/specs", strings.NewReader(`{"task":"add request timeouts"}`))
+	srv.PrivateHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("repo-less spec with 2 registered repos: status=%d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
-	if j.Repo != "arepo" {
-		t.Fatalf("repo-less spec repo=%q, want the primary registered repo \"arepo\" (NOT \"default\")", j.Repo)
+	if !strings.Contains(rec.Body.String(), "arepo") || !strings.Contains(rec.Body.String(), "zrepo") {
+		t.Fatalf("400 body should name the registered repos so the caller can pick one; got %q", rec.Body.String())
 	}
 }
 
@@ -117,6 +122,29 @@ func TestEpicCreateRepoLessDefaultsToPrimaryRepo(t *testing.T) {
 	}
 	if j.Repo != "arepo" {
 		t.Fatalf("repo-less epic repo=%q, want the primary registered repo \"arepo\" (NOT \"default\")", j.Repo)
+	}
+}
+
+// TestEpicCreateRepoLessWithMultipleReposIsRejected mirrors
+// TestSpecCreateRepoLessWithMultipleReposIsRejected for /v1/epics, which shares the
+// same resolveIngestRepo call.
+func TestEpicCreateRepoLessWithMultipleReposIsRejected(t *testing.T) {
+	ctx := context.Background()
+	st, srv := newSpecServer(t)
+	for _, r := range []store.Repo{
+		{ID: "zrepo", Owner: "o", Repo: "z", DefaultBranch: "main", Active: true},
+		{ID: "arepo", Owner: "o", Repo: "a", DefaultBranch: "main", Active: true},
+	} {
+		if err := st.RegisterRepo(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/epics",
+		strings.NewReader(`{"title":"e","issues":[{"task":"a"},{"task":"b"}]}`))
+	srv.PrivateHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("repo-less epic with 2 registered repos: status=%d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
 }
 
