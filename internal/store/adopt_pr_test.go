@@ -19,7 +19,7 @@ func TestAdoptPRForReview(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(9000, 0)
 
-	id, err := st.AdoptPRForReview(ctx, 4242, "base-sha", "head-sha", false, true, false, now, now)
+	id, err := st.AdoptPRForReview(ctx, "russ", 4242, "base-sha", "head-sha", false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("adopt: %v", err)
 	}
@@ -40,6 +40,10 @@ func TestAdoptPRForReview(t *testing.T) {
 	if j.PRNumber != 4242 {
 		t.Fatalf("adopted PR number=%d, want 4242", j.PRNumber)
 	}
+	// repo MUST be set — else project-OUT's per-repo outbox drain strands the merge.
+	if j.Repo != "russ" {
+		t.Fatalf("adopted PR repo=%q, want russ (empty repo strands the merge in multi-repo)", j.Repo)
+	}
 	// it must be opted-in (NOT quiescent) — project-out has to render it so the
 	// reviewer is actually offered the work.
 	quiescent, err := st.IsQuiescent(ctx, id)
@@ -51,7 +55,7 @@ func TestAdoptPRForReview(t *testing.T) {
 	}
 
 	// idempotent: re-adopting the same PR is a no-op ("" id), no duplicate job.
-	again, err := st.AdoptPRForReview(ctx, 4242, "base-sha", "head-sha", false, true, false, now, now)
+	again, err := st.AdoptPRForReview(ctx, "russ", 4242, "base-sha", "head-sha", false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("re-adopt: %v", err)
 	}
@@ -82,7 +86,7 @@ func TestAdoptPRForReviewSkipsOriginatedPR(t *testing.T) {
 		t.Fatalf("stamp pr: %v", err)
 	}
 
-	id, err := st.AdoptPRForReview(ctx, 555, "base", "head", false, true, false, now, now)
+	id, err := st.AdoptPRForReview(ctx, "russ", 555, "base", "head", false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("adopt: %v", err)
 	}

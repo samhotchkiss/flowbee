@@ -216,7 +216,7 @@ func (r *Reconciler) AdoptPR(ctx context.Context, prNumber int) (string, error) 
 		return "", fmt.Errorf("pr #%d is closed unmerged", prNumber)
 	}
 	ciGreen := pr.CIRollup == gh.CISuccess && pr.CIHasRealSuccess
-	id, err := r.store.AdoptPRForReview(ctx, prNumber, pr.BaseRefOid, pr.HeadRefOid,
+	id, err := r.store.AdoptPRForReview(ctx, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid,
 		pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
 	if err != nil {
 		return "", err

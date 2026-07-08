@@ -156,7 +156,7 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 // the whole board. It is idempotent — a PR already bound to any non-cancelled job
 // (Flowbee-originated OR previously adopted) is a no-op returning "" — so a repeated
 // adopt, or an adopt of a PR Flowbee already tracks, never creates a duplicate.
-func (s *Store) AdoptPRForReview(ctx context.Context, prNumber int, baseSHA, headSHA string, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, error) {
+func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int, baseSHA, headSHA string, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, error) {
 	id := fmt.Sprintf("adopt-pr-%d", prNumber)
 	adopted := ""
 	err := s.tx(ctx, func(tx *sql.Tx) error {
@@ -169,13 +169,19 @@ func (s *Store) AdoptPRForReview(ctx context.Context, prNumber int, baseSHA, hea
 		if err != sql.ErrNoRows {
 			return fmt.Errorf("adopt lookup pr %d: %w", prNumber, err)
 		}
+		// repo MUST be set: project-OUT drains the outbox per repo (NextPendingOutboxForRepo
+		// joins on jobs.repo), so an empty-repo adopted job in a multi-repo control plane has
+		// its merge/comment actions stranded forever — reviewed and merge_started, but the PR
+		// never actually merges. (AdoptSweep's first-boot import has this same latent gap; it
+		// predates multi-repo. This targeted path is repo-scoped from the reconciler, so it
+		// always has the right repo.)
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO jobs (id, kind, flow, stage, state, role, pr_number, base_sha, head_sha,
+			INSERT INTO jobs (id, kind, flow, stage, state, role, repo, pr_number, base_sha, head_sha,
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 			                  adopted, opted_in, priority)
-			VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, 1, 5)`,
-			id, string(job.StateReviewPending), prNumber, baseSHA, headSHA,
+			VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, 1, 5)`,
+			id, string(job.StateReviewPending), repo, prNumber, baseSHA, headSHA,
 			marshalStrings([]string{"role:code_reviewer"}), now.Format(rfc3339)); err != nil {
 			return fmt.Errorf("insert adopted job pr %d: %w", prNumber, err)
 		}
