@@ -444,6 +444,20 @@ func (c *Client) Cancel(ctx context.Context, jobID string, force bool) (status i
 	return c.postJSONStatus(ctx, path, nil, nil, &out)
 }
 
+// AdoptPR imports a pre-existing PR (one Flowbee did not originate) into the named
+// repo's review pipeline via POST /v1/adopt. Returns the new adopted job id, whether
+// the PR was already tracked (idempotent no-op), and the HTTP status. repo may be ""
+// when exactly one repo is registered; with 2+ repos the server requires it.
+func (c *Client) AdoptPR(ctx context.Context, repo string, prNumber int) (jobID string, alreadyTracked bool, status int, err error) {
+	var out struct {
+		JobID          string `json:"job_id"`
+		AlreadyTracked bool   `json:"already_tracked"`
+	}
+	st, e := c.postJSONStatus(ctx, "/v1/adopt", nil,
+		map[string]any{"repo": repo, "pr": prNumber}, &out)
+	return out.JobID, out.AlreadyTracked, st, e
+}
+
 // SpecRequest is the /v1/specs intake payload (the planner front door): a work item a
 // spec_author drafts into a spec. Repo defaults to the primary registered repo.
 type SpecRequest struct {

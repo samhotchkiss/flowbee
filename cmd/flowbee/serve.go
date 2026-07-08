@@ -505,6 +505,8 @@ func runServe(args []string) error {
 	// compatibility, the single-repo FLOWBEE_GITHUB_OWNER/REPO env path. There are no
 	// creds in dev/CI, so this stays dormant when nothing is configured.
 	if mgr := wireMultiRepo(ctx, logger, cfg, st, srv); mgr != nil {
+		// let POST /v1/adopt (flowbee adopt <pr>) reach the per-repo GitHub loops.
+		srv.SetAdopter(mgr)
 		// boot sweep + periodic floor sweep PER repo (every 2-5 min; default 3 min),
 		// plus a periodic project-OUT drain PER repo.
 		// reconcile cadence drives how fast Flowbee REACTS to GitHub facts — chiefly

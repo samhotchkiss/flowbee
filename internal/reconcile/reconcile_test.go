@@ -144,3 +144,51 @@ func mustJSON(t *testing.T, v any) string {
 	}
 	return string(b)
 }
+
+// TestAdoptPRReadsRealStateAndImports covers the `flowbee adopt <pr>` reconcile edge:
+// it fetches the PR's real state from GitHub (a fake here) and binds it to an opted-in
+// adopted code_reviewer job in review_pending — idempotently, and refusing a
+// merged/closed PR.
+func TestAdoptPRReadsRealStateAndImports(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+
+	f := gh.NewFake()
+	f.SetPR(gh.PullRequest{Number: 900, HeadRefOid: "hh", BaseRefOid: "bb", CIRollup: gh.CISuccess, CIHasRealSuccess: true, UpdatedAt: time.Unix(10, 0)})
+	rec := reconcile.New(st, f, clock.NewFake(time.Unix(20, 0)), nil)
+
+	id, err := rec.AdoptPR(ctx, 900)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if id == "" {
+		t.Fatal("expected a new adopted job id")
+	}
+	j, err := st.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if j.State != job.StateReviewPending || j.PRNumber != 900 {
+		t.Fatalf("adopted job state=%q pr=%d, want review_pending / 900", j.State, j.PRNumber)
+	}
+
+	// idempotent
+	again, err := rec.AdoptPR(ctx, 900)
+	if err != nil {
+		t.Fatalf("re-adopt: %v", err)
+	}
+	if again != "" {
+		t.Fatalf("re-adopt must no-op, got %q", again)
+	}
+
+	// a merged PR is refused (nothing to review)
+	f.SetPR(gh.PullRequest{Number: 901, HeadRefOid: "h1", BaseRefOid: "b1", Merged: true, UpdatedAt: time.Unix(12, 0)})
+	if _, err := rec.AdoptPR(ctx, 901); err == nil {
+		t.Fatal("adopting a merged PR must error")
+	}
+
+	// a non-existent PR is refused
+	if _, err := rec.AdoptPR(ctx, 999); err == nil {
+		t.Fatal("adopting a non-existent PR must error")
+	}
+}

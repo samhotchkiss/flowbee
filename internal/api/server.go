@@ -58,6 +58,11 @@ type Server struct {
 	// flowbee_unstick_total counter; the conditional 🔀 log line is the per-event detail.
 	unstickTotal atomic.Int64
 
+	// adopter imports a pre-existing PR into a repo's review pipeline (POST /v1/adopt).
+	// Wired from the multi-repo Manager via SetAdopter; nil until then (single-repo /
+	// test servers have no Manager, so adopt 503s there).
+	adopter PRAdopter
+
 	facts  store.FactSource
 	policy job.Policy
 	// reviewersByRepo overrides policy.RequiredReviewers per repo (F5 consensus panel): a
@@ -335,6 +340,18 @@ func (s *Server) Broker() *Broker { return s.broker }
 // at serve startup with the same config the alarm poller evaluates against.
 func (s *Server) SetLiveness(cfg store.LivenessConfig) { s.liveness = cfg }
 
+// PRAdopter imports a pre-existing PR (one Flowbee did not originate) into a repo's
+// review pipeline. Satisfied by the multi-repo Manager (which owns the GitHub loops);
+// nil when no repos are wired (single-repo/legacy or a test server), in which case
+// POST /v1/adopt returns 503.
+type PRAdopter interface {
+	AdoptPR(ctx context.Context, repoID string, prNumber int) (string, error)
+}
+
+// SetAdopter wires the PR-adoption backend (the multi-repo Manager). Called after
+// wireMultiRepo builds the Manager, so adopt is only live once GitHub loops exist.
+func (s *Server) SetAdopter(a PRAdopter) { s.adopter = a }
+
 // HealthHandler serves the health listener.
 func (s *Server) HealthHandler() http.Handler {
 	mux := http.NewServeMux()
@@ -415,6 +432,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.Handle("POST /v1/jobs/{job}/cancel", op(s.cancel))
 	mux.Handle("POST /v1/specs", op(s.specCreate))
 	mux.Handle("POST /v1/epics", op(s.epicCreate))
+	mux.Handle("POST /v1/adopt", op(s.adoptPR))
 	// the board's machine-readable snapshot (HTML clients hit the web UI's "/"; a
 	// JSON client uses this stable endpoint instead of content-negotiating "/").
 	mux.HandleFunc("GET /v1/board", s.boardJSON)
@@ -597,6 +615,47 @@ func (s *Server) adoptOptIn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"opted_in": true})
+}
+
+// adoptPR is the targeted import edge (`flowbee adopt <pr>`): it pulls a pre-existing
+// PR — one Flowbee did not originate, e.g. an external agent-pool branch — into the
+// named repo's review pipeline. Flowbee reads the PR's REAL state from GitHub, binds
+// it to an opted-in adopted code_reviewer job in review_pending, and the normal
+// review/merge machinery takes over (self-merge on approval + green CI, or needs_human
+// on changes_requested). Idempotent: a PR Flowbee already tracks returns
+// already_tracked=true with no new job. 503 when no repos are wired (no adopter).
+func (s *Server) adoptPR(w http.ResponseWriter, r *http.Request) {
+	if s.adopter == nil {
+		http.Error(w, "adoption unavailable: no repos wired (single-repo/legacy control plane)", http.StatusServiceUnavailable)
+		return
+	}
+	var body struct {
+		Repo string `json:"repo"`
+		PR   int    `json:"pr"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if body.PR <= 0 {
+		http.Error(w, `"pr" is required (a positive PR number)`, http.StatusBadRequest)
+		return
+	}
+	repo, err := s.resolveIngestRepo(r.Context(), body.Repo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	id, err := s.adopter.AdoptPR(r.Context(), repo, body.PR)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if id == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"already_tracked": true, "pr": body.PR, "repo": repo})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"job_id": id, "pr": body.PR, "repo": repo})
 }
 
 // rosterJSON serves the worker roster as JSON (§12.6.2).

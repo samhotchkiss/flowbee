@@ -144,6 +144,64 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 	return adopted, nil
 }
 
+// AdoptPRForReview imports a SINGLE pre-existing PR (one not originated by Flowbee —
+// e.g. an external agent-pool branch) directly into Flowbee's review pipeline: an
+// opted-in adopted `code_reviewer` job in review_pending, with its Domain-B facts
+// reconciled. Flowbee's reviewer then judges the diff and, on approval + green CI,
+// self-merges — or routes to needs_human on changes_requested (there is no
+// eng_worker bound to a foreign branch to bounce back to).
+//
+// This is the TARGETED, operator-driven counterpart to AdoptSweep's first-boot mass
+// import: `flowbee adopt <pr>` calls it for one PR on demand, rather than importing
+// the whole board. It is idempotent — a PR already bound to any non-cancelled job
+// (Flowbee-originated OR previously adopted) is a no-op returning "" — so a repeated
+// adopt, or an adopt of a PR Flowbee already tracks, never creates a duplicate.
+func (s *Store) AdoptPRForReview(ctx context.Context, prNumber int, baseSHA, headSHA string, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, error) {
+	id := fmt.Sprintf("adopt-pr-%d", prNumber)
+	adopted := ""
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		var existing string
+		err := tx.QueryRowContext(ctx,
+			`SELECT id FROM jobs WHERE pr_number = ? AND state != 'cancelled' LIMIT 1`, prNumber).Scan(&existing)
+		if err == nil {
+			return nil // already known (originated or previously adopted) — idempotent no-op
+		}
+		if err != sql.ErrNoRows {
+			return fmt.Errorf("adopt lookup pr %d: %w", prNumber, err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO jobs (id, kind, flow, stage, state, role, pr_number, base_sha, head_sha,
+			                  blocked_by, required_capabilities, enqueued_at,
+			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
+			                  adopted, opted_in, priority)
+			VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, 1, 5)`,
+			id, string(job.StateReviewPending), prNumber, baseSHA, headSHA,
+			marshalStrings([]string{"role:code_reviewer"}), now.Format(rfc3339)); err != nil {
+			return fmt.Errorf("insert adopted job pr %d: %w", prNumber, err)
+		}
+		ev := ledger.Event{
+			JobID: id, JobSeq: 1, Kind: ledger.KindAdopted,
+			ToState: job.StateReviewPending, Actor: "operator", CreatedAt: now,
+			Payload: ledger.Payload{PRNumber: prNumber},
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if err := setJobSeq(ctx, tx, id, 1); err != nil {
+			return err
+		}
+		if err := upsertDomainBFactsTx(ctx, tx, id, ReconciledPR{
+			Number: prNumber, HeadSHA: headSHA, BaseSHA: baseSHA,
+			Merged: merged, IsDraft: isDraft, CIGreen: ciGreen, UpdatedAt: updatedAt,
+		}); err != nil {
+			return err
+		}
+		adopted = id
+		return nil
+	})
+	return adopted, err
+}
+
 // IsQuiescent reports whether a job is an adopted-but-not-opted-in job (§12.7).
 // project-OUT MUST suppress every action on such a job (the §8.2.3 exception).
 func (s *Store) IsQuiescent(ctx context.Context, jobID string) (bool, error) {

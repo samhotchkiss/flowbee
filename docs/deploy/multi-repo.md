@@ -106,6 +106,23 @@ If you're deciding *which* managed repo a spec belongs to and the answer isn't o
 the task text alone, that's a sign the idea needs to name the target file paths/feature area
 before it's specced — don't guess and let the spec_author sort it out.
 
+### Adopting a PR Flowbee didn't originate
+
+A PR created outside Flowbee's pipeline — an external agent-pool branch, a hand-pushed
+branch, anything on a `codex/*`-style branch — can be pulled INTO Flowbee's review pipeline:
+
+```bash
+flowbee adopt --repo russ 3966 3967 3968      # one or more PR numbers
+```
+
+Each adopted PR becomes an opted-in `code_reviewer` job in `review_pending`: Flowbee reads
+the PR's real state from GitHub, its reviewer judges the diff, and on approval + green CI it
+**self-merges** — or routes to `needs_human` on `changes_requested` (there is no `eng_worker`
+bound to a foreign branch to bounce the change back to, so a requested change surfaces for a
+human rather than looping). `--repo` is required with 2+ managed repos (PR numbers are
+repo-scoped); omit it only in a single-repo setup. Adoption is idempotent — a PR Flowbee
+already tracks is reported as already-tracked and left alone.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

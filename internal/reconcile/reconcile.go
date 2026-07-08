@@ -14,6 +14,7 @@ package reconcile
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -190,6 +191,40 @@ func (r *Reconciler) RefetchHint(ctx context.Context, prNumber int) bool {
 		return false
 	}
 	return reconciled
+}
+
+// AdoptPR imports a single pre-existing PR (one Flowbee did not originate — e.g. an
+// external agent-pool branch) into this repo's review pipeline: it reads the PR's
+// REAL state from GitHub (never trusting the caller), then binds it to an opted-in
+// adopted code_reviewer job in review_pending via store.AdoptPRForReview. The normal
+// reconcile + project-out machinery drives it from there (review -> self-merge on
+// green, or needs_human on changes_requested). Idempotent: a PR already tracked by a
+// non-cancelled job returns ("", nil) with no new job. Returns the new job id (or ""
+// if it was already tracked / the PR does not exist).
+func (r *Reconciler) AdoptPR(ctx context.Context, prNumber int) (string, error) {
+	pr, ok, err := r.gh.PullRequest(ctx, prNumber)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("pr #%d not found", prNumber)
+	}
+	if pr.Merged {
+		return "", fmt.Errorf("pr #%d is already merged", prNumber)
+	}
+	if pr.ClosedUnmerged {
+		return "", fmt.Errorf("pr #%d is closed unmerged", prNumber)
+	}
+	ciGreen := pr.CIRollup == gh.CISuccess && pr.CIHasRealSuccess
+	id, err := r.store.AdoptPRForReview(ctx, prNumber, pr.BaseRefOid, pr.HeadRefOid,
+		pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
+	if err != nil {
+		return "", err
+	}
+	if id != "" && r.pub != nil {
+		r.pub.PublishReconcile(id, "adopted")
+	}
+	return id, nil
 }
 
 // IntakeSweep runs a reconcile sweep so a freshly labeled/opened issue is adopted on
