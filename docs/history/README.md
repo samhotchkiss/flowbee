@@ -4,8 +4,8 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 
 | Job | Title | Status | Issue | PR | Last event |
 | --- | --- | --- | --- | --- | --- |
-| [``](./unknown.md) | (untitled) | done | — | #4022 | 2026-07-08T16:09:53Z |
 | [``](./unknown.md) | (untitled) | done | — | #4050 | 2026-07-09T05:06:08Z |
+| [``](./unknown.md) | (untitled) | done | — | #4025 | 2026-07-08T17:04:37Z |
 | [``](./unknown.md) | (untitled) | done | — | #3968 | 2026-07-08T03:17:23Z |
 | [``](./unknown.md) | (untitled) | merge_handoff | — | #3969 | 2026-07-08T03:37:23Z |
 | [``](./unknown.md) | (untitled) | done | — | #3970 | 2026-07-08T04:00:08Z |
@@ -19,27 +19,26 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [``](./unknown.md) | (untitled) | done | — | #4004 | 2026-07-08T06:38:22Z |
 | [``](./unknown.md) | (untitled) | done | — | #4005 | 2026-07-08T06:48:08Z |
 | [``](./unknown.md) | (untitled) | done | — | #4006 | 2026-07-08T06:51:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #267 | 2026-07-09T22:04:05Z |
 | [``](./unknown.md) | (untitled) | done | — | #4007 | 2026-07-08T12:13:38Z |
 | [``](./unknown.md) | (untitled) | done | — | #4018 | 2026-07-08T16:23:23Z |
 | [``](./unknown.md) | (untitled) | done | — | #4019 | 2026-07-08T16:31:38Z |
 | [``](./unknown.md) | (untitled) | done | — | #4020 | 2026-07-08T15:33:52Z |
 | [``](./unknown.md) | (untitled) | done | — | #4021 | 2026-07-08T15:56:22Z |
+| [``](./unknown.md) | (untitled) | done | — | #4022 | 2026-07-08T16:09:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4143 | 2026-07-09T21:52:10Z |
 | [``](./unknown.md) | (untitled) | done | — | #3972 | 2026-07-08T02:38:22Z |
-| [``](./unknown.md) | (untitled) | done | — | #4025 | 2026-07-08T17:04:37Z |
-| [``](./unknown.md) | (untitled) | done | — | #267 | 2026-07-09T22:04:05Z |
 | [``](./unknown.md) | (untitled) | done | — | #4051 | 2026-07-09T04:53:24Z |
 | [``](./unknown.md) | (untitled) | done | — | #4052 | 2026-07-09T05:33:53Z |
 | [``](./unknown.md) | (untitled) | done | — | #4055 | 2026-07-09T06:12:52Z |
 | [``](./unknown.md) | (untitled) | done | — | #4056 | 2026-07-09T06:38:24Z |
 | [``](./unknown.md) | (untitled) | done | — | #4057 | 2026-07-09T06:25:38Z |
-| [``](./unknown.md) | (untitled) | done | — | #4140 | 2026-07-09T21:46:09Z |
 | [``](./unknown.md) | (untitled) | done | — | #3966 | 2026-07-08T02:48:54Z |
 | [``](./unknown.md) | (untitled) | done | — | #3967 | 2026-07-08T02:54:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #267 | 2026-07-09T22:04:05Z |
-| [``](./unknown.md) | (untitled) | done | — | #4058 | 2026-07-09T07:18:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #4143 | 2026-07-09T21:52:10Z |
-| [``](./unknown.md) | (untitled) | done | — | #4086 | 2026-07-09T21:05:25Z |
 | [``](./unknown.md) | (untitled) | done | — | #4081 | 2026-07-09T21:34:09Z |
+| [``](./unknown.md) | (untitled) | done | — | #4058 | 2026-07-09T07:18:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4086 | 2026-07-09T21:05:25Z |
+| [``](./unknown.md) | (untitled) | done | — | #4140 | 2026-07-09T21:46:09Z |
 | [``](./unknown.md) | (untitled) | done | — | #4080 | 2026-07-09T21:05:25Z |
 | [``](./unknown.md) | (untitled) | done | — | #4071 | 2026-07-09T12:43:38Z |
 | [``](./unknown.md) | (untitled) | done | — | #4069 | 2026-07-09T12:18:53Z |
@@ -861,11 +860,13 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KX0TRB70VYNFPPDGJC8ZWZPV`](./01KX0TRB70VYNFPPDGJC8ZWZPV.md) | mail UI: Newman unreachable at 1024-1279px viewports — realign isMobile/sidebar breakpoints | done | — | #4015 | 2026-07-08T12:39:52Z |
 | [`01KX491VCQ95P3BZQXQYCMTZSX`](./01KX491VCQ95P3BZQXQYCMTZSX.md) | [mail stage 4] resolve human identity in Newman VIP model | done | — | #4133 | 2026-07-09T21:05:25Z |
 | [`01KX491VE71Z4DXMCMRYFBWA49`](./01KX491VE71Z4DXMCMRYFBWA49.md) | [mail stage 4] wire heavy draft weakness into quick reply and reader | done | — | #4125 | 2026-07-09T21:07:00Z |
+| [`01KX491VGGGTKJ1XQQWNWDSG7H`](./01KX491VGGGTKJ1XQQWNWDSG7H.md) | [mail stage 4] protect read models from stubs and stale ranking signals | done | — | #4135 | 2026-07-09T22:13:26Z |
 | [`01KX491VHMXW18JBV0XKF5Z3PV`](./01KX491VHMXW18JBV0XKF5Z3PV.md) | [mail stage 4] complete provider identity linking and adaptive-rule scheduling | done | — | #4134 | 2026-07-09T21:04:37Z |
 | [`01KX49NP781XJQRDMSS6X0PJEV`](./01KX49NP781XJQRDMSS6X0PJEV.md) | # Epic: A21 Deterministic Mail Authority Inversion | done | #4128 | — | 2026-07-09T20:42:24Z |
 | [`01KX49NP781XJQRDMSS6X0PJEV-build`](./01KX49NP781XJQRDMSS6X0PJEV-build.md) | # Epic: A21 Deterministic Mail Authority Inversion | done | — | #4132 | 2026-07-09T21:17:24Z |
 | [`01KX49P0V33HA3QT9HK2QSEX6B`](./01KX49P0V33HA3QT9HK2QSEX6B.md) | # Stage 4 A22: Canonical Owner-Attention Count Contract | done | #4126 | — | 2026-07-09T20:41:39Z |
 | [`01KX4ABTW14HYRX1F3ZKF1JG3X`](./01KX4ABTW14HYRX1F3ZKF1JG3X.md) | # Spec: Adopted PR Diff Propagation for Flowbee Review Leases | done | #265 | — | 2026-07-09T20:53:14Z |
+| [`01KX4ABTW14HYRX1F3ZKF1JG3X-build`](./01KX4ABTW14HYRX1F3ZKF1JG3X-build.md) | # Spec: Adopted PR Diff Propagation for Flowbee Review Leases | done | — | #266 | 2026-07-09T22:17:51Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
