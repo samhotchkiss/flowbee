@@ -3,8 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
-	"strings"
 	"time"
 
 	gh "github.com/samhotchkiss/flowbee/internal/github"
@@ -24,8 +24,7 @@ func adoptedPRJobID(repo string, prNumber int) string {
 	if repo == "" {
 		return fmt.Sprintf("adopt-pr-%d", prNumber)
 	}
-	repl := strings.NewReplacer("/", "-", "\\", "-", " ", "-", ":", "-")
-	return fmt.Sprintf("adopt-pr-%s-%d", repl.Replace(repo), prNumber)
+	return fmt.Sprintf("adopt-pr-repo-%s-%d", base64.RawURLEncoding.EncodeToString([]byte(repo)), prNumber)
 }
 
 // AdoptSweep is the ADOPT-mode first-boot import (§12.7, I-16). It imports every

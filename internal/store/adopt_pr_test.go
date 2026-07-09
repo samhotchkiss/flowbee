@@ -162,6 +162,30 @@ func TestAdoptPRForReviewScopesPRNumbersByRepo(t *testing.T) {
 	}
 }
 
+func TestAdoptPRForReviewJobIDUsesCollisionFreeRepoEncoding(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	idA, err := st.AdoptPRForReview(ctx, "owner/repo", 4078, "base-a", "head-a", "diff --git a/slash b/slash\n", false, false, true, false, now, now)
+	if err != nil {
+		t.Fatalf("adopt owner/repo: %v", err)
+	}
+	idB, err := st.AdoptPRForReview(ctx, "owner-repo", 4078, "base-b", "head-b", "diff --git a/dash b/dash\n", false, false, true, false, now, now)
+	if err != nil {
+		t.Fatalf("adopt owner-repo: %v", err)
+	}
+	if idA == "" || idB == "" || idA == idB {
+		t.Fatalf("repo identities must not collide in adopted job ids, got %q and %q", idA, idB)
+	}
+	if d, _ := st.JobPatchDiff(ctx, idA); d != "diff --git a/slash b/slash\n" {
+		t.Fatalf("owner/repo patch=%q", d)
+	}
+	if d, _ := st.JobPatchDiff(ctx, idB); d != "diff --git a/dash b/dash\n" {
+		t.Fatalf("owner-repo patch=%q", d)
+	}
+}
+
 func TestAdoptPRForReviewRecordsExplicitEmptyDiff(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
