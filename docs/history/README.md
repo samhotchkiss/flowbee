@@ -4,6 +4,46 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 
 | Job | Title | Status | Issue | PR | Last event |
 | --- | --- | --- | --- | --- | --- |
+| [``](./unknown.md) | (untitled) | done | — | #4022 | 2026-07-08T16:09:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4050 | 2026-07-09T05:06:08Z |
+| [``](./unknown.md) | (untitled) | done | — | #3968 | 2026-07-08T03:17:23Z |
+| [``](./unknown.md) | (untitled) | merge_handoff | — | #3969 | 2026-07-08T03:37:23Z |
+| [``](./unknown.md) | (untitled) | done | — | #3970 | 2026-07-08T04:00:08Z |
+| [``](./unknown.md) | (untitled) | merge_handoff | — | #3990 | 2026-07-08T04:04:51Z |
+| [``](./unknown.md) | (untitled) | done | — | #3991 | 2026-07-08T04:09:52Z |
+| [``](./unknown.md) | (untitled) | done | — | #3994 | 2026-07-08T02:54:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #3996 | 2026-07-08T04:30:08Z |
+| [``](./unknown.md) | (untitled) | done | — | #3997 | 2026-07-08T04:41:23Z |
+| [``](./unknown.md) | (untitled) | done | — | #3998 | 2026-07-08T05:03:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4001 | 2026-07-08T06:02:23Z |
+| [``](./unknown.md) | (untitled) | done | — | #4004 | 2026-07-08T06:38:22Z |
+| [``](./unknown.md) | (untitled) | done | — | #4005 | 2026-07-08T06:48:08Z |
+| [``](./unknown.md) | (untitled) | done | — | #4006 | 2026-07-08T06:51:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4007 | 2026-07-08T12:13:38Z |
+| [``](./unknown.md) | (untitled) | done | — | #4018 | 2026-07-08T16:23:23Z |
+| [``](./unknown.md) | (untitled) | done | — | #4019 | 2026-07-08T16:31:38Z |
+| [``](./unknown.md) | (untitled) | done | — | #4020 | 2026-07-08T15:33:52Z |
+| [``](./unknown.md) | (untitled) | done | — | #4021 | 2026-07-08T15:56:22Z |
+| [``](./unknown.md) | (untitled) | done | — | #3972 | 2026-07-08T02:38:22Z |
+| [``](./unknown.md) | (untitled) | done | — | #4025 | 2026-07-08T17:04:37Z |
+| [``](./unknown.md) | (untitled) | done | — | #267 | 2026-07-09T22:04:05Z |
+| [``](./unknown.md) | (untitled) | done | — | #4051 | 2026-07-09T04:53:24Z |
+| [``](./unknown.md) | (untitled) | done | — | #4052 | 2026-07-09T05:33:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4055 | 2026-07-09T06:12:52Z |
+| [``](./unknown.md) | (untitled) | done | — | #4056 | 2026-07-09T06:38:24Z |
+| [``](./unknown.md) | (untitled) | done | — | #4057 | 2026-07-09T06:25:38Z |
+| [``](./unknown.md) | (untitled) | done | — | #4140 | 2026-07-09T21:46:09Z |
+| [``](./unknown.md) | (untitled) | done | — | #3966 | 2026-07-08T02:48:54Z |
+| [``](./unknown.md) | (untitled) | done | — | #3967 | 2026-07-08T02:54:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #267 | 2026-07-09T22:04:05Z |
+| [``](./unknown.md) | (untitled) | done | — | #4058 | 2026-07-09T07:18:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4143 | 2026-07-09T21:52:10Z |
+| [``](./unknown.md) | (untitled) | done | — | #4086 | 2026-07-09T21:05:25Z |
+| [``](./unknown.md) | (untitled) | done | — | #4081 | 2026-07-09T21:34:09Z |
+| [``](./unknown.md) | (untitled) | done | — | #4080 | 2026-07-09T21:05:25Z |
+| [``](./unknown.md) | (untitled) | done | — | #4071 | 2026-07-09T12:43:38Z |
+| [``](./unknown.md) | (untitled) | done | — | #4069 | 2026-07-09T12:18:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4060 | 2026-07-09T08:30:08Z |
 | [`01KV9B7P5X6TFFQ1TBK662TNNX`](./01KV9B7P5X6TFFQ1TBK662TNNX.md) | Project Overview 'where it stands' hallucinates on brand-new/empty projects | done | — | #2218 | 2026-06-23T20:51:03Z |
 | [`01KV9NWZVKJ2YQP0N8VPD0H88X`](./01KV9NWZVKJ2YQP0N8VPD0H88X.md) | Drawer: context-aware close-button aria-label (hardcoded 'Close profile' is wrong for non-profile drawers) | done | — | #2220 | 2026-06-17T02:34:41Z |
 | [`01KV9QNJ8AZR2KH2WQ0K9WWPK4`](./01KV9QNJ8AZR2KH2WQ0K9WWPK4.md) | Documents list: use consistent compact date formatting (toLocaleDateString options) | done | — | #2222 | 2026-06-17T03:19:20Z |
@@ -95,9 +135,12 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KVF1GQYMPD587D9NKZX6GJ7W-build`](./01KVF1GQYMPD587D9NKZX6GJ7W-build.md) | # ApprovalQueue — Three Generic UI Fixes | done | — | #2299 | 2026-06-19T12:59:31Z |
 | [`01KVF1VPW44BVNA2399VCCYJTS`](./01KVF1VPW44BVNA2399VCCYJTS.md) | 01KVF1VPW44BVNA2399VCCYJTS | done | #2298 | — | 2026-06-19T04:24:11Z |
 | [`01KVF1VPW44BVNA2399VCCYJTS-build`](./01KVF1VPW44BVNA2399VCCYJTS-build.md) | # Spec: ApprovalQueueContext — post-resolution refresh & Brief sync | done | — | #2300 | 2026-06-23T03:14:51Z |
+| [`01KVF1VPXE2GNV74AG076BCPWB-build`](./01KVF1VPXE2GNV74AG076BCPWB-build.md) | # Spec: Close Seat-Definition Divergence Between Task Create and Need Derive | done | — | #3920 | 2026-07-06T07:24:16Z |
+| [`01KVF1VPYS4RV3FC5P1DH2CQX3-build`](./01KVF1VPYS4RV3FC5P1DH2CQX3-build.md) | # Spec: Unified Send-Back — Note-Bearing Reject That Advances to Writer | done | — | #3918 | 2026-07-06T07:46:45Z |
 | [`01KVF2NXYEDPTHQ2PXNMP4RBY7-build`](./01KVF2NXYEDPTHQ2PXNMP4RBY7-build.md) | # Spec: Fix scoping_review False-Positive When Worker Is Seated | done | — | #2304 | 2026-06-19T13:01:46Z |
 | [`01KVF2NXZV9H9Q42Q4ZB1EM32Y-build`](./01KVF2NXZV9H9Q42Q4ZB1EM32Y-build.md) | # Spec: work_review reject carries note to writer rework | done | — | #2303 | 2026-06-19T13:27:34Z |
-| [`01KVF3JHWTEN2TS9YJCAGMC2YP`](./01KVF3JHWTEN2TS9YJCAGMC2YP.md) | 01KVF3JHWTEN2TS9YJCAGMC2YP | done | — | — | 2026-06-19T04:54:06Z |
+| [`01KVF3JHWTEN2TS9YJCAGMC2YP`](./01KVF3JHWTEN2TS9YJCAGMC2YP.md) | 01KVF3JHWTEN2TS9YJCAGMC2YP | done | #3917 | — | 2026-07-06T06:39:08Z |
+| [`01KVF3JHWTEN2TS9YJCAGMC2YP-build`](./01KVF3JHWTEN2TS9YJCAGMC2YP-build.md) | # Spec: Instant Brief "What Matters" Narrative with Stale-While-Revalidate Push | done | — | #3919 | 2026-07-06T07:17:31Z |
 | [`01KVFNP6P2F9G8FG6CNHV24DV0`](./01KVFNP6P2F9G8FG6CNHV24DV0.md) | flowbee doctor --json for CI/automation readiness gating | done | — | #181 | 2026-06-19T10:23:24Z |
 | [`01KVFQBRTZ14W98M7CGVJ85NRF`](./01KVFQBRTZ14W98M7CGVJ85NRF.md) | flowbee restore — safe disaster recovery from a backup snapshot | done | — | #183 | 2026-06-19T11:02:24Z |
 | [`01KVFS5EHW3BDX624HJ3CM8FN1`](./01KVFS5EHW3BDX624HJ3CM8FN1.md) | flowbee pause / resume — graceful fleet pause (stop new leases, let in-flight finish) | done | — | #185 | 2026-06-19T11:25:39Z |
@@ -753,13 +796,76 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KWNC1Q1R5TQ1MXKPM9HY641H`](./01KWNC1Q1R5TQ1MXKPM9HY641H.md) | # Spec: List Feature | done | #247 | — | 2026-07-04T01:32:50Z |
 | [`01KWNC1Q1R5TQ1MXKPM9HY641H-build`](./01KWNC1Q1R5TQ1MXKPM9HY641H-build.md) | # Spec: List Feature | done | — | #249 | 2026-07-05T01:04:50Z |
 | [`01KWNDKHE057JZXZF5CD6QC7GN`](./01KWNDKHE057JZXZF5CD6QC7GN.md) | # Spec: Make Priority Comprehension Enqueue Failures Non-Fatal to IMAP Sync | done | #248 | — | 2026-07-04T02:01:50Z |
+| [`01KWPZ799VK39BBC8BQ6NTAHX4`](./01KWPZ799VK39BBC8BQ6NTAHX4.md) | Mail: build real Reply all (seed To/Cc from thread, exclude self, re-add 'a' shortcut) | done | — | #3811 | 2026-07-05T16:00:58Z |
 | [`01KWQ1FYNXHW71PEWPDH6MEMQP`](./01KWQ1FYNXHW71PEWPDH6MEMQP.md) | # Spec: Centralized LLM Model Router and Slot Bindings | done | #251 | — | 2026-07-04T17:08:15Z |
 | [`01KWQ5354ZNZW3P4PQ6XXK4PG7`](./01KWQ5354ZNZW3P4PQ6XXK4PG7.md) | Email P0: deliverability resume path (rolling complaint window) + unstick pending domain + surface bounces | done | — | #3817 | 2026-07-04T18:43:53Z |
+| [`01KWQ5355A7963A840RNEC912A`](./01KWQ5355A7963A840RNEC912A.md) | Email P0: auto-provision mailbox + sending-limit on tenant create (new tenants can't send today) | done | — | #3815 | 2026-07-08T13:20:23Z |
 | [`01KWQ5355GCHWVAXPBWENFGSSB`](./01KWQ5355GCHWVAXPBWENFGSSB.md) | Email P0: ship AI Compose Copilot backend (draft/rewrite/check routes 404 today) | done | — | #3816 | 2026-07-04T18:28:53Z |
+| [`01KWQD6PXXR2Y9P7R5PDY7BWYP`](./01KWQD6PXXR2Y9P7R5PDY7BWYP.md) | Email P0 (launch): zero-miss on obligations & deadlines (extract to reminders/calendar) | done | — | #3820 | 2026-07-05T01:54:23Z |
 | [`01KWQEA38GG77NQWTS60AG6BV6`](./01KWQEA38GG77NQWTS60AG6BV6.md) | # Mail Urgency Source-Gating Spec | done | #254 | — | 2026-07-04T20:51:35Z |
 | [`01KWQEAMNGXJAQDDPMNNVSS3D3`](./01KWQEAMNGXJAQDDPMNNVSS3D3.md) | # Spec: Implement Gradient Inbox Mail Page | done | #255 | — | 2026-07-04T20:51:55Z |
 | [`01KWQF3KTQ5RWFH4NQZ1025FSR`](./01KWQF3KTQ5RWFH4NQZ1025FSR.md) | # Per-Message Mail Processing Trace | done | #257 | — | 2026-07-04T21:05:50Z |
 | [`01KWQF4YETDV1F9CDQZ23W4321`](./01KWQF4YETDV1F9CDQZ23W4321.md) | # Spec: Superadmin Email Trace Entry in Mail Card Kebab Menu | done | #258 | — | 2026-07-04T21:06:10Z |
+| [`01KWQKGKFM3ZPWBBM405PWZME5`](./01KWQKGKFM3ZPWBBM405PWZME5.md) | Email P0 (launch): outbound via customer's own SMTP (bring-your-own-mailbox relay) | done | — | #3821 | 2026-07-08T03:20:22Z |
+| [`01KWSGQBYNKVY6DK3J4K8M7SG4`](./01KWSGQBYNKVY6DK3J4K8M7SG4.md) | # Spec: Content-Hash Gated Ellie Maintenance Sweeps | done | #261 | — | 2026-07-05T16:12:22Z |
+| [`01KWSNRQ15JR4PJEQ8PTDEFNHB`](./01KWSNRQ15JR4PJEQ8PTDEFNHB.md) | mail: unblind comprehension read path | done | — | #3831 | 2026-07-05T18:12:14Z |
+| [`01KWSR034YT8C06SJ6P0VJWQDC`](./01KWSR034YT8C06SJ6P0VJWQDC.md) | infra: expose app deploy version marker | done | — | #3835 | 2026-07-08T04:50:24Z |
+| [`01KWSRQENEH5Z4V7B4GSBY49CG`](./01KWSRQENEH5Z4V7B4GSBY49CG.md) | ci: restore G1 gates blocking mail PRs | done | — | #3837 | 2026-07-05T18:35:29Z |
+| [`01KWSS9BY88N6X8FQQ1TB822WV`](./01KWSS9BY88N6X8FQQ1TB822WV.md) | ci: add missing mail comprehension env example key | done | — | #3839 | 2026-07-05T18:43:45Z |
+| [`01KWSTW6TXT46YCVNZ6NKP95M3`](./01KWSTW6TXT46YCVNZ6NKP95M3.md) | mail: guard comprehension reprocess backfill | done | — | #3841 | 2026-07-05T19:11:29Z |
+| [`01KWSVVQ06PM79QJ7Q9FRC538F`](./01KWSVVQ06PM79QJ7Q9FRC538F.md) | mail: make comprehension reprocess safe for prod backfill | done | — | #3844 | 2026-07-05T19:32:29Z |
+| [`01KWSVZS7ZFZBCQ4KK8CMWJ462`](./01KWSVZS7ZFZBCQ4KK8CMWJ462.md) | mail: backfill impact retractions for false-positive asks | done | — | #3845 | 2026-07-05T19:43:00Z |
+| [`01KWSWVCV0FQCVMH3Q6NJRJA18`](./01KWSWVCV0FQCVMH3Q6NJRJA18.md) | mail: align reprocess guard with active comprehension prompt version | done | — | #3847 | 2026-07-05T19:57:59Z |
+| [`01KWSYD480C92CE6P6RHGE8E1M`](./01KWSYD480C92CE6P6RHGE8E1M.md) | # Spec: Mail Checklist 1.2b Legacy Impact Retraction Cleanup | done | #3849 | — | 2026-07-05T20:11:16Z |
+| [`01KWSYD480C92CE6P6RHGE8E1M-build`](./01KWSYD480C92CE6P6RHGE8E1M-build.md) | # Spec: Mail Checklist 1.2b Legacy Impact Retraction Cleanup | done | — | #3851 | 2026-07-05T20:28:01Z |
+| [`01KWSYFBN7NV983APC3Y54XZ72`](./01KWSYFBN7NV983APC3Y54XZ72.md) | # Spec: Mail Checklist 1.3 Count-Honesty Fix | done | #3850 | — | 2026-07-05T20:12:23Z |
+| [`01KWSYFBN7NV983APC3Y54XZ72-build`](./01KWSYFBN7NV983APC3Y54XZ72-build.md) | # Spec: Mail Checklist 1.3 Count-Honesty Fix | done | — | #3852 | 2026-07-05T20:45:14Z |
+| [`01KWSZKPNC2SS7HJRZRP1CC9SE`](./01KWSZKPNC2SS7HJRZRP1CC9SE.md) | # Spec: Fix Residual Mail Impact Retraction False Positives After #3851 | done | #3853 | — | 2026-07-05T20:32:38Z |
+| [`01KWSZKPNC2SS7HJRZRP1CC9SE-build`](./01KWSZKPNC2SS7HJRZRP1CC9SE-build.md) | # Spec: Fix Residual Mail Impact Retraction False Positives After #3851 | done | — | #3854 | 2026-07-05T20:56:29Z |
+| [`01KWT1C7G81EJ1YX4P8MH7ZSJ4`](./01KWT1C7G81EJ1YX4P8MH7ZSJ4.md) | # Mail Checklist 1.2b Residual Impact Retraction Spec | done | #3855 | — | 2026-07-05T21:03:06Z |
+| [`01KWT1C7G81EJ1YX4P8MH7ZSJ4-build`](./01KWT1C7G81EJ1YX4P8MH7ZSJ4-build.md) | # Mail Checklist 1.2b Residual Impact Retraction Spec | done | — | #3856 | 2026-07-05T21:11:30Z |
+| [`01KWT27VDJTBF79MF1TT2E2ZM5`](./01KWT27VDJTBF79MF1TT2E2ZM5.md) | # Spec: Fix mail-impact-retractions 1.2b Residual False Positives | done | #263 | — | 2026-07-05T21:18:23Z |
+| [`01KWT2C82EMYXWRNZGCJVTGH93`](./01KWT2C82EMYXWRNZGCJVTGH93.md) | # Spec: Fix mail-impact-retractions Consumer Subscription Blocker Overmatches | done | #3857 | — | 2026-07-05T21:20:16Z |
+| [`01KWT2C82EMYXWRNZGCJVTGH93-build`](./01KWT2C82EMYXWRNZGCJVTGH93-build.md) | # Spec: Fix mail-impact-retractions Consumer Subscription Blocker Overmatches | done | — | #3858 | 2026-07-05T21:30:14Z |
+| [`01KWT38KAFF63QCC4XR09D7R8G`](./01KWT38KAFF63QCC4XR09D7R8G.md) | # Spec: Fix Dry-Run Retraction Test Count | done | #3859 | — | 2026-07-05T21:35:38Z |
+| [`01KWT38KAFF63QCC4XR09D7R8G-build`](./01KWT38KAFF63QCC4XR09D7R8G-build.md) | # Spec: Fix Dry-Run Retraction Test Count | done | — | #3860 | 2026-07-05T21:38:29Z |
+| [`01KWT44SHGFZJYSSTAZ765C1MD`](./01KWT44SHGFZJYSSTAZ765C1MD.md) | mail: fix GradientInbox refresh and mobile Newman routing for checklist 1.4 | done | — | #3862 | 2026-07-05T21:53:29Z |
+| [`01KWT4SCWJJE72M9K6RMRWJR2D`](./01KWT4SCWJJE72M9K6RMRWJR2D.md) | mail: wire GradientInbox dead controls for checklist 1.5 | done | — | #3865 | 2026-07-05T22:12:14Z |
+| [`01KWT5YD8E88NXNXEY96KFMMDB`](./01KWT5YD8E88NXNXEY96KFMMDB.md) | mail: server-owned ranked ordering for checklist 1.6 | done | — | #3868 | 2026-07-05T22:41:30Z |
+| [`01KWT6K0MG74JP8EJT3FJ4G54B`](./01KWT6K0MG74JP8EJT3FJ4G54B.md) | mail: reading tab and rich ledger fields for checklist 1.7 | done | — | #3873 | 2026-07-05T22:41:30Z |
+| [`01KWT6XZ8A2NKFW9PM9GD7EHYN`](./01KWT6XZ8A2NKFW9PM9GD7EHYN.md) | mail: Newman conversational endpoint for checklist 2.1 | done | — | #3874 | 2026-07-05T23:25:01Z |
+| [`01KWTCT589272Y0YBYA0MHX9VH`](./01KWTCT589272Y0YBYA0MHX9VH.md) | mail: stage Gradient quick replies as drafts | done | — | #3878 | 2026-07-06T00:29:30Z |
+| [`01KWTDJVE085SE1DM6P5WJDKCM`](./01KWTDJVE085SE1DM6P5WJDKCM.md) | mail: fix main-red mail_item_score ranking test | done | — | #3881 | 2026-07-06T00:37:44Z |
+| [`01KWTE0KNXZGB9B351AWV6FEBF`](./01KWTE0KNXZGB9B351AWV6FEBF.md) | mail: fix rank rationale JSON assertion after score upsert | done | — | #3883 | 2026-07-06T00:45:15Z |
+| [`01KWTESB5GJDVCWRBWWFG7ZA7B`](./01KWTESB5GJDVCWRBWWFG7ZA7B.md) | mail: supersede dirty phase 1 receipt/ranking PR | done | — | #3885 | 2026-07-06T01:06:14Z |
+| [`01KWTFT8BQJ4SQ7S42576M7Y7Z`](./01KWTFT8BQJ4SQ7S42576M7Y7Z.md) | mail: damp archived shopping receipts in ranked inbox | done | — | #3888 | 2026-07-06T01:18:15Z |
+| [`01KWTGHM1DYWJNJ9WXYPTR5NWE`](./01KWTGHM1DYWJNJ9WXYPTR5NWE.md) | mail: fix archived shopping clamp regression fixture | done | — | #3890 | 2026-07-06T01:30:14Z |
+| [`01KWTGNPCZTSPMTNFZXZ6RH2AC`](./01KWTGNPCZTSPMTNFZXZ6RH2AC.md) | mail: keep quiet shopping surface receipts out of the attention lane | done | — | #3892 | 2026-07-06T01:38:30Z |
+| [`01KWTHD28YX24WDK4X1WJTM4B7`](./01KWTHD28YX24WDK4X1WJTM4B7.md) | mail: damp non-escalated no-action rows out of the attention lane | done | — | #3895 | 2026-07-06T01:46:44Z |
+| [`01KWTHSE1W1NHTQT9JZ6PE1BYK`](./01KWTHSE1W1NHTQT9JZ6PE1BYK.md) | mail: fix no-action ranking regression fixture | done | — | #3897 | 2026-07-06T01:52:00Z |
+| [`01KWTJCNNGSNC7BZZ4WPZM82F5`](./01KWTJCNNGSNC7BZZ4WPZM82F5.md) | mail: record 1.6 ranked-ordering receipt | done | — | #3899 | 2026-07-06T02:01:44Z |
+| [`01KWTJP8ZHD7CHJSNH1F0XCJHY`](./01KWTJP8ZHD7CHJSNH1F0XCJHY.md) | mail: populate Reading tab from routing_tab data for checklist 1.7 | done | — | #3901 | 2026-07-06T02:13:46Z |
+| [`01KWTKWQ9M1EAW5B5Q0PBAQXMV`](./01KWTKWQ9M1EAW5B5Q0PBAQXMV.md) | mail: fix routing-tab reading test fixture after #3901 | done | — | #3905 | 2026-07-06T02:44:30Z |
+| [`01KWTMTY3HN3KK77RMEDJH07JZ`](./01KWTMTY3HN3KK77RMEDJH07JZ.md) | mail: complete live Reading rollup and undoable ledger data for checklist 1.7 | done | — | #3906 | 2026-07-06T03:22:44Z |
+| [`01KWY9A4YT4KRBQGS3B0CFTTM0`](./01KWY9A4YT4KRBQGS3B0CFTTM0.md) | mail: unblock provable judgment rescore harness | done | — | #3974 | 2026-07-07T12:49:02Z |
+| [`01KWYA9N1YJXS8344GKTXFC2EF`](./01KWYA9N1YJXS8344GKTXFC2EF.md) | test: make brief streamer/author fakes concurrency-safe (make backend-test -race is red) | done | — | #3988 | 2026-07-08T04:53:23Z |
+| [`01KWYA9N234TWVQZTY2GJV2XG8`](./01KWYA9N234TWVQZTY2GJV2XG8.md) | mail UI: reset Newman tab on desktop resize + rename 'Gradient inbox' codename aria-labels | done | — | #3985 | 2026-07-07T13:05:43Z |
+| [`01KWYA9N2H6VBY9RHAZ85K69NK`](./01KWYA9N2H6VBY9RHAZ85K69NK.md) | hygiene: delete spent cmd/mail-35-repair, register cmd tools in go-arch-lint, fix STATUS.md docs/history | done | — | #3984 | 2026-07-07T13:05:43Z |
+| [`01KWYA9N30JD7KGK0Z65YTDTZK`](./01KWYA9N30JD7KGK0Z65YTDTZK.md) | cleanup: remove orphaned email_recipient_priority_profile table + reader + seed | done | — | #3986 | 2026-07-07T13:13:59Z |
+| [`01KWYA9N33N0XQ6KZ3V0WSDVT5`](./01KWYA9N33N0XQ6KZ3V0WSDVT5.md) | test: real-pool coverage for open-loops per-user mailbox visibility gate | done | — | #3983 | 2026-07-07T13:00:28Z |
+| [`01KWYA9N36RZBCB3KZVZMDNRDM`](./01KWYA9N36RZBCB3KZVZMDNRDM.md) | obs: drop tenant_id from inputflow SLO Prometheus labels (unbounded cardinality) | done | — | #3987 | 2026-07-07T13:16:15Z |
+| [`01KX05GBQZV0NBX96R66JK83Y1`](./01KX05GBQZV0NBX96R66JK83Y1.md) | # Spec: Founder-Style Ranked Due Open-Loop Decision Cards in Mail | done | #4002 | — | 2026-07-08T06:10:19Z |
+| [`01KX05GBQZV0NBX96R66JK83Y1-build`](./01KX05GBQZV0NBX96R66JK83Y1-build.md) | # Spec: Founder-Style Ranked Due Open-Loop Decision Cards in Mail | done | — | #4003 | 2026-07-08T06:18:07Z |
+| [`01KX0TRB67N48JQA6SNVETZPXJ`](./01KX0TRB67N48JQA6SNVETZPXJ.md) | obs: instrument open-loop resurface job (runs/outcome counter + stall alert) | done | — | #4013 | 2026-07-08T12:29:22Z |
+| [`01KX0TRB6DFSTMTYWCB4C016F1`](./01KX0TRB6DFSTMTYWCB4C016F1.md) | ci: setup-ci-postgres holds global lock through readiness-wait + recreate (false-red under saturation) | done | — | #4012 | 2026-07-08T13:09:10Z |
+| [`01KX0TRB70VYNFPPDGJC8ZWZPV`](./01KX0TRB70VYNFPPDGJC8ZWZPV.md) | mail UI: Newman unreachable at 1024-1279px viewports — realign isMobile/sidebar breakpoints | done | — | #4015 | 2026-07-08T12:39:52Z |
+| [`01KX491VCQ95P3BZQXQYCMTZSX`](./01KX491VCQ95P3BZQXQYCMTZSX.md) | [mail stage 4] resolve human identity in Newman VIP model | done | — | #4133 | 2026-07-09T21:05:25Z |
+| [`01KX491VE71Z4DXMCMRYFBWA49`](./01KX491VE71Z4DXMCMRYFBWA49.md) | [mail stage 4] wire heavy draft weakness into quick reply and reader | done | — | #4125 | 2026-07-09T21:07:00Z |
+| [`01KX491VHMXW18JBV0XKF5Z3PV`](./01KX491VHMXW18JBV0XKF5Z3PV.md) | [mail stage 4] complete provider identity linking and adaptive-rule scheduling | done | — | #4134 | 2026-07-09T21:04:37Z |
+| [`01KX49NP781XJQRDMSS6X0PJEV`](./01KX49NP781XJQRDMSS6X0PJEV.md) | # Epic: A21 Deterministic Mail Authority Inversion | done | #4128 | — | 2026-07-09T20:42:24Z |
+| [`01KX49NP781XJQRDMSS6X0PJEV-build`](./01KX49NP781XJQRDMSS6X0PJEV-build.md) | # Epic: A21 Deterministic Mail Authority Inversion | done | — | #4132 | 2026-07-09T21:17:24Z |
+| [`01KX49P0V33HA3QT9HK2QSEX6B`](./01KX49P0V33HA3QT9HK2QSEX6B.md) | # Stage 4 A22: Canonical Owner-Attention Count Contract | done | #4126 | — | 2026-07-09T20:41:39Z |
+| [`01KX4ABTW14HYRX1F3ZKF1JG3X`](./01KX4ABTW14HYRX1F3ZKF1JG3X.md) | # Spec: Adopted PR Diff Propagation for Flowbee Review Leases | done | #265 | — | 2026-07-09T20:53:14Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
