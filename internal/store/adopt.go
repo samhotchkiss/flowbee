@@ -180,8 +180,11 @@ func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int,
 		err := tx.QueryRowContext(ctx,
 			`SELECT id, COALESCE(adopted,0)
 			   FROM jobs
-			  WHERE repo = ? AND pr_number = ? AND state != 'cancelled'
-			  LIMIT 1`, repo, prNumber).Scan(&existing, &existingAdopted)
+			  WHERE pr_number = ?
+			    AND state != 'cancelled'
+			    AND (repo = ? OR (? != '' AND repo = '' AND COALESCE(adopted,0) = 0))
+			  ORDER BY CASE WHEN repo = ? THEN 0 ELSE 1 END, updated_at DESC, id DESC
+			  LIMIT 1`, prNumber, repo, repo, repo).Scan(&existing, &existingAdopted)
 		if err == nil {
 			if existingAdopted == 1 {
 				if _, err := tx.ExecContext(ctx, `

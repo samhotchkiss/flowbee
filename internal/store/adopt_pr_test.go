@@ -102,6 +102,31 @@ func TestAdoptPRForReviewSkipsOriginatedPR(t *testing.T) {
 	}
 }
 
+func TestAdoptPRForReviewSkipsLegacyOriginatedPR(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	issue := 77
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "legacy-orig", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, IssueNumber: &issue, Now: now,
+	}); err != nil {
+		t.Fatalf("seed legacy originated: %v", err)
+	}
+	if err := st.StampPRNumber(ctx, "legacy-orig", 555, "head", "base", now); err != nil {
+		t.Fatalf("stamp legacy pr: %v", err)
+	}
+
+	id, err := st.AdoptPRForReview(ctx, "russ", 555, "base", "head", "diff --git a/x b/x\n", false, false, true, false, now, now)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if id != "" {
+		t.Fatalf("must not adopt a legacy single-repo PR Flowbee already originated, got id %q", id)
+	}
+}
+
 func TestAdoptPRForReviewRefreshesLegacyAndHeadMove(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
