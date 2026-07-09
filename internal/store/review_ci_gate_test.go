@@ -37,6 +37,10 @@ func seedReviewPending(t *testing.T, st *store.Store, id string, now time.Time, 
 			id, green, now.Format(time.RFC3339Nano)); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := st.DB.ExecContext(ctx,
+			`UPDATE jobs SET head_sha='head', base_sha='base' WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -70,6 +74,28 @@ func TestReviewCandidatesExcludeCINotReady(t *testing.T) {
 	}
 	if got["pending"] || got["nopr"] {
 		t.Fatalf("CI-not-ready reviews must NOT be candidates; got %v", got)
+	}
+}
+
+func TestReviewCandidatesExcludeGreenFactsForObsoleteHead(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+
+	seedReviewPending(t, st, "stale-facts", now, true, true)
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET head_sha='new-builder-head' WHERE id='stale-facts'`); err != nil {
+		t.Fatal(err)
+	}
+
+	cands, err := st.ReviewPendingCandidates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cands {
+		if c.JobID == "stale-facts" {
+			t.Fatalf("green CI for an obsolete head must not authorize review: %+v", cands)
+		}
 	}
 }
 

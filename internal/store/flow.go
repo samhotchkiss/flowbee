@@ -162,7 +162,7 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 			           AND ja.job_seq > (SELECT COALESCE(MAX(job_seq),0) FROM job_events
 			                              WHERE job_id = jobs.id
 			                                AND kind IN ('result_accepted','rebased','conflict_resolved')) )
-			RETURNING lease_epoch, job_seq`,
+		RETURNING lease_epoch, job_seq`,
 			p.Identity, p.ModelFamily, p.Lens, p.LeaseID,
 			deadline.Format(rfc3339), deadline.Format(rfc3339),
 			p.JobID, p.Identity, p.ModelFamily, p.Identity,
@@ -272,6 +272,12 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 		j, seq, err := loadJobTx(ctx, tx, in.JobID)
 		if err != nil {
 			return err
+		}
+		// The reviewer judged the patch attached to j.HeadSHA. Reconciled green CI
+		// for an older head must never mint a verdict for that older SHA after a
+		// bounced builder has already advanced the PR.
+		if facts.HeadSHA != j.HeadSHA || facts.BaseSHA != j.BaseSHA {
+			facts.CIGreen = false
 		}
 
 		// M9 (§9.2, I-11): run the deterministic content-integrity gate over the
@@ -452,7 +458,8 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 				UPDATE jobs
 				   SET state = 'ready', role = 'eng_worker', stage = 'build',
 				       required_capabilities = ?, bounces = bounces + ?,
-				       patch_diff = '', declared_blast_radius = '',
+			       patch_diff = CASE WHEN adopted = 1 THEN patch_diff ELSE '' END,
+			       declared_blast_radius = CASE WHEN adopted = 1 THEN declared_blast_radius ELSE '' END,
 				       reservation_paths = '', reservation_wide = 0,
 				       enqueued_at = ?,
 				       last_review_notes = CASE WHEN ? <> '' THEN ? ELSE last_review_notes END,

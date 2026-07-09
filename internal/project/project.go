@@ -91,6 +91,8 @@ const maxOutboxAttempts = 100
 // conflict stays not-mergeable past the retries and then routes correctly.
 const mergeMergeabilityRetries = 3
 
+var errStaleMergeAuthorization = errors.New("merge authorization does not match the reviewed head")
+
 // criticalAction reports whether a permanently-failed outbox action should escalate
 // its job to a human (it blocks the pipeline: no PR -> no review/merge; no merge -> no
 // completion; no issue -> no spec materialization). A cosmetic action (a comment, a
@@ -258,6 +260,15 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 
 		detail, err := s.send(ctx, row)
 		if err != nil {
+			if errors.Is(err, errStaleMergeAuthorization) || errors.Is(err, gh.ErrMergeHeadModified) {
+				if ierr := s.store.InvalidateStaleMergeAuthorization(ctx, row.JobID, s.clock.Now()); ierr != nil {
+					return sent, ierr
+				}
+				if s.pub != nil {
+					s.pub.PublishReconcile(row.JobID, "project_out:merge_head_superseded")
+				}
+				continue
+			}
 			var ra *gh.ErrRetryAfter
 			if errors.As(err, &ra) {
 				// a rate-limit (primary 5000/hr, secondary/abuse, or GraphQL RATE_LIMITED):
@@ -486,16 +497,14 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		// verify FAILURE (can't fetch/diff) returns an error → the merge RETRIES (transient),
 		// never a silent autonomous merge of unverified content.
 		// expectedHead pins the GitHub merge to the EXACT head the gate reviewed.
-		// `merging` is non-supersedable, so a commit pushed to the feature branch
-		// after the verdict was minted would otherwise merge unreviewed (the merge
-		// API merges the live head). Passing it as the merge `sha` makes GitHub 409
-		// if the head moved, routing to retry/handoff instead of a silent bad merge.
+		// Passing it as the merge `sha` makes GitHub 409 if the head moved; that
+		// invalidates the stale verdict/outbox and re-arms review.
 		// An AUTONOMOUS merge MUST be SHA-pinned to the reviewed head AND content-re-verified
 		// against the REAL base..head diff — and BOTH require the local history/mirror writer.
 		// If it is absent (no FLOWBEE_MIRROR_PATH) or the job has no bound base/head, neither
 		// safeguard can run, so FAIL CLOSED to the human merge gate rather than merge the live
-		// head unpinned + unchecked. Otherwise an approve-then-push race (merging is
-		// non-supersedable) or an under-reported denylisted/secret diff would land on main. The
+		// head unpinned + unchecked. Otherwise an approve-then-push race or an
+		// under-reported denylisted/secret diff would land on main. The
 		// guards used to sit INSIDE `if s.history != nil`, which silently downgraded the
 		// highest-stakes action to "merge whatever is live" when no mirror was configured.
 		// Self-merge therefore REQUIRES a mirror; without one, every autonomous merge handoffs.
@@ -510,8 +519,12 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		}
 		var expectedHead string
 		j, jerr := s.store.GetJob(ctx, row.JobID)
-		if jerr == nil && j.BaseSHA != "" && j.HeadSHA != "" {
-			expectedHead = j.HeadSHA
+		if jerr != nil || j.Verdict == nil || row.HeadSHA == "" || j.HeadSHA != row.HeadSHA ||
+			!j.Verdict.Verify(row.HeadSHA, j.BaseSHA) {
+			return "", errStaleMergeAuthorization
+		}
+		expectedHead = row.HeadSHA
+		if j.BaseSHA != "" {
 			br := store.IssueBranch(s.resolveIssueNum(ctx, j), row.JobID)
 			if ferr := s.history.FetchBranch(br); ferr != nil {
 				return "", fmt.Errorf("verify autonomous merge: fetch %s: %w", br, ferr)
@@ -547,31 +560,6 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			}
 		}
 		if err := s.gh.EnqueueMergeQueue(ctx, number, expectedHead); err != nil {
-			if errors.Is(err, gh.ErrMergeHeadModified) {
-				// The feature branch moved after the gate reviewed it. Before deferring to a
-				// human, check whether the move was COSMETIC — a reviewer's empty --allow-empty
-				// findings-commit (or any push leaving the base..head diff byte-identical to what
-				// was reviewed) changes the SHA but NOT the content. If so the live head IS the
-				// reviewed change: re-verify the denylist + merge the live head (russ #214 —
-				// reviewed-and-green PRs rotting 15–19h on a cosmetic head move). Safe by
-				// construction — it merges ONLY content identical to the review; a real content
-				// change (or a rebase, where the base context shifts) falls through to the human
-				// gate exactly as before.
-				if jerr == nil {
-					if detail, ok := s.mergeIfContentUnchanged(ctx, j, number); ok {
-						return detail, nil
-					}
-				}
-				// the head that would merge is unreviewed (real change). `merging` is
-				// non-supersedable, so route to the HUMAN merge gate — a human re-reviews it.
-				if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, "head_modified_after_review", s.clock.Now()); rerr != nil {
-					return "", fmt.Errorf("route head-modified to handoff: %w", rerr)
-				}
-				if s.pub != nil {
-					s.pub.PublishReconcile(row.JobID, "project_out:head_modified")
-				}
-				return "autonomous merge DEFERRED (head moved after review) -> merge_handoff", nil
-			}
 			if errors.Is(err, gh.ErrMergeRuleViolationPending) && gh.IsMergeRuleBehind(err) {
 				// A branch-up-to-date ruleset violation is retryable, but it will not clear
 				// until GitHub fast-forwards the PR head. Do that best-effort here, then let
@@ -737,49 +725,6 @@ func (s *Sender) resolveIssueNum(ctx context.Context, j job.Job) int {
 // job (the signed_off_issue -> build link). The build carries the spec prose as
 // its task and binds to the current main tip as base_sha. Idempotent: a build
 // with the derived id already present is a no-op, so a re-drain never dupes.
-// mergeIfContentUnchanged is the head_modified recovery (russ #214): the PR head moved
-// after the verdict bound to j.HeadSHA, but if the move was COSMETIC — a reviewer's empty
-// --allow-empty findings-commit, or any push leaving the base..head diff byte-identical to
-// what was reviewed — then the LIVE head IS the reviewed change and is safe to merge. It
-// re-verifies the denylist against the live diff, then merges the live head. Returns
-// ok=false (so the caller hands off to a human) when: the content actually changed; the
-// diffs can't be computed (e.g. the verdict head was force-pushed away — a rebase, which
-// genuinely shifts the integration context and SHOULD re-review); or the re-merge still
-// fails. Safe by construction — it merges ONLY content byte-identical to the review, so a
-// bug here can at worst hand off (no worse than before), never merge unreviewed content.
-func (s *Sender) mergeIfContentUnchanged(ctx context.Context, j job.Job, number int) (string, bool) {
-	if s.history == nil || j.BaseSHA == "" || j.HeadSHA == "" {
-		return "", false
-	}
-	br := store.IssueBranch(s.resolveIssueNum(ctx, j), j.ID)
-	if err := s.history.FetchBranch(br); err != nil {
-		return "", false
-	}
-	liveHead, err := s.history.HeadSHA("refs/heads/" + br)
-	if err != nil || liveHead == "" || liveHead == j.HeadSHA {
-		return "", false
-	}
-	reviewed, err := s.history.DiffBetween(j.BaseSHA, j.HeadSHA)
-	if err != nil {
-		return "", false // verdict head gone (force-pushed/rebased) -> re-review via handoff
-	}
-	live, err := s.history.DiffBetween(j.BaseSHA, liveHead)
-	if err != nil || live != reviewed {
-		return "", false // real content change -> handoff
-	}
-	if reason := contentDenyReason(live, s.allowOwnSource); reason != "" {
-		return "", false // the live diff now trips the denylist -> handoff
-	}
-	if err := s.gh.EnqueueMergeQueue(ctx, number, liveHead); err != nil {
-		return "", false // still can't merge -> handoff
-	}
-	if s.logger != nil {
-		s.logger.Info("merged content-verified live head after a cosmetic head move",
-			"job", j.ID, "pr", number, "reviewed_head", j.HeadSHA, "live_head", liveHead)
-	}
-	return fmt.Sprintf("merge_enqueue pr=%d (content-verified live head; cosmetic head move)", number), true
-}
-
 func (s *Sender) seedBuildFromSpec(ctx context.Context, spec job.Job, now time.Time) (string, error) {
 	buildID := spec.ID + "-build"
 	if _, err := s.store.GetJob(ctx, buildID); err == nil {

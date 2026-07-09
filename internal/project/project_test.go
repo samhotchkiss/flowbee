@@ -275,11 +275,9 @@ func TestTransientNotMergeableRetriedNotResolved(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging', base_sha='b', head_sha='h' WHERE id='t'`); err != nil {
-		t.Fatal(err)
-	}
+	setMergingAuthorization(t, st, "t", "b", "h")
 	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
-		JobID: "t", Action: store.ActionEnqueueMerge, Payload: `{"pr_number":42}`,
+		JobID: "t", Action: store.ActionEnqueueMerge, HeadSHA: "h", Payload: `{"pr_number":42}`,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -335,11 +333,9 @@ func TestSelfMergeWithoutHistoryFailsClosed(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging', base_sha='b', head_sha='h' WHERE id='n'`); err != nil {
-		t.Fatal(err)
-	}
+	setMergingAuthorization(t, st, "n", "b", "h")
 	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
-		JobID: "n", Action: store.ActionEnqueueMerge, Payload: `{"pr_number":99}`,
+		JobID: "n", Action: store.ActionEnqueueMerge, HeadSHA: "h", Payload: `{"pr_number":99}`,
 	}); err != nil {
 		t.Fatal(err)
 	}

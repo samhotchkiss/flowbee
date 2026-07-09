@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"time"
 
@@ -265,6 +266,23 @@ func (s *Store) IsQuiescent(ctx context.Context, jobID string) (bool, error) {
 		return false, err
 	}
 	return adopted == 1 && optedIn == 0, nil
+}
+
+// AdoptedPatchForRebuild returns the cumulative PR patch retained across an
+// adopted code-review bounce. Base-starting worker modes apply it before asking
+// the builder for the correction, so the next result remains the full PR diff.
+func (s *Store) AdoptedPatchForRebuild(ctx context.Context, jobID string) (string, bool, error) {
+	var patch string
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT COALESCE(patch_diff,'') FROM jobs
+		 WHERE id=? AND adopted=1 AND bounces>0`, jobID).Scan(&patch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return patch, patch != "", nil
 }
 
 // OptIn promotes a quiescent adopted job into Flowbee's control (§12.7): the

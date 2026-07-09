@@ -1401,6 +1401,9 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 		if role == job.RoleEngWorker && (j.Bounces > 0 || j.LastCIFailures != "") {
 			grant.Context.Rebuild = true
 			grant.Context.CIFailures = j.LastCIFailures
+			if d, ok, derr := s.store.AdoptedPatchForRebuild(ctx, jobID); derr == nil && ok {
+				grant.Context.Diff = d
+			}
 		}
 		// F9: tell the (fungible) worker which repo this job belongs to so
 		// worker-push targets the right remote. Resolve the job's repo scope to

@@ -717,7 +717,9 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT j.id, j.priority, j.enqueued_at, j.required_capabilities,
 		       COALESCE(f.pr_exists,0), COALESCE(f.ci_green,0), COALESCE(f.merged,0),
-		       COALESCE(j.adopted,0), COALESCE(j.patch_diff,''), COALESCE(j.diff_empty,0)
+		       COALESCE(j.adopted,0), COALESCE(j.patch_diff,''), COALESCE(j.diff_empty,0),
+		       COALESCE(j.head_sha,''), COALESCE(j.base_sha,''),
+		       COALESCE(f.head_sha,''), COALESCE(f.base_sha,'')
 		  FROM jobs j
 		  LEFT JOIN domain_b_facts f ON f.job_id = j.id
 		 WHERE j.state='review_pending'`)
@@ -728,9 +730,10 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 	var out []scheduler.Candidate
 	for rows.Next() {
 		var c scheduler.Candidate
-		var enqueued, reqJSON, patchDiff string
+		var enqueued, reqJSON, patchDiff, jobHead, jobBase, factHead, factBase string
 		var prExists, ciGreen, merged, adopted, diffEmpty int
-		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON, &prExists, &ciGreen, &merged, &adopted, &patchDiff, &diffEmpty); err != nil {
+		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON, &prExists, &ciGreen, &merged,
+			&adopted, &patchDiff, &diffEmpty, &jobHead, &jobBase, &factHead, &factBase); err != nil {
 			return nil, err
 		}
 		if ts, perr := time.Parse(rfc3339, enqueued); perr == nil {
@@ -746,7 +749,8 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 		// CI run (observed: 98 churn cycles over a 40-min CI wait). The forward-progress
 		// watchdog treats a PR-open/CI-pending review as healthy (it no longer relies on
 		// that churn to keep updated_at fresh — see ReconcileStuck).
-		c.CIReady = prExists == 1 && ciGreen == 1 && merged == 0
+		c.CIReady = prExists == 1 && ciGreen == 1 && merged == 0 &&
+			jobHead != "" && jobBase != "" && factHead == jobHead && factBase == jobBase
 		if !c.CIReady {
 			continue
 		}

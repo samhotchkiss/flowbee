@@ -24,12 +24,10 @@ func TestMergeBaseModifiedRetriesNotDeadLetters(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging', base_sha='b', head_sha='h' WHERE id='j'`); err != nil {
-		t.Fatal(err)
-	}
+	setMergingAuthorization(t, st, "j", "b", "h")
 	fake.SetMergeBaseModified(91)
 	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
-		JobID: "j", Action: store.ActionEnqueueMerge, Payload: `{"pr_number":91}`,
+		JobID: "j", Action: store.ActionEnqueueMerge, HeadSHA: "h", Payload: `{"pr_number":91}`,
 	}); err != nil {
 		t.Fatal(err)
 	}
