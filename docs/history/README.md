@@ -4,8 +4,8 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 
 | Job | Title | Status | Issue | PR | Last event |
 | --- | --- | --- | --- | --- | --- |
+| [``](./unknown.md) | (untitled) | done | — | #4051 | 2026-07-09T04:53:24Z |
 | [``](./unknown.md) | (untitled) | done | — | #4050 | 2026-07-09T05:06:08Z |
-| [``](./unknown.md) | (untitled) | done | — | #4025 | 2026-07-08T17:04:37Z |
 | [``](./unknown.md) | (untitled) | done | — | #3968 | 2026-07-08T03:17:23Z |
 | [``](./unknown.md) | (untitled) | merge_handoff | — | #3969 | 2026-07-08T03:37:23Z |
 | [``](./unknown.md) | (untitled) | done | — | #3970 | 2026-07-08T04:00:08Z |
@@ -19,30 +19,33 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [``](./unknown.md) | (untitled) | done | — | #4004 | 2026-07-08T06:38:22Z |
 | [``](./unknown.md) | (untitled) | done | — | #4005 | 2026-07-08T06:48:08Z |
 | [``](./unknown.md) | (untitled) | done | — | #4006 | 2026-07-08T06:51:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #267 | 2026-07-09T22:04:05Z |
 | [``](./unknown.md) | (untitled) | done | — | #4007 | 2026-07-08T12:13:38Z |
 | [``](./unknown.md) | (untitled) | done | — | #4018 | 2026-07-08T16:23:23Z |
+| [``](./unknown.md) | (untitled) | done | — | #4143 | 2026-07-09T21:52:10Z |
 | [``](./unknown.md) | (untitled) | done | — | #4019 | 2026-07-08T16:31:38Z |
 | [``](./unknown.md) | (untitled) | done | — | #4020 | 2026-07-08T15:33:52Z |
 | [``](./unknown.md) | (untitled) | done | — | #4021 | 2026-07-08T15:56:22Z |
 | [``](./unknown.md) | (untitled) | done | — | #4022 | 2026-07-08T16:09:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #4143 | 2026-07-09T21:52:10Z |
+| [``](./unknown.md) | (untitled) | done | — | #4025 | 2026-07-08T17:04:37Z |
+| [``](./unknown.md) | (untitled) | done | — | #4152 | 2026-07-09T23:11:55Z |
 | [``](./unknown.md) | (untitled) | done | — | #3972 | 2026-07-08T02:38:22Z |
-| [``](./unknown.md) | (untitled) | done | — | #4051 | 2026-07-09T04:53:24Z |
 | [``](./unknown.md) | (untitled) | done | — | #4052 | 2026-07-09T05:33:53Z |
 | [``](./unknown.md) | (untitled) | done | — | #4055 | 2026-07-09T06:12:52Z |
 | [``](./unknown.md) | (untitled) | done | — | #4056 | 2026-07-09T06:38:24Z |
 | [``](./unknown.md) | (untitled) | done | — | #4057 | 2026-07-09T06:25:38Z |
-| [``](./unknown.md) | (untitled) | done | — | #3966 | 2026-07-08T02:48:54Z |
-| [``](./unknown.md) | (untitled) | done | — | #3967 | 2026-07-08T02:54:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #4081 | 2026-07-09T21:34:09Z |
 | [``](./unknown.md) | (untitled) | done | — | #4058 | 2026-07-09T07:18:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #4086 | 2026-07-09T21:05:25Z |
+| [``](./unknown.md) | (untitled) | done | — | #3966 | 2026-07-08T02:48:54Z |
+| [``](./unknown.md) | (untitled) | done | — | #268 | 2026-07-09T23:29:06Z |
+| [``](./unknown.md) | (untitled) | done | — | #3967 | 2026-07-08T02:54:53Z |
 | [``](./unknown.md) | (untitled) | done | — | #4140 | 2026-07-09T21:46:09Z |
+| [``](./unknown.md) | (untitled) | done | — | #4060 | 2026-07-09T08:30:08Z |
+| [``](./unknown.md) | (untitled) | done | — | #268 | 2026-07-09T23:29:06Z |
+| [``](./unknown.md) | (untitled) | done | — | #267 | 2026-07-09T22:04:05Z |
+| [``](./unknown.md) | (untitled) | done | — | #4086 | 2026-07-09T21:05:25Z |
+| [``](./unknown.md) | (untitled) | done | — | #4081 | 2026-07-09T21:34:09Z |
 | [``](./unknown.md) | (untitled) | done | — | #4080 | 2026-07-09T21:05:25Z |
 | [``](./unknown.md) | (untitled) | done | — | #4071 | 2026-07-09T12:43:38Z |
 | [``](./unknown.md) | (untitled) | done | — | #4069 | 2026-07-09T12:18:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #4060 | 2026-07-09T08:30:08Z |
 | [`01KV9B7P5X6TFFQ1TBK662TNNX`](./01KV9B7P5X6TFFQ1TBK662TNNX.md) | Project Overview 'where it stands' hallucinates on brand-new/empty projects | done | — | #2218 | 2026-06-23T20:51:03Z |
 | [`01KV9NWZVKJ2YQP0N8VPD0H88X`](./01KV9NWZVKJ2YQP0N8VPD0H88X.md) | Drawer: context-aware close-button aria-label (hardcoded 'Close profile' is wrong for non-profile drawers) | done | — | #2220 | 2026-06-17T02:34:41Z |
 | [`01KV9QNJ8AZR2KH2WQ0K9WWPK4`](./01KV9QNJ8AZR2KH2WQ0K9WWPK4.md) | Documents list: use consistent compact date formatting (toLocaleDateString options) | done | — | #2222 | 2026-06-17T03:19:20Z |
@@ -867,6 +870,11 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KX49P0V33HA3QT9HK2QSEX6B`](./01KX49P0V33HA3QT9HK2QSEX6B.md) | # Stage 4 A22: Canonical Owner-Attention Count Contract | done | #4126 | — | 2026-07-09T20:41:39Z |
 | [`01KX4ABTW14HYRX1F3ZKF1JG3X`](./01KX4ABTW14HYRX1F3ZKF1JG3X.md) | # Spec: Adopted PR Diff Propagation for Flowbee Review Leases | done | #265 | — | 2026-07-09T20:53:14Z |
 | [`01KX4ABTW14HYRX1F3ZKF1JG3X-build`](./01KX4ABTW14HYRX1F3ZKF1JG3X-build.md) | # Spec: Adopted PR Diff Propagation for Flowbee Review Leases | done | — | #266 | 2026-07-09T22:17:51Z |
+| [`01KX4GTQ6FCJAJVSK4YJHAHBDP`](./01KX4GTQ6FCJAJVSK4YJHAHBDP.md) | # Epic decomposition | done | — | — | 2026-07-09T22:44:41Z |
+| [`01KX4GTQ6FCJAJVSK4YMQ6QKPG`](./01KX4GTQ6FCJAJVSK4YMQ6QKPG.md) | Existing issue #4123 / unsafe PR #4131. Preserve INV-10, INV-16, ADR-018 tenant safety, soft delete, transactional events, and no new table unless proven unavoidable. Do not mutate production in build/review. PR must say Refs #4123, not close it. Build the fail-closed operator control plane for temporal urgency repair: default-off server feature gate; package /app/email-comprehension in Docker; enforce DB runtime role; tenant-scoped top-100 dry-run with stable candidate IDs, run_id, worst-case spend, current-obligation control, signed/frozen selection token, and idempotent apply token. Supersede the unsafe CLI behavior in PR #4131 without executing it. | done | #4144 | — | 2026-07-09T22:46:30Z |
+| [`01KX4GTQ6FCJAJVSK4YNY77J2V`](./01KX4GTQ6FCJAJVSK4YNY77J2V.md) | Existing issue #4123 / unsafe PR #4131. Preserve INV-10, INV-16, ADR-018 tenant safety, soft delete, transactional events, and no new table unless proven unavoidable. Do not mutate production in build/review. PR must say Refs #4123, not close it. After the operator-control child lands, replace generic email.message.received replay with a repair-only comprehension/ranking execution path using existing queues/events. Correlate every queue row and model invocation to repair_run_id and enforce a durable aggregate $15 cap across retries and failed/successful attempts. | done | #4146 | — | 2026-07-09T22:47:06Z |
+| [`01KX4GTQ6FCJAJVSK4YP8T368Y`](./01KX4GTQ6FCJAJVSK4YP8T368Y.md) | Existing issue #4123 / unsafe PR #4131. Preserve INV-10, INV-16, ADR-018 tenant safety, soft delete, transactional events, and no new table unless proven unavoidable. Do not mutate production in build/review. PR must say Refs #4123, not close it. After the operator-control child lands, fix temporal candidate selection and judgment: filter/paginate eligible expired temporal rows in SQL before LIMIT, avoid starvation, and demote stale urgency without clearing a separate current obligation in the same message. Remove hardcoded/fallback evaluation paths and produce a real recorded-output rescore artifact. | done | #4145 | — | 2026-07-09T22:46:36Z |
+| [`01KX4GTQ6FCJAJVSK4YQFDRMYY`](./01KX4GTQ6FCJAJVSK4YQFDRMYY.md) | Existing issue #4123 / unsafe PR #4131. Preserve INV-10, INV-16, ADR-018 tenant safety, soft delete, transactional events, and no new table unless proven unavoidable. Do not mutate production in build/review. PR must say Refs #4123, not close it. Operator-only completion receipt, blocked on all implementation children and deployment. Run the bounded dry-run/apply against swh only after exact deployed SHA verification; measure queue completion and model spend; capture before/after API and database evidence; do not proceed if any safety gate fails. | done | #4147 | — | 2026-07-09T22:50:15Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
