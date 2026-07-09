@@ -11,6 +11,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/intake"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
+	"github.com/samhotchkiss/flowbee/internal/ulid"
 )
 
 func intFromBool(v bool) int {
@@ -173,6 +174,7 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 // adopt, or an adopt of a PR Flowbee already tracks, never creates a duplicate.
 func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int, baseSHA, headSHA, patchDiff string, diffEmpty bool, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, error) {
 	id := adoptedPRJobID(repo, prNumber)
+	replacementID := id + "-" + ulid.New()
 	adopted := ""
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var existing string
@@ -203,6 +205,15 @@ func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int,
 		}
 		if err != sql.ErrNoRows {
 			return fmt.Errorf("adopt lookup pr %d: %w", prNumber, err)
+		}
+		// The stable first-adoption id may belong to cancelled history. Preserve that
+		// terminal audit row and allocate a fresh id, matching issue re-adoption.
+		var idCollision int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE id = ?`, id).Scan(&idCollision); err != nil {
+			return fmt.Errorf("adopt lookup cancelled pr %d: %w", prNumber, err)
+		}
+		if idCollision > 0 {
+			id = replacementID
 		}
 		// repo MUST be set: project-OUT drains the outbox per repo (NextPendingOutboxForRepo
 		// joins on jobs.repo), so an empty-repo adopted job in a multi-repo control plane has

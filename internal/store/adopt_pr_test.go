@@ -71,6 +71,50 @@ func TestAdoptPRForReview(t *testing.T) {
 	}
 }
 
+func TestAdoptPRForReviewReadoptsAfterCancel(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	firstID, err := st.AdoptPRForReview(ctx, "russ", 4078, "base-1", "head-1", "diff --git a/old b/old\n", false, false, true, false, now, now)
+	if err != nil || firstID == "" {
+		t.Fatalf("first adopt: id=%q err=%v", firstID, err)
+	}
+	if _, err := st.CancelJob(ctx, firstID, false, now.Add(time.Minute)); err != nil {
+		t.Fatalf("cancel first adopt: %v", err)
+	}
+
+	const newPatch = "diff --git a/new b/new\n"
+	secondID, err := st.AdoptPRForReview(ctx, "russ", 4078, "base-2", "head-2", newPatch, false, false, false, false, now.Add(2*time.Minute), now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("re-adopt: %v", err)
+	}
+	if secondID == "" || secondID == firstID {
+		t.Fatalf("re-adopt after cancel must create a fresh job, first=%q second=%q", firstID, secondID)
+	}
+
+	first, err := st.GetJob(ctx, firstID)
+	if err != nil {
+		t.Fatalf("get cancelled job: %v", err)
+	}
+	if first.State != job.StateCancelled {
+		t.Fatalf("historical job state=%q, want cancelled", first.State)
+	}
+	second, err := st.GetJob(ctx, secondID)
+	if err != nil {
+		t.Fatalf("get replacement job: %v", err)
+	}
+	if second.State != job.StateReviewPending || second.Role != job.RoleCodeReviewer {
+		t.Fatalf("replacement state/role=%q/%q, want review_pending/code_reviewer", second.State, second.Role)
+	}
+	if second.BaseSHA != "base-2" || second.HeadSHA != "head-2" {
+		t.Fatalf("replacement base/head=%q/%q, want base-2/head-2", second.BaseSHA, second.HeadSHA)
+	}
+	if diff, err := st.JobPatchDiff(ctx, secondID); err != nil || diff != newPatch {
+		t.Fatalf("replacement diff=%q err=%v, want authoritative new diff", diff, err)
+	}
+}
+
 // TestAdoptPRForReviewSkipsOriginatedPR: a PR Flowbee ALREADY originated (its own
 // build job carries the pr_number) must not be re-adopted — adoption is only for
 // foreign PRs. The idempotency guard keys on pr_number regardless of how the job
