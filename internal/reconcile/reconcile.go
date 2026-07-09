@@ -216,7 +216,17 @@ func (r *Reconciler) AdoptPR(ctx context.Context, prNumber int) (string, error) 
 		return "", fmt.Errorf("pr #%d is closed unmerged", prNumber)
 	}
 	ciGreen := pr.CIRollup == gh.CISuccess && pr.CIHasRealSuccess
+	differ, ok := r.gh.(gh.PRDiffer)
+	if !ok {
+		return "", fmt.Errorf("pr #%d cannot be adopted for review: github client cannot provide an authoritative diff", prNumber)
+	}
+	diff, err := differ.PullRequestDiff(ctx, prNumber, pr.BaseRefOid, pr.HeadRefOid)
+	if err != nil {
+		return "", fmt.Errorf("fetch adopted pr diff repo=%q pr=%d base=%s head=%s: %w",
+			r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid, err)
+	}
 	id, err := r.store.AdoptPRForReview(ctx, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid,
+		diff, diff == "",
 		pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
 	if err != nil {
 		return "", err

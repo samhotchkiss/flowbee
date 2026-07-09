@@ -117,6 +117,13 @@ type Client interface {
 	PullRequest(ctx context.Context, number int) (PullRequest, bool, error)
 }
 
+// PRDiffer is the optional authoritative diff surface used by targeted adopted-PR
+// review. The base/head SHAs are the resolved facts from PullRequest; implementations
+// must return the diff for that exact pair or fail.
+type PRDiffer interface {
+	PullRequestDiff(ctx context.Context, number int, baseSHA, headSHA string) (string, error)
+}
+
 // BranchCIReader resolves the CI rollup at a branch HEAD — the integration branch's
 // green/red state, for the green-main invariant (don't bounce a PR for a CI failure it
 // merely inherited from a red main). A SEPARATE optional interface (reconcile type-asserts
@@ -883,6 +890,49 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 		pr.Labels = append(pr.Labels, l.Name)
 	}
 	return pr, true, nil
+}
+
+// PullRequestDiff returns GitHub's PR unified diff for the exact base/head pair the
+// caller resolved. The PR diff endpoint handles stacked bases and fork heads under
+// the original PR identity; the post-fetch SHA check prevents persisting a diff for
+// a PR that moved during adoption.
+func (c *RealClient) PullRequestDiff(ctx context.Context, number int, baseSHA, headSHA string) (string, error) {
+	tok, err := c.Token(ctx)
+	if err != nil {
+		return "", fmt.Errorf("installation token: %w", err)
+	}
+	base := c.RESTBase
+	if base == "" {
+		base = "https://api.github.com"
+	}
+	u := strings.TrimRight(base, "/") + "/repos/" + url.PathEscape(c.Owner) + "/" + url.PathEscape(c.Repo) + "/pulls/" + strconv.Itoa(number)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Accept", "application/vnd.github.v3.diff")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", &ErrGitHub{StatusCode: resp.StatusCode, Method: http.MethodGet, Path: req.URL.Path, Body: string(raw)}
+	}
+	pr, ok, err := c.PullRequest(ctx, number)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("pr #%d disappeared while fetching diff", number)
+	}
+	if pr.BaseRefOid != baseSHA || pr.HeadRefOid != headSHA {
+		return "", fmt.Errorf("pr #%d moved while fetching diff: base %s->%s head %s->%s",
+			number, baseSHA, pr.BaseRefOid, headSHA, pr.HeadRefOid)
+	}
+	return string(raw), nil
 }
 
 // ── project-OUT writes (§8.2): the REST surface. Wired but unexercised in this
