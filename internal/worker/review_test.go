@@ -40,6 +40,48 @@ func TestReadVerdict(t *testing.T) {
 	}
 }
 
+func TestWriteReviewDiffArtifactWritesNonemptyDiff(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, ".flowbee", "diff.patch")
+	const diff = "diff --git a/x b/x\n+new\n"
+	if err := writeReviewDiffArtifact(p, &client.LeaseContext{Diff: diff}); err != nil {
+		t.Fatalf("write diff artifact: %v", err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read diff artifact: %v", err)
+	}
+	if string(b) != diff {
+		t.Fatalf("diff artifact=%q, want exact lease diff", string(b))
+	}
+}
+
+func TestWriteReviewDiffArtifactWritesExplicitEmptyDiff(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, ".flowbee", "diff.patch")
+	if err := writeReviewDiffArtifact(p, &client.LeaseContext{DiffEmpty: true}); err != nil {
+		t.Fatalf("write empty diff artifact: %v", err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("explicit empty diff should still materialize diff.patch: %v", err)
+	}
+	if len(b) != 0 {
+		t.Fatalf("empty diff artifact has %d bytes", len(b))
+	}
+}
+
+func TestWriteReviewDiffArtifactLeavesLegacyMissingDiffAbsent(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, ".flowbee", "diff.patch")
+	if err := writeReviewDiffArtifact(p, &client.LeaseContext{}); err != nil {
+		t.Fatalf("legacy missing diff write: %v", err)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatalf("legacy missing diff should remain absent, stat err=%v", err)
+	}
+}
+
 func TestRenderReviewBriefCodeReviewer(t *testing.T) {
 	c := &client.LeaseContext{Identity: "senior_code_reviewer", Lens: "correctness", Task: "Add CHANGELOG", Diff: "MY_UNIQUE_DIFF_BODY"}
 	brief := renderReviewBrief("job-1", "code_reviewer", c)

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"time"
 
@@ -11,6 +12,20 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
+
+func intFromBool(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func adoptedPRJobID(repo string, prNumber int) string {
+	if repo == "" {
+		return fmt.Sprintf("adopt-pr-%d", prNumber)
+	}
+	return fmt.Sprintf("adopt-pr-repo-%s-%d", base64.RawURLEncoding.EncodeToString([]byte(repo)), prNumber)
+}
 
 // AdoptSweep is the ADOPT-mode first-boot import (§12.7, I-16). It imports every
 // open/merged PR on the board as a Domain-A job in state `quiescent`: reconciled
@@ -156,14 +171,34 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 // the whole board. It is idempotent — a PR already bound to any non-cancelled job
 // (Flowbee-originated OR previously adopted) is a no-op returning "" — so a repeated
 // adopt, or an adopt of a PR Flowbee already tracks, never creates a duplicate.
-func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int, baseSHA, headSHA string, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, error) {
-	id := fmt.Sprintf("adopt-pr-%d", prNumber)
+func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int, baseSHA, headSHA, patchDiff string, diffEmpty bool, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, error) {
+	id := adoptedPRJobID(repo, prNumber)
 	adopted := ""
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var existing string
+		var existingAdopted int
 		err := tx.QueryRowContext(ctx,
-			`SELECT id FROM jobs WHERE pr_number = ? AND state != 'cancelled' LIMIT 1`, prNumber).Scan(&existing)
+			`SELECT id, COALESCE(adopted,0)
+			   FROM jobs
+			  WHERE repo = ? AND pr_number = ? AND state != 'cancelled'
+			  LIMIT 1`, repo, prNumber).Scan(&existing, &existingAdopted)
 		if err == nil {
+			if existingAdopted == 1 {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE jobs
+					   SET base_sha = ?, head_sha = ?, patch_diff = ?, diff_empty = ?,
+					       updated_at = datetime('now')
+					 WHERE id = ?`,
+					baseSHA, headSHA, patchDiff, intFromBool(diffEmpty), existing); err != nil {
+					return fmt.Errorf("refresh adopted pr %d: %w", prNumber, err)
+				}
+				if err := upsertDomainBFactsTx(ctx, tx, existing, ReconciledPR{
+					Number: prNumber, HeadSHA: headSHA, BaseSHA: baseSHA,
+					Merged: merged, IsDraft: isDraft, CIGreen: ciGreen, UpdatedAt: updatedAt,
+				}); err != nil {
+					return err
+				}
+			}
 			return nil // already known (originated or previously adopted) — idempotent no-op
 		}
 		if err != sql.ErrNoRows {
@@ -177,11 +212,12 @@ func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int,
 		// always has the right repo.)
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO jobs (id, kind, flow, stage, state, role, repo, pr_number, base_sha, head_sha,
+			                  patch_diff, diff_empty,
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 			                  adopted, opted_in, priority)
-			VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, 1, 5)`,
-			id, string(job.StateReviewPending), repo, prNumber, baseSHA, headSHA,
+			VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, 1, 5)`,
+			id, string(job.StateReviewPending), repo, prNumber, baseSHA, headSHA, patchDiff, intFromBool(diffEmpty),
 			marshalStrings([]string{"role:code_reviewer"}), now.Format(rfc3339)); err != nil {
 			return fmt.Errorf("insert adopted job pr %d: %w", prNumber, err)
 		}

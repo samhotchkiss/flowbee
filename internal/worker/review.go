@@ -117,8 +117,8 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		return out, fmt.Errorf("write brief: %w", err)
 	}
 	diffFile := filepath.Join(fbDir, "diff.patch")
-	if cctx.Diff != "" {
-		_ = os.WriteFile(diffFile, []byte(cctx.Diff), 0o644)
+	if err := writeReviewDiffArtifact(diffFile, cctx); err != nil {
+		return out, err
 	}
 	// INSTRUMENTATION: surface the review INPUT size. A code review of an empty/tiny diff
 	// (cctx.Diff unpopulated at lease-grant) can only bounce — the reviewer has nothing to
@@ -148,6 +148,7 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		"FLOWBEE_IDENTITY="+cctx.Identity,
 		"FLOWBEE_LENS="+cctx.Lens,
 		"FLOWBEE_DIFF_FILE="+diffFile,
+		"FLOWBEE_DIFF_EMPTY="+fmt.Sprintf("%t", cctx.DiffEmpty),
 		"FLOWBEE_VERDICT_FILE="+verdictFile,
 		"FLOWBEE_SPEC_FILE="+specFile,
 	)
@@ -414,6 +415,22 @@ func reviewerEmptyCommit(cfg HarnessConfig, grant client.LeaseGrant, verdict, no
 	}
 	head = sha
 	return
+}
+
+func writeReviewDiffArtifact(path string, cctx *client.LeaseContext) error {
+	if cctx == nil {
+		return nil
+	}
+	if cctx.Diff == "" && !cctx.DiffEmpty {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("mkdir diff artifact dir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(cctx.Diff), 0o644); err != nil {
+		return fmt.Errorf("write diff artifact: %w", err)
+	}
+	return nil
 }
 
 func readVerdict(path string) (reviewVerdict, error) {

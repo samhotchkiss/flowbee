@@ -1046,6 +1046,9 @@ type LeaseContext struct {
 	// Diff is the eng_worker's build patch, shipped to a code_reviewer so its agent
 	// judges the actual change (the review harness writes .flowbee/diff.patch).
 	Diff string `json:"diff,omitempty"`
+	// DiffEmpty marks an authoritative empty adopted-PR diff; missing legacy diffs
+	// keep this false so review tooling can distinguish absence from no-op changes.
+	DiffEmpty bool `json:"diff_empty,omitempty"`
 	// CIReady is true when reconciled facts are green; a code_reviewer harness skips
 	// (releases) until then, so it never approves a not-green PR and thrashes.
 	CIReady bool `json:"ci_ready,omitempty"`
@@ -1429,6 +1432,7 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 		if d, derr := s.store.JobPatchDiff(ctx, jobID); derr == nil {
 			grant.Context.Diff = d
 		}
+		grant.Context.DiffEmpty = j.DiffEmpty
 		if f, _, ferr := s.facts.Facts(ctx, jobID); ferr == nil {
 			grant.Context.CIReady = f.PRExists && f.CIGreen && !f.Merged
 		}
@@ -1620,7 +1624,7 @@ func (s *Server) epicCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Title    string `json:"title"` // the epic goal / chat ref
 		Lens     string `json:"lens"`  // the lens that authored the decomposition (anti-affinity)
-		Repo     string `json:"repo"` // repos.id — REQUIRED whenever more than one repo is registered; see resolveIngestRepo
+		Repo     string `json:"repo"`  // repos.id — REQUIRED whenever more than one repo is registered; see resolveIngestRepo
 		Priority int    `json:"priority"`
 		Issues   []struct {
 			Task       string `json:"task"`

@@ -131,6 +131,59 @@ func TestReportRebaseConflictDivertsToResolver(t *testing.T) {
 	}
 }
 
+func TestLeaseGrantCarriesAdoptedPRDiff(t *testing.T) {
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t)
+	if _, err := c.Register(ctx, client.Registration{
+		WorkerID: "rv", Identity: "rv", Host: "h",
+		Capabilities: []string{"role:code_reviewer", "model_family:opus"},
+	}); err != nil {
+		t.Fatalf("register reviewer: %v", err)
+	}
+	const diff = "diff --git a/review.go b/review.go\nindex 1111111..2222222 100644\n--- a/review.go\n+++ b/review.go\n@@ -1 +1 @@\n-old\n+new\n"
+	id, err := st.AdoptPRForReview(ctx, "", 4078, "base-sha", "head-sha", diff, false, false, true, false, clk.Now(), clk.Now())
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+
+	g, ok, err := c.Lease(ctx, "rv", "opus", "code_reviewer")
+	if err != nil || !ok || g.JobID != id || g.Context == nil {
+		t.Fatalf("lease adopted review: ok=%v job=%s err=%v ctx=%v", ok, g.JobID, err, g.Context)
+	}
+	if g.Context.Diff != diff {
+		t.Fatalf("lease diff=%q, want stored adopted diff", g.Context.Diff)
+	}
+	if g.Context.DiffEmpty {
+		t.Fatal("nonempty adopted diff must not set DiffEmpty")
+	}
+}
+
+func TestLeaseGrantCarriesExplicitEmptyAdoptedPRDiff(t *testing.T) {
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t)
+	if _, err := c.Register(ctx, client.Registration{
+		WorkerID: "rv", Identity: "rv", Host: "h",
+		Capabilities: []string{"role:code_reviewer", "model_family:opus"},
+	}); err != nil {
+		t.Fatalf("register reviewer: %v", err)
+	}
+	id, err := st.AdoptPRForReview(ctx, "", 12, "same", "same", "", true, false, true, false, clk.Now(), clk.Now())
+	if err != nil {
+		t.Fatalf("adopt empty: %v", err)
+	}
+
+	g, ok, err := c.Lease(ctx, "rv", "opus", "code_reviewer")
+	if err != nil || !ok || g.JobID != id || g.Context == nil {
+		t.Fatalf("lease empty adopted review: ok=%v job=%s err=%v ctx=%v", ok, g.JobID, err, g.Context)
+	}
+	if g.Context.Diff != "" {
+		t.Fatalf("empty lease diff=%q, want empty", g.Context.Diff)
+	}
+	if !g.Context.DiffEmpty {
+		t.Fatal("explicit empty adopted diff must set DiffEmpty")
+	}
+}
+
 // TestLeaseGatedWhenAccountRateLimited: a worker whose agent login (FLOWBEE_ACCOUNT) is
 // rate-limited gets NO work (the F6 per-account ceiling), so dispatch rolls over to boxes
 // on accounts that aren't maxed; once the account clears, work flows again.

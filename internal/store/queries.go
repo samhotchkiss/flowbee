@@ -716,7 +716,8 @@ func (s *Store) ReadyCandidates(ctx context.Context) ([]scheduler.Candidate, err
 func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candidate, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT j.id, j.priority, j.enqueued_at, j.required_capabilities,
-		       COALESCE(f.pr_exists,0), COALESCE(f.ci_green,0), COALESCE(f.merged,0)
+		       COALESCE(f.pr_exists,0), COALESCE(f.ci_green,0), COALESCE(f.merged,0),
+		       COALESCE(j.adopted,0), COALESCE(j.patch_diff,''), COALESCE(j.diff_empty,0)
 		  FROM jobs j
 		  LEFT JOIN domain_b_facts f ON f.job_id = j.id
 		 WHERE j.state='review_pending'`)
@@ -727,9 +728,9 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 	var out []scheduler.Candidate
 	for rows.Next() {
 		var c scheduler.Candidate
-		var enqueued, reqJSON string
-		var prExists, ciGreen, merged int
-		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON, &prExists, &ciGreen, &merged); err != nil {
+		var enqueued, reqJSON, patchDiff string
+		var prExists, ciGreen, merged, adopted, diffEmpty int
+		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON, &prExists, &ciGreen, &merged, &adopted, &patchDiff, &diffEmpty); err != nil {
 			return nil, err
 		}
 		if ts, perr := time.Parse(rfc3339, enqueued); perr == nil {
@@ -747,6 +748,9 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 		// that churn to keep updated_at fresh — see ReconcileStuck).
 		c.CIReady = prExists == 1 && ciGreen == 1 && merged == 0
 		if !c.CIReady {
+			continue
+		}
+		if adopted == 1 && patchDiff == "" && diffEmpty == 0 {
 			continue
 		}
 		out = append(out, c)
@@ -987,7 +991,8 @@ const jobSelect = `
 	       build_epoch, COALESCE(merge_provenance,''),
 	       COALESCE(task_text,''), COALESCE(spec_text,''), COALESCE(acceptance_criteria,''),
 	       COALESCE(epic_id,''), COALESCE(is_epic,0), COALESCE(epic_reviewed,0),
-	       COALESCE(repo,''), COALESCE(last_review_notes,''), COALESCE(last_ci_failures,'')
+	       COALESCE(repo,''), COALESCE(last_review_notes,''), COALESCE(last_ci_failures,''),
+	       COALESCE(diff_empty,0)
 	  FROM jobs`
 
 type rowScanner interface {
@@ -997,7 +1002,7 @@ type rowScanner interface {
 func scanJob(row rowScanner) (job.Job, error) {
 	var j job.Job
 	var kind, role, blockedJSON, reqJSON, enqueued, verdictJSON, specSignoffJSON string
-	var overBudget, isEpic, epicReviewed int
+	var overBudget, isEpic, epicReviewed, diffEmpty int
 	var ceiling sql.NullInt64
 	err := row.Scan(&j.ID, &kind, &j.Flow, &j.Stage, (*string)(&j.State), &role,
 		&j.BaseSHA, &j.HeadSHA, &j.Priority, &blockedJSON, &reqJSON, &enqueued,
@@ -1012,12 +1017,13 @@ func scanJob(row rowScanner) (job.Job, error) {
 		&j.BuildEpoch, &j.MergeProvenance,
 		&j.TaskText, &j.SpecText, &j.AcceptanceCriteria,
 		&j.EpicID, &isEpic, &epicReviewed,
-		&j.Repo, &j.LastReviewNotes, &j.LastCIFailures)
+		&j.Repo, &j.LastReviewNotes, &j.LastCIFailures, &diffEmpty)
 	if err != nil {
 		return j, err
 	}
 	j.IsEpic = isEpic != 0
 	j.EpicReviewed = epicReviewed != 0
+	j.DiffEmpty = diffEmpty != 0
 	if ceiling.Valid {
 		c := ceiling.Int64
 		j.CostCeilingMicroUSD = &c

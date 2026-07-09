@@ -365,6 +365,10 @@ type Job struct {
 	// memory, read side). A projection field folded from the ci-fail bounce event.
 	LastCIFailures string
 
+	// DiffEmpty records an authoritative empty diff for an adopted PR review. It
+	// distinguishes "this PR has no changes" from legacy/missing patch_diff=''.
+	DiffEmpty bool
+
 	// counters (§6.7)
 	Attempts         int
 	MaxAttempts      int

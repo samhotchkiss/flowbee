@@ -129,6 +129,64 @@ func TestRefetchReadsRealState(t *testing.T) {
 	}
 }
 
+func TestAdoptPRPersistsAuthoritativeDiff(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	f := gh.NewFake()
+	const diff = "diff --git a/x.go b/x.go\nindex 1111111..2222222 100644\n--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-old\n+new\n"
+	f.SetPR(gh.PullRequest{Number: 4078, HeadRefOid: "head-sha", BaseRefOid: "base-sha", CIRollup: gh.CISuccess, UpdatedAt: time.Unix(5, 0)})
+	f.SetPRDiff(4078, diff)
+
+	rec := reconcile.NewForRepo("russ", st, f, clock.NewFake(time.Unix(10, 0)), nil)
+	id, err := rec.AdoptPR(ctx, 4078)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if id == "" {
+		t.Fatal("expected adopted job")
+	}
+	j, _ := st.GetJob(ctx, id)
+	if j.BaseSHA != "base-sha" || j.HeadSHA != "head-sha" || j.Repo != "russ" {
+		t.Fatalf("adopted shas/repo: %+v", j)
+	}
+	if got, _ := st.JobPatchDiff(ctx, id); got != diff {
+		t.Fatalf("patch_diff=%q, want authoritative diff", got)
+	}
+}
+
+func TestAdoptPREmptyDiffIsExplicit(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	f := gh.NewFake()
+	f.SetPR(gh.PullRequest{Number: 12, HeadRefOid: "same", BaseRefOid: "same", CIRollup: gh.CISuccess, UpdatedAt: time.Unix(5, 0)})
+	f.SetPRDiff(12, "")
+
+	rec := reconcile.NewForRepo("russ", st, f, clock.NewFake(time.Unix(10, 0)), nil)
+	id, err := rec.AdoptPR(ctx, 12)
+	if err != nil {
+		t.Fatalf("adopt empty: %v", err)
+	}
+	j, _ := st.GetJob(ctx, id)
+	if !j.DiffEmpty {
+		t.Fatal("empty adopted PR must be recorded explicitly")
+	}
+}
+
+func TestAdoptPRFailsWithoutAuthoritativeDiff(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	f := gh.NewFake()
+	f.SetPR(gh.PullRequest{Number: 4079, HeadRefOid: "head-sha", BaseRefOid: "base-sha", CIRollup: gh.CISuccess, UpdatedAt: time.Unix(5, 0)})
+
+	rec := reconcile.NewForRepo("russ", st, f, clock.NewFake(time.Unix(10, 0)), nil)
+	if _, err := rec.AdoptPR(ctx, 4079); err == nil {
+		t.Fatal("adoption without an authoritative diff must fail")
+	}
+	if id, ok, err := st.JobIDForPRInRepo(ctx, "russ", 4079); err != nil || ok || id != "" {
+		t.Fatalf("failed adoption must not create review job: id=%q ok=%v err=%v", id, ok, err)
+	}
+}
+
 func mustExec(t *testing.T, st *store.Store, q string, args ...any) {
 	t.Helper()
 	if _, err := st.DB.ExecContext(context.Background(), q, args...); err != nil {
@@ -155,6 +213,7 @@ func TestAdoptPRReadsRealStateAndImports(t *testing.T) {
 
 	f := gh.NewFake()
 	f.SetPR(gh.PullRequest{Number: 900, HeadRefOid: "hh", BaseRefOid: "bb", CIRollup: gh.CISuccess, CIHasRealSuccess: true, UpdatedAt: time.Unix(10, 0)})
+	f.SetPRDiff(900, "diff --git a/adopted b/adopted\n+review me\n")
 	rec := reconcile.New(st, f, clock.NewFake(time.Unix(20, 0)), nil)
 
 	id, err := rec.AdoptPR(ctx, 900)
@@ -170,6 +229,9 @@ func TestAdoptPRReadsRealStateAndImports(t *testing.T) {
 	}
 	if j.State != job.StateReviewPending || j.PRNumber != 900 {
 		t.Fatalf("adopted job state=%q pr=%d, want review_pending / 900", j.State, j.PRNumber)
+	}
+	if got, _ := st.JobPatchDiff(ctx, id); got != "diff --git a/adopted b/adopted\n+review me\n" {
+		t.Fatalf("adopted patch_diff=%q", got)
 	}
 
 	// idempotent

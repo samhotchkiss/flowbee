@@ -17,6 +17,7 @@ import (
 type Fake struct {
 	mu          sync.Mutex
 	prs         map[int]PullRequest
+	diffs       map[int]string
 	boardIssues map[int]Issue // open issues the BoardSweep returns (F7 direct-to-GitHub issues)
 	rate        RateLimit
 	branchCI    CIState  // scripted integration-branch CI rollup (green-main signal); "" => SUCCESS
@@ -58,6 +59,7 @@ type Fake struct {
 func NewFake() *Fake {
 	return &Fake{
 		prs:         map[int]PullRequest{},
+		diffs:       map[int]string{},
 		boardIssues: map[int]Issue{},
 		rate:        RateLimit{Limit: 5000, Remaining: 5000},
 		nextPR:      1000,
@@ -133,6 +135,14 @@ func (f *Fake) SetPR(pr PullRequest) {
 	f.prs[pr.Number] = pr
 }
 
+// SetPRDiff scripts the authoritative unified diff returned for a PR adoption.
+// An empty string is a valid explicit empty PR diff.
+func (f *Fake) SetPRDiff(number int, diff string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.diffs[number] = diff
+}
+
 // SetIssue scripts (or replaces) one OPEN issue in the fake's board — the
 // direct-to-GitHub issue the F7 adopt sweep imports mirrored-quiescent (a
 // flowbee:adopt label opts it in to a single-issue flow at issue-review).
@@ -200,6 +210,27 @@ func (f *Fake) PullRequest(ctx context.Context, number int) (PullRequest, bool, 
 	f.calls = append(f.calls, sprintfPR(number))
 	pr, ok := f.prs[number]
 	return pr, ok, nil
+}
+
+// PullRequestDiff implements PRDiffer for adoption tests. It enforces the resolved
+// base/head pair so tests catch accidental default-branch or stale-head comparisons.
+func (f *Fake) PullRequestDiff(ctx context.Context, number int, baseSHA, headSHA string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("PullRequestDiff(%d,%s,%s)", number, baseSHA, headSHA))
+	pr, ok := f.prs[number]
+	if !ok {
+		return "", fmt.Errorf("pr #%d not found", number)
+	}
+	if pr.BaseRefOid != baseSHA || pr.HeadRefOid != headSHA {
+		return "", fmt.Errorf("pr #%d diff sha mismatch: have base=%s head=%s want base=%s head=%s",
+			number, pr.BaseRefOid, pr.HeadRefOid, baseSHA, headSHA)
+	}
+	diff, ok := f.diffs[number]
+	if !ok {
+		return "", fmt.Errorf("pr #%d diff not scripted", number)
+	}
+	return diff, nil
 }
 
 // ── project-OUT scripting helpers ──
