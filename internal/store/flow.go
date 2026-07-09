@@ -273,10 +273,11 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 		if err != nil {
 			return err
 		}
-		// The reviewer judged the patch attached to j.HeadSHA. Reconciled green CI
-		// for an older head must never mint a verdict for that older SHA after a
-		// bounced builder has already advanced the PR.
-		if facts.HeadSHA != j.HeadSHA || facts.BaseSHA != j.BaseSHA {
+		// A known job head is the patch the reviewer judged and must exactly match
+		// reconciled facts. An empty head is not an assertion: fresh non-empty facts
+		// establish it for legacy/control-plane result paths that cannot report a SHA.
+		if (j.HeadSHA != "" && facts.HeadSHA != j.HeadSHA) ||
+			(j.BaseSHA != "" && facts.BaseSHA != j.BaseSHA) {
 			facts.CIGreen = false
 		}
 

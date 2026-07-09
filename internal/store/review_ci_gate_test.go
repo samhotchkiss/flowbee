@@ -99,6 +99,66 @@ func TestReviewCandidatesExcludeGreenFactsForObsoleteHead(t *testing.T) {
 	}
 }
 
+func TestReviewCandidatesAllowFreshFactsWhenBuildHeadUnknown(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+
+	seedReviewPending(t, st, "unknown-head", now, true, true)
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET head_sha='' WHERE id='unknown-head'`); err != nil {
+		t.Fatal(err)
+	}
+
+	cands, err := st.ReviewPendingCandidates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cands {
+		if c.JobID == "unknown-head" {
+			return
+		}
+	}
+	t.Fatalf("fresh reconciled facts must establish an unknown build head: %+v", cands)
+}
+
+func TestBuildResultInvalidatesPriorHeadGreenCI(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "new-result", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, BaseSHA: "base", Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertDomainBFacts(ctx, "new-result", job.DomainBFacts{
+		PRExists: true, PRNumber: 42, HeadSHA: "old-head", BaseSHA: "base", CIGreen: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ls, err := st.ClaimReadyJob(ctx, store.ClaimParams{
+		JobID: "new-result", LeaseID: "build", Identity: "builder", ModelFamily: "codex",
+		Role: job.RoleEngWorker, Attested: []string{"role:eng_worker"}, TTL: time.Minute, Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Result(ctx, store.ResultParams{
+		JobID: "new-result", Epoch: ls.Epoch, PushedSHA: "new-head", Now: now.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var green int
+	if err := st.DB.QueryRowContext(ctx,
+		`SELECT ci_green FROM domain_b_facts WHERE job_id='new-result'`).Scan(&green); err != nil {
+		t.Fatal(err)
+	}
+	if green != 0 {
+		t.Fatal("a new build result must invalidate green CI from the prior head")
+	}
+}
+
 // TestWatchdogToleratesSlowCIWithinWindow: a review_pending job blocked on a CI run
 // that is still WITHIN the generous stall window is healthily waiting on Domain B —
 // the watchdog must leave it alone (no false page for a slow CI run).

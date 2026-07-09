@@ -80,3 +80,26 @@ func TestAdoptedReviewBouncePreservesCumulativePatch(t *testing.T) {
 		t.Fatalf("adopted cumulative patch after bounce=%q err=%v, want preserved patch", got, err)
 	}
 }
+
+func TestReviewMintsFromFreshFactsWhenJobHeadUnknown(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	src := store.DBFactSource{DB: st.DB}
+	driveToCodeReview(t, st, "unknown-review-head", "reconciled-head", "base")
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET head_sha='' WHERE id='unknown-review-head'`); err != nil {
+		t.Fatal(err)
+	}
+	mustGreen(t, st, "unknown-review-head", "reconciled-head", "base")
+
+	resp, err := st.ReviewResult(ctx, src, job.Policy{}, store.ReviewResultParams{
+		JobID: "unknown-review-head", Epoch: epochOf(t, st, "unknown-review-head"),
+		Claim: job.VerdictApproved, Disposition: job.DispositionHandoff, Now: time.Unix(3000, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Minted {
+		t.Fatalf("fresh authoritative facts must mint when the job head is unknown: %+v", resp)
+	}
+}

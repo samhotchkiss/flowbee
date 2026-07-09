@@ -248,13 +248,9 @@ func Fold(events []Event) (job.Job, error) {
 			// projection-resync would strip the gate (the #2221/#2223 live regression).
 			j.State = e.ToState
 			j.RequiredCapabilities = []string{"role:code_reviewer"}
-			// mirror the projection's head_sha = COALESCE(NULLIF(PushedSHA,''), head_sha) so a
-			// fold-rebuild keeps the head reconcile's flowbeePlaced guard reads — else it
-			// blanks head_sha and supersedes a good build back to ready. Same conditional as
-			// KindConflictResolved (this was the missed sibling of that #2221/#2223-era fix).
-			if e.Payload.HeadSHA != "" {
-				j.HeadSHA = e.Payload.HeadSHA
-			}
+			// Each accepted result establishes a new artifact. A missing pushed SHA means
+			// its GitHub head is unknown, not that the prior attempt's head remains valid.
+			j.HeadSHA = e.Payload.HeadSHA
 			// the lease is released on result: clear live lease columns, keep epoch.
 			j.LeaseID = ""
 			j.BoundIdentity = ""
@@ -683,12 +679,9 @@ func Fold(events []Event) (job.Job, error) {
 			j.Stage = "build"
 			j.RequiredCapabilities = []string{"role:code_reviewer"}
 			j.Verdict = nil
-			// the resolve UPDATE sets head_sha = COALESCE(NULLIF(PushedSHA,''), head_sha) —
-			// the resolved head when the resolver force-pushed one, else the prior head.
-			// Mirror that conditional so a fold-rebuild keeps head_sha == the projection.
-			if e.Payload.HeadSHA != "" {
-				j.HeadSHA = e.Payload.HeadSHA
-			}
+			// A missing pushed SHA means the resolved artifact's GitHub head is not yet
+			// known. Never retain the pre-resolution head as its review authorization.
+			j.HeadSHA = e.Payload.HeadSHA
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""

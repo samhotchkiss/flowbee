@@ -83,21 +83,19 @@ func TestFoldCarriesHeadOnReArm(t *testing.T) {
 		t.Errorf("resolve fold head=%q want resolvedhead", j.HeadSHA)
 	}
 
-	// an empty resolved head keeps the prior head — mirrors the store's
-	// COALESCE(NULLIF(PushedSHA,''), head_sha).
+	// An empty resolved head means the new artifact is not stamped on GitHub yet.
+	// It must clear the prior head so old CI/review cannot authorize the resolution.
 	keep := append(append([]Event{}, reb...),
 		Event{JobID: "H1", JobSeq: 5, Kind: KindConflictResolved, ToState: job.StateReviewPending, LeaseEpoch: 2, CreatedAt: now,
 			Payload: Payload{HeadSHA: ""}})
 	if j, err := Fold(keep); err != nil {
 		t.Fatal(err)
-	} else if j.HeadSHA != "rebasedhead" {
-		t.Errorf("empty resolved head must keep the prior head; got %q want rebasedhead", j.HeadSHA)
+	} else if j.HeadSHA != "" {
+		t.Errorf("empty resolved head must clear prior authorization; got %q", j.HeadSHA)
 	}
 
 	// the BUILD RESULT itself carries the worker's pushed head -> the fold must reproduce it
-	// (the result UPDATE sets head_sha = COALESCE(NULLIF(PushedSHA,''), head_sha)). Without it
-	// a rebuild blanks head_sha for any job sitting in review_pending/code_review/mergeable
-	// before a verdict mints the SHA, and the next sweep supersedes a good built+CI'd job.
+	// (the result UPDATE sets head_sha to the reported SHA).
 	built := []Event{
 		{JobID: "H2", JobSeq: 1, Kind: KindJobCreated, ToState: job.StateReady, CreatedAt: now,
 			Payload: Payload{Kind: job.KindBuild, Role: job.RoleEngWorker, RequiredCapabilities: []string{"role:eng_worker"}}},
@@ -109,6 +107,14 @@ func TestFoldCarriesHeadOnReArm(t *testing.T) {
 		t.Fatal(err)
 	} else if j.HeadSHA != "builthead" {
 		t.Errorf("result-accepted fold head=%q want builthead (a blank head breaks the flowbeePlaced guard)", j.HeadSHA)
+	}
+
+	unknown := append(append([]Event{}, built...),
+		Event{JobID: "H2", JobSeq: 4, Kind: KindResultAccepted, ToState: job.StateReviewPending, LeaseEpoch: 2, CreatedAt: now})
+	if j, err := Fold(unknown); err != nil {
+		t.Fatal(err)
+	} else if j.HeadSHA != "" {
+		t.Errorf("unstamped build result must clear prior head; got %q", j.HeadSHA)
 	}
 }
 

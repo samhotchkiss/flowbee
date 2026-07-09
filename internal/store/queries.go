@@ -482,12 +482,9 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 				Actor: j.BoundIdentity, CreatedAt: p.Now,
 			}
 			if t.Kind == ledger.KindResultAccepted {
-				// Carry the pushed head on the event so Fold can reconstruct head_sha. The
-				// projection below writes head_sha = COALESCE(NULLIF(PushedSHA,''), head_sha);
-				// without this the event is payload-less and a DR re-fold blanks head_sha,
-				// after which reconcile's flowbeePlaced guard reads the unchanged PR head as a
-				// SHA move and supersedes a good, built+CI'd job back to `ready`. Mirrors the
-				// head-carrying KindRebased / KindConflictResolved payloads.
+				// Carry the pushed head on the event so Fold can reconstruct head_sha. An
+				// empty value explicitly means this result's GitHub head is not stamped yet;
+				// do not retain a prior attempt's head as authorization for the new result.
 				ev.Payload.HeadSHA = p.PushedSHA
 			}
 			if err := appendEvent(ctx, tx, ev); err != nil {
@@ -516,7 +513,7 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 				       builder_identity     = COALESCE(builder_identity, bound_identity),
 				       builder_model_family = COALESCE(builder_model_family, bound_model_family),
 				       head_ref = COALESCE(NULLIF(?, ''), head_ref),
-				       head_sha = COALESCE(NULLIF(?, ''), head_sha),
+				       head_sha = NULLIF(?, ''),
 				       patch_diff = ?, declared_blast_radius = ?,
 				       lease_id = NULL, bound_identity = NULL,
 				       bound_model_family = NULL, lease_hb_due = NULL,
@@ -526,6 +523,13 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 				string(final), marshalStrings([]string{"role:code_reviewer"}), p.PushedRef,
 				p.PushedSHA, p.PatchDiff, p.DeclaredBlastRadius, p.JobID); err != nil {
 				return fmt.Errorf("apply result projection: %w", err)
+			}
+			// A new artifact must earn CI at its own head. Clear the prior head's green
+			// authorization even when the worker could not report PushedSHA; reconcile-IN
+			// will restore green only after reading the current GitHub PR head.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE domain_b_facts SET ci_green=0, updated_at=datetime('now') WHERE job_id=?`, p.JobID); err != nil {
+				return fmt.Errorf("invalidate prior CI facts: %w", err)
 			}
 			// arm the review-stage no_eligible_worker alarm (I-6): if no compliant,
 			// independent code_reviewer claims this review_pending job before the
@@ -750,7 +754,8 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 		// watchdog treats a PR-open/CI-pending review as healthy (it no longer relies on
 		// that churn to keep updated_at fresh — see ReconcileStuck).
 		c.CIReady = prExists == 1 && ciGreen == 1 && merged == 0 &&
-			jobHead != "" && jobBase != "" && factHead == jobHead && factBase == jobBase
+			factHead != "" && factBase != "" &&
+			(jobHead == "" || factHead == jobHead) && (jobBase == "" || factBase == jobBase)
 		if !c.CIReady {
 			continue
 		}
