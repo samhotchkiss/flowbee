@@ -315,13 +315,10 @@ func TestSupersedeOnSHAMove(t *testing.T) {
 	}
 }
 
-// TestMergeHandoffNotSuperseded pins the loop fix: a job handed to a human
-// (merge_handoff — e.g. a change to Flowbee's own source the flowbee_source denylist
-// blocks from self-merge) must SETTLE, not get re-armed. The reviewer's empty
-// findings-commit moves the branch head after the verdict bound to the reviewed head,
-// so a supersedable merge_handoff looped handoff→supersede→rebuild→re-review forever
-// (the live #41 stall). A head move must leave merge_handoff untouched.
-func TestMergeHandoffNotSuperseded(t *testing.T) {
+// A handoff is not permission to merge a different head. Any head move invalidates
+// the SHA-bound verdict, re-arms independent review, and preserves the stale outbox
+// row as abandoned audit history.
+func TestMergeHandoffHeadMoveSupersedesAndAbandonsMerge(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
 	seedBuildPR(t, st, "jh", 41)
@@ -332,12 +329,19 @@ func TestMergeHandoffNotSuperseded(t *testing.T) {
 	}, t1); err != nil {
 		t.Fatalf("baseline: %v", err)
 	}
+	v := job.MintVerdict(job.VerdictApproved, job.DispositionSelfMerge, "h1", "b1")
 	if _, err := st.DB.ExecContext(ctx, `
-		UPDATE jobs SET state='merge_handoff', head_sha='h1', lease_epoch=4 WHERE id='jh'`); err != nil {
+		UPDATE jobs SET state='merge_handoff', head_sha='h1', verdict=?, lease_epoch=4 WHERE id='jh'`, mustJSON(t, v)); err != nil {
 		t.Fatalf("set merge_handoff: %v", err)
 	}
+	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
+		JobID: "jh", Action: store.ActionEnqueueMerge, HeadSHA: "h1", Payload: `{"pr_number":41}`,
+	}); err != nil {
+		t.Fatalf("enqueue stale merge: %v", err)
+	}
 
-	// the reviewer's empty findings-commit moved the head to h2: must NOT supersede.
+	// The live PR moved after approval. Even byte-identical content needs a new
+	// SHA-bound approval and CI result.
 	t2 := t1.Add(time.Minute)
 	out, err := st.ApplyReconciledPR(ctx, "jh", store.ReconciledPR{
 		Number: 41, UpdatedAt: t2, HeadSHA: "h2", BaseSHA: "b1", CIGreen: true,
@@ -345,12 +349,52 @@ func TestMergeHandoffNotSuperseded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply move: %v", err)
 	}
-	if out.Superseded {
-		t.Fatalf("merge_handoff was superseded on a head move — the human-merge loop bug")
+	if !out.Superseded {
+		t.Fatalf("merge_handoff head move must supersede stale approval: %+v", out)
 	}
 	j, _ := st.GetJob(ctx, "jh")
-	if j.State != job.StateMergeHandoff {
-		t.Fatalf("state=%s want merge_handoff (settled for the human)", j.State)
+	if j.State != job.StateReady || j.Verdict != nil {
+		t.Fatalf("state/verdict=%s/%+v want ready/nil", j.State, j.Verdict)
+	}
+	var status string
+	if err := st.DB.QueryRowContext(ctx,
+		`SELECT status FROM outbox WHERE job_id='jh' AND action=? AND head_sha='h1'`,
+		store.ActionEnqueueMerge).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "abandoned" {
+		t.Fatalf("stale merge outbox status=%q want abandoned", status)
+	}
+}
+
+func TestMergeHandoffStaleVerdictSupersedesAfterFactsAlreadyAdvanced(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	seedBuildPR(t, st, "restart-stale", 4138)
+	now := time.Unix(8000, 0)
+
+	// Simulate a restart snapshot where reconcile already knows the live head, but
+	// the job/outbox still carry the obsolete pre-fix approval.
+	if _, err := st.ApplyReconciledPR(ctx, "restart-stale", store.ReconciledPR{
+		Number: 4138, UpdatedAt: now, HeadSHA: "fd8f16912", BaseSHA: "base", CIGreen: true,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	v := job.MintVerdict(job.VerdictApproved, job.DispositionSelfMerge, "dcff475eb", "base")
+	if _, err := st.DB.ExecContext(ctx, `
+		UPDATE jobs SET state='merge_handoff', base_sha='base', head_sha='dcff475eb', verdict=?
+		 WHERE id='restart-stale'`, mustJSON(t, v)); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := st.ApplyReconciledPR(ctx, "restart-stale", store.ReconciledPR{
+		Number: 4138, UpdatedAt: now.Add(time.Minute), HeadSHA: "fd8f16912", BaseSHA: "base", CIGreen: true,
+	}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Superseded {
+		t.Fatalf("stale verdict must supersede even when facts already hold the live head: %+v", out)
 	}
 }
 

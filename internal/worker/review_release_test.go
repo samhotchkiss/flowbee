@@ -61,11 +61,12 @@ func TestCodeReviewerReleasesLeaseOnAgentFailure(t *testing.T) {
 	// TestLeaseReviewAccountPin in internal/api/control_test.go).
 	const hugeDiff = "diff --git a/x b/x\n+the full PR diff, in this real bug ~266KB of it"
 	if _, err := st.DB.ExecContext(ctx,
-		`UPDATE jobs SET state='review_pending', patch_diff=? WHERE id=?`, hugeDiff, jobID); err != nil {
+		`UPDATE jobs SET state='review_pending', head_sha='head', patch_diff=? WHERE id=?`, hugeDiff, jobID); err != nil {
 		t.Fatalf("set review_pending + diff: %v", err)
 	}
 	if _, err := st.DB.ExecContext(ctx,
-		`INSERT INTO domain_b_facts (job_id, pr_exists, pr_number, ci_green, merged) VALUES (?,1,1,1,0)`, jobID); err != nil {
+		`INSERT INTO domain_b_facts (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged)
+		 VALUES (?,1,1,'head','base',1,0)`, jobID); err != nil {
 		t.Fatalf("seed domain_b_facts: %v", err)
 	}
 	before, err := st.GetJob(ctx, jobID)

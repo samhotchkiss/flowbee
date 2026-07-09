@@ -50,12 +50,10 @@ func TestMergeConflictRoutesToResolverAfterFetch(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging' WHERE id='j'`); err != nil {
-		t.Fatal(err)
-	}
+	setMergingAuthorization(t, st, "j", "base", "head")
 	fake.SetMergeConflict(78)
 	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
-		JobID: "j", Action: store.ActionEnqueueMerge, Payload: `{"pr_number":78}`,
+		JobID: "j", Action: store.ActionEnqueueMerge, HeadSHA: "head", Payload: `{"pr_number":78}`,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +66,11 @@ func TestMergeConflictRoutesToResolverAfterFetch(t *testing.T) {
 	}
 
 	// fetched main (so the resolver base is the real post-merge main, not the stale mirror)
-	if len(hist.fetched) == 0 || hist.fetched[0] != "main" {
+	fetchedMain := false
+	for _, branch := range hist.fetched {
+		fetchedMain = fetchedMain || branch == "main"
+	}
+	if !fetchedMain {
 		t.Fatalf("FetchBranch(main) not called before routing: %v", hist.fetched)
 	}
 	// routed to the resolver at the fetched tip

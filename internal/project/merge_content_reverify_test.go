@@ -2,6 +2,7 @@ package project
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -21,13 +22,27 @@ func mergingJob(t *testing.T, st *store.Store, id string) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	setMergingAuthorization(t, st, id, "base-sha", "head-sha")
 	if _, err := st.DB.ExecContext(ctx,
-		`UPDATE jobs SET state='merging', head_sha='head-sha', issue_number=42 WHERE id=?`, id); err != nil {
+		`UPDATE jobs SET issue_number=42 WHERE id=?`, id); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
-		JobID: id, Action: store.ActionEnqueueMerge, Payload: `{"pr_number":42}`,
+		JobID: id, Action: store.ActionEnqueueMerge, HeadSHA: "head-sha", Payload: `{"pr_number":42}`,
 	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setMergingAuthorization(t *testing.T, st *store.Store, id, base, head string) {
+	t.Helper()
+	v := job.MintVerdict(job.VerdictApproved, job.DispositionSelfMerge, head, base)
+	vb, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.ExecContext(context.Background(),
+		`UPDATE jobs SET state='merging', base_sha=?, head_sha=?, verdict=? WHERE id=?`, base, head, string(vb), id); err != nil {
 		t.Fatal(err)
 	}
 }

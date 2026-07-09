@@ -158,6 +158,31 @@ func TestLeaseGrantCarriesAdoptedPRDiff(t *testing.T) {
 	}
 }
 
+func TestAdoptedRebuildLeaseCarriesCumulativePRDiff(t *testing.T) {
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t)
+	const cumulative = "diff --git a/feature.go b/feature.go\n--- a/feature.go\n+++ b/feature.go\n@@ -1 +1 @@\n-old\n+adopted change\n"
+	id, err := st.AdoptPRForReview(ctx, "", 4138, "base", "reviewed-head", cumulative, false,
+		false, true, false, clk.Now(), clk.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `
+		UPDATE jobs SET state='ready', role='eng_worker', stage='build', bounces=1,
+		       required_capabilities='["role:eng_worker"]'
+		 WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	g, ok, err := c.Lease(ctx, "w", "codex", "eng_worker")
+	if err != nil || !ok || g.Context == nil {
+		t.Fatalf("lease adopted rebuild: ok=%v err=%v grant=%+v", ok, err, g)
+	}
+	if !g.Context.Rebuild || g.Context.Diff != cumulative {
+		t.Fatalf("rebuild/diff=%v/%q want true/full cumulative patch", g.Context.Rebuild, g.Context.Diff)
+	}
+}
+
 func TestLeaseGrantCarriesExplicitEmptyAdoptedPRDiff(t *testing.T) {
 	ctx := context.Background()
 	st, c, clk := ctrlServer(t)
@@ -240,12 +265,13 @@ func TestLeaseReviewAccountPin(t *testing.T) {
 	}
 	seedReady(t, st, "j", "", clk.Now())
 	if _, err := st.DB.ExecContext(ctx,
-		`UPDATE jobs SET state='review_pending', role='code_reviewer', required_capabilities='["role:code_reviewer"]' WHERE id='j'`); err != nil {
+		`UPDATE jobs SET state='review_pending', role='code_reviewer', base_sha='base', head_sha='head', required_capabilities='["role:code_reviewer"]' WHERE id='j'`); err != nil {
 		t.Fatal(err)
 	}
 	// a review is only an offerable candidate when its reconciled CI is green (CIReady).
 	if _, err := st.DB.ExecContext(ctx,
-		`INSERT INTO domain_b_facts (job_id, pr_exists, pr_number, ci_green, merged) VALUES ('j',1,7,1,0)`); err != nil {
+		`INSERT INTO domain_b_facts (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged)
+		 VALUES ('j',1,7,'head','base',1,0)`); err != nil {
 		t.Fatal(err)
 	}
 

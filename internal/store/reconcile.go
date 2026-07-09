@@ -167,8 +167,9 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		// (pr.base != j.base_sha) still differs from the job record -> a real move.
 		flowbeePlaced := j.HeadSHA != "" && pr.HeadSHA == j.HeadSHA &&
 			(j.BaseSHA == "" || pr.BaseSHA == "" || pr.BaseSHA == j.BaseSHA)
+		verdictStale := j.Verdict != nil && !j.Verdict.Verify(pr.HeadSHA, pr.BaseSHA)
 		shaMoved := !pr.Merged && !flowbeePlaced &&
-			(prevHead != "" && prevHead != pr.HeadSHA ||
+			(verdictStale || prevHead != "" && prevHead != pr.HeadSHA ||
 				prevBase != "" && pr.BaseSHA != "" && prevBase != pr.BaseSHA)
 
 		// write the Domain-B facts (the ONLY columns reconcile-IN may touch).
@@ -245,7 +246,7 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 			// re-arms review + CI. Invalidate the verdict, revoke any active lease
 			// (epoch bump -> a still-running worker is fenced 409 on its next call),
 			// route to ready with the new base.
-			if err := supersedeTx(ctx, tx, &j, seq, pr, now); err != nil {
+			if err := supersedeTx(ctx, tx, &j, seq, pr, "reconcile", now); err != nil {
 				return err
 			}
 			out.Superseded = true
@@ -281,18 +282,9 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 func supersedable(s job.State) bool {
 	switch s {
 	case job.StateLeased, job.StateBuilding, job.StateReviewPending,
-		job.StateCodeReview, job.StateMergeable:
+		job.StateCodeReview, job.StateMergeable, job.StateMerging, job.StateMergeHandoff:
 		return true
 	default:
-		// merge_handoff is DELIBERATELY excluded: it is the "a human merges" state
-		// (self-merge denied — e.g. a change to Flowbee's own source hits the
-		// flowbee_source denylist). The reviewer's empty findings-commit moves the
-		// branch head AFTER the verdict bound to the reviewed head, so leaving
-		// merge_handoff supersedable re-armed it on every sweep → an infinite
-		// handoff→supersede→rebuild→re-review loop the human could never merge into.
-		// A handed-off job must SETTLE; if a human pushes a real fix to the branch and
-		// wants re-review, they `flowbee requeue` it explicitly. merging is excluded
-		// too — a merge in flight must not be yanked back to build mid-dispatch.
 		return false
 	}
 }
@@ -429,7 +421,8 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET state='ready', role='eng_worker', required_capabilities=?,
 		       bounces=bounces+1,
-		       patch_diff='', declared_blast_radius='',
+		       patch_diff=CASE WHEN adopted=1 THEN patch_diff ELSE '' END,
+		       declared_blast_radius=CASE WHEN adopted=1 THEN declared_blast_radius ELSE '' END,
 		       reservation_paths='', reservation_wide=0,
 		       last_ci_failures = CASE WHEN ? <> '' THEN ? ELSE last_ci_failures END,
 		       enqueued_at=?, lease_id=NULL, bound_identity=NULL, bound_model_family=NULL,
@@ -445,14 +438,14 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 // with the new base. It writes the new base_sha (a Domain-B fact) and clears the
 // verdict (whose binding is now stale) — clearing a now-invalid verdict is part of
 // the supersession the SHA owner triggers, not an edit of a live Domain-A decision.
-func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr ReconciledPR, now time.Time) error {
+func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr ReconciledPR, actor string, now time.Time) error {
 	nextSeq := seq + 1
 	// the supersede event records the move for replay/audit.
 	ev := ledger.Event{
 		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindSuperseded,
 		FromState: j.State, ToState: job.StateReady, LeaseEpoch: j.LeaseEpoch + 1,
-		Actor: "reconcile", CreatedAt: now,
-		Payload: ledger.Payload{BaseSHA: pr.BaseSHA},
+		Actor: actor, CreatedAt: now,
+		Payload: ledger.Payload{BaseSHA: pr.BaseSHA, HeadSHA: pr.HeadSHA},
 	}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return err
@@ -476,6 +469,14 @@ func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr Reconc
 		marshalStrings([]string{"role:eng_worker"}), pr.BaseSHA,
 		now.Format(rfc3339), j.ID); err != nil {
 		return fmt.Errorf("apply supersede: %w", err)
+	}
+	// The same SHA move that voids the verdict also voids every pending rendering
+	// bound to an obsolete SHA. Preserve rows as abandoned audit history.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE outbox SET status='abandoned', sent_at=datetime('now')
+		 WHERE job_id=? AND status='pending' AND head_sha<>''
+		   AND (?='' OR head_sha<>?)`, j.ID, pr.HeadSHA, pr.HeadSHA); err != nil {
+		return fmt.Errorf("abandon superseded outbox: %w", err)
 	}
 	// close any open lease audit row as superseded.
 	if _, err := tx.ExecContext(ctx, `

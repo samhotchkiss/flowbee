@@ -149,8 +149,9 @@ var livenessEvaluableStates = func() map[State]bool {
 
 // LivenessEvaluable reports whether the liveness ladder (the two-rung stall kill +
 // heartbeat-staleness reap) should evaluate a job in state s. It is HasActiveLease
-// EXCEPT the two states with NO bound worker, which the reconcile-side supersedable()
-// excludes for the SAME reason — they must SETTLE, not be yanked back to build:
+// EXCEPT the two states with NO bound worker. Reconciliation may still supersede
+// either state when GitHub's head no longer matches its SHA-bound verdict; the
+// liveness ladder must not move them merely because no worker is heartbeating:
 //
 //   - merge_handoff: parked at the HUMAN merge gate, where a "stall" is the normal,
 //     expected condition (a human may take hours/days). Evaluating it made the ladder

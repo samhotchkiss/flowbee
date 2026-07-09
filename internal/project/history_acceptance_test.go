@@ -225,7 +225,7 @@ func buildAndReview(t *testing.T, st *store.Store, src store.FactSource, policy 
 		t.Fatalf("claim build attempt %d: %v", attempt, err)
 	}
 	if _, err := st.Result(ctx, store.ResultParams{
-		JobID: id, Epoch: ls.Epoch, Now: time.Unix(int64(1050+attempt*100), 0),
+		JobID: id, Epoch: ls.Epoch, PushedSHA: head, Now: time.Unix(int64(1050+attempt*100), 0),
 	}); err != nil {
 		t.Fatalf("build result attempt %d: %v", attempt, err)
 	}

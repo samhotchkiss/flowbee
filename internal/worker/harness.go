@@ -42,10 +42,10 @@ func writeTaskContext(wsDir string, grant client.LeaseGrant) ([]string, error) {
 		c = &client.LeaseContext{Role: grant.Role, BaseSHA: grant.BaseSHA}
 	}
 
-	if d := strings.TrimSpace(c.Diff); d != "" {
+	if strings.TrimSpace(c.Diff) != "" {
 		// Always written (cheap) so renderTaskMarkdown's oversized-diff fallback reference
 		// (.flowbee/original-diff.patch) is valid whether or not it ends up needing it.
-		_ = os.WriteFile(filepath.Join(dir, "original-diff.patch"), []byte(d), 0o644)
+		_ = os.WriteFile(filepath.Join(dir, "original-diff.patch"), []byte(c.Diff), 0o644)
 	}
 
 	md := renderTaskMarkdown(grant.JobID, c)
@@ -65,6 +65,23 @@ func writeTaskContext(wsDir string, grant client.LeaseGrant) ([]string, error) {
 		"FLOWBEE_IDENTITY=" + c.Identity,
 		"FLOWBEE_LENS=" + c.Lens,
 	}, nil
+}
+
+// bootstrapAdoptedRebuild materializes the cumulative patch retained from an
+// adopted PR before a bounced builder makes its correction. Local worktree and
+// bundle modes start at base_sha; without this step their result contains only
+// the correction delta and silently drops the PR's original change.
+func bootstrapAdoptedRebuild(wsDir string, c *client.LeaseContext) error {
+	if c == nil || c.Role != "eng_worker" || !c.Rebuild || strings.TrimSpace(c.Diff) == "" {
+		return nil
+	}
+	patchFile := filepath.Join(wsDir, ".flowbee", "original-diff.patch")
+	cmd := exec.Command("git", "apply", "--index", "--whitespace=nowarn", patchFile)
+	cmd.Dir = wsDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("apply adopted cumulative patch: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // renderTaskMarkdown renders the resolved context block as the .flowbee/task.md
@@ -429,6 +446,10 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 	if err != nil {
 		return out, fmt.Errorf("write task context: %w", err)
 	}
+	if err := bootstrapAdoptedRebuild(wsDir, grant.Context); err != nil {
+		_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
+		return out, err
+	}
 
 	// ── spawn the agent CLI in the worktree (a black box, §7.1) ──
 	agentEnv := append(os.Environ(),
@@ -607,6 +628,10 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	taskEnv, err := writeTaskContext(wsDir, grant)
 	if err != nil {
 		return out, fmt.Errorf("write task context: %w", err)
+	}
+	if err := bootstrapAdoptedRebuild(wsDir, grant.Context); err != nil {
+		_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
+		return out, err
 	}
 
 	agentEnv := append(os.Environ(),

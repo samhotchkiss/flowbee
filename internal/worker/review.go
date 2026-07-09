@@ -342,10 +342,9 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 // a repo with required status checks (russ): GitHub re-runs the FULL required-CI matrix on
 // the empty commit (so every review costs a 6-shard backend run, ~3-4m each) AND advances
 // the branch tip PAST the head the verdict pins to. Self-merge SHA-interlocks on the
-// reviewed head, so the live tip (the empty commit) 409s as head_modified_after_review and
-// routes to merge_handoff — while its own required CI sits pending, so it can never merge
-// either. The result is a churn loop: approve -> empty commit -> CI reset + head move ->
-// merge deadlock -> re-arm -> repeat (observed on russ #2359/#2407, and the driver behind
+// reviewed head, so the live tip (the empty commit) invalidates that approval and re-arms
+// review while its own required CI is pending. The result is a churn loop: approve -> empty
+// commit -> CI reset + head move -> re-arm -> repeat (observed on russ #2359/#2407, and the driver behind
 // #2466's dozens-of-builder-passes churn). Review attribution does NOT depend on this commit:
 // the verdict is canonical in Flowbee's ledger and the control plane mirrors it to the GitHub
 // issue as a durable comment (api.server.review). Re-enable only once CI is made to skip

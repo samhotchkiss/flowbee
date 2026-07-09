@@ -243,7 +243,9 @@ func driveToCodeReview(t *testing.T, st *store.Store, id, head, base string) {
 	if err != nil {
 		t.Fatalf("claim build %s: %v", id, err)
 	}
-	if _, err := st.Result(ctx, store.ResultParams{JobID: id, Epoch: ls.Epoch, Now: time.Unix(1500, 0)}); err != nil {
+	if _, err := st.Result(ctx, store.ResultParams{
+		JobID: id, Epoch: ls.Epoch, PushedSHA: head, Now: time.Unix(1500, 0),
+	}); err != nil {
 		t.Fatalf("build result %s: %v", id, err)
 	}
 	// bind the head sha the gate will judge.
@@ -255,7 +257,7 @@ func driveToCodeReview(t *testing.T, st *store.Store, id, head, base string) {
 	if _, err := st.ClaimReviewJob(ctx, store.ClaimReviewParams{
 		JobID: id, LeaseID: "rl-" + id, Identity: "reviewer-" + id, ModelFamily: "opus",
 		Attested: []string{"role:code_reviewer", "model_family:opus"},
-		TTL: time.Minute, Now: time.Unix(1600, 0),
+		TTL:      time.Minute, Now: time.Unix(1600, 0),
 	}); err != nil {
 		t.Fatalf("claim review %s: %v", id, err)
 	}

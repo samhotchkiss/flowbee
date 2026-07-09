@@ -30,6 +30,17 @@ func rebuildToReviewPending(t *testing.T, ctx context.Context, st *store.Store, 
 	if j, _ := st.GetJob(ctx, jobID); j.State != job.StateReviewPending {
 		t.Fatalf("rebuild #%d -> state=%s want review_pending", attempt, j.State)
 	}
+	// Every accepted build result invalidates the prior head's green CI. Model the
+	// reconcile/CI pass for this distinct rebuild before asking for re-review; otherwise
+	// the helper tries to reuse the pre-bounce head's authorization and is correctly
+	// withheld by ReviewPendingCandidates. A unique head per attempt makes this guard
+	// deterministic under both normal and -race test scheduling.
+	if err := st.UpsertDomainBFacts(ctx, jobID, job.DomainBFacts{
+		PRExists: true, PRNumber: 42, HeadSHA: "head-rebuild-" + itoa(attempt),
+		BaseSHA: "base1", CIGreen: true,
+	}); err != nil {
+		t.Fatalf("rebuild #%d reconcile green facts: %v", attempt, err)
+	}
 }
 
 type reviewLease struct {

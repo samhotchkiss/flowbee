@@ -625,8 +625,8 @@ func (s *Store) ResolveConflictResult(ctx context.Context, p ResolveConflictPara
 			JobID: p.JobID, JobSeq: nextSeq, Kind: ledger.KindConflictResolved,
 			FromState: j.State, ToState: job.StateReviewPending, LeaseEpoch: j.LeaseEpoch,
 			Actor: j.BoundIdentity, CreatedAt: p.Now,
-			// carry the resolved head so Fold reproduces head_sha (the UPDATE below sets it
-			// to PushedSHA when non-empty, else keeps the prior head — mirror that in Fold).
+			// Carry the resolved head so Fold reproduces head_sha. Empty explicitly
+			// means the resolved artifact's GitHub head is not stamped yet.
 			Payload: ledger.Payload{BaseSHA: j.BaseSHA, HeadSHA: p.PushedSHA},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
@@ -642,7 +642,7 @@ func (s *Store) ResolveConflictResult(ctx context.Context, p ResolveConflictPara
 			       builder_identity     = COALESCE(builder_identity, bound_identity),
 			       builder_model_family = COALESCE(builder_model_family, bound_model_family),
 			       head_ref = COALESCE(NULLIF(?, ''), head_ref),
-			       head_sha = COALESCE(NULLIF(?, ''), head_sha),
+			       head_sha = NULLIF(?, ''),
 			       patch_diff = ?, declared_blast_radius = ?,
 			       verdict = NULL,
 			       eng_worker_job = COALESCE(eng_worker_job, id),
@@ -654,12 +654,13 @@ func (s *Store) ResolveConflictResult(ctx context.Context, p ResolveConflictPara
 			p.ResolvedDiff, p.DeclaredBlastRadius, p.JobID); err != nil {
 			return fmt.Errorf("apply resolve_conflict result: %w", err)
 		}
-		// j.head_sha (set above to the resolved commit) + j.base_sha (already the rebased
-		// base from RouteMergeConflict) record where Flowbee placed the branch. The
-		// resolver force-pushed BEFORE submitting, so GitHub already has this head — and
-		// reconcile's `flowbeePlaced` guard reads these to recognise the resolution as
-		// Flowbee's own head/base advance, not an external move (uniform with the rebase
-		// path, and race-free: the JOB row is the atomic record, not domain_b_facts).
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE domain_b_facts SET ci_green=0, updated_at=datetime('now') WHERE job_id=?`, p.JobID); err != nil {
+			return fmt.Errorf("invalidate pre-resolution CI facts: %w", err)
+		}
+		// When PushedSHA is present, j.head_sha + j.base_sha record where Flowbee placed
+		// the branch so reconcile's flowbeePlaced guard recognises its own advance. When
+		// it is absent, head_sha stays unknown until reconcile reads the resolved PR head.
 		// close the resolver lease audit row.
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE leases SET ended_at = datetime('now'), end_reason = 'completed'

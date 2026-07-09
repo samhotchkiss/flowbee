@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -146,16 +147,22 @@ func (s *Store) EnqueueMergeForJob(ctx context.Context, jobID string, now time.T
 	enqueued := false
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var prNumber sql.NullInt64
-		var headSHA, state string
+		var headSHA, baseSHA, state, verdictJSON string
 		if err := tx.QueryRowContext(ctx,
-			`SELECT pr_number, COALESCE(head_sha,''), state FROM jobs WHERE id = ?`, jobID).
-			Scan(&prNumber, &headSHA, &state); err != nil {
+			`SELECT pr_number, COALESCE(head_sha,''), COALESCE(base_sha,''), state, COALESCE(verdict,'')
+			   FROM jobs WHERE id = ?`, jobID).
+			Scan(&prNumber, &headSHA, &baseSHA, &state, &verdictJSON); err != nil {
 			return err
 		}
 		if !prNumber.Valid || prNumber.Int64 <= 0 {
 			return nil // no PR to enqueue
 		}
 		if job.State(state) != job.StateMerging && job.State(state) != job.StateMergeHandoff {
+			return nil
+		}
+		var verdict job.Verdict
+		if verdictJSON == "" || json.Unmarshal([]byte(verdictJSON), &verdict) != nil ||
+			!verdict.Verify(headSHA, baseSHA) {
 			return nil
 		}
 		if err := enqueueOutboxTx(ctx, tx, OutboxRow{
@@ -168,6 +175,45 @@ func (s *Store) EnqueueMergeForJob(ctx context.Context, jobID string, now time.T
 		return nil
 	})
 	return enqueued, err
+}
+
+// InvalidateStaleMergeAuthorization fails closed after GitHub rejects an
+// expected-head merge or project-OUT detects that its outbox row no longer
+// matches the persisted verdict. The verdict is invalidated, the build is
+// re-armed, and every pending SHA-bound rendering is retained as abandoned
+// history. For adopted PRs, keep the cumulative patch so base-starting builders
+// can apply it before making the requested correction.
+func (s *Store) InvalidateStaleMergeAuthorization(ctx context.Context, jobID string, now time.Time) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		j, seq, err := loadJobTx(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		if j.State != job.StateMerging && j.State != job.StateMergeHandoff {
+			_, err := tx.ExecContext(ctx, `
+				UPDATE outbox SET status='abandoned', sent_at=datetime('now')
+				 WHERE job_id=? AND action=? AND status='pending'`, jobID, ActionEnqueueMerge)
+			return err
+		}
+		var adopted int
+		var cumulativePatch, declared string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(adopted,0), COALESCE(patch_diff,''), COALESCE(declared_blast_radius,'')
+			   FROM jobs WHERE id=?`, jobID).Scan(&adopted, &cumulativePatch, &declared); err != nil {
+			return err
+		}
+		if err := supersedeTx(ctx, tx, &j, seq, ReconciledPR{BaseSHA: j.BaseSHA}, "project-out", now); err != nil {
+			return err
+		}
+		if adopted == 1 && cumulativePatch != "" {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE jobs SET patch_diff=?, declared_blast_radius=? WHERE id=?`,
+				cumulativePatch, declared, jobID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // JobPR returns the stamped PR number for a job (0 if none).

@@ -58,3 +58,48 @@ func TestReviewFindingsCarriedToRebuild(t *testing.T) {
 	// the carry-forward is a projection field folded from the bounce event's payload.
 	assertFoldMatchesProjection(t, st, "rj")
 }
+
+func TestAdoptedReviewBouncePreservesCumulativePatch(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	src := store.DBFactSource{DB: st.DB}
+
+	driveToCodeReview(t, st, "adopted-rj", "adopted-head", "base")
+	const cumulative = "diff --git a/original.go b/original.go\n--- a/original.go\n+++ b/original.go\n@@ -1 +1 @@\n-old\n+original change\n"
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET adopted=1, patch_diff=? WHERE id='adopted-rj'`, cumulative); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReviewResult(ctx, src, job.Policy{}, store.ReviewResultParams{
+		JobID: "adopted-rj", Epoch: epochOf(t, st, "adopted-rj"),
+		Claim: job.VerdictChangesRequested, Notes: "correct the edge case", Now: time.Unix(3000, 0),
+	}); err != nil {
+		t.Fatalf("bounce adopted PR: %v", err)
+	}
+	if got, err := st.JobPatchDiff(ctx, "adopted-rj"); err != nil || got != cumulative {
+		t.Fatalf("adopted cumulative patch after bounce=%q err=%v, want preserved patch", got, err)
+	}
+}
+
+func TestReviewMintsFromFreshFactsWhenJobHeadUnknown(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	src := store.DBFactSource{DB: st.DB}
+	driveToCodeReview(t, st, "unknown-review-head", "reconciled-head", "base")
+	if _, err := st.DB.ExecContext(ctx,
+		`UPDATE jobs SET head_sha='' WHERE id='unknown-review-head'`); err != nil {
+		t.Fatal(err)
+	}
+	mustGreen(t, st, "unknown-review-head", "reconciled-head", "base")
+
+	resp, err := st.ReviewResult(ctx, src, job.Policy{}, store.ReviewResultParams{
+		JobID: "unknown-review-head", Epoch: epochOf(t, st, "unknown-review-head"),
+		Claim: job.VerdictApproved, Disposition: job.DispositionHandoff, Now: time.Unix(3000, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Minted {
+		t.Fatalf("fresh authoritative facts must mint when the job head is unknown: %+v", resp)
+	}
+}

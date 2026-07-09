@@ -322,9 +322,9 @@ var ErrMergeRuleViolationPending = errors.New("merge blocked by pending reposito
 // the merge again." — returned when the merge call pins an expected-head `sha` and the
 // PR's live head no longer matches it. This is the SAFETY interlock against an
 // approve-then-push race: the gate minted its verdict against the reviewed head, but a
-// commit landed on the feature branch afterward. Because `merging` is non-supersedable,
-// without this pin GitHub would merge the unreviewed head. The sender routes this to the
-// human merge gate (handoff) — never a silent merge, never a blind retry of the moved head.
+// commit landed on the feature branch afterward. The sender invalidates the verdict,
+// abandons the stale merge outbox row, and re-arms independent review — never a
+// silent merge or a blind retry of the moved head.
 var ErrMergeHeadModified = errors.New("merge head branch was modified after review")
 
 // ErrGitHub is a non-2xx REST response carrying its status code, so the sender can
@@ -1168,16 +1168,16 @@ func (c *RealClient) EnqueueMergeQueue(ctx context.Context, number int, expected
 	if expectedHead != "" {
 		// SHA interlock: GitHub merges ONLY if the PR head still equals the head the
 		// gate reviewed. If a commit landed after approval, GitHub 409s rather than
-		// merging the unreviewed head (see ErrMergeHeadModified). `merging` is
-		// non-supersedable, so this pin is the only thing standing between an
-		// approve-then-push race and an unreviewed autonomous merge.
+		// merging the unreviewed head (see ErrMergeHeadModified). This atomic
+		// GitHub check backs up reconcile-IN and catches a move that races the
+		// final project-OUT call.
 		body["sha"] = expectedHead
 	}
 	err := c.rest(ctx, http.MethodPut, fmt.Sprintf("/pulls/%d/merge", number), body, nil)
 	if err != nil && isHeadModified(err) {
 		// the reviewed head moved under us — do NOT merge, do NOT blind-retry (the head
-		// is still the unreviewed one); surface the typed error so the sender routes to
-		// the human merge gate.
+		// is still the unreviewed one); surface the typed error so the sender invalidates
+		// the stale approval and re-arms review.
 		return fmt.Errorf("%w: %v", ErrMergeHeadModified, err)
 	}
 	if err != nil && isBaseModified(err) {

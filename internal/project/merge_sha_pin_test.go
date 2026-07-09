@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
 // TestAutonomousMergePinsReviewedHead: the merge call carries the reviewed head as the
@@ -27,11 +28,7 @@ func TestAutonomousMergePinsReviewedHead(t *testing.T) {
 	}
 }
 
-// TestAutonomousMergeDeferredWhenHeadMoved: the approve-then-push race with a REAL content
-// change. The PR's live head moved to an unreviewed commit AND its base..head diff differs
-// from what was reviewed, so the content-equality recovery (russ #214) correctly declines
-// and the sender routes to the human merge gate — never merging the unreviewed change.
-func TestAutonomousMergeDeferredWhenHeadMoved(t *testing.T) {
+func TestAutonomousMergeHeadMoveRearmsReviewAndAbandonsOutbox(t *testing.T) {
 	st, fake, sender, _ := newSender(t)
 	ctx := context.Background()
 	// live head "moved-head" carries a DIFFERENT diff than the reviewed "head-sha".
@@ -52,16 +49,22 @@ func TestAutonomousMergeDeferredWhenHeadMoved(t *testing.T) {
 	if n := fake.Enqueued(); len(n) != 0 {
 		t.Fatalf("a moved head with CHANGED content must NOT merge, got enqueued=%v", n)
 	}
-	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateMergeHandoff {
-		t.Fatalf("state=%s, want merge_handoff (real content change -> human gate)", j.State)
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateReady || j.Verdict != nil {
+		t.Fatalf("state/verdict=%s/%+v, want ready/nil after stale merge authorization", j.State, j.Verdict)
+	}
+	var status string
+	if err := st.DB.QueryRowContext(ctx,
+		`SELECT status FROM outbox WHERE job_id='j' AND action=?`, store.ActionEnqueueMerge).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "abandoned" {
+		t.Fatalf("stale merge outbox status=%q want abandoned", status)
 	}
 }
 
-// TestHeadModifiedCosmeticMoveMerges: russ #214. The PR head moved after the verdict (a
-// reviewer's empty --allow-empty findings-commit) but the base..head DIFF is byte-identical
-// to what was reviewed — a cosmetic move. The content-equality recovery merges the live
-// head instead of rotting in merge_handoff for hours. Safe: it merges only identical content.
-func TestHeadModifiedCosmeticMoveMerges(t *testing.T) {
+// Byte-identical content is still a different commit. Independent review and CI
+// authorize an exact SHA, not a tree equivalence class.
+func TestHeadModifiedCosmeticMoveAlsoRearmsReview(t *testing.T) {
 	st, fake, sender, _ := newSender(t)
 	ctx := context.Background()
 	// live head "cosmetic-head" — DiffBetween returns the SAME diffOut for every head, so the
@@ -73,13 +76,10 @@ func TestHeadModifiedCosmeticMoveMerges(t *testing.T) {
 	if _, err := sender.DrainOnce(ctx); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if n := fake.Enqueued(); len(n) != 1 || n[0] != 42 {
-		t.Fatalf("a cosmetic head move with IDENTICAL content must merge, got enqueued=%v", n)
+	if n := fake.Enqueued(); len(n) != 0 {
+		t.Fatalf("a different live SHA must not merge even with identical content, got %v", n)
 	}
-	if got := fake.MergeHead(42); got != "cosmetic-head" {
-		t.Fatalf("must re-merge pinned to the content-verified LIVE head, got %q", got)
-	}
-	if j, _ := st.GetJob(ctx, "j"); j.State == job.StateMergeHandoff {
-		t.Fatalf("a content-verified cosmetic move must NOT hand off to a human")
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateReady || j.Verdict != nil {
+		t.Fatalf("cosmetic SHA move state/verdict=%s/%+v want ready/nil", j.State, j.Verdict)
 	}
 }
