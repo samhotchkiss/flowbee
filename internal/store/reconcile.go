@@ -112,7 +112,7 @@ func FormatCIFailures(failingChecks []string, checkURLs map[string]string) strin
 //     re-dispatches it (closes the double-merge failure at ingestion).
 //
 // Then the §3.4 reconcile-driven transitions:
-//   - merged PR + non-terminal job -> done (the terminal Domain-B fact).
+//   - merged PR + terminal-green required CI + non-terminal job -> done.
 //   - a head/base SHA MOVE on an open PR whose job holds a SHA-bound verdict ->
 //     superseded + re-arm (I-5): invalidate the verdict, route to ready with the
 //     new base, revoke any active lease (epoch bump), re-run review + CI.
@@ -209,7 +209,7 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 				return err
 			}
 			out.Applied = true
-		case pr.Merged && pr.MergeCommit != "" && prBoundActive(j.State):
+		case pr.Merged && pr.MergeCommit != "" && pr.CIGreen && prBoundActive(j.State):
 			// the terminal Domain-B fact: the job is done. No counter or verdict edit.
 			// GATE on prBoundActive (a non-terminal state that HAS an open PR), NOT merely
 			// "not done": a merged PR completes a job ONLY from a state that legitimately

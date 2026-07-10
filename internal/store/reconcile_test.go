@@ -184,7 +184,7 @@ func TestTerminalSHAGuard(t *testing.T) {
 	t1 := time.Unix(6000, 0)
 	// reconcile a merged PR: terminal. The job goes done; merge_commit recorded.
 	out, err := st.ApplyReconciledPR(ctx, "jt", store.ReconciledPR{
-		Number: 9, UpdatedAt: t1, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "merge-sha",
+		Number: 9, UpdatedAt: t1, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "merge-sha", CIGreen: true,
 	}, t1)
 	if err != nil {
 		t.Fatalf("apply merged: %v", err)
@@ -229,7 +229,7 @@ func TestTerminalFactRepairsActiveProjection(t *testing.T) {
 
 	now := time.Unix(7000, 0)
 	out, err := st.ApplyReconciledPR(ctx, "jr", store.ReconciledPR{
-		Number: 19, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "merge-sha",
+		Number: 19, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "merge-sha", CIGreen: true,
 	}, now)
 	if err != nil {
 		t.Fatalf("repair terminal fact: %v", err)
@@ -271,6 +271,43 @@ func TestMergedPRWithFailedRequiredCheckDoesNotMarkDone(t *testing.T) {
 		if !strings.Contains(j.LastCIFailures, want) {
 			t.Fatalf("last_ci_failures=%q missing %q", j.LastCIFailures, want)
 		}
+	}
+}
+
+func TestMergedPRWithPendingRequiredCheckWaitsBeforeDone(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	seedBuildPR(t, st, "jpending", 30)
+	markMergeable(t, st, "jpending")
+
+	now := time.Unix(7100, 0)
+	out, err := st.ApplyReconciledPR(ctx, "jpending", store.ReconciledPR{
+		Number: 30, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b",
+		Merged: true, MergeCommit: "merge-sha",
+	}, now)
+	if err != nil {
+		t.Fatalf("apply merged pending: %v", err)
+	}
+	if out.Done {
+		t.Fatalf("merged PR with pending required CI must not be marked done: %+v", out)
+	}
+	if j, _ := st.GetJob(ctx, "jpending"); j.State != job.StateMergeable {
+		t.Fatalf("state=%s, want mergeable while required CI is pending", j.State)
+	}
+
+	later := now.Add(time.Minute)
+	out, err = st.ApplyReconciledPR(ctx, "jpending", store.ReconciledPR{
+		Number: 30, UpdatedAt: later, HeadSHA: "h", BaseSHA: "b",
+		Merged: true, MergeCommit: "merge-sha", CIGreen: true,
+	}, later)
+	if err != nil {
+		t.Fatalf("apply merged green: %v", err)
+	}
+	if !out.Done {
+		t.Fatalf("merged PR must complete after required CI turns green: %+v", out)
+	}
+	if j, _ := st.GetJob(ctx, "jpending"); j.State != job.StateDone {
+		t.Fatalf("state=%s, want done after required CI turns green", j.State)
 	}
 }
 
@@ -511,7 +548,7 @@ func TestBaseRefreshOnMerge(t *testing.T) {
 	seedBuildPR(t, st, "merged1", 9)
 	markMergeable(t, st, "merged1")
 	if _, err := st.ApplyReconciledPR(ctx, "merged1", store.ReconciledPR{
-		Number: 9, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "NEWMAIN",
+		Number: 9, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "NEWMAIN", CIGreen: true,
 	}, now); err != nil {
 		t.Fatalf("apply merge: %v", err)
 	}
@@ -561,7 +598,7 @@ func TestReconcileParksOnClosedUnmergedPR(t *testing.T) {
 	seedBuildPR(t, st, "jm2", 8)
 	_, _ = st.DB.ExecContext(ctx, `UPDATE jobs SET state='merging' WHERE id='jm2'`)
 	if _, err := st.ApplyReconciledPR(ctx, "jm2", store.ReconciledPR{
-		Number: 8, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "m",
+		Number: 8, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "m", CIGreen: true,
 	}, now); err != nil {
 		t.Fatalf("apply merged: %v", err)
 	}

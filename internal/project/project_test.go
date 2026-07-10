@@ -249,7 +249,7 @@ func TestMergedJobDeletesItsIssueBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.ApplyReconciledPR(ctx, "m", store.ReconciledPR{
-		Number: 77, Merged: true, MergeCommit: "mc", HeadSHA: "h", BaseSHA: "b",
+		Number: 77, Merged: true, MergeCommit: "mc", HeadSHA: "h", BaseSHA: "b", CIGreen: true,
 	}, clk.Now()); err != nil {
 		t.Fatalf("reconcile merged: %v", err)
 	}
