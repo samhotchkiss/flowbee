@@ -63,6 +63,101 @@ func TestSweepMatchesScriptedRepo(t *testing.T) {
 	}
 }
 
+func TestRequiredChecksAuthorizeOnlyCompleteCurrentHead(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(30, 0)
+
+	t.Run("late required failure never reaches review or merge", func(t *testing.T) {
+		st := testutil.NewStore(t)
+		seed(t, st, "late-fail", 271)
+		if _, err := st.DB.ExecContext(ctx, `
+			UPDATE jobs
+			   SET state='review_pending', required_capabilities='["role:code_reviewer"]',
+			       head_sha='visible-head', base_sha='visible-base'
+			 WHERE id='late-fail'`); err != nil {
+			t.Fatal(err)
+		}
+
+		f := gh.NewFake()
+		f.SetBranchProtection("main", gh.Protection{RequiredChecks: []string{"fast", "late"}})
+		f.SetPR(gh.PullRequest{
+			Number: 271, HeadRefOid: "visible-head", BaseRefOid: "visible-base",
+			CIRollup: gh.CISuccess, CIHasRealSuccess: true,
+			PassedChecks: []string{"fast"}, UpdatedAt: time.Unix(10, 0),
+		})
+		rec := reconcile.New(st, f, clock.NewFake(now), nil)
+		if _, err := rec.Sweep(ctx); err != nil {
+			t.Fatalf("sweep partial: %v", err)
+		}
+		if candidates, err := st.ReviewPendingCandidates(ctx); err != nil {
+			t.Fatal(err)
+		} else if len(candidates) != 0 {
+			t.Fatalf("partial required-check rollup offered review candidates: %+v", candidates)
+		}
+		if j, _ := st.GetJob(ctx, "late-fail"); j.State == job.StateMergeable || j.State == job.StateMerging || j.State == job.StateMergeHandoff || j.State == job.StateDone {
+			t.Fatalf("partial required-check rollup transitioned to %s", j.State)
+		}
+
+		f.SetPR(gh.PullRequest{
+			Number: 271, HeadRefOid: "visible-head", BaseRefOid: "visible-base",
+			CIRollup: gh.CIFailure, CIHasRealSuccess: true,
+			PassedChecks: []string{"fast"}, FailingChecks: []string{"late"},
+			UpdatedAt: time.Unix(20, 0),
+		})
+		if _, err := rec.Sweep(ctx); err != nil {
+			t.Fatalf("sweep late failure: %v", err)
+		}
+		if j, _ := st.GetJob(ctx, "late-fail"); j.State != job.StateReady {
+			t.Fatalf("late required failure state=%s, want ready rebuild without approval/merge", j.State)
+		}
+	})
+
+	t.Run("complete terminal success at same visible head permits review", func(t *testing.T) {
+		st := testutil.NewStore(t)
+		seed(t, st, "all-green", 272)
+		if _, err := st.DB.ExecContext(ctx, `
+			UPDATE jobs
+			   SET state='review_pending', required_capabilities='["role:code_reviewer"]',
+			       head_sha='visible-head', base_sha='visible-base'
+			 WHERE id='all-green'`); err != nil {
+			t.Fatal(err)
+		}
+
+		f := gh.NewFake()
+		f.SetBranchProtection("main", gh.Protection{RequiredChecks: []string{"fast", "late"}})
+		f.SetPR(gh.PullRequest{
+			Number: 272, HeadRefOid: "visible-head", BaseRefOid: "visible-base",
+			CIRollup: gh.CIPending, CIHasRealSuccess: true,
+			PassedChecks: []string{"fast"}, UpdatedAt: time.Unix(10, 0),
+		})
+		rec := reconcile.New(st, f, clock.NewFake(now), nil)
+		if _, err := rec.Sweep(ctx); err != nil {
+			t.Fatalf("sweep partial: %v", err)
+		}
+		if candidates, err := st.ReviewPendingCandidates(ctx); err != nil {
+			t.Fatal(err)
+		} else if len(candidates) != 0 {
+			t.Fatalf("missing required check offered review candidates: %+v", candidates)
+		}
+
+		f.SetPR(gh.PullRequest{
+			Number: 272, HeadRefOid: "visible-head", BaseRefOid: "visible-base",
+			CIRollup: gh.CISuccess, CIHasRealSuccess: true,
+			PassedChecks: []string{"fast", "late"}, UpdatedAt: time.Unix(20, 0),
+		})
+		if _, err := rec.Sweep(ctx); err != nil {
+			t.Fatalf("sweep all green: %v", err)
+		}
+		candidates, err := st.ReviewPendingCandidates(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates) != 1 || candidates[0].JobID != "all-green" {
+			t.Fatalf("complete required-check rollup candidates=%+v, want all-green", candidates)
+		}
+	})
+}
+
 // TestSweepSupersedesOnNewCommit: a new commit (head SHA move) to an open PR whose
 // job holds a SHA-bound verdict -> superseded + re-armed (the DONE-WHEN "new commit
 // to an open PR -> job superseded + re-armed").

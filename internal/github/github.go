@@ -84,7 +84,11 @@ type PullRequest struct {
 	// UNSTABLE/PENDING overall (a non-required cosmetic check) while every REQUIRED check
 	// has passed, which is exactly when GitHub itself permits the merge.
 	PassedChecks []string
-	Labels       []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
+	// CheckContextsTruncated is true when GitHub reported more statusCheckRollup
+	// contexts than Flowbee read for this head. A partial context list cannot prove
+	// every required check is terminal-success, so reconcile must fail closed.
+	CheckContextsTruncated bool
+	Labels                 []string // read only to DETECT drift on Flowbee-owned renderings (§8.1.2)
 }
 
 // Issue is the Domain-B snapshot of one open issue from a BoardSweep. Title/Body
@@ -454,7 +458,7 @@ fragment prFields on PullRequest {
   headRefOid baseRefOid mergeStateStatus
   mergeCommit { oid }
   commits(last:1) { nodes { commit { statusCheckRollup { state
-    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
+    contexts(first:100) { pageInfo { hasNextPage } nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
   labels(first:20) { nodes { name } }
 }
 query BoardSweep($owner:String!, $repo:String!, $prCursor:String, $issueCursor:String, $includeMerged:Boolean!) {
@@ -551,7 +555,8 @@ type prNode struct {
 				StatusCheckRollup *struct {
 					State    string `json:"state"`
 					Contexts struct {
-						Nodes []struct {
+						PageInfo pageInfo `json:"pageInfo"`
+						Nodes    []struct {
 							Typename   string `json:"__typename"`
 							Name       string `json:"name"`       // CheckRun (Actions) check name
 							Conclusion string `json:"conclusion"` // CheckRun (Actions)
@@ -621,6 +626,7 @@ func prFromNode(n prNode) PullRequest {
 	if len(n.Commits.Nodes) > 0 && n.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
 		rollup := n.Commits.Nodes[0].Commit.StatusCheckRollup
 		pr.CIRollup = CIState(rollup.State)
+		pr.CheckContextsTruncated = rollup.Contexts.PageInfo.HasNextPage
 		// a REAL success = at least one NON-skipped check actually concluded SUCCESS (a CheckRun
 		// conclusion or a legacy StatusContext state). SKIPPED/NEUTRAL/missing don't count, so an
 		// all-skipped rollup (which GitHub aggregates to SUCCESS) is NOT a real success.
@@ -806,7 +812,7 @@ query PR($owner:String!, $repo:String!, $number:Int!) {
       headRefOid baseRefOid mergeStateStatus
       mergeCommit { oid }
       commits(last:1) { nodes { commit { statusCheckRollup { state
-    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
+    contexts(first:100) { pageInfo { hasNextPage } nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
       labels(first:20) { nodes { name } }
     }
   }
@@ -834,7 +840,8 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 							StatusCheckRollup *struct {
 								State    string `json:"state"`
 								Contexts struct {
-									Nodes []struct {
+									PageInfo pageInfo `json:"pageInfo"`
+									Nodes    []struct {
 										Typename   string `json:"__typename"`
 										Name       string `json:"name"`
 										Conclusion string `json:"conclusion"`
@@ -877,6 +884,7 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 	if len(n.Commits.Nodes) > 0 && n.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
 		rollup := n.Commits.Nodes[0].Commit.StatusCheckRollup
 		pr.CIRollup = CIState(rollup.State)
+		pr.CheckContextsTruncated = rollup.Contexts.PageInfo.HasNextPage
 		// a REAL success = at least one NON-skipped check actually concluded SUCCESS (a CheckRun
 		// conclusion or a legacy StatusContext state). SKIPPED/NEUTRAL/missing don't count, so an
 		// all-skipped rollup (which GitHub aggregates to SUCCESS) is NOT a real success.

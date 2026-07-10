@@ -89,79 +89,51 @@ func TestF10ArchLotteryRoutesTestJobToArmWorkerOnly(t *testing.T) {
 	}
 }
 
-// TestF10GateAcceptsFlowbeeTestCIAsWellAsActions is the F10 pluggable-CI
-// acceptance: the merge gate's ci_green@head is satisfied by EITHER a Flowbee
-// `test` job's recorded green fact OR reconciled GitHub-Actions CI. It drives the
-// REAL review gate (ClaimReviewJob -> ReviewResult) against a real SQLite DB.
-//
-// Scenario A: Actions CI is NOT green (reconciled ci_green=false), but a Flowbee
-// test job recorded green-at-head -> the gate MINTS the approval (CI satisfied by
-// the test-job provenance).
-//
-// Scenario B (control): the SAME setup with NO test-job fact and red Actions CI ->
-// the gate BOUNCES (no green from either provenance).
-func TestF10GateAcceptsFlowbeeTestCIAsWellAsActions(t *testing.T) {
+// TestFlowbeeTestCICannotAuthorizeGitHubVisiblePRHead locks the #272/#273
+// authority boundary: PR review/merge authorization is bound to the reconciled
+// GitHub-visible head and its required checks. Flowbee test facts may be recorded
+// for audit, but they cannot substitute for GitHub-required CI at the current PR
+// head — not from the current hidden test head, a prior head, or the base head.
+func TestFlowbeeTestCICannotAuthorizeGitHubVisiblePRHead(t *testing.T) {
 	ctx := context.Background()
-	src := store.DBFactSource{}
 	policy := job.Policy{} // handoff posture; CI-greenness is what we are testing
 
-	// ── Scenario A: green Flowbee test job, RED Actions ──
-	t.Run("flowbee_test_green_satisfies_gate", func(t *testing.T) {
-		st := testutil.NewStore(t)
-		src := store.DBFactSource{DB: st.DB}
-		driveToCodeReview(t, st, "buildA", "head-A", "base-A")
+	for _, c := range []struct {
+		name    string
+		factSHA string
+	}{
+		{name: "hidden_current_head", factSHA: "head-A"},
+		{name: "prior_head", factSHA: "old-head-A"},
+		{name: "base_head", factSHA: "base-A"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			st := testutil.NewStore(t)
+			src := store.DBFactSource{DB: st.DB}
+			driveToCodeReview(t, st, "buildA-"+c.name, "head-A", "base-A")
 
-		// reconciled GitHub-Actions CI is NOT green (pending/failed) — the only thing
-		// turning the gate green here is the Flowbee test job.
-		mustFacts(t, st, "buildA", job.DomainBFacts{
-			PRExists: true, PRNumber: 1, HeadSHA: "head-A", BaseSHA: "base-A",
-			CIGreen: false, Merged: false,
+			mustFacts(t, st, "buildA-"+c.name, job.DomainBFacts{
+				PRExists: true, PRNumber: 1, HeadSHA: "head-A", BaseSHA: "base-A",
+				CIGreen: false, Merged: false,
+			})
+
+			if err := st.RecordTestJobCI(ctx, "buildA-"+c.name, c.factSHA, "arm-test", true, time.Unix(2000, 0)); err != nil {
+				t.Fatalf("record test ci: %v", err)
+			}
+
+			resp, err := st.ReviewResult(ctx, src, policy, store.ReviewResultParams{
+				JobID: "buildA-" + c.name, Epoch: epochOf(t, st, "buildA-"+c.name),
+				Claim: job.VerdictApproved, Disposition: job.DispositionHandoff,
+				Now: time.Unix(3000, 0),
+			})
+			if err != nil {
+				t.Fatalf("review result: %v", err)
+			}
+			if resp.Minted || resp.JobState == string(job.StateMergeable) {
+				t.Fatalf("Flowbee test fact at %s must not authorize GitHub-visible head; resp=%+v", c.factSHA, resp)
+			}
 		})
+	}
 
-		// a Flowbee `test` job ran the build's tests and reported GREEN at head-A.
-		if err := st.RecordTestJobCI(ctx, "buildA", "head-A", "arm-test", true, time.Unix(2000, 0)); err != nil {
-			t.Fatalf("record test ci: %v", err)
-		}
-
-		resp, err := st.ReviewResult(ctx, src, policy, store.ReviewResultParams{
-			JobID: "buildA", Epoch: epochOf(t, st, "buildA"),
-			Claim: job.VerdictApproved, Disposition: job.DispositionHandoff,
-			Now: time.Unix(3000, 0),
-		})
-		if err != nil {
-			t.Fatalf("review result: %v", err)
-		}
-		if !resp.Minted {
-			t.Fatalf("gate must MINT with a green Flowbee test job even when Actions is red; resp=%+v", resp)
-		}
-		if resp.JobState != string(job.StateMergeable) {
-			t.Fatalf("approved job state=%s want mergeable", resp.JobState)
-		}
-	})
-
-	// ── Scenario B (control): no test job, RED Actions -> bounce ──
-	t.Run("no_green_from_either_provenance_bounces", func(t *testing.T) {
-		st := testutil.NewStore(t)
-		src := store.DBFactSource{DB: st.DB}
-		driveToCodeReview(t, st, "buildB", "head-B", "base-B")
-		mustFacts(t, st, "buildB", job.DomainBFacts{
-			PRExists: true, PRNumber: 2, HeadSHA: "head-B", BaseSHA: "base-B",
-			CIGreen: false, Merged: false,
-		})
-		resp, err := st.ReviewResult(ctx, src, policy, store.ReviewResultParams{
-			JobID: "buildB", Epoch: epochOf(t, st, "buildB"),
-			Claim: job.VerdictApproved, Disposition: job.DispositionHandoff,
-			Now: time.Unix(3000, 0),
-		})
-		if err != nil {
-			t.Fatalf("review result: %v", err)
-		}
-		if resp.Minted {
-			t.Fatal("gate must NOT mint with red Actions and no test-job CI")
-		}
-	})
-
-	// ── Scenario C: reconciled Actions green alone still satisfies (unchanged) ──
 	t.Run("reconciled_actions_green_alone_satisfies", func(t *testing.T) {
 		st := testutil.NewStore(t)
 		src := store.DBFactSource{DB: st.DB}
@@ -182,34 +154,6 @@ func TestF10GateAcceptsFlowbeeTestCIAsWellAsActions(t *testing.T) {
 			t.Fatal("reconciled Actions green must still satisfy the gate on its own")
 		}
 	})
-
-	// ── Scenario D: a Flowbee test green bound to a STALE head does NOT satisfy ──
-	t.Run("stale_head_test_green_does_not_satisfy", func(t *testing.T) {
-		st := testutil.NewStore(t)
-		src := store.DBFactSource{DB: st.DB}
-		driveToCodeReview(t, st, "buildD", "head-D", "base-D")
-		mustFacts(t, st, "buildD", job.DomainBFacts{
-			PRExists: true, PRNumber: 4, HeadSHA: "head-D", BaseSHA: "base-D",
-			CIGreen: false, Merged: false,
-		})
-		// green recorded at an OLD head — the build's head has since moved to head-D.
-		if err := st.RecordTestJobCI(ctx, "buildD", "old-head", "arm-test", true, time.Unix(2000, 0)); err != nil {
-			t.Fatalf("record stale test ci: %v", err)
-		}
-		resp, err := st.ReviewResult(ctx, src, policy, store.ReviewResultParams{
-			JobID: "buildD", Epoch: epochOf(t, st, "buildD"),
-			Claim: job.VerdictApproved, Disposition: job.DispositionHandoff,
-			Now: time.Unix(3000, 0),
-		})
-		if err != nil {
-			t.Fatalf("review result: %v", err)
-		}
-		if resp.Minted {
-			t.Fatal("a Flowbee test green bound to a STALE head must NOT satisfy the gate (SHA binding)")
-		}
-	})
-
-	_ = src
 }
 
 // ── helpers ──
