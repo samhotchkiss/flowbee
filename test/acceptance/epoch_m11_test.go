@@ -332,6 +332,10 @@ func TestM11_ToggleOnCleanDiffMergesUnattended(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("reconcile facts: %v", err)
 	}
+	e.fake.SetPR(gh.PullRequest{
+		Number: prNum, HeadRefOid: headSHA, BaseRefOid: e.base,
+		CIRollup: gh.CISuccess, PassedChecks: []string{"acceptance"},
+	})
 	reviewer := registerCaps(t, ctx, url, "ren", "opus", []string{"role:code_reviewer", "model_family:opus"})
 	rg, ok, err := reviewer.Lease(ctx, "ren", "opus", string(job.RoleCodeReviewer))
 	if err != nil || !ok || rg.JobID != jobID {

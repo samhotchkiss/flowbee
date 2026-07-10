@@ -72,6 +72,111 @@ func contentDenyReason(actualDiff string, allowOwnSource bool) string {
 	return "content gate (actual diff) " + strings.Join(reasons, "; ")
 }
 
+type liveMergeCIResult struct {
+	green         bool
+	failed        bool
+	failingChecks []string
+}
+
+func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedHead string) (liveMergeCIResult, error) {
+	reader, ok := s.gh.(gh.Client)
+	if !ok || prNumber == 0 {
+		return liveMergeCIResult{}, errMergeCINotReady
+	}
+	pr, ok, err := reader.PullRequest(ctx, prNumber)
+	if err != nil {
+		return liveMergeCIResult{}, err
+	}
+	if !ok {
+		return liveMergeCIResult{}, errMergeCINotReady
+	}
+	if expectedHead != "" && pr.HeadRefOid != expectedHead {
+		return liveMergeCIResult{}, errStaleMergeAuthorization
+	}
+	if ms, ok := s.gh.(gh.MergeUnsticker); ok {
+		state, found, err := ms.PullMergeableState(ctx, prNumber)
+		if err != nil {
+			return liveMergeCIResult{}, err
+		}
+		if !found || strings.EqualFold(state, "unknown") {
+			return liveMergeCIResult{}, errMergeCINotReady
+		}
+	}
+	required, err := s.requiredChecks(ctx)
+	if err != nil {
+		return liveMergeCIResult{}, err
+	}
+	if len(required) > 0 {
+		return liveMergeCIResult{
+			green:         pr.CIHasRealSuccess && checksContainAll(pr.PassedChecks, required),
+			failed:        checksIntersect(pr.FailingChecks, required),
+			failingChecks: intersectNames(pr.FailingChecks, required),
+		}, nil
+	}
+	return liveMergeCIResult{
+		green:         pr.CIHasRealSuccess && pr.CIRollup == gh.CISuccess,
+		failed:        pr.CIRollup == gh.CIFailure || pr.CIRollup == gh.CIError,
+		failingChecks: append([]string(nil), pr.FailingChecks...),
+	}, nil
+}
+
+func (s *Sender) requiredChecks(ctx context.Context) ([]string, error) {
+	branch := orDefault(s.baseBranch, "main")
+	if rr, ok := s.gh.(gh.RequiredChecksReader); ok {
+		checks, err := rr.BranchRequiredChecks(ctx, branch)
+		if err != nil {
+			return nil, err
+		}
+		if len(checks) > 0 {
+			return checks, nil
+		}
+	}
+	if br, ok := s.gh.(gh.BranchProtectionReader); ok {
+		prot, ok, err := br.BranchProtection(ctx, branch)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return prot.RequiredChecks, nil
+		}
+	}
+	return nil, nil
+}
+
+func checksContainAll(have, required []string) bool {
+	set := make(map[string]bool, len(have))
+	for _, h := range have {
+		set[h] = true
+	}
+	for _, req := range required {
+		if !set[req] {
+			return false
+		}
+	}
+	return true
+}
+
+func checksIntersect(xs, ys []string) bool {
+	return len(intersectNames(xs, ys)) > 0
+}
+
+func intersectNames(xs, ys []string) []string {
+	if len(xs) == 0 || len(ys) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(ys))
+	for _, y := range ys {
+		set[y] = true
+	}
+	var out []string
+	for _, x := range xs {
+		if set[x] {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
 // Clock is the injected clock (DESIGN: Flowbee is the sole clock).
 type Clock interface{ Now() time.Time }
 
@@ -92,6 +197,8 @@ const maxOutboxAttempts = 100
 const mergeMergeabilityRetries = 3
 
 var errStaleMergeAuthorization = errors.New("merge authorization does not match the reviewed head")
+var errMergeCINotReady = errors.New("merge blocked: live required checks are not terminal green")
+var errMergeCIFailedRouted = errors.New("merge blocked: live required checks failed and repair was routed")
 
 // criticalAction reports whether a permanently-failed outbox action should escalate
 // its job to a human (it blocks the pipeline: no PR -> no review/merge; no merge -> no
@@ -267,6 +374,12 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 				if s.pub != nil {
 					s.pub.PublishReconcile(row.JobID, "project_out:merge_head_superseded")
 				}
+				continue
+			}
+			if errors.Is(err, errMergeCINotReady) {
+				return sent, nil
+			}
+			if errors.Is(err, errMergeCIFailedRouted) {
 				continue
 			}
 			var ra *gh.ErrRetryAfter
@@ -558,6 +671,22 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 				}
 				return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
 			}
+		}
+		ci, err := s.liveMergeCI(ctx, number, expectedHead)
+		if err != nil {
+			return "", err
+		}
+		if ci.failed {
+			if rerr := s.store.RoutePostApprovalCIFailure(ctx, row.JobID, ci.failingChecks, s.clock.Now()); rerr != nil {
+				return "", fmt.Errorf("route post-approval CI failure: %w", rerr)
+			}
+			if s.pub != nil {
+				s.pub.PublishReconcile(row.JobID, "project_out:merge_ci_failed")
+			}
+			return "", errMergeCIFailedRouted
+		}
+		if !ci.green {
+			return "", errMergeCINotReady
 		}
 		if err := s.gh.EnqueueMergeQueue(ctx, number, expectedHead); err != nil {
 			if errors.Is(err, gh.ErrMergeRuleViolationPending) && gh.IsMergeRuleBehind(err) {

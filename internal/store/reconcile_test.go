@@ -241,6 +241,33 @@ func TestTerminalFactRepairsActiveProjection(t *testing.T) {
 	}
 }
 
+func TestMergedPRWithFailedRequiredCheckDoesNotMarkDone(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	seedBuildPR(t, st, "jpost", 29)
+	markMergeable(t, st, "jpost")
+
+	now := time.Unix(7000, 0)
+	out, err := st.ApplyReconciledPR(ctx, "jpost", store.ReconciledPR{
+		Number: 29, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b",
+		Merged: true, MergeCommit: "merge-sha",
+		CIFailed: true, FailingChecks: []string{"backend shard 2"},
+	}, now)
+	if err != nil {
+		t.Fatalf("apply merged red: %v", err)
+	}
+	if out.Done {
+		t.Fatalf("merged PR with failed required CI must not be marked done: %+v", out)
+	}
+	j, _ := st.GetJob(ctx, "jpost")
+	if j.State != job.StateNeedsHuman || j.EscalationReason != string(job.EscalationPostMergeCI) {
+		t.Fatalf("state/reason=%s/%q, want needs_human/%s", j.State, j.EscalationReason, job.EscalationPostMergeCI)
+	}
+	if j.LastCIFailures != "backend shard 2" {
+		t.Fatalf("last_ci_failures=%q, want failed check name", j.LastCIFailures)
+	}
+}
+
 // TestSupersedeOnSHAMove: a new head SHA on an open PR (with the job past build)
 // supersedes the SHA-bound verdict and re-arms to ready against the new base, with
 // the lease epoch bumped (I-5, §6.2.4). And the ledger replays to the same row.

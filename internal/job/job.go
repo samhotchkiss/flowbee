@@ -198,6 +198,10 @@ const (
 	// requeue) rather than hunting the job. A silent indefinite review is a worse failure
 	// than a clear page, so the watchdog surfaces it instead of waiting forever.
 	EscalationCIStalled EscalationReason = "ci_stalled"
+	// EscalationPostMergeCI is the post-merge red-main trigger: GitHub reports the PR
+	// merged, but a required check at the merged head failed. Do not silently mark the
+	// job done; surface an explicit repair/human state with the failed checks recorded.
+	EscalationPostMergeCI EscalationReason = "post_merge_ci"
 	// EscalationPRClosed: a human CLOSED the job's PR without merging (rejected the
 	// change). The job is parked promptly with this legible reason instead of waiting
 	// on a merge that will never come (and instead of a misleading `stall`).

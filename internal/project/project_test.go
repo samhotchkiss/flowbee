@@ -276,6 +276,7 @@ func TestTransientNotMergeableRetriedNotResolved(t *testing.T) {
 		t.Fatal(err)
 	}
 	setMergingAuthorization(t, st, "t", "b", "h")
+	setLiveGreenPR(fake, 42, "b", "h")
 	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
 		JobID: "t", Action: store.ActionEnqueueMerge, HeadSHA: "h", Payload: `{"pr_number":42}`,
 	}); err != nil {

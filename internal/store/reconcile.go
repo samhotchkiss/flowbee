@@ -181,6 +181,11 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		// reconcile-driven transitions (§3.4). These move STATE only as a consequence
 		// of a GitHub-owned fact changing — never a stage/role/verdict edit.
 		switch {
+		case pr.Merged && pr.MergeCommit != "" && pr.CIFailed && prBoundActive(j.State):
+			if err := postMergeCIFailureTx(ctx, tx, &j, seq, now, pr.FailingChecks); err != nil {
+				return err
+			}
+			out.Applied = true
 		case pr.Merged && pr.MergeCommit != "" && prBoundActive(j.State):
 			// the terminal Domain-B fact: the job is done. No counter or verdict edit.
 			// GATE on prBoundActive (a non-terminal state that HAS an open PR), NOT merely
@@ -301,6 +306,28 @@ func prBoundActive(s job.State) bool {
 	default:
 		return false
 	}
+}
+
+func postMergeCIFailureTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time, failingChecks []string) error {
+	nextSeq := seq + 1
+	ev := ledger.Event{
+		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
+		FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
+		Actor: "reconcile", CreatedAt: now,
+		Payload: ledger.Payload{EscalationReason: string(job.EscalationPostMergeCI)},
+	}
+	if err := appendEvent(ctx, tx, ev); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state='needs_human', escalation_reason=?, last_ci_failures=?,
+		     lease_id=NULL, bound_identity=NULL, bound_model_family=NULL, lease_hb_due=NULL,
+		     updated_at=datetime('now') WHERE id=?`,
+		string(job.EscalationPostMergeCI), strings.Join(failingChecks, "\n"), j.ID); err != nil {
+		return fmt.Errorf("apply post-merge CI failure: %w", err)
+	}
+	j.State = job.StateNeedsHuman
+	return setJobSeq(ctx, tx, j.ID, nextSeq)
 }
 
 // escalatePRClosedTx parks a job whose PR a human closed without merging: needs_human
