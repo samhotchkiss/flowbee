@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
@@ -20,9 +21,12 @@ func TestAdoptPRForReview(t *testing.T) {
 	now := time.Unix(9000, 0)
 
 	const patch = "diff --git a/x.go b/x.go\nindex 1111111..2222222 100644\n--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-old\n+new\n"
-	id, err := st.AdoptPRForReview(ctx, "russ", 4242, "base-sha", "head-sha", patch, false, false, true, false, now, now)
+	id, rearmed, err := st.AdoptPRForReview(ctx, "russ", 4242, "base-sha", "head-sha", patch, false, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("adopt: %v", err)
+	}
+	if rearmed {
+		t.Fatal("first adopt must not report re-armed")
 	}
 	if id == "" {
 		t.Fatal("expected a new adopted job id")
@@ -62,12 +66,12 @@ func TestAdoptPRForReview(t *testing.T) {
 	}
 
 	// idempotent: re-adopting the same PR is a no-op ("" id), no duplicate job.
-	again, err := st.AdoptPRForReview(ctx, "russ", 4242, "base-sha", "head-sha", patch, false, false, true, false, now, now)
+	again, rearmed, err := st.AdoptPRForReview(ctx, "russ", 4242, "base-sha", "head-sha", patch, false, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("re-adopt: %v", err)
 	}
-	if again != "" {
-		t.Fatalf("re-adopting a tracked PR must be a no-op, got new id %q", again)
+	if again != "" || rearmed {
+		t.Fatalf("re-adopting an unchanged tracked PR must be a no-op, got id=%q rearmed=%v", again, rearmed)
 	}
 }
 
@@ -76,7 +80,7 @@ func TestAdoptPRForReviewReadoptsAfterCancel(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(9000, 0)
 
-	firstID, err := st.AdoptPRForReview(ctx, "russ", 4078, "base-1", "head-1", "diff --git a/old b/old\n", false, false, true, false, now, now)
+	firstID, _, err := st.AdoptPRForReview(ctx, "russ", 4078, "base-1", "head-1", "diff --git a/old b/old\n", false, false, true, false, now, now)
 	if err != nil || firstID == "" {
 		t.Fatalf("first adopt: id=%q err=%v", firstID, err)
 	}
@@ -85,9 +89,12 @@ func TestAdoptPRForReviewReadoptsAfterCancel(t *testing.T) {
 	}
 
 	const newPatch = "diff --git a/new b/new\n"
-	secondID, err := st.AdoptPRForReview(ctx, "russ", 4078, "base-2", "head-2", newPatch, false, false, false, false, now.Add(2*time.Minute), now.Add(2*time.Minute))
+	secondID, rearmed, err := st.AdoptPRForReview(ctx, "russ", 4078, "base-2", "head-2", newPatch, false, false, false, false, now.Add(2*time.Minute), now.Add(2*time.Minute))
 	if err != nil {
 		t.Fatalf("re-adopt: %v", err)
+	}
+	if rearmed {
+		t.Fatal("re-adopt after cancel creates a replacement, not an in-place re-arm")
 	}
 	if secondID == "" || secondID == firstID {
 		t.Fatalf("re-adopt after cancel must create a fresh job, first=%q second=%q", firstID, secondID)
@@ -137,7 +144,7 @@ func TestAdoptPRForReviewSkipsOriginatedPR(t *testing.T) {
 		t.Fatalf("stamp pr: %v", err)
 	}
 
-	id, err := st.AdoptPRForReview(ctx, "russ", 555, "base", "head", "diff --git a/x b/x\n", false, false, true, false, now, now)
+	id, _, err := st.AdoptPRForReview(ctx, "russ", 555, "base", "head", "diff --git a/x b/x\n", false, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("adopt: %v", err)
 	}
@@ -151,27 +158,30 @@ func TestAdoptPRForReviewRefreshesLegacyAndHeadMove(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(9000, 0)
 
-	id, err := st.AdoptPRForReview(ctx, "russ", 99, "base1", "head1", "", false, false, true, false, now, now)
+	id, _, err := st.AdoptPRForReview(ctx, "russ", 99, "base1", "head1", "", false, false, true, false, now, now)
 	if err != nil || id == "" {
 		t.Fatalf("legacy seed adopt id=%q err=%v", id, err)
 	}
 	if d, _ := st.JobPatchDiff(ctx, id); d != "" {
 		t.Fatalf("legacy setup patch=%q, want empty", d)
 	}
-	again, err := st.AdoptPRForReview(ctx, "russ", 99, "base1", "head1", "diff --git a/a b/a\n", false, false, true, false, now, now)
+	again, rearmed, err := st.AdoptPRForReview(ctx, "russ", 99, "base1", "head1", "diff --git a/a b/a\n", false, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("backfill adopt: %v", err)
 	}
-	if again != "" {
-		t.Fatalf("backfill should not duplicate, got id %q", again)
+	if again != "" || rearmed {
+		t.Fatalf("backfill should not duplicate or re-arm, got id=%q rearmed=%v", again, rearmed)
 	}
 	if d, _ := st.JobPatchDiff(ctx, id); d != "diff --git a/a b/a\n" {
 		t.Fatalf("backfilled patch=%q", d)
 	}
 
-	_, err = st.AdoptPRForReview(ctx, "russ", 99, "base1", "head2", "diff --git a/b b/b\n", false, false, true, false, now, now)
+	again, rearmed, err = st.AdoptPRForReview(ctx, "russ", 99, "base1", "head2", "diff --git a/b b/b\n", false, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("head refresh adopt: %v", err)
+	}
+	if again != id || !rearmed {
+		t.Fatalf("head refresh should re-arm existing job, got id=%q rearmed=%v", again, rearmed)
 	}
 	j, _ := st.GetJob(ctx, id)
 	if j.HeadSHA != "head2" {
@@ -182,16 +192,134 @@ func TestAdoptPRForReviewRefreshesLegacyAndHeadMove(t *testing.T) {
 	}
 }
 
+func TestAdoptPRForReviewHeadMoveRearmsReviewAndInvalidatesStaleAuthorization(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	oldDiff := "diff --git a/app.go b/app.go\n@@ -1 +1 @@\n-old\n+reviewed\n"
+	id, _, err := st.AdoptPRForReview(ctx, "russ", 4153, "base-old", "head-old", oldDiff, false, false, true, false, now, now)
+	if err != nil || id == "" {
+		t.Fatalf("adopt: id=%q err=%v", id, err)
+	}
+	v := job.MintVerdict(job.VerdictApproved, job.DispositionSelfMerge, "head-old", "base-old")
+	if _, err := st.DB.ExecContext(ctx, `
+		UPDATE jobs
+		   SET state='merge_handoff', verdict=?, lease_epoch=7, lease_id='lease-old',
+		       bound_identity='reviewer-old', bound_model_family='opus',
+		       lease_deadline=?, lease_hb_due=?, phase_deadline_at=?
+		 WHERE id=?`,
+		mustJSON(t, v), now.Add(time.Hour).Format(time.RFC3339),
+		now.Add(time.Minute).Format(time.RFC3339), now.Add(30*time.Minute).Format(time.RFC3339), id); err != nil {
+		t.Fatalf("seed stale handoff: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `
+		INSERT INTO leases (lease_id, job_id, lease_epoch, identity, model_family, granted_at, ttl_s, deadline)
+		VALUES ('lease-old', ?, 7, 'reviewer-old', 'opus', ?, 3600, ?)`,
+		id, now.Format(time.RFC3339), now.Add(time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+	if err := st.EnqueueOutbox(ctx, store.OutboxRow{JobID: id, Action: store.ActionEnqueueMerge, HeadSHA: "head-old"}); err != nil {
+		t.Fatalf("seed stale merge outbox: %v", err)
+	}
+
+	newDiff := "diff --git a/app.go b/app.go\n@@ -1 +1 @@\n-reviewed\n+fixed\n"
+	gotID, rearmed, err := st.AdoptPRForReview(ctx, "russ", 4153, "base-new", "head-new", newDiff, false, false, true, false, now.Add(time.Minute), now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("re-adopt moved head: %v", err)
+	}
+	if gotID != id || !rearmed {
+		t.Fatalf("moved head must re-arm existing job, got id=%q rearmed=%v", gotID, rearmed)
+	}
+
+	j, err := st.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("get re-armed job: %v", err)
+	}
+	if j.State != job.StateReviewPending || j.Role != job.RoleCodeReviewer || j.Stage != "review" {
+		t.Fatalf("state/role/stage=%s/%s/%s, want review_pending/code_reviewer/review", j.State, j.Role, j.Stage)
+	}
+	if j.BaseSHA != "base-new" || j.HeadSHA != "head-new" {
+		t.Fatalf("base/head=%q/%q, want refreshed base-new/head-new", j.BaseSHA, j.HeadSHA)
+	}
+	if j.Verdict != nil {
+		t.Fatalf("stale verdict survived re-arm: %+v", j.Verdict)
+	}
+	if j.LeaseEpoch != 8 || j.LeaseID != "" || j.BoundIdentity != "" {
+		t.Fatalf("lease fence not reset: epoch=%d lease=%q identity=%q", j.LeaseEpoch, j.LeaseID, j.BoundIdentity)
+	}
+	if diff, err := st.JobPatchDiff(ctx, id); err != nil || diff != newDiff {
+		t.Fatalf("review diff=%q err=%v, want refreshed diff", diff, err)
+	}
+	cands, err := st.ReviewPendingCandidates(ctx)
+	if err != nil {
+		t.Fatalf("review candidates: %v", err)
+	}
+	var found bool
+	for _, c := range cands {
+		if c.JobID == id {
+			found = true
+			if !c.CIReady {
+				t.Fatal("re-armed review candidate must carry refreshed green CI facts")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("re-armed job is not an active review candidate: %+v", cands)
+	}
+
+	var outboxStatus string
+	if err := st.DB.QueryRowContext(ctx, `
+		SELECT status FROM outbox WHERE job_id=? AND action=? AND head_sha='head-old'`,
+		id, store.ActionEnqueueMerge).Scan(&outboxStatus); err != nil {
+		t.Fatalf("read stale outbox: %v", err)
+	}
+	if outboxStatus != "abandoned" {
+		t.Fatalf("stale merge outbox status=%q, want abandoned", outboxStatus)
+	}
+	var openLeaseEnded, openLeaseReason string
+	if err := st.DB.QueryRowContext(ctx, `
+		SELECT COALESCE(ended_at,''), COALESCE(end_reason,'') FROM leases WHERE lease_id='lease-old'`).
+		Scan(&openLeaseEnded, &openLeaseReason); err != nil {
+		t.Fatalf("read lease audit: %v", err)
+	}
+	if openLeaseEnded == "" || openLeaseReason != "superseded" {
+		t.Fatalf("lease audit ended_at=%q reason=%q, want superseded closure", openLeaseEnded, openLeaseReason)
+	}
+	var leaseDeadline string
+	if err := st.DB.QueryRowContext(ctx, `SELECT COALESCE(lease_deadline,'') FROM jobs WHERE id=?`, id).Scan(&leaseDeadline); err != nil {
+		t.Fatalf("read lease deadline: %v", err)
+	}
+	if leaseDeadline != "" {
+		t.Fatalf("stale lease_deadline=%q, want cleared", leaseDeadline)
+	}
+	events, err := st.LoadEvents(ctx, id)
+	if err != nil {
+		t.Fatalf("load events: %v", err)
+	}
+	if len(events) != 2 || events[0].Kind != ledger.KindAdopted || events[1].Kind != ledger.KindAdoptRearmed {
+		t.Fatalf("audit history should preserve adopt and append re-arm, got %+v", events)
+	}
+	folded, err := ledger.Fold(events)
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if folded.State != j.State || folded.Role != j.Role || folded.BaseSHA != j.BaseSHA ||
+		folded.HeadSHA != j.HeadSHA || folded.Verdict != nil || folded.LeaseEpoch != j.LeaseEpoch {
+		t.Fatalf("fold != projection:\n fold=%+v\n proj=%+v", folded, j)
+	}
+}
+
 func TestAdoptPRForReviewScopesPRNumbersByRepo(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
 	now := time.Unix(9000, 0)
 
-	idA, err := st.AdoptPRForReview(ctx, "core", 4078, "base-a", "head-a", "diff --git a/core b/core\n", false, false, true, false, now, now)
+	idA, _, err := st.AdoptPRForReview(ctx, "core", 4078, "base-a", "head-a", "diff --git a/core b/core\n", false, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("adopt core: %v", err)
 	}
-	idB, err := st.AdoptPRForReview(ctx, "web", 4078, "base-b", "head-b", "diff --git a/web b/web\n", false, false, true, false, now, now)
+	idB, _, err := st.AdoptPRForReview(ctx, "web", 4078, "base-b", "head-b", "diff --git a/web b/web\n", false, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("adopt web: %v", err)
 	}
@@ -211,11 +339,11 @@ func TestAdoptPRForReviewJobIDUsesCollisionFreeRepoEncoding(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(9000, 0)
 
-	idA, err := st.AdoptPRForReview(ctx, "owner/repo", 4078, "base-a", "head-a", "diff --git a/slash b/slash\n", false, false, true, false, now, now)
+	idA, _, err := st.AdoptPRForReview(ctx, "owner/repo", 4078, "base-a", "head-a", "diff --git a/slash b/slash\n", false, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("adopt owner/repo: %v", err)
 	}
-	idB, err := st.AdoptPRForReview(ctx, "owner-repo", 4078, "base-b", "head-b", "diff --git a/dash b/dash\n", false, false, true, false, now, now)
+	idB, _, err := st.AdoptPRForReview(ctx, "owner-repo", 4078, "base-b", "head-b", "diff --git a/dash b/dash\n", false, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("adopt owner-repo: %v", err)
 	}
@@ -235,7 +363,7 @@ func TestAdoptPRForReviewRecordsExplicitEmptyDiff(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(9000, 0)
 
-	id, err := st.AdoptPRForReview(ctx, "russ", 12, "same", "same", "", true, false, true, false, now, now)
+	id, _, err := st.AdoptPRForReview(ctx, "russ", 12, "same", "same", "", true, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("adopt empty: %v", err)
 	}
@@ -256,7 +384,7 @@ func TestAdoptedPRMissingDiffIsNotReviewCandidate(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(9000, 0)
 
-	id, err := st.AdoptPRForReview(ctx, "russ", 13, "base", "head", "", false, false, true, false, now, now)
+	id, _, err := st.AdoptPRForReview(ctx, "russ", 13, "base", "head", "", false, false, true, false, now, now)
 	if err != nil {
 		t.Fatalf("adopt legacy missing diff: %v", err)
 	}
@@ -270,7 +398,7 @@ func TestAdoptedPRMissingDiffIsNotReviewCandidate(t *testing.T) {
 		}
 	}
 
-	if _, err := st.AdoptPRForReview(ctx, "russ", 13, "base", "head", "diff --git a/x b/x\n", false, false, true, false, now, now); err != nil {
+	if _, _, err := st.AdoptPRForReview(ctx, "russ", 13, "base", "head", "diff --git a/x b/x\n", false, false, true, false, now, now); err != nil {
 		t.Fatalf("backfill diff: %v", err)
 	}
 	cands, err = st.ReviewPendingCandidates(ctx)

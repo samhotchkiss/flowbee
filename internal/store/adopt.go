@@ -171,12 +171,16 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 // This is the TARGETED, operator-driven counterpart to AdoptSweep's first-boot mass
 // import: `flowbee adopt <pr>` calls it for one PR on demand, rather than importing
 // the whole board. It is idempotent — a PR already bound to any non-cancelled job
-// (Flowbee-originated OR previously adopted) is a no-op returning "" — so a repeated
-// adopt, or an adopt of a PR Flowbee already tracks, never creates a duplicate.
-func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int, baseSHA, headSHA, patchDiff string, diffEmpty bool, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, error) {
+// (Flowbee-originated OR previously adopted) is a no-op returning ("", false) — so a
+// repeated adopt, or an adopt of a PR Flowbee already tracks, never creates a duplicate.
+// If the already-adopted PR's authoritative base/head moved, it returns the existing
+// job id with rearmed=true after superseding stale review authorization and re-arming
+// code review against the refreshed diff.
+func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int, baseSHA, headSHA, patchDiff string, diffEmpty bool, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, bool, error) {
 	id := adoptedPRJobID(repo, prNumber)
 	replacementID := id + "-" + ulid.New()
 	adopted := ""
+	rearmed := false
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var existing string
 		var existingAdopted int
@@ -187,13 +191,69 @@ func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int,
 			  LIMIT 1`, repo, prNumber).Scan(&existing, &existingAdopted)
 		if err == nil {
 			if existingAdopted == 1 {
+				j, seq, err := loadJobTx(ctx, tx, existing)
+				if err != nil {
+					return err
+				}
+				moved := j.BaseSHA != baseSHA || j.HeadSHA != headSHA
+				if moved {
+					nextSeq := seq + 1
+					ev := ledger.Event{
+						JobID: existing, JobSeq: nextSeq, Kind: ledger.KindAdoptRearmed,
+						FromState: j.State, ToState: job.StateReviewPending, LeaseEpoch: j.LeaseEpoch + 1,
+						Actor: "operator", CreatedAt: now,
+						Payload: ledger.Payload{PRNumber: prNumber, BaseSHA: baseSHA, HeadSHA: headSHA},
+					}
+					if err := appendEvent(ctx, tx, ev); err != nil {
+						return err
+					}
+					if _, err := tx.ExecContext(ctx, `
+						UPDATE jobs
+						   SET state = 'review_pending', role = 'code_reviewer', stage = 'review',
+						       required_capabilities = ?,
+						       base_sha = ?, head_sha = ?, patch_diff = ?, diff_empty = ?,
+						       verdict = NULL,
+						       lease_epoch = lease_epoch + 1,
+						       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL, bound_lens = NULL,
+						       lease_hb_due = NULL, lease_deadline = NULL, phase_deadline_at = NULL,
+						       agent_health = '', rung1_class = '', rung2_last_verdict = 'abstain',
+						       enqueued_at = ?, updated_at = datetime('now')
+						 WHERE id = ?`,
+						marshalStrings([]string{"role:code_reviewer"}),
+						baseSHA, headSHA, patchDiff, intFromBool(diffEmpty), now.Format(rfc3339), existing); err != nil {
+						return fmt.Errorf("re-arm adopted pr %d: %w", prNumber, err)
+					}
+					if _, err := tx.ExecContext(ctx, `
+						UPDATE outbox SET status='abandoned', sent_at=datetime('now')
+						 WHERE job_id=? AND status='pending' AND head_sha<>''
+						   AND (?='' OR head_sha<>?)`, existing, headSHA, headSHA); err != nil {
+						return fmt.Errorf("abandon re-armed adopted outbox: %w", err)
+					}
+					if _, err := tx.ExecContext(ctx, `
+						UPDATE leases SET ended_at = datetime('now'), end_reason = 'superseded'
+						 WHERE job_id = ? AND ended_at IS NULL`, existing); err != nil {
+						return fmt.Errorf("close re-armed adopted lease: %w", err)
+					}
+					if err := setJobSeq(ctx, tx, existing, nextSeq); err != nil {
+						return err
+					}
+					adopted = existing
+					rearmed = true
+				} else {
+					// Same SHA: allow targeted adopt to backfill a missing/legacy diff, but do not
+					// disturb state, verdict, lease, or outbox authorization.
+					if _, err := tx.ExecContext(ctx, `
+						UPDATE jobs
+						   SET base_sha = ?, head_sha = ?, patch_diff = ?, diff_empty = ?,
+						       updated_at = datetime('now')
+						 WHERE id = ?`,
+						baseSHA, headSHA, patchDiff, intFromBool(diffEmpty), existing); err != nil {
+						return fmt.Errorf("refresh adopted pr %d: %w", prNumber, err)
+					}
+				}
 				if _, err := tx.ExecContext(ctx, `
-					UPDATE jobs
-					   SET base_sha = ?, head_sha = ?, patch_diff = ?, diff_empty = ?,
-					       updated_at = datetime('now')
-					 WHERE id = ?`,
-					baseSHA, headSHA, patchDiff, intFromBool(diffEmpty), existing); err != nil {
-					return fmt.Errorf("refresh adopted pr %d: %w", prNumber, err)
+					UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`, existing); err != nil {
+					return err
 				}
 				if err := upsertDomainBFactsTx(ctx, tx, existing, ReconciledPR{
 					Number: prNumber, HeadSHA: headSHA, BaseSHA: baseSHA,
@@ -253,7 +313,7 @@ func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int,
 		adopted = id
 		return nil
 	})
-	return adopted, err
+	return adopted, rearmed, err
 }
 
 // IsQuiescent reports whether a job is an adopted-but-not-opted-in job (§12.7).

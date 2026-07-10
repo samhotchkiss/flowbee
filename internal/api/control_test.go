@@ -141,7 +141,7 @@ func TestLeaseGrantCarriesAdoptedPRDiff(t *testing.T) {
 		t.Fatalf("register reviewer: %v", err)
 	}
 	const diff = "diff --git a/review.go b/review.go\nindex 1111111..2222222 100644\n--- a/review.go\n+++ b/review.go\n@@ -1 +1 @@\n-old\n+new\n"
-	id, err := st.AdoptPRForReview(ctx, "", 4078, "base-sha", "head-sha", diff, false, false, true, false, clk.Now(), clk.Now())
+	id, _, err := st.AdoptPRForReview(ctx, "", 4078, "base-sha", "head-sha", diff, false, false, true, false, clk.Now(), clk.Now())
 	if err != nil {
 		t.Fatalf("adopt: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestAdoptedRebuildLeaseCarriesCumulativePRDiff(t *testing.T) {
 	ctx := context.Background()
 	st, c, clk := ctrlServer(t)
 	const cumulative = "diff --git a/feature.go b/feature.go\n--- a/feature.go\n+++ b/feature.go\n@@ -1 +1 @@\n-old\n+adopted change\n"
-	id, err := st.AdoptPRForReview(ctx, "", 4138, "base", "reviewed-head", cumulative, false,
+	id, _, err := st.AdoptPRForReview(ctx, "", 4138, "base", "reviewed-head", cumulative, false,
 		false, true, false, clk.Now(), clk.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +192,7 @@ func TestLeaseGrantCarriesExplicitEmptyAdoptedPRDiff(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register reviewer: %v", err)
 	}
-	id, err := st.AdoptPRForReview(ctx, "", 12, "same", "same", "", true, false, true, false, clk.Now(), clk.Now())
+	id, _, err := st.AdoptPRForReview(ctx, "", 12, "same", "same", "", true, false, true, false, clk.Now(), clk.Now())
 	if err != nil {
 		t.Fatalf("adopt empty: %v", err)
 	}

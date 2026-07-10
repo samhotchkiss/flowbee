@@ -349,7 +349,7 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			 WHERE job_id = ? AND kind = 'verdict_claim'
 			   AND json_extract(payload, '$.VerdictClaim') = 'approved'
 			   AND job_seq > (SELECT COALESCE(MAX(job_seq),0) FROM job_events
-			                   WHERE job_id = ? AND kind IN ('result_accepted','rebased','conflict_resolved'))`,
+			                   WHERE job_id = ? AND kind IN ('result_accepted','rebased','conflict_resolved','adopt_rearmed'))`,
 			in.JobID, in.JobID).Scan(&priorApprovals); err != nil {
 			return fmt.Errorf("count round approvals: %w", err)
 		}

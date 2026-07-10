@@ -20,8 +20,9 @@ import (
 //	flowbee adopt [--repo <id>] <pr> [<pr> ...]
 //
 // --repo is required when the control plane manages more than one repo (PR numbers are
-// repo-scoped). It may be omitted when exactly one repo is registered. Idempotent: a
-// PR Flowbee already tracks is reported as already-tracked and left alone.
+// repo-scoped). It may be omitted when exactly one repo is registered. Idempotent: an
+// unchanged PR Flowbee already tracks is reported as already-tracked and left alone;
+// a tracked adopted PR whose head/base moved is re-armed and reported distinctly.
 func runAdopt(args []string) error {
 	fs := flag.NewFlagSet("adopt", flag.ContinueOnError)
 	repo := fs.String("repo", "", "repo id the PR(s) belong to (required with 2+ managed repos)")
@@ -43,11 +44,13 @@ func runAdopt(args []string) error {
 			failed = true
 			continue
 		}
-		jobID, already, status, err := c.AdoptPR(context.Background(), *repo, pr)
+		jobID, already, rearmed, status, err := c.AdoptPR(context.Background(), *repo, pr)
 		switch {
 		case err != nil:
 			fmt.Fprintf(os.Stderr, "adopt PR #%d: %v (status %d)\n", pr, err, status)
 			failed = true
+		case rearmed:
+			fmt.Printf("re-armed PR #%d -> review_pending (job %s)\n", pr, jobID)
 		case already:
 			fmt.Printf("PR #%d already tracked by Flowbee — left alone\n", pr)
 		default:

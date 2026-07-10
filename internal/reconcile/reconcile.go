@@ -199,42 +199,48 @@ func (r *Reconciler) RefetchHint(ctx context.Context, prNumber int) bool {
 // adopted code_reviewer job in review_pending via store.AdoptPRForReview. The normal
 // reconcile + project-out machinery drives it from there (review -> self-merge on
 // green, or needs_human on changes_requested). Idempotent: a PR already tracked by a
-// non-cancelled job returns ("", nil) with no new job. Returns the new job id (or ""
-// if it was already tracked / the PR does not exist).
-func (r *Reconciler) AdoptPR(ctx context.Context, prNumber int) (string, error) {
+// non-cancelled job returns ("", false, nil) with no new job. If an already-adopted
+// PR's authoritative base/head moved, the existing job is re-armed and returned with
+// rearmed=true. Returns the new/re-armed job id (or "" if it was already tracked /
+// the PR does not exist).
+func (r *Reconciler) AdoptPR(ctx context.Context, prNumber int) (string, bool, error) {
 	pr, ok, err := r.gh.PullRequest(ctx, prNumber)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if !ok {
-		return "", fmt.Errorf("pr #%d not found", prNumber)
+		return "", false, fmt.Errorf("pr #%d not found", prNumber)
 	}
 	if pr.Merged {
-		return "", fmt.Errorf("pr #%d is already merged", prNumber)
+		return "", false, fmt.Errorf("pr #%d is already merged", prNumber)
 	}
 	if pr.ClosedUnmerged {
-		return "", fmt.Errorf("pr #%d is closed unmerged", prNumber)
+		return "", false, fmt.Errorf("pr #%d is closed unmerged", prNumber)
 	}
 	ciGreen := pr.CIRollup == gh.CISuccess && pr.CIHasRealSuccess
 	differ, ok := r.gh.(gh.PRDiffer)
 	if !ok {
-		return "", fmt.Errorf("pr #%d cannot be adopted for review: github client cannot provide an authoritative diff", prNumber)
+		return "", false, fmt.Errorf("pr #%d cannot be adopted for review: github client cannot provide an authoritative diff", prNumber)
 	}
 	diff, err := differ.PullRequestDiff(ctx, prNumber, pr.BaseRefOid, pr.HeadRefOid)
 	if err != nil {
-		return "", fmt.Errorf("fetch adopted pr diff repo=%q pr=%d base=%s head=%s: %w",
+		return "", false, fmt.Errorf("fetch adopted pr diff repo=%q pr=%d base=%s head=%s: %w",
 			r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid, err)
 	}
-	id, err := r.store.AdoptPRForReview(ctx, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid,
+	id, rearmed, err := r.store.AdoptPRForReview(ctx, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid,
 		diff, diff == "",
 		pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if id != "" && r.pub != nil {
-		r.pub.PublishReconcile(id, "adopted")
+		if rearmed {
+			r.pub.PublishReconcile(id, "adopt_rearmed")
+		} else {
+			r.pub.PublishReconcile(id, "adopted")
+		}
 	}
-	return id, nil
+	return id, rearmed, nil
 }
 
 // IntakeSweep runs a reconcile sweep so a freshly labeled/opened issue is adopted on

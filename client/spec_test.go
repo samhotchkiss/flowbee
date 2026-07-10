@@ -54,3 +54,27 @@ func TestCreateSpecNon200(t *testing.T) {
 		t.Fatal("expected an error on 409, got nil")
 	}
 }
+
+func TestAdoptPRParsesRearmedResult(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/adopt" {
+			t.Fatalf("posted to %q, want /v1/adopt", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"job_id":"adopt-pr-repo-russ-4153","rearmed":true}`))
+	}))
+	defer srv.Close()
+
+	jobID, already, rearmed, status, err := New(srv.URL).AdoptPR(context.Background(), "russ", 4153)
+	if err != nil {
+		t.Fatalf("AdoptPR: %v", err)
+	}
+	if status != http.StatusOK || jobID != "adopt-pr-repo-russ-4153" || already || !rearmed {
+		t.Fatalf("status/job/already/rearmed=%d/%q/%v/%v", status, jobID, already, rearmed)
+	}
+	if gotBody["repo"] != "russ" || gotBody["pr"] != float64(4153) {
+		t.Fatalf("request body=%v, want repo russ pr 4153", gotBody)
+	}
+}
