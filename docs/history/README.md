@@ -4,19 +4,16 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 
 | Job | Title | Status | Issue | PR | Last event |
 | --- | --- | --- | --- | --- | --- |
+| [``](./unknown.md) | (untitled) | done | — | #4051 | 2026-07-09T04:53:24Z |
 | [``](./unknown.md) | (untitled) | done | — | #4050 | 2026-07-09T05:06:08Z |
-| [``](./unknown.md) | (untitled) | done | — | #4021 | 2026-07-08T15:56:22Z |
 | [``](./unknown.md) | (untitled) | done | — | #3968 | 2026-07-08T03:17:23Z |
 | [``](./unknown.md) | (untitled) | merge_handoff | — | #3969 | 2026-07-08T03:37:23Z |
 | [``](./unknown.md) | (untitled) | done | — | #3970 | 2026-07-08T04:00:08Z |
-| [``](./unknown.md) | (untitled) | done | — | #4060 | 2026-07-09T08:30:08Z |
-| [``](./unknown.md) | (untitled) | done | — | #4069 | 2026-07-09T12:18:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #4071 | 2026-07-09T12:43:38Z |
-| [``](./unknown.md) | (untitled) | done | — | #4152 | 2026-07-09T23:11:55Z |
 | [``](./unknown.md) | (untitled) | merge_handoff | — | #3990 | 2026-07-08T04:04:51Z |
 | [``](./unknown.md) | (untitled) | done | — | #3991 | 2026-07-08T04:09:52Z |
 | [``](./unknown.md) | (untitled) | done | — | #3994 | 2026-07-08T02:54:53Z |
 | [``](./unknown.md) | (untitled) | done | — | #3996 | 2026-07-08T04:30:08Z |
+| [``](./unknown.md) | (untitled) | done | — | #4138 | 2026-07-09T23:48:08Z |
 | [``](./unknown.md) | (untitled) | done | — | #3997 | 2026-07-08T04:41:23Z |
 | [``](./unknown.md) | (untitled) | done | — | #3998 | 2026-07-08T05:03:53Z |
 | [``](./unknown.md) | (untitled) | done | — | #4001 | 2026-07-08T06:02:23Z |
@@ -27,21 +24,25 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [``](./unknown.md) | (untitled) | done | — | #4018 | 2026-07-08T16:23:23Z |
 | [``](./unknown.md) | (untitled) | done | — | #4019 | 2026-07-08T16:31:38Z |
 | [``](./unknown.md) | (untitled) | done | — | #4020 | 2026-07-08T15:33:52Z |
-| [``](./unknown.md) | (untitled) | done | — | #4058 | 2026-07-09T07:18:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4021 | 2026-07-08T15:56:22Z |
 | [``](./unknown.md) | (untitled) | done | — | #4022 | 2026-07-08T16:09:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #4140 | 2026-07-09T21:46:09Z |
 | [``](./unknown.md) | (untitled) | done | — | #4025 | 2026-07-08T17:04:37Z |
+| [``](./unknown.md) | (untitled) | done | — | #4142 | 2026-07-10T02:01:37Z |
 | [``](./unknown.md) | (untitled) | done | — | #3972 | 2026-07-08T02:38:22Z |
-| [``](./unknown.md) | (untitled) | done | — | #4051 | 2026-07-09T04:53:24Z |
 | [``](./unknown.md) | (untitled) | done | — | #4052 | 2026-07-09T05:33:53Z |
 | [``](./unknown.md) | (untitled) | done | — | #4055 | 2026-07-09T06:12:52Z |
 | [``](./unknown.md) | (untitled) | done | — | #4056 | 2026-07-09T06:38:24Z |
+| [``](./unknown.md) | (untitled) | done | — | #4057 | 2026-07-09T06:25:38Z |
+| [``](./unknown.md) | (untitled) | done | — | #4058 | 2026-07-09T07:18:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4060 | 2026-07-09T08:30:08Z |
+| [``](./unknown.md) | (untitled) | done | — | #4069 | 2026-07-09T12:18:53Z |
 | [``](./unknown.md) | (untitled) | done | — | #3966 | 2026-07-08T02:48:54Z |
 | [``](./unknown.md) | (untitled) | done | — | #4153 | 2026-07-10T01:00:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #3967 | 2026-07-08T02:54:53Z |
-| [``](./unknown.md) | (untitled) | done | — | #4138 | 2026-07-09T23:48:08Z |
-| [``](./unknown.md) | (untitled) | done | — | #4057 | 2026-07-09T06:25:38Z |
+| [``](./unknown.md) | (untitled) | done | — | #4152 | 2026-07-09T23:11:55Z |
 | [``](./unknown.md) | (untitled) | done | — | #4143 | 2026-07-09T21:52:10Z |
+| [``](./unknown.md) | (untitled) | done | — | #3967 | 2026-07-08T02:54:53Z |
+| [``](./unknown.md) | (untitled) | done | — | #4140 | 2026-07-09T21:46:09Z |
+| [``](./unknown.md) | (untitled) | done | — | #4071 | 2026-07-09T12:43:38Z |
 | [``](./unknown.md) | (untitled) | done | — | #4079 | 2026-07-10T01:12:51Z |
 | [``](./unknown.md) | (untitled) | done | — | #4078 | 2026-07-09T23:29:54Z |
 | [``](./unknown.md) | (untitled) | done | — | #268 | 2026-07-09T23:29:06Z |
@@ -864,8 +865,8 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KX0TRB67N48JQA6SNVETZPXJ`](./01KX0TRB67N48JQA6SNVETZPXJ.md) | obs: instrument open-loop resurface job (runs/outcome counter + stall alert) | done | — | #4013 | 2026-07-08T12:29:22Z |
 | [`01KX0TRB6DFSTMTYWCB4C016F1`](./01KX0TRB6DFSTMTYWCB4C016F1.md) | ci: setup-ci-postgres holds global lock through readiness-wait + recreate (false-red under saturation) | done | — | #4012 | 2026-07-08T13:09:10Z |
 | [`01KX0TRB70VYNFPPDGJC8ZWZPV`](./01KX0TRB70VYNFPPDGJC8ZWZPV.md) | mail UI: Newman unreachable at 1024-1279px viewports — realign isMobile/sidebar breakpoints | done | — | #4015 | 2026-07-08T12:39:52Z |
+| [`01KX491VAW7Z7T8QE7V6CFE9N5`](./01KX491VAW7Z7T8QE7V6CFE9N5.md) | [mail stage 4] reconcile expired temporal urgency through semantic ranking | done | — | #4131 | 2026-07-10T06:42:51Z |
 | [`01KX491VCQ95P3BZQXQYCMTZSX`](./01KX491VCQ95P3BZQXQYCMTZSX.md) | [mail stage 4] resolve human identity in Newman VIP model | done | — | #4133 | 2026-07-09T21:05:25Z |
-| [`01KX491VDSFHBB34GXDZMTZ4DX`](./01KX491VDSFHBB34GXDZMTZ4DX.md) | [mail stage 4] rank decision mail above bulk search hits | done | — | #4127 | 2026-07-10T00:23:22Z |
 | [`01KX491VE71Z4DXMCMRYFBWA49`](./01KX491VE71Z4DXMCMRYFBWA49.md) | [mail stage 4] wire heavy draft weakness into quick reply and reader | done | — | #4125 | 2026-07-09T21:07:00Z |
 | [`01KX491VFZQ9R8FXX0P7XFY88H`](./01KX491VFZQ9R8FXX0P7XFY88H.md) | [mail stage 4] require evidence before rendering shipments | done | — | #4136 | 2026-07-10T00:01:38Z |
 | [`01KX491VGGGTKJ1XQQWNWDSG7H`](./01KX491VGGGTKJ1XQQWNWDSG7H.md) | [mail stage 4] protect read models from stubs and stale ranking signals | done | — | #4135 | 2026-07-09T22:13:26Z |
@@ -883,6 +884,11 @@ A read-model projection of Flowbee's event ledger: one card per completed job. T
 | [`01KX4GTQ6FCJAJVSK4YQFDRMYY`](./01KX4GTQ6FCJAJVSK4YQFDRMYY.md) | Existing issue #4123 / unsafe PR #4131. Preserve INV-10, INV-16, ADR-018 tenant safety, soft delete, transactional events, and no new table unless proven unavoidable. Do not mutate production in build/review. PR must say Refs #4123, not close it. Operator-only completion receipt, blocked on all implementation children and deployment. Run the bounded dry-run/apply against swh only after exact deployed SHA verification; measure queue completion and model spend; capture before/after API and database evidence; do not proceed if any safety gate fails. | done | #4147 | — | 2026-07-09T22:50:15Z |
 | [`01KX4QQDGYGP9F4XWZXTGKCCP1`](./01KX4QQDGYGP9F4XWZXTGKCCP1.md) | [mail stage 4] keep mail inside the iPad visual viewport | done | — | #4155 | 2026-07-10T00:56:22Z |
 | [`01KX4RNBPD9QH5PH59WJ1KZGT7`](./01KX4RNBPD9QH5PH59WJ1KZGT7.md) | adopt: re-arm review when a tracked PR head changes | done | — | #270 | 2026-07-10T01:17:17Z |
+| [`01KX4TN03DMYJNH2HB5CER659N`](./01KX4TN03DMYJNH2HB5CER659N.md) | [mail stage 4] bind reply drafts to the connected SMTP identity | done | — | #4158 | 2026-07-10T01:45:07Z |
+| [`01KX4V14M0S6MKTSNVDSDBZKS1`](./01KX4V14M0S6MKTSNVDSDBZKS1.md) | [mail stage 4] make comprehension budget outages visible and recoverable | done | — | #4142 | 2026-07-10T02:00:51Z |
+| [`01KX53JD9172BBG885B12ETYSQ`](./01KX53JD9172BBG885B12ETYSQ.md) | [mail stage 4] require real shipment evidence at writer and reader boundaries | done | — | #4165 | 2026-07-10T04:58:35Z |
+| [`01KX54HZ7BXXBTKWRE46CHDJSQ`](./01KX54HZ7BXXBTKWRE46CHDJSQ.md) | [mail stage 4] make notification groups and stale targets reachable | done | — | #4169 | 2026-07-10T05:40:35Z |
+| [`01KX58V16CQH9MVW41BHRSDGA5`](./01KX58V16CQH9MVW41BHRSDGA5.md) | merge gate allows PRs to merge while CI is still running | done | — | #271 | 2026-07-10T07:22:31Z |
 | [`cc-a-e1fcdb1`](./cc-a-e1fcdb1.md) | cc-a-e1fcdb1 | done | #84 | — | 2026-06-17T12:15:55Z |
 | [`cc-a-e1fcdb1-build`](./cc-a-e1fcdb1-build.md) | # Spec: Add token + cost reporting bullet to §3 What-it-does list | done | — | #86 | 2026-06-17T12:20:35Z |
 | [`cc-b-e1fcdb1`](./cc-b-e1fcdb1.md) | cc-b-e1fcdb1 | done | #85 | — | 2026-06-17T12:16:00Z |
