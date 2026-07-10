@@ -102,3 +102,43 @@ func TestDispatchMergeDoesNotHandoffWhileRequiredCheckPending(t *testing.T) {
 		t.Fatalf("pending required check moved to %s, want mergeable", final)
 	}
 }
+
+func TestDispatchMergeBlocksUnknownMergeableState(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	seedMergeableWithVerdict(t, st, "unknown-mergeable", 90, job.DispositionSelfMerge)
+
+	if err := st.SetReconciledFacts(ctx, "unknown-mergeable", store.ReconciledPR{
+		Number: 90, HeadSHA: "h", BaseSHA: "b", CIGreen: true, MergeableState: "UNKNOWN",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	final, err := st.DispatchMerge(ctx, staleGreenFacts{}, job.Policy{AllowSelfMerge: true},
+		store.DispatchMergeParams{JobID: "unknown-mergeable", Now: time.Unix(9200, 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final != job.StateMergeable {
+		t.Fatalf("unknown GitHub mergeable state moved to %s, want mergeable", final)
+	}
+	if enqueued, err := st.EnqueueMergeForJob(ctx, "unknown-mergeable", time.Unix(9201, 0)); err != nil {
+		t.Fatal(err)
+	} else if enqueued {
+		t.Fatal("unknown GitHub mergeable state must not enqueue a merge")
+	}
+
+	if err := st.SetReconciledFacts(ctx, "unknown-mergeable", store.ReconciledPR{
+		Number: 90, HeadSHA: "h", BaseSHA: "b", CIGreen: true, MergeableState: "CLEAN",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	final, err = st.DispatchMerge(ctx, staleGreenFacts{}, job.Policy{AllowSelfMerge: true},
+		store.DispatchMergeParams{JobID: "unknown-mergeable", Now: time.Unix(9210, 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final != job.StateMerging {
+		t.Fatalf("known-clean mergeable state moved to %s, want merging", final)
+	}
+}

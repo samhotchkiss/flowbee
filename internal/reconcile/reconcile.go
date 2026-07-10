@@ -404,16 +404,17 @@ func toReconciled(pr gh.PullRequest, mainCIRed bool, requiredChecks []string) st
 		ciFailed = pr.CIRollup == gh.CIFailure || pr.CIRollup == gh.CIError
 	}
 	return store.ReconciledPR{
-		Number:      pr.Number,
-		UpdatedAt:   pr.UpdatedAt,
-		IsDraft:     pr.IsDraft,
-		Merged:      pr.Merged,
-		HeadSHA:     pr.HeadRefOid,
-		BaseSHA:     pr.BaseRefOid,
-		MergeCommit: pr.MergeCommit,
-		MainCIRed:   mainCIRed,
-		CIGreen:     ciGreen,
-		CIFailed:    ciFailed,
+		Number:         pr.Number,
+		UpdatedAt:      pr.UpdatedAt,
+		IsDraft:        pr.IsDraft,
+		Merged:         pr.Merged,
+		HeadSHA:        pr.HeadRefOid,
+		BaseSHA:        pr.BaseRefOid,
+		MergeCommit:    pr.MergeCommit,
+		MergeableState: pr.MergeableState,
+		MainCIRed:      mainCIRed,
+		CIGreen:        ciGreen,
+		CIFailed:       ciFailed,
 		// the NAMES of the failed checks, carried to a bounced build so the rebuild brief
 		// tells the agent exactly which gate to re-run + fix (not a generic "CI was red").
 		FailingChecks:    pr.FailingChecks,

@@ -33,9 +33,10 @@ func (f DBFactSource) Facts(ctx context.Context, jobID string) (job.DomainBFacts
 		prExists, ciGreen, mrg int
 	)
 	err := f.DB.QueryRowContext(ctx, `
-		SELECT pr_exists, pr_number, head_sha, base_sha, ci_green, merged
+		SELECT pr_exists, pr_number, head_sha, base_sha, ci_green, merged, mergeable_state
 		  FROM domain_b_facts WHERE job_id = ?`, jobID).Scan(
-		&prExists, &facts.PRNumber, &facts.HeadSHA, &facts.BaseSHA, &ciGreen, &mrg)
+		&prExists, &facts.PRNumber, &facts.HeadSHA, &facts.BaseSHA, &ciGreen, &mrg,
+		&facts.MergeableState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return job.DomainBFacts{}, false, nil
 	}
@@ -54,9 +55,10 @@ func domainBFactsTx(ctx context.Context, tx *sql.Tx, jobID string) (job.DomainBF
 		prExists, ciGreen, mrg int
 	)
 	err := tx.QueryRowContext(ctx, `
-		SELECT pr_exists, pr_number, head_sha, base_sha, ci_green, merged
+		SELECT pr_exists, pr_number, head_sha, base_sha, ci_green, merged, mergeable_state
 		  FROM domain_b_facts WHERE job_id = ?`, jobID).Scan(
-		&prExists, &facts.PRNumber, &facts.HeadSHA, &facts.BaseSHA, &ciGreen, &mrg)
+		&prExists, &facts.PRNumber, &facts.HeadSHA, &facts.BaseSHA, &ciGreen, &mrg,
+		&facts.MergeableState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return job.DomainBFacts{}, false, nil
 	}
@@ -74,14 +76,16 @@ func domainBFactsTx(ctx context.Context, tx *sql.Tx, jobID string) (job.DomainBF
 // never by a worker call.
 func (s *Store) UpsertDomainBFacts(ctx context.Context, jobID string, f job.DomainBFacts) error {
 	_, err := s.DB.ExecContext(ctx, `
-		INSERT INTO domain_b_facts (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+		INSERT INTO domain_b_facts (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged, mergeable_state, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
 		ON CONFLICT (job_id) DO UPDATE SET
 		    pr_exists = excluded.pr_exists, pr_number = excluded.pr_number,
 		    head_sha = excluded.head_sha, base_sha = excluded.base_sha,
 		    ci_green = excluded.ci_green, merged = excluded.merged,
+		    mergeable_state = excluded.mergeable_state,
 		    updated_at = datetime('now')`,
-		jobID, b2i(f.PRExists), f.PRNumber, f.HeadSHA, f.BaseSHA, b2i(f.CIGreen), b2i(f.Merged))
+		jobID, b2i(f.PRExists), f.PRNumber, f.HeadSHA, f.BaseSHA, b2i(f.CIGreen), b2i(f.Merged),
+		f.MergeableState)
 	return err
 }
 

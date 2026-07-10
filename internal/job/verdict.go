@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/samhotchkiss/flowbee/internal/content"
 )
@@ -125,12 +126,13 @@ func (p Policy) RequiredReviewersOrDefault() int {
 // lands in M6). They are passed INTO the pure engine as values; the engine never
 // fetches them.
 type DomainBFacts struct {
-	PRExists bool
-	PRNumber int
-	HeadSHA  string
-	BaseSHA  string
-	CIGreen  bool
-	Merged   bool
+	PRExists       bool
+	PRNumber       int
+	HeadSHA        string
+	BaseSHA        string
+	CIGreen        bool
+	Merged         bool
+	MergeableState string
 }
 
 // GateInputs bundles everything the pure code_review gate needs to decide whether
@@ -188,10 +190,11 @@ func SelfMergeEligible(v Verdict, gh DomainBFacts, chk *content.Result, p Policy
 
 // MergeReady is the current, reconciled fact boundary for every merge arm. A job
 // may leave mergeable only while GitHub reports an open PR at a concrete head/base
-// pair with required CI terminal and successful. Pending, queued, missing, unknown,
-// failed, or already-merged facts all fail closed as CIGreen=false.
+// pair with required CI terminal and successful, and GitHub has finished computing
+// PR mergeability. Pending, queued, missing, unknown, failed, already-merged, or
+// explicit UNKNOWN mergeability facts all fail closed.
 func MergeReady(f DomainBFacts) bool {
-	return gatePredicate(f)
+	return gatePredicate(f) && !strings.EqualFold(f.MergeableState, "unknown")
 }
 
 // GateOutcome is the pure result of evaluating the code_review gate.

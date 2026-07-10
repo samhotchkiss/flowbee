@@ -124,6 +124,9 @@ func TestDecideMergeDispatchWaitsForRequiredChecks(t *testing.T) {
 		"missing_pr":    {HeadSHA: "h", BaseSHA: "b", CIGreen: true},
 		"unknown_sha":   {PRExists: true, CIGreen: true},
 		"stale_binding": {PRExists: true, HeadSHA: "new", BaseSHA: "b", CIGreen: true},
+		"unknown_mergeable_state": {
+			PRExists: true, HeadSHA: "h", BaseSHA: "b", CIGreen: true, MergeableState: "UNKNOWN",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := base

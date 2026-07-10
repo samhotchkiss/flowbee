@@ -43,6 +43,10 @@ type ReconciledPR struct {
 	BaseSHA     string
 	MergeCommit string
 	CIGreen     bool
+	// MergeableState is GitHub's computed PR mergeability. Explicit UNKNOWN means
+	// GitHub has not finished computing the mergeability graph yet and must fail
+	// the merge gate closed.
+	MergeableState string
 	// CIFailed is true only on a DEFINITIVE CI failure at the head (FAILURE/ERROR,
 	// not PENDING): the build is broken. A review_pending job then bounces back to
 	// build (rebuild), escalating to needs_human at max_bounces. Transient (not
@@ -387,19 +391,21 @@ func upsertDomainBFactsTx(ctx context.Context, tx *sql.Tx, jobID string, pr Reco
 		updated = pr.UpdatedAt.Format(rfc3339)
 	}
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO domain_b_facts
-		    (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged,
-		     head_updated_at, merge_commit, is_draft, updated_at)
-		VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-		ON CONFLICT (job_id) DO UPDATE SET
-		    pr_exists = 1, pr_number = excluded.pr_number,
-		    head_sha = excluded.head_sha, base_sha = excluded.base_sha,
-		    ci_green = excluded.ci_green, merged = excluded.merged,
-		    head_updated_at = excluded.head_updated_at,
-		    merge_commit = excluded.merge_commit,
-		    is_draft = excluded.is_draft, updated_at = datetime('now')`,
+	INSERT INTO domain_b_facts
+	    (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged,
+	     head_updated_at, merge_commit, is_draft, mergeable_state, updated_at)
+	VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+	ON CONFLICT (job_id) DO UPDATE SET
+	    pr_exists = 1, pr_number = excluded.pr_number,
+	    head_sha = excluded.head_sha, base_sha = excluded.base_sha,
+	    ci_green = excluded.ci_green, merged = excluded.merged,
+	    head_updated_at = excluded.head_updated_at,
+	    merge_commit = excluded.merge_commit,
+	    is_draft = excluded.is_draft,
+	    mergeable_state = excluded.mergeable_state,
+	    updated_at = datetime('now')`,
 		jobID, pr.Number, pr.HeadSHA, pr.BaseSHA, b2i(pr.CIGreen), b2i(pr.Merged),
-		updated, pr.MergeCommit, b2i(pr.IsDraft))
+		updated, pr.MergeCommit, b2i(pr.IsDraft), pr.MergeableState)
 	return err
 }
 
