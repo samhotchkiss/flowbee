@@ -43,6 +43,10 @@ type ReconciledPR struct {
 	BaseSHA     string
 	MergeCommit string
 	CIGreen     bool
+	// MergeableState is GitHub's computed PR mergeability. Explicit UNKNOWN means
+	// GitHub has not finished computing the mergeability graph yet and must fail
+	// the merge gate closed.
+	MergeableState string
 	// CIFailed is true only on a DEFINITIVE CI failure at the head (FAILURE/ERROR,
 	// not PENDING): the build is broken. A review_pending job then bounces back to
 	// build (rebuild), escalating to needs_human at max_bounces. Transient (not
@@ -53,6 +57,9 @@ type ReconciledPR struct {
 	// rebuild's lease context so the agent re-runs the named gate + fixes the real
 	// violation rather than rebuilding blind. Empty when CI is green or only pending.
 	FailingChecks []string
+	// FailingCheckURLs maps failed check names to their GitHub details URL. It is
+	// persisted alongside the check name so post-merge red-main escalations are actionable.
+	FailingCheckURLs map[string]string
 	// ClosedUnmerged is true for a PR a human CLOSED without merging — the change was
 	// rejected, so the job is parked (pr_closed) instead of waiting on a merge that will
 	// never come (and instead of the slow, misleading stall the watchdog would otherwise
@@ -75,6 +82,26 @@ type ReconcileOutcome struct {
 	Done       bool // a non-terminal job whose PR merged transitioned to done
 }
 
+// FormatCIFailures renders failed check names with their GitHub details URLs when
+// available for persistence in last_ci_failures.
+func FormatCIFailures(failingChecks []string, checkURLs map[string]string) string {
+	if len(failingChecks) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(failingChecks))
+	for _, name := range failingChecks {
+		if name == "" {
+			continue
+		}
+		if url := checkURLs[name]; url != "" {
+			lines = append(lines, fmt.Sprintf("%s (%s)", name, url))
+			continue
+		}
+		lines = append(lines, name)
+	}
+	return strings.Join(lines, "\n")
+}
+
 // ApplyReconciledPR ingests one PR's Domain-B facts for the job bound to that PR
 // number, applying the I-3 guards and the §3.4 reconcile-driven transitions. It is
 // the ONLY writer of Domain-B fact-fields (I-1). It NEVER writes a Domain-A field
@@ -89,7 +116,7 @@ type ReconcileOutcome struct {
 //     re-dispatches it (closes the double-merge failure at ingestion).
 //
 // Then the §3.4 reconcile-driven transitions:
-//   - merged PR + non-terminal job -> done (the terminal Domain-B fact).
+//   - merged PR + terminal-green required CI + non-terminal job -> done.
 //   - a head/base SHA MOVE on an open PR whose job holds a SHA-bound verdict ->
 //     superseded + re-arm (I-5): invalidate the verdict, route to ready with the
 //     new base, revoke any active lease (epoch bump), re-run review + CI.
@@ -181,7 +208,12 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		// reconcile-driven transitions (§3.4). These move STATE only as a consequence
 		// of a GitHub-owned fact changing — never a stage/role/verdict edit.
 		switch {
-		case pr.Merged && pr.MergeCommit != "" && prBoundActive(j.State):
+		case pr.Merged && pr.MergeCommit != "" && pr.CIFailed && prBoundActive(j.State):
+			if err := postMergeCIFailureTx(ctx, tx, &j, seq, now, pr.FailingChecks, pr.FailingCheckURLs); err != nil {
+				return err
+			}
+			out.Applied = true
+		case pr.Merged && pr.MergeCommit != "" && pr.CIGreen && prBoundActive(j.State):
 			// the terminal Domain-B fact: the job is done. No counter or verdict edit.
 			// GATE on prBoundActive (a non-terminal state that HAS an open PR), NOT merely
 			// "not done": a merged PR completes a job ONLY from a state that legitimately
@@ -264,7 +296,7 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 			// it's THIS change): bounce it back to build (rebuild), escalating to needs_human
 			// at max_bounces. Gated to review_pending so a single failure bounces once
 			// (the rebuild moves the head; the next sweep sees fresh/pending CI).
-			if err := ciFailBounceTx(ctx, tx, &j, seq, now, pr.FailingChecks); err != nil {
+			if err := ciFailBounceTx(ctx, tx, &j, seq, now, pr.FailingChecks, pr.FailingCheckURLs); err != nil {
 				return err
 			}
 			out.Applied = true
@@ -303,6 +335,29 @@ func prBoundActive(s job.State) bool {
 	}
 }
 
+func postMergeCIFailureTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time, failingChecks []string, checkURLs map[string]string) error {
+	nextSeq := seq + 1
+	ciFails := FormatCIFailures(failingChecks, checkURLs)
+	ev := ledger.Event{
+		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
+		FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
+		Actor: "reconcile", CreatedAt: now,
+		Payload: ledger.Payload{EscalationReason: string(job.EscalationPostMergeCI), CIFailures: ciFails},
+	}
+	if err := appendEvent(ctx, tx, ev); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state='needs_human', escalation_reason=?, last_ci_failures=?,
+		     lease_id=NULL, bound_identity=NULL, bound_model_family=NULL, lease_hb_due=NULL,
+		     updated_at=datetime('now') WHERE id=?`,
+		string(job.EscalationPostMergeCI), ciFails, j.ID); err != nil {
+		return fmt.Errorf("apply post-merge CI failure: %w", err)
+	}
+	j.State = job.StateNeedsHuman
+	return setJobSeq(ctx, tx, j.ID, nextSeq)
+}
+
 // escalatePRClosedTx parks a job whose PR a human closed without merging: needs_human
 // with the legible `pr_closed` reason, the lease cleared. The change was rejected, so
 // there is nothing to retry — an operator decides whether to requeue.
@@ -336,19 +391,21 @@ func upsertDomainBFactsTx(ctx context.Context, tx *sql.Tx, jobID string, pr Reco
 		updated = pr.UpdatedAt.Format(rfc3339)
 	}
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO domain_b_facts
-		    (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged,
-		     head_updated_at, merge_commit, is_draft, updated_at)
-		VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-		ON CONFLICT (job_id) DO UPDATE SET
-		    pr_exists = 1, pr_number = excluded.pr_number,
-		    head_sha = excluded.head_sha, base_sha = excluded.base_sha,
-		    ci_green = excluded.ci_green, merged = excluded.merged,
-		    head_updated_at = excluded.head_updated_at,
-		    merge_commit = excluded.merge_commit,
-		    is_draft = excluded.is_draft, updated_at = datetime('now')`,
+	INSERT INTO domain_b_facts
+	    (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged,
+	     head_updated_at, merge_commit, is_draft, mergeable_state, updated_at)
+	VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+	ON CONFLICT (job_id) DO UPDATE SET
+	    pr_exists = 1, pr_number = excluded.pr_number,
+	    head_sha = excluded.head_sha, base_sha = excluded.base_sha,
+	    ci_green = excluded.ci_green, merged = excluded.merged,
+	    head_updated_at = excluded.head_updated_at,
+	    merge_commit = excluded.merge_commit,
+	    is_draft = excluded.is_draft,
+	    mergeable_state = excluded.mergeable_state,
+	    updated_at = datetime('now')`,
 		jobID, pr.Number, pr.HeadSHA, pr.BaseSHA, b2i(pr.CIGreen), b2i(pr.Merged),
-		updated, pr.MergeCommit, b2i(pr.IsDraft))
+		updated, pr.MergeCommit, b2i(pr.IsDraft), pr.MergeableState)
 	return err
 }
 
@@ -382,18 +439,18 @@ func reconcileTransitionTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int,
 // build (a rebuild), or escalates to needs_human at max_bounces. It mirrors the
 // gate's own bounce events (KindReviewBounced / KindBounceExhausted) EXACTLY so the
 // jobs projection stays equal to a re-fold of the ledger (determinism).
-func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time, failingChecks []string) error {
+func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time, failingChecks []string, checkURLs map[string]string) error {
 	nextSeq := seq + 1
 	// the names of the gates that failed, recorded on the job so the rebuild's lease
 	// context tells the agent exactly which check to re-run + fix (not "CI was red").
-	ciFails := strings.Join(failingChecks, "\n")
+	ciFails := FormatCIFailures(failingChecks, checkURLs)
 	if j.Bounces+1 > j.MaxBounces {
 		// the rebuild keeps failing CI: escalate to a human (KindBounceExhausted fold:
 		// state = ToState, bounces += delta, lease cleared).
 		ev := ledger.Event{
 			JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindBounceExhausted,
 			FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
-			Actor: "reconcile", CreatedAt: now, Payload: ledger.Payload{BouncesDelta: 1},
+			Actor: "reconcile", CreatedAt: now, Payload: ledger.Payload{BouncesDelta: 1, CIFailures: ciFails},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err
@@ -413,7 +470,7 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 	ev := ledger.Event{
 		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindReviewBounced,
 		FromState: j.State, ToState: job.StateReady, LeaseEpoch: j.LeaseEpoch,
-		Actor: "reconcile", CreatedAt: now, Payload: ledger.Payload{BouncesDelta: 1},
+		Actor: "reconcile", CreatedAt: now, Payload: ledger.Payload{BouncesDelta: 1, CIFailures: ciFails},
 	}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return err
@@ -438,14 +495,18 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 // with the new base. It writes the new base_sha (a Domain-B fact) and clears the
 // verdict (whose binding is now stale) — clearing a now-invalid verdict is part of
 // the supersession the SHA owner triggers, not an edit of a live Domain-A decision.
-func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr ReconciledPR, actor string, now time.Time) error {
+func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr ReconciledPR, actor string, now time.Time, ciFailures ...string) error {
 	nextSeq := seq + 1
+	payload := ledger.Payload{BaseSHA: pr.BaseSHA, HeadSHA: pr.HeadSHA}
+	if len(ciFailures) > 0 {
+		payload.CIFailures = ciFailures[0]
+	}
 	// the supersede event records the move for replay/audit.
 	ev := ledger.Event{
 		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindSuperseded,
 		FromState: j.State, ToState: job.StateReady, LeaseEpoch: j.LeaseEpoch + 1,
 		Actor: actor, CreatedAt: now,
-		Payload: ledger.Payload{BaseSHA: pr.BaseSHA, HeadSHA: pr.HeadSHA},
+		Payload: payload,
 	}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return err

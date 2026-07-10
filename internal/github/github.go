@@ -55,6 +55,9 @@ type PullRequest struct {
 	HeadRefOid  string // Domain-B: head SHA
 	BaseRefOid  string // Domain-B: base SHA
 	MergeCommit string // Domain-B: merge commit SHA (terminal fact)
+	// MergeableState is GitHub's computed mergeability status (GraphQL
+	// mergeStateStatus, e.g. CLEAN/UNKNOWN). UNKNOWN is not mergeable.
+	MergeableState string
 	// ClosedUnmerged is true for a PR a human CLOSED without merging (GitHub state
 	// CLOSED, not MERGED) — the signal that the change was rejected, so reconcile parks
 	// the job instead of waiting on a merge that will never come.
@@ -72,6 +75,9 @@ type PullRequest struct {
 	// to re-run + fix locally instead of a generic "CI was red". Empty when CI is green
 	// or only pending.
 	FailingChecks []string
+	// FailingCheckURLs maps each failed check name to its actionable GitHub URL when
+	// GitHub exposes one (CheckRun.detailsUrl or StatusContext.targetUrl).
+	FailingCheckURLs map[string]string
 	// PassedChecks names the checks that concluded SUCCESS at the head (CheckRun SUCCESS
 	// or legacy StatusContext SUCCESS). Used to evaluate whether the repo's REQUIRED
 	// status checks are green independently of the aggregate rollup — a PR can be
@@ -445,10 +451,10 @@ func NewRealClient(owner, repo string, token func(ctx context.Context) (string, 
 const boardSweepQuery = `
 fragment prFields on PullRequest {
   number updatedAt isDraft merged mergedAt
-  headRefOid baseRefOid
+  headRefOid baseRefOid mergeStateStatus
   mergeCommit { oid }
   commits(last:1) { nodes { commit { statusCheckRollup { state
-    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
+    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
   labels(first:20) { nodes { name } }
 }
 query BoardSweep($owner:String!, $repo:String!, $prCursor:String, $issueCursor:String, $includeMerged:Boolean!) {
@@ -528,14 +534,15 @@ type pageInfo struct {
 // prNode is one pullRequests connection node (shared by the OPEN and MERGED selections
 // via the prFields fragment).
 type prNode struct {
-	Number      int       `json:"number"`
-	UpdatedAt   time.Time `json:"updatedAt"`
-	IsDraft     bool      `json:"isDraft"`
-	Merged      bool      `json:"merged"`
-	MergedAt    time.Time `json:"mergedAt"`
-	HeadRefOid  string    `json:"headRefOid"`
-	BaseRefOid  string    `json:"baseRefOid"`
-	MergeCommit *struct {
+	Number         int       `json:"number"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+	IsDraft        bool      `json:"isDraft"`
+	Merged         bool      `json:"merged"`
+	MergedAt       time.Time `json:"mergedAt"`
+	HeadRefOid     string    `json:"headRefOid"`
+	BaseRefOid     string    `json:"baseRefOid"`
+	MergeableState string    `json:"mergeStateStatus"`
+	MergeCommit    *struct {
 		Oid string `json:"oid"`
 	} `json:"mergeCommit"`
 	Commits struct {
@@ -548,8 +555,10 @@ type prNode struct {
 							Typename   string `json:"__typename"`
 							Name       string `json:"name"`       // CheckRun (Actions) check name
 							Conclusion string `json:"conclusion"` // CheckRun (Actions)
+							DetailsURL string `json:"detailsUrl"` // CheckRun URL
 							Context    string `json:"context"`    // StatusContext (legacy) name
 							State      string `json:"state"`      // StatusContext (legacy)
+							TargetURL  string `json:"targetUrl"`  // StatusContext URL
 						} `json:"nodes"`
 					} `json:"contexts"`
 				} `json:"statusCheckRollup"`
@@ -604,6 +613,7 @@ func prFromNode(n prNode) PullRequest {
 		Number: n.Number, UpdatedAt: n.UpdatedAt, IsDraft: n.IsDraft,
 		Merged: n.Merged, MergedAt: n.MergedAt,
 		HeadRefOid: n.HeadRefOid, BaseRefOid: n.BaseRefOid,
+		MergeableState: n.MergeableState,
 	}
 	if n.MergeCommit != nil {
 		pr.MergeCommit = n.MergeCommit.Oid
@@ -638,10 +648,22 @@ func prFromNode(n prNode) PullRequest {
 			case c.Typename == "CheckRun" && (c.Conclusion == "FAILURE" || c.Conclusion == "TIMED_OUT" || c.Conclusion == "STARTUP_FAILURE" || c.Conclusion == "CANCELLED"):
 				if c.Name != "" {
 					pr.FailingChecks = append(pr.FailingChecks, c.Name)
+					if c.DetailsURL != "" {
+						if pr.FailingCheckURLs == nil {
+							pr.FailingCheckURLs = make(map[string]string)
+						}
+						pr.FailingCheckURLs[c.Name] = c.DetailsURL
+					}
 				}
 			case c.Typename == "StatusContext" && (c.State == "FAILURE" || c.State == "ERROR"):
 				if c.Context != "" {
 					pr.FailingChecks = append(pr.FailingChecks, c.Context)
+					if c.TargetURL != "" {
+						if pr.FailingCheckURLs == nil {
+							pr.FailingCheckURLs = make(map[string]string)
+						}
+						pr.FailingCheckURLs[c.Context] = c.TargetURL
+					}
 				}
 			}
 		}
@@ -781,10 +803,10 @@ query PR($owner:String!, $repo:String!, $number:Int!) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
       number updatedAt isDraft merged mergedAt
-      headRefOid baseRefOid
+      headRefOid baseRefOid mergeStateStatus
       mergeCommit { oid }
       commits(last:1) { nodes { commit { statusCheckRollup { state
-    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
+    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
       labels(first:20) { nodes { name } }
     }
   }
@@ -795,14 +817,15 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 	var data struct {
 		Repository struct {
 			PullRequest *struct {
-				Number      int       `json:"number"`
-				UpdatedAt   time.Time `json:"updatedAt"`
-				IsDraft     bool      `json:"isDraft"`
-				Merged      bool      `json:"merged"`
-				MergedAt    time.Time `json:"mergedAt"`
-				HeadRefOid  string    `json:"headRefOid"`
-				BaseRefOid  string    `json:"baseRefOid"`
-				MergeCommit *struct {
+				Number         int       `json:"number"`
+				UpdatedAt      time.Time `json:"updatedAt"`
+				IsDraft        bool      `json:"isDraft"`
+				Merged         bool      `json:"merged"`
+				MergedAt       time.Time `json:"mergedAt"`
+				HeadRefOid     string    `json:"headRefOid"`
+				BaseRefOid     string    `json:"baseRefOid"`
+				MergeableState string    `json:"mergeStateStatus"`
+				MergeCommit    *struct {
 					Oid string `json:"oid"`
 				} `json:"mergeCommit"`
 				Commits struct {
@@ -815,8 +838,10 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 										Typename   string `json:"__typename"`
 										Name       string `json:"name"`
 										Conclusion string `json:"conclusion"`
+										DetailsURL string `json:"detailsUrl"`
 										Context    string `json:"context"`
 										State      string `json:"state"`
+										TargetURL  string `json:"targetUrl"`
 									} `json:"nodes"`
 								} `json:"contexts"`
 							} `json:"statusCheckRollup"`
@@ -844,6 +869,7 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 		Number: n.Number, UpdatedAt: n.UpdatedAt, IsDraft: n.IsDraft,
 		Merged: n.Merged, MergedAt: n.MergedAt,
 		HeadRefOid: n.HeadRefOid, BaseRefOid: n.BaseRefOid,
+		MergeableState: n.MergeableState,
 	}
 	if n.MergeCommit != nil {
 		pr.MergeCommit = n.MergeCommit.Oid
@@ -878,10 +904,22 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 			case c.Typename == "CheckRun" && (c.Conclusion == "FAILURE" || c.Conclusion == "TIMED_OUT" || c.Conclusion == "STARTUP_FAILURE" || c.Conclusion == "CANCELLED"):
 				if c.Name != "" {
 					pr.FailingChecks = append(pr.FailingChecks, c.Name)
+					if c.DetailsURL != "" {
+						if pr.FailingCheckURLs == nil {
+							pr.FailingCheckURLs = make(map[string]string)
+						}
+						pr.FailingCheckURLs[c.Name] = c.DetailsURL
+					}
 				}
 			case c.Typename == "StatusContext" && (c.State == "FAILURE" || c.State == "ERROR"):
 				if c.Context != "" {
 					pr.FailingChecks = append(pr.FailingChecks, c.Context)
+					if c.TargetURL != "" {
+						if pr.FailingCheckURLs == nil {
+							pr.FailingCheckURLs = make(map[string]string)
+						}
+						pr.FailingCheckURLs[c.Context] = c.TargetURL
+					}
 				}
 			}
 		}

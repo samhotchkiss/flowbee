@@ -581,6 +581,17 @@ func (f *Fake) BranchProtection(ctx context.Context, branch string) (Protection,
 	return p, ok, nil
 }
 
+func (f *Fake) BranchRequiredChecks(ctx context.Context, branch string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("BranchRequiredChecks(%s)", branch))
+	p, ok := f.protection[branch]
+	if !ok {
+		return nil, nil
+	}
+	return append([]string(nil), p.RequiredChecks...), nil
+}
+
 func sprintfPR(n int) string {
 	// tiny local helper to avoid importing fmt just for the call log.
 	const digits = "0123456789"

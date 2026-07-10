@@ -16,6 +16,7 @@ func TestAutonomousMergePinsReviewedHead(t *testing.T) {
 	ctx := context.Background()
 	sender.WithHistory(&fakeHistory{tip: "t", diffOut: diffAdding("docs/operating.md", "clean")}, "main")
 	mergingJob(t, st, "j")
+	setLiveGreenPR(fake, 42, "base-sha", "head-sha")
 
 	if _, err := sender.DrainOnce(ctx); err != nil {
 		t.Fatalf("drain: %v", err)
@@ -41,6 +42,7 @@ func TestAutonomousMergeHeadMoveRearmsReviewAndAbandonsOutbox(t *testing.T) {
 		},
 	}, "main")
 	mergingJob(t, st, "j")
+	setLiveGreenPR(fake, 42, "base-sha", "head-sha")
 	fake.SetHeadMoved(42, "moved-head")
 
 	if _, err := sender.DrainOnce(ctx); err != nil {
@@ -71,6 +73,7 @@ func TestHeadModifiedCosmeticMoveAlsoRearmsReview(t *testing.T) {
 	// reviewed and live diffs are identical (an empty commit changes the SHA, not the diff).
 	sender.WithHistory(&fakeHistory{tip: "cosmetic-head", diffOut: diffAdding("docs/operating.md", "clean")}, "main")
 	mergingJob(t, st, "j")
+	setLiveGreenPR(fake, 42, "base-sha", "head-sha")
 	fake.SetHeadMoved(42, "cosmetic-head")
 
 	if _, err := sender.DrainOnce(ctx); err != nil {

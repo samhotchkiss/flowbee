@@ -216,6 +216,36 @@ func (s *Store) InvalidateStaleMergeAuthorization(ctx context.Context, jobID str
 	})
 }
 
+// RoutePostApprovalCIFailure handles a required CI check that turns red after a
+// verdict was minted but before the merge is sent. The stale approval is no longer
+// sufficient, so re-arm the job through the normal builder repair path and carry
+// the failed check names and URLs into the next lease brief.
+func (s *Store) RoutePostApprovalCIFailure(ctx context.Context, jobID string, failingChecks []string, checkURLs map[string]string, now time.Time) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		j, seq, err := loadJobTx(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		if j.State != job.StateMerging && j.State != job.StateMergeHandoff && j.State != job.StateMergeable {
+			return nil
+		}
+		msg := FormatCIFailures(failingChecks, checkURLs)
+		if err := supersedeTx(ctx, tx, &j, seq, ReconciledPR{BaseSHA: j.BaseSHA, HeadSHA: j.HeadSHA}, "project-out", now, msg); err != nil {
+			return err
+		}
+		if msg != "" {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE jobs SET last_ci_failures=? WHERE id=?`, msg, jobID); err != nil {
+				return err
+			}
+		}
+		_, err = tx.ExecContext(ctx, `
+			UPDATE outbox SET status='abandoned', sent_at=datetime('now')
+			 WHERE job_id=? AND action=? AND status='pending'`, jobID, ActionEnqueueMerge)
+		return err
+	})
+}
+
 // JobPR returns the stamped PR number for a job (0 if none).
 func (s *Store) JobPR(ctx context.Context, jobID string) (int, error) {
 	var pr sql.NullInt64

@@ -249,7 +249,7 @@ func TestMergedJobDeletesItsIssueBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.ApplyReconciledPR(ctx, "m", store.ReconciledPR{
-		Number: 77, Merged: true, MergeCommit: "mc", HeadSHA: "h", BaseSHA: "b",
+		Number: 77, Merged: true, MergeCommit: "mc", HeadSHA: "h", BaseSHA: "b", CIGreen: true,
 	}, clk.Now()); err != nil {
 		t.Fatalf("reconcile merged: %v", err)
 	}
@@ -276,6 +276,7 @@ func TestTransientNotMergeableRetriedNotResolved(t *testing.T) {
 		t.Fatal(err)
 	}
 	setMergingAuthorization(t, st, "t", "b", "h")
+	setLiveGreenPR(fake, 42, "b", "h")
 	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
 		JobID: "t", Action: store.ActionEnqueueMerge, HeadSHA: "h", Payload: `{"pr_number":42}`,
 	}); err != nil {

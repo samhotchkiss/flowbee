@@ -25,6 +25,7 @@ func TestMergeBaseModifiedRetriesNotDeadLetters(t *testing.T) {
 		t.Fatal(err)
 	}
 	setMergingAuthorization(t, st, "j", "b", "h")
+	setLiveGreenPR(fake, 91, "b", "h")
 	fake.SetMergeBaseModified(91)
 	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
 		JobID: "j", Action: store.ActionEnqueueMerge, HeadSHA: "h", Payload: `{"pr_number":91}`,

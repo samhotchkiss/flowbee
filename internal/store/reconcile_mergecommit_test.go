@@ -40,7 +40,7 @@ func TestMergedWithoutCommitDefersDone(t *testing.T) {
 
 	// next sweep: the commit resolved. NOW the job settles and the freeze arms.
 	out2, err := st.ApplyReconciledPR(ctx, "jw", store.ReconciledPR{
-		Number: 11, UpdatedAt: t1.Add(time.Minute), HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "REALSHA",
+		Number: 11, UpdatedAt: t1.Add(time.Minute), HeadSHA: "h", BaseSHA: "b", Merged: true, MergeCommit: "REALSHA", CIGreen: true,
 	}, t1.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("apply merged+commit: %v", err)

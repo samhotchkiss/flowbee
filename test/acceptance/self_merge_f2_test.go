@@ -139,6 +139,10 @@ func driveApprovedCleanJob(t *testing.T, ctx context.Context, e *f2Env, jobID, d
 	}); err != nil {
 		t.Fatalf("reconcile facts: %v", err)
 	}
+	e.fake.SetPR(gh.PullRequest{
+		Number: prNum, HeadRefOid: headSHA, BaseRefOid: "base-sha-0",
+		CIRollup: gh.CISuccess, PassedChecks: []string{"acceptance"},
+	})
 
 	// a DISTINCT reviewer leases the gate.
 	reviewer := client.New(url)

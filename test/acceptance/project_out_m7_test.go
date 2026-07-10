@@ -345,6 +345,10 @@ func TestM7_BuildPatchToOpenPRStampToMergeToDone(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("reconcile facts: %v", err)
 	}
+	e.fake.SetPR(gh.PullRequest{
+		Number: prNum, HeadRefOid: headSHA, BaseRefOid: "base-sha-0",
+		CIRollup: gh.CISuccess, PassedChecks: []string{"acceptance"},
+	})
 	reviewer := client.New(url)
 	if _, err := reviewer.Register(ctx, client.Registration{
 		WorkerID: "wk-rev", Identity: "rev", Host: "t",

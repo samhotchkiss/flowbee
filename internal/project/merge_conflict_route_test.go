@@ -51,6 +51,7 @@ func TestMergeConflictRoutesToResolverAfterFetch(t *testing.T) {
 		t.Fatal(err)
 	}
 	setMergingAuthorization(t, st, "j", "base", "head")
+	setLiveGreenPR(fake, 78, "base", "head")
 	fake.SetMergeConflict(78)
 	if err := st.EnqueueOutbox(ctx, store.OutboxRow{
 		JobID: "j", Action: store.ActionEnqueueMerge, HeadSHA: "head", Payload: `{"pr_number":78}`,

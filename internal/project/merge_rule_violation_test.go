@@ -16,6 +16,7 @@ func TestRequiredCheckExpectedRetriesThenMerges(t *testing.T) {
 	ctx := context.Background()
 	sender.WithHistory(&fakeHistory{tip: "head-sha", diffOut: diffAdding("docs/x.md", "clean")}, "main")
 	mergingJob(t, st, "j")
+	setLiveGreenPR(fake, 42, "base-sha", "head-sha")
 	fake.SetMergeRuleViolationPending(42, 1, false)
 
 	_, _ = sender.DrainOnce(ctx)
@@ -52,6 +53,7 @@ func TestBehindRuleViolationUpdatesBranchAndRetries(t *testing.T) {
 	ctx := context.Background()
 	sender.WithHistory(&fakeHistory{tip: "head-sha", diffOut: diffAdding("docs/x.md", "clean")}, "main")
 	mergingJob(t, st, "j")
+	setLiveGreenPR(fake, 42, "base-sha", "head-sha")
 	fake.SetMergeRuleViolationPending(42, 1, true)
 
 	_, _ = sender.DrainOnce(ctx)

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	gh "github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
@@ -45,6 +46,14 @@ func setMergingAuthorization(t *testing.T, st *store.Store, id, base, head strin
 		`UPDATE jobs SET state='merging', base_sha=?, head_sha=?, verdict=? WHERE id=?`, base, head, string(vb), id); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func setLiveGreenPR(fake *gh.Fake, number int, base, head string) {
+	fake.SetPR(gh.PullRequest{
+		Number: number, HeadRefOid: head, BaseRefOid: base,
+		CIRollup: gh.CISuccess, PassedChecks: []string{"ci"},
+	})
+	fake.SetBranchProtection("main", gh.Protection{RequiredChecks: []string{"ci"}})
 }
 
 // diffAdding builds a minimal unified diff that adds one line to path.
@@ -109,6 +118,7 @@ func TestAutonomousMergeProceedsWhenActualDiffClean(t *testing.T) {
 	ctx := context.Background()
 	sender.WithHistory(&fakeHistory{tip: "t", diffOut: diffAdding("docs/operating.md", "a new clarifying sentence")}, "main")
 	mergingJob(t, st, "j")
+	setLiveGreenPR(fake, 42, "base-sha", "head-sha")
 
 	if _, err := sender.DrainOnce(ctx); err != nil {
 		t.Fatalf("drain: %v", err)

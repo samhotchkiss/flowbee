@@ -152,6 +152,9 @@ type Payload struct {
 	// ReviewNotes carries a code-review's changes-requested findings on the bounce event,
 	// so the rebuild can surface them (§F compounding memory). Folded onto LastReviewNotes.
 	ReviewNotes string `json:",omitempty"`
+	// CIFailures carries failed check names plus actionable details URLs when available.
+	// Folded onto LastCIFailures so CI repair context survives a ledger rebuild.
+	CIFailures string `json:",omitempty"`
 	// stall_revocations governor counter delta (M8, §10.7); set on lease_revoked /
 	// stall_escalated. Distinct from attempts/bounces.
 	StallRevocationsDelta int `json:",omitempty"`
@@ -724,6 +727,9 @@ func Fold(events []Event) (job.Job, error) {
 		// the bounce event carries it (empty elsewhere -> the prior findings are retained).
 		if e.Payload.ReviewNotes != "" {
 			j.LastReviewNotes = e.Payload.ReviewNotes
+		}
+		if e.Payload.CIFailures != "" {
+			j.LastCIFailures = e.Payload.CIFailures
 		}
 		switch j.State {
 		case job.StateNeedsHuman, job.StateNeedsDesign:

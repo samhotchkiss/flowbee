@@ -33,9 +33,32 @@ func (f DBFactSource) Facts(ctx context.Context, jobID string) (job.DomainBFacts
 		prExists, ciGreen, mrg int
 	)
 	err := f.DB.QueryRowContext(ctx, `
-		SELECT pr_exists, pr_number, head_sha, base_sha, ci_green, merged
+		SELECT pr_exists, pr_number, head_sha, base_sha, ci_green, merged, mergeable_state
 		  FROM domain_b_facts WHERE job_id = ?`, jobID).Scan(
-		&prExists, &facts.PRNumber, &facts.HeadSHA, &facts.BaseSHA, &ciGreen, &mrg)
+		&prExists, &facts.PRNumber, &facts.HeadSHA, &facts.BaseSHA, &ciGreen, &mrg,
+		&facts.MergeableState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return job.DomainBFacts{}, false, nil
+	}
+	if err != nil {
+		return job.DomainBFacts{}, false, err
+	}
+	facts.PRExists = prExists == 1
+	facts.CIGreen = ciGreen == 1
+	facts.Merged = mrg == 1
+	return facts, true, nil
+}
+
+func domainBFactsTx(ctx context.Context, tx *sql.Tx, jobID string) (job.DomainBFacts, bool, error) {
+	var (
+		facts                  job.DomainBFacts
+		prExists, ciGreen, mrg int
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT pr_exists, pr_number, head_sha, base_sha, ci_green, merged, mergeable_state
+		  FROM domain_b_facts WHERE job_id = ?`, jobID).Scan(
+		&prExists, &facts.PRNumber, &facts.HeadSHA, &facts.BaseSHA, &ciGreen, &mrg,
+		&facts.MergeableState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return job.DomainBFacts{}, false, nil
 	}
@@ -53,14 +76,16 @@ func (f DBFactSource) Facts(ctx context.Context, jobID string) (job.DomainBFacts
 // never by a worker call.
 func (s *Store) UpsertDomainBFacts(ctx context.Context, jobID string, f job.DomainBFacts) error {
 	_, err := s.DB.ExecContext(ctx, `
-		INSERT INTO domain_b_facts (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+		INSERT INTO domain_b_facts (job_id, pr_exists, pr_number, head_sha, base_sha, ci_green, merged, mergeable_state, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
 		ON CONFLICT (job_id) DO UPDATE SET
 		    pr_exists = excluded.pr_exists, pr_number = excluded.pr_number,
 		    head_sha = excluded.head_sha, base_sha = excluded.base_sha,
 		    ci_green = excluded.ci_green, merged = excluded.merged,
+		    mergeable_state = excluded.mergeable_state,
 		    updated_at = datetime('now')`,
-		jobID, b2i(f.PRExists), f.PRNumber, f.HeadSHA, f.BaseSHA, b2i(f.CIGreen), b2i(f.Merged))
+		jobID, b2i(f.PRExists), f.PRNumber, f.HeadSHA, f.BaseSHA, b2i(f.CIGreen), b2i(f.Merged),
+		f.MergeableState)
 	return err
 }
 
@@ -554,20 +579,15 @@ type DispatchMergeParams struct {
 // from the persisted verdict + reconciled facts + the content Result + policy.
 // Returns the resulting state.
 func (s *Store) DispatchMerge(ctx context.Context, src FactSource, p job.Policy, in DispatchMergeParams) (job.State, error) {
-	// reconcile facts OUTSIDE the tx (read-only) for the §5.4 condition-5 SHA
-	// re-binding; a nil/erroring source leaves facts zero (self_merge then denied,
-	// the safe default — handoff).
-	var facts job.DomainBFacts
-	if src != nil {
-		if f, _, ferr := src.Facts(ctx, in.JobID); ferr == nil {
-			facts = f
-		}
-	}
 	var final job.State
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		j, seq, err := loadJobTx(ctx, tx, in.JobID)
 		if err != nil {
 			return err
+		}
+		facts, _, err := domainBFactsTx(ctx, tx, in.JobID)
+		if err != nil {
+			return fmt.Errorf("read merge facts: %w", err)
 		}
 		chk, err := s.contentResultTx(ctx, tx, in.JobID)
 		if err != nil {
