@@ -74,6 +74,9 @@ func assertFoldMatchesProjection(t *testing.T, st *store.Store, id string) {
 	if folded.LastReviewNotes != proj.LastReviewNotes {
 		t.Fatalf("fold last_review_notes=%q != projection %q (review-findings carry-forward must fold)", folded.LastReviewNotes, proj.LastReviewNotes)
 	}
+	if folded.LastCIFailures != proj.LastCIFailures {
+		t.Fatalf("fold last_ci_failures=%q != projection %q (CI failure details must fold)", folded.LastCIFailures, proj.LastCIFailures)
+	}
 	if folded.LeaseEpoch != proj.LeaseEpoch {
 		t.Fatalf("fold lease_epoch=%d != projection %d (epoch bumps must fold)", folded.LeaseEpoch, proj.LeaseEpoch)
 	}

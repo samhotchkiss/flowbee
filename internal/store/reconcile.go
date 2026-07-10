@@ -333,11 +333,12 @@ func prBoundActive(s job.State) bool {
 
 func postMergeCIFailureTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time, failingChecks []string, checkURLs map[string]string) error {
 	nextSeq := seq + 1
+	ciFails := FormatCIFailures(failingChecks, checkURLs)
 	ev := ledger.Event{
 		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
 		FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
 		Actor: "reconcile", CreatedAt: now,
-		Payload: ledger.Payload{EscalationReason: string(job.EscalationPostMergeCI)},
+		Payload: ledger.Payload{EscalationReason: string(job.EscalationPostMergeCI), CIFailures: ciFails},
 	}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return err
@@ -346,7 +347,7 @@ func postMergeCIFailureTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, 
 		UPDATE jobs SET state='needs_human', escalation_reason=?, last_ci_failures=?,
 		     lease_id=NULL, bound_identity=NULL, bound_model_family=NULL, lease_hb_due=NULL,
 		     updated_at=datetime('now') WHERE id=?`,
-		string(job.EscalationPostMergeCI), FormatCIFailures(failingChecks, checkURLs), j.ID); err != nil {
+		string(job.EscalationPostMergeCI), ciFails, j.ID); err != nil {
 		return fmt.Errorf("apply post-merge CI failure: %w", err)
 	}
 	j.State = job.StateNeedsHuman
@@ -443,7 +444,7 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 		ev := ledger.Event{
 			JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindBounceExhausted,
 			FromState: j.State, ToState: job.StateNeedsHuman, LeaseEpoch: j.LeaseEpoch,
-			Actor: "reconcile", CreatedAt: now, Payload: ledger.Payload{BouncesDelta: 1},
+			Actor: "reconcile", CreatedAt: now, Payload: ledger.Payload{BouncesDelta: 1, CIFailures: ciFails},
 		}
 		if err := appendEvent(ctx, tx, ev); err != nil {
 			return err
@@ -463,7 +464,7 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 	ev := ledger.Event{
 		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindReviewBounced,
 		FromState: j.State, ToState: job.StateReady, LeaseEpoch: j.LeaseEpoch,
-		Actor: "reconcile", CreatedAt: now, Payload: ledger.Payload{BouncesDelta: 1},
+		Actor: "reconcile", CreatedAt: now, Payload: ledger.Payload{BouncesDelta: 1, CIFailures: ciFails},
 	}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return err
@@ -488,14 +489,18 @@ func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now ti
 // with the new base. It writes the new base_sha (a Domain-B fact) and clears the
 // verdict (whose binding is now stale) — clearing a now-invalid verdict is part of
 // the supersession the SHA owner triggers, not an edit of a live Domain-A decision.
-func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr ReconciledPR, actor string, now time.Time) error {
+func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr ReconciledPR, actor string, now time.Time, ciFailures ...string) error {
 	nextSeq := seq + 1
+	payload := ledger.Payload{BaseSHA: pr.BaseSHA, HeadSHA: pr.HeadSHA}
+	if len(ciFailures) > 0 {
+		payload.CIFailures = ciFailures[0]
+	}
 	// the supersede event records the move for replay/audit.
 	ev := ledger.Event{
 		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindSuperseded,
 		FromState: j.State, ToState: job.StateReady, LeaseEpoch: j.LeaseEpoch + 1,
 		Actor: actor, CreatedAt: now,
-		Payload: ledger.Payload{BaseSHA: pr.BaseSHA, HeadSHA: pr.HeadSHA},
+		Payload: payload,
 	}
 	if err := appendEvent(ctx, tx, ev); err != nil {
 		return err

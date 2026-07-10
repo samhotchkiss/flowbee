@@ -229,10 +229,11 @@ func (s *Store) RoutePostApprovalCIFailure(ctx context.Context, jobID string, fa
 		if j.State != job.StateMerging && j.State != job.StateMergeHandoff && j.State != job.StateMergeable {
 			return nil
 		}
-		if err := supersedeTx(ctx, tx, &j, seq, ReconciledPR{BaseSHA: j.BaseSHA, HeadSHA: j.HeadSHA}, "project-out", now); err != nil {
+		msg := FormatCIFailures(failingChecks, checkURLs)
+		if err := supersedeTx(ctx, tx, &j, seq, ReconciledPR{BaseSHA: j.BaseSHA, HeadSHA: j.HeadSHA}, "project-out", now, msg); err != nil {
 			return err
 		}
-		if msg := FormatCIFailures(failingChecks, checkURLs); msg != "" {
+		if msg != "" {
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE jobs SET last_ci_failures=? WHERE id=?`, msg, jobID); err != nil {
 				return err

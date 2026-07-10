@@ -272,6 +272,18 @@ func TestMergedPRWithFailedRequiredCheckDoesNotMarkDone(t *testing.T) {
 			t.Fatalf("last_ci_failures=%q missing %q", j.LastCIFailures, want)
 		}
 	}
+	events, err := st.LoadEvents(ctx, "jpost")
+	if err != nil {
+		t.Fatalf("load events: %v", err)
+	}
+	folded, err := ledger.Fold(events)
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if folded.LastCIFailures != j.LastCIFailures {
+		t.Fatalf("fold last_ci_failures=%q != projection %q; post-merge CI URL must survive replay",
+			folded.LastCIFailures, j.LastCIFailures)
+	}
 }
 
 func TestMergedPRWithPendingRequiredCheckWaitsBeforeDone(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 
 	gh "github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
@@ -78,6 +79,18 @@ func TestAutonomousMergeRoutesRepairWhenRequiredCheckFailsAfterStaleGreen(t *tes
 		if !strings.Contains(j.LastCIFailures, want) {
 			t.Fatalf("last_ci_failures=%q missing %q", j.LastCIFailures, want)
 		}
+	}
+	events, err := st.LoadEvents(ctx, "j")
+	if err != nil {
+		t.Fatalf("load events: %v", err)
+	}
+	folded, err := ledger.Fold(events)
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if folded.LastCIFailures != j.LastCIFailures {
+		t.Fatalf("fold last_ci_failures=%q != projection %q; repair URL must survive replay",
+			folded.LastCIFailures, j.LastCIFailures)
 	}
 	row, ok, err := st.NextPendingOutbox(ctx)
 	if err != nil {
