@@ -347,10 +347,12 @@ func (r *Reconciler) ensureRequiredChecks(ctx context.Context) {
 }
 
 // requiredChecksGreen reports whether EVERY required check has passed at the head. Empty
-// required => false (caller falls back to the full-rollup rule). A required check that is
-// pending/missing/failing is simply absent from PassedChecks, so this stays false until it
-// genuinely concludes SUCCESS — it can only ever make the gate match GitHub's required-
-// checks policy, never approve a PR whose required check has not passed.
+// required => false (caller falls back to the full-rollup rule). A truncated GitHub
+// context read also returns false because Flowbee cannot prove the visible head's full
+// required-check rollup is terminal-success. A required check that is pending/missing/
+// failing is absent from PassedChecks, so this stays false until it genuinely concludes
+// SUCCESS — it can only ever make the gate match GitHub's required-checks policy, never
+// approve a PR whose required check has not passed.
 // anyIn reports whether any name in xs is also in ys (set intersection non-empty) —
 // used to detect whether a REQUIRED check is among the definitively-failed checks.
 func anyIn(xs, ys []string) bool {
@@ -371,6 +373,9 @@ func anyIn(xs, ys []string) bool {
 
 func requiredChecksGreen(pr gh.PullRequest, required []string) bool {
 	if len(required) == 0 {
+		return false
+	}
+	if pr.CheckContextsTruncated {
 		return false
 	}
 	passed := make(map[string]bool, len(pr.PassedChecks))

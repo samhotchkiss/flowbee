@@ -315,18 +315,11 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			return err
 		}
 
-		// F10 (§F10): ci_green@head is a PLUGGABLE fact. It is satisfied by EITHER the
-		// reconciled GitHub-Actions CI (facts.CIGreen, set above) OR a Flowbee `test`
-		// job that ran the build's tests on a capability-matched worker and recorded a
-		// green fact bound to the SAME reconciled head. OR-in the test-job provenance
-		// here so a build with no Actions CI (or red/pending Actions) but a green
-		// Flowbee test job at the reconciled head still satisfies the gate. The SHA
-		// binding (test fact head == reconciled head) is the supersession guard.
-		testFacts, err := testCIFactsTx(ctx, tx, in.JobID)
-		if err != nil {
-			return err
-		}
-		facts.CIGreen = job.CIGreenAtHead(facts.CIGreen, facts.HeadSHA, testFacts)
+		// GitHub-visible required CI is the non-bypassable authorization boundary for
+		// PR review and merge. Flowbee `test` job facts remain audit data, but they
+		// cannot substitute for required GitHub checks on the reconciled PR head: a
+		// hidden Flowbee-only head, prior PR head, or base head must never mint a verdict
+		// for the current GitHub-visible head.
 
 		// M11 (§6.5.2, I-12): (job, epoch)-scoped CI gating. When epoch CI is in use
 		// for this job, the live gate honors ONLY the LIVE build epoch's CI — a zombie

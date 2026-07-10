@@ -41,6 +41,18 @@ func TestToReconciledRequiredChecksGate(t *testing.T) {
 			wantGreen: false, wantFailed: false,
 		},
 		{
+			name:      "partial required rollup with late required missing -> not green",
+			pr:        gh.PullRequest{CIRollup: gh.CISuccess, CIHasRealSuccess: true, PassedChecks: []string{reqd}},
+			required:  []string{reqd, "frontend"},
+			wantGreen: false, wantFailed: false,
+		},
+		{
+			name:      "truncated context list with visible required passed -> not green",
+			pr:        gh.PullRequest{CIRollup: gh.CISuccess, CIHasRealSuccess: true, PassedChecks: []string{reqd}, CheckContextsTruncated: true},
+			required:  required,
+			wantGreen: false, wantFailed: false,
+		},
+		{
 			// non-migration PR: the guard is SKIPPED but GitHub still merges it (CLEAN). The
 			// github layer records a SKIPPED required check in PassedChecks, so it's satisfied.
 			name:      "required check SKIPPED (satisfied) + a real success -> green",
