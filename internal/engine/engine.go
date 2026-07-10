@@ -550,6 +550,10 @@ func Decide(s EngineState, e Event) Decision {
 		if s.Job.State != job.StateMergeable {
 			return Decision{Reject: &RejectReason{Reason: "job not mergeable"}}
 		}
+		if s.Job.Verdict == nil || !job.MergeReady(s.GitHub) ||
+			!s.Job.Verdict.Verify(s.GitHub.HeadSHA, s.GitHub.BaseSHA) {
+			return Decision{}
+		}
 		// the branch arm is decided by the SINGLE canonical §5.4 predicate over the
 		// MINTED verdict + reconciled facts + the content-integrity Result + policy.
 		// self_merge is reachable only when the verdict carried the self_merge

@@ -179,8 +179,19 @@ func SelfMergeEligible(v Verdict, gh DomainBFacts, chk *content.Result, p Policy
 	if chk == nil || !chk.Eligible() {
 		return false
 	}
+	if !MergeReady(gh) {
+		return false
+	}
 	// condition 5: the minted verdict must still bind to the reconciled SHA pair.
 	return v.Verify(gh.HeadSHA, gh.BaseSHA)
+}
+
+// MergeReady is the current, reconciled fact boundary for every merge arm. A job
+// may leave mergeable only while GitHub reports an open PR at a concrete head/base
+// pair with required CI terminal and successful. Pending, queued, missing, unknown,
+// failed, or already-merged facts all fail closed as CIGreen=false.
+func MergeReady(f DomainBFacts) bool {
+	return gatePredicate(f)
 }
 
 // GateOutcome is the pure result of evaluating the code_review gate.

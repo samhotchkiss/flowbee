@@ -74,8 +74,17 @@ func TestDecideMergeDispatchBranch(t *testing.T) {
 	base := EngineState{Job: job.Job{State: job.StateMergeable}, Now: time.Unix(3000, 0)}
 
 	d := Decide(base, MergeDispatch{})
+	if len(d.Transitions) != 0 {
+		t.Fatalf("dispatch without a current SHA-bound verdict and green facts must wait: %+v", d.Transitions)
+	}
+
+	handoff := base
+	hv := job.MintVerdict(job.VerdictApproved, job.DispositionHandoff, "h", "b")
+	handoff.Job.Verdict = &hv
+	handoff.GitHub = job.DomainBFacts{PRExists: true, HeadSHA: "h", BaseSHA: "b", CIGreen: true}
+	d = Decide(handoff, MergeDispatch{})
 	if len(d.Transitions) != 1 || d.Transitions[0].To != job.StateMergeHandoff {
-		t.Fatalf("default dispatch should be handoff: %+v", d.Transitions)
+		t.Fatalf("green approved handoff dispatch should be handoff: %+v", d.Transitions)
 	}
 
 	sm := base
@@ -84,7 +93,7 @@ func TestDecideMergeDispatchBranch(t *testing.T) {
 	sm.Job.Verdict = &v
 	// M9 (§5.4 conditions 2–5): self_merge also requires a clean content-integrity
 	// Result AND the verdict still bound to the reconciled SHA pair.
-	sm.GitHub = job.DomainBFacts{HeadSHA: "h", BaseSHA: "b"}
+	sm.GitHub = job.DomainBFacts{PRExists: true, HeadSHA: "h", BaseSHA: "b", CIGreen: true}
 	sm.Content = &content.Result{DenylistClear: true, BlastRadiusConsistent: true, StaticChecksPass: true}
 	d = Decide(sm, MergeDispatch{})
 	if len(d.Transitions) != 1 || d.Transitions[0].To != job.StateMerging {
@@ -98,5 +107,30 @@ func TestDecideMergeDispatchBranch(t *testing.T) {
 	d = Decide(tampered, MergeDispatch{})
 	if len(d.Transitions) != 1 || d.Transitions[0].To != job.StateMergeHandoff {
 		t.Fatalf("self_merge over a denylisted diff must fall back to handoff: %+v", d.Transitions)
+	}
+}
+
+func TestDecideMergeDispatchWaitsForRequiredChecks(t *testing.T) {
+	v := job.MintVerdict(job.VerdictApproved, job.DispositionSelfMerge, "h", "b")
+	base := EngineState{
+		Job:     job.Job{State: job.StateMergeable, Verdict: &v},
+		Now:     time.Unix(3000, 0),
+		Policy:  job.Policy{AllowSelfMerge: true},
+		Content: &content.Result{DenylistClear: true, BlastRadiusConsistent: true, StaticChecksPass: true},
+	}
+
+	for name, facts := range map[string]job.DomainBFacts{
+		"pending_ci":    {PRExists: true, HeadSHA: "h", BaseSHA: "b", CIGreen: false},
+		"missing_pr":    {HeadSHA: "h", BaseSHA: "b", CIGreen: true},
+		"unknown_sha":   {PRExists: true, CIGreen: true},
+		"stale_binding": {PRExists: true, HeadSHA: "new", BaseSHA: "b", CIGreen: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := base
+			s.GitHub = facts
+			if d := Decide(s, MergeDispatch{}); len(d.Transitions) != 0 {
+				t.Fatalf("non-terminal/current-success CI facts must not transition to merge: %+v", d.Transitions)
+			}
+		})
 	}
 }

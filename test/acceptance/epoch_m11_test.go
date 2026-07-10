@@ -419,11 +419,12 @@ func TestM11_DenylistAndSHAMovedFallToHandoff(t *testing.T) {
 		}
 	})
 
-	// case B: a SHA move since review denies self_merge -> handoff (§5.4 condition 5,
+	// case B: a SHA move since review denies every merge arm (§5.4 condition 5,
 	// I-5). A self_merge-eligible verdict is minted bound to head-1; the head then MOVES
 	// to head-2 before the branch point dispatches. The branch point re-checks the §5.4
 	// predicate (SelfMergeEligible re-Verifies the verdict against the LIVE facts): the
-	// moved head fails the binding, so the branch takes handoff instead of merging.
+	// moved head fails the binding, so dispatch waits at mergeable for reconcile to
+	// supersede/re-arm instead of entering merging or merge_handoff.
 	t.Run("sha_moved", func(t *testing.T) {
 		e := newM11Env(t, job.Policy{AllowSelfMerge: true})
 		jobID := "build-shamove"
@@ -461,8 +462,8 @@ func TestM11_DenylistAndSHAMovedFallToHandoff(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dispatch merge: %v", err)
 		}
-		if final != job.StateMergeHandoff {
-			t.Fatalf("a SHA move since review must fall to handoff (binding superseded), got %s", final)
+		if final != job.StateMergeable {
+			t.Fatalf("a SHA move since review must not enter a merge path (binding superseded), got %s", final)
 		}
 	})
 }

@@ -48,6 +48,27 @@ func (f DBFactSource) Facts(ctx context.Context, jobID string) (job.DomainBFacts
 	return facts, true, nil
 }
 
+func domainBFactsTx(ctx context.Context, tx *sql.Tx, jobID string) (job.DomainBFacts, bool, error) {
+	var (
+		facts                  job.DomainBFacts
+		prExists, ciGreen, mrg int
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT pr_exists, pr_number, head_sha, base_sha, ci_green, merged
+		  FROM domain_b_facts WHERE job_id = ?`, jobID).Scan(
+		&prExists, &facts.PRNumber, &facts.HeadSHA, &facts.BaseSHA, &ciGreen, &mrg)
+	if errors.Is(err, sql.ErrNoRows) {
+		return job.DomainBFacts{}, false, nil
+	}
+	if err != nil {
+		return job.DomainBFacts{}, false, err
+	}
+	facts.PRExists = prExists == 1
+	facts.CIGreen = ciGreen == 1
+	facts.Merged = mrg == 1
+	return facts, true, nil
+}
+
 // UpsertDomainBFacts writes the reconciled Domain-B facts for a job (M3: test
 // seam standing in for reconcile-IN). Only ever called by the reconcile path —
 // never by a worker call.
@@ -554,20 +575,15 @@ type DispatchMergeParams struct {
 // from the persisted verdict + reconciled facts + the content Result + policy.
 // Returns the resulting state.
 func (s *Store) DispatchMerge(ctx context.Context, src FactSource, p job.Policy, in DispatchMergeParams) (job.State, error) {
-	// reconcile facts OUTSIDE the tx (read-only) for the §5.4 condition-5 SHA
-	// re-binding; a nil/erroring source leaves facts zero (self_merge then denied,
-	// the safe default — handoff).
-	var facts job.DomainBFacts
-	if src != nil {
-		if f, _, ferr := src.Facts(ctx, in.JobID); ferr == nil {
-			facts = f
-		}
-	}
 	var final job.State
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		j, seq, err := loadJobTx(ctx, tx, in.JobID)
 		if err != nil {
 			return err
+		}
+		facts, _, err := domainBFactsTx(ctx, tx, in.JobID)
+		if err != nil {
+			return fmt.Errorf("read merge facts: %w", err)
 		}
 		chk, err := s.contentResultTx(ctx, tx, in.JobID)
 		if err != nil {
