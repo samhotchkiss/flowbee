@@ -72,6 +72,9 @@ type PullRequest struct {
 	// to re-run + fix locally instead of a generic "CI was red". Empty when CI is green
 	// or only pending.
 	FailingChecks []string
+	// FailingCheckURLs maps each failed check name to its actionable GitHub URL when
+	// GitHub exposes one (CheckRun.detailsUrl or StatusContext.targetUrl).
+	FailingCheckURLs map[string]string
 	// PassedChecks names the checks that concluded SUCCESS at the head (CheckRun SUCCESS
 	// or legacy StatusContext SUCCESS). Used to evaluate whether the repo's REQUIRED
 	// status checks are green independently of the aggregate rollup — a PR can be
@@ -448,7 +451,7 @@ fragment prFields on PullRequest {
   headRefOid baseRefOid
   mergeCommit { oid }
   commits(last:1) { nodes { commit { statusCheckRollup { state
-    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
+    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
   labels(first:20) { nodes { name } }
 }
 query BoardSweep($owner:String!, $repo:String!, $prCursor:String, $issueCursor:String, $includeMerged:Boolean!) {
@@ -548,8 +551,10 @@ type prNode struct {
 							Typename   string `json:"__typename"`
 							Name       string `json:"name"`       // CheckRun (Actions) check name
 							Conclusion string `json:"conclusion"` // CheckRun (Actions)
+							DetailsURL string `json:"detailsUrl"` // CheckRun URL
 							Context    string `json:"context"`    // StatusContext (legacy) name
 							State      string `json:"state"`      // StatusContext (legacy)
+							TargetURL  string `json:"targetUrl"`  // StatusContext URL
 						} `json:"nodes"`
 					} `json:"contexts"`
 				} `json:"statusCheckRollup"`
@@ -638,10 +643,22 @@ func prFromNode(n prNode) PullRequest {
 			case c.Typename == "CheckRun" && (c.Conclusion == "FAILURE" || c.Conclusion == "TIMED_OUT" || c.Conclusion == "STARTUP_FAILURE" || c.Conclusion == "CANCELLED"):
 				if c.Name != "" {
 					pr.FailingChecks = append(pr.FailingChecks, c.Name)
+					if c.DetailsURL != "" {
+						if pr.FailingCheckURLs == nil {
+							pr.FailingCheckURLs = make(map[string]string)
+						}
+						pr.FailingCheckURLs[c.Name] = c.DetailsURL
+					}
 				}
 			case c.Typename == "StatusContext" && (c.State == "FAILURE" || c.State == "ERROR"):
 				if c.Context != "" {
 					pr.FailingChecks = append(pr.FailingChecks, c.Context)
+					if c.TargetURL != "" {
+						if pr.FailingCheckURLs == nil {
+							pr.FailingCheckURLs = make(map[string]string)
+						}
+						pr.FailingCheckURLs[c.Context] = c.TargetURL
+					}
 				}
 			}
 		}
@@ -784,7 +801,7 @@ query PR($owner:String!, $repo:String!, $number:Int!) {
       headRefOid baseRefOid
       mergeCommit { oid }
       commits(last:1) { nodes { commit { statusCheckRollup { state
-    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }
+    contexts(first:100) { nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
       labels(first:20) { nodes { name } }
     }
   }
@@ -815,8 +832,10 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 										Typename   string `json:"__typename"`
 										Name       string `json:"name"`
 										Conclusion string `json:"conclusion"`
+										DetailsURL string `json:"detailsUrl"`
 										Context    string `json:"context"`
 										State      string `json:"state"`
+										TargetURL  string `json:"targetUrl"`
 									} `json:"nodes"`
 								} `json:"contexts"`
 							} `json:"statusCheckRollup"`
@@ -878,10 +897,22 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 			case c.Typename == "CheckRun" && (c.Conclusion == "FAILURE" || c.Conclusion == "TIMED_OUT" || c.Conclusion == "STARTUP_FAILURE" || c.Conclusion == "CANCELLED"):
 				if c.Name != "" {
 					pr.FailingChecks = append(pr.FailingChecks, c.Name)
+					if c.DetailsURL != "" {
+						if pr.FailingCheckURLs == nil {
+							pr.FailingCheckURLs = make(map[string]string)
+						}
+						pr.FailingCheckURLs[c.Name] = c.DetailsURL
+					}
 				}
 			case c.Typename == "StatusContext" && (c.State == "FAILURE" || c.State == "ERROR"):
 				if c.Context != "" {
 					pr.FailingChecks = append(pr.FailingChecks, c.Context)
+					if c.TargetURL != "" {
+						if pr.FailingCheckURLs == nil {
+							pr.FailingCheckURLs = make(map[string]string)
+						}
+						pr.FailingCheckURLs[c.Context] = c.TargetURL
+					}
 				}
 			}
 		}

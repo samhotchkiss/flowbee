@@ -53,6 +53,9 @@ type ReconciledPR struct {
 	// rebuild's lease context so the agent re-runs the named gate + fixes the real
 	// violation rather than rebuilding blind. Empty when CI is green or only pending.
 	FailingChecks []string
+	// FailingCheckURLs maps failed check names to their GitHub details URL. It is
+	// persisted alongside the check name so post-merge red-main escalations are actionable.
+	FailingCheckURLs map[string]string
 	// ClosedUnmerged is true for a PR a human CLOSED without merging — the change was
 	// rejected, so the job is parked (pr_closed) instead of waiting on a merge that will
 	// never come (and instead of the slow, misleading stall the watchdog would otherwise
@@ -73,6 +76,26 @@ type ReconcileOutcome struct {
 	Superseded bool // a SHA move re-armed the job (I-5, §6.2.4)
 	Frozen     bool // terminal-SHA guard fired: merged job, no re-dispatch (I-3)
 	Done       bool // a non-terminal job whose PR merged transitioned to done
+}
+
+// FormatCIFailures renders failed check names with their GitHub details URLs when
+// available for persistence in last_ci_failures.
+func FormatCIFailures(failingChecks []string, checkURLs map[string]string) string {
+	if len(failingChecks) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(failingChecks))
+	for _, name := range failingChecks {
+		if name == "" {
+			continue
+		}
+		if url := checkURLs[name]; url != "" {
+			lines = append(lines, fmt.Sprintf("%s (%s)", name, url))
+			continue
+		}
+		lines = append(lines, name)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // ApplyReconciledPR ingests one PR's Domain-B facts for the job bound to that PR
@@ -182,7 +205,7 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		// of a GitHub-owned fact changing — never a stage/role/verdict edit.
 		switch {
 		case pr.Merged && pr.MergeCommit != "" && pr.CIFailed && prBoundActive(j.State):
-			if err := postMergeCIFailureTx(ctx, tx, &j, seq, now, pr.FailingChecks); err != nil {
+			if err := postMergeCIFailureTx(ctx, tx, &j, seq, now, pr.FailingChecks, pr.FailingCheckURLs); err != nil {
 				return err
 			}
 			out.Applied = true
@@ -269,7 +292,7 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 			// it's THIS change): bounce it back to build (rebuild), escalating to needs_human
 			// at max_bounces. Gated to review_pending so a single failure bounces once
 			// (the rebuild moves the head; the next sweep sees fresh/pending CI).
-			if err := ciFailBounceTx(ctx, tx, &j, seq, now, pr.FailingChecks); err != nil {
+			if err := ciFailBounceTx(ctx, tx, &j, seq, now, pr.FailingChecks, pr.FailingCheckURLs); err != nil {
 				return err
 			}
 			out.Applied = true
@@ -308,7 +331,7 @@ func prBoundActive(s job.State) bool {
 	}
 }
 
-func postMergeCIFailureTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time, failingChecks []string) error {
+func postMergeCIFailureTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time, failingChecks []string, checkURLs map[string]string) error {
 	nextSeq := seq + 1
 	ev := ledger.Event{
 		JobID: j.ID, JobSeq: nextSeq, Kind: ledger.KindStateChanged,
@@ -323,7 +346,7 @@ func postMergeCIFailureTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, 
 		UPDATE jobs SET state='needs_human', escalation_reason=?, last_ci_failures=?,
 		     lease_id=NULL, bound_identity=NULL, bound_model_family=NULL, lease_hb_due=NULL,
 		     updated_at=datetime('now') WHERE id=?`,
-		string(job.EscalationPostMergeCI), strings.Join(failingChecks, "\n"), j.ID); err != nil {
+		string(job.EscalationPostMergeCI), FormatCIFailures(failingChecks, checkURLs), j.ID); err != nil {
 		return fmt.Errorf("apply post-merge CI failure: %w", err)
 	}
 	j.State = job.StateNeedsHuman
@@ -409,11 +432,11 @@ func reconcileTransitionTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int,
 // build (a rebuild), or escalates to needs_human at max_bounces. It mirrors the
 // gate's own bounce events (KindReviewBounced / KindBounceExhausted) EXACTLY so the
 // jobs projection stays equal to a re-fold of the ledger (determinism).
-func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time, failingChecks []string) error {
+func ciFailBounceTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, now time.Time, failingChecks []string, checkURLs map[string]string) error {
 	nextSeq := seq + 1
 	// the names of the gates that failed, recorded on the job so the rebuild's lease
 	// context tells the agent exactly which check to re-run + fix (not "CI was red").
-	ciFails := strings.Join(failingChecks, "\n")
+	ciFails := FormatCIFailures(failingChecks, checkURLs)
 	if j.Bounces+1 > j.MaxBounces {
 		// the rebuild keeps failing CI: escalate to a human (KindBounceExhausted fold:
 		// state = ToState, bounces += delta, lease cleared).

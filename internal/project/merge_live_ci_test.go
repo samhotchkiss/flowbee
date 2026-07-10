@@ -2,6 +2,7 @@ package project
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	gh "github.com/samhotchkiss/flowbee/internal/github"
@@ -58,6 +59,9 @@ func TestAutonomousMergeRoutesRepairWhenRequiredCheckFailsAfterStaleGreen(t *tes
 	fake.SetPR(gh.PullRequest{
 		Number: 42, HeadRefOid: "head-sha", BaseRefOid: "base-sha",
 		CIRollup: gh.CIFailure, FailingChecks: []string{"backend shard 2"},
+		FailingCheckURLs: map[string]string{
+			"backend shard 2": "https://github.com/acme/api/actions/runs/123",
+		},
 	})
 
 	if n, err := sender.DrainOnce(ctx); err != nil || n != 0 {
@@ -70,8 +74,10 @@ func TestAutonomousMergeRoutesRepairWhenRequiredCheckFailsAfterStaleGreen(t *tes
 	if j.State != job.StateReady || j.Verdict != nil {
 		t.Fatalf("job state/verdict=%s/%+v, want repair-ready with stale verdict cleared", j.State, j.Verdict)
 	}
-	if j.LastCIFailures != "backend shard 2" {
-		t.Fatalf("last_ci_failures=%q, want failed required check name", j.LastCIFailures)
+	for _, want := range []string{"backend shard 2", "https://github.com/acme/api/actions/runs/123"} {
+		if !strings.Contains(j.LastCIFailures, want) {
+			t.Fatalf("last_ci_failures=%q missing %q", j.LastCIFailures, want)
+		}
 	}
 	row, ok, err := st.NextPendingOutbox(ctx)
 	if err != nil {

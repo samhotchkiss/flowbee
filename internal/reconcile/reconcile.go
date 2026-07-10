@@ -416,7 +416,8 @@ func toReconciled(pr gh.PullRequest, mainCIRed bool, requiredChecks []string) st
 		CIFailed:    ciFailed,
 		// the NAMES of the failed checks, carried to a bounced build so the rebuild brief
 		// tells the agent exactly which gate to re-run + fix (not a generic "CI was red").
-		FailingChecks:  pr.FailingChecks,
-		ClosedUnmerged: pr.ClosedUnmerged,
+		FailingChecks:    pr.FailingChecks,
+		FailingCheckURLs: pr.FailingCheckURLs,
+		ClosedUnmerged:   pr.ClosedUnmerged,
 	}
 }

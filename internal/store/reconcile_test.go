@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -252,6 +253,9 @@ func TestMergedPRWithFailedRequiredCheckDoesNotMarkDone(t *testing.T) {
 		Number: 29, UpdatedAt: now, HeadSHA: "h", BaseSHA: "b",
 		Merged: true, MergeCommit: "merge-sha",
 		CIFailed: true, FailingChecks: []string{"backend shard 2"},
+		FailingCheckURLs: map[string]string{
+			"backend shard 2": "https://github.com/acme/api/actions/runs/456",
+		},
 	}, now)
 	if err != nil {
 		t.Fatalf("apply merged red: %v", err)
@@ -263,8 +267,10 @@ func TestMergedPRWithFailedRequiredCheckDoesNotMarkDone(t *testing.T) {
 	if j.State != job.StateNeedsHuman || j.EscalationReason != string(job.EscalationPostMergeCI) {
 		t.Fatalf("state/reason=%s/%q, want needs_human/%s", j.State, j.EscalationReason, job.EscalationPostMergeCI)
 	}
-	if j.LastCIFailures != "backend shard 2" {
-		t.Fatalf("last_ci_failures=%q, want failed check name", j.LastCIFailures)
+	for _, want := range []string{"backend shard 2", "https://github.com/acme/api/actions/runs/456"} {
+		if !strings.Contains(j.LastCIFailures, want) {
+			t.Fatalf("last_ci_failures=%q missing %q", j.LastCIFailures, want)
+		}
 	}
 }
 

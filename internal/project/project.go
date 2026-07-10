@@ -76,6 +76,7 @@ type liveMergeCIResult struct {
 	green         bool
 	failed        bool
 	failingChecks []string
+	checkURLs     map[string]string
 }
 
 func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedHead string) (liveMergeCIResult, error) {
@@ -111,12 +112,14 @@ func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedHead str
 			green:         pr.CIHasRealSuccess && checksContainAll(pr.PassedChecks, required),
 			failed:        checksIntersect(pr.FailingChecks, required),
 			failingChecks: intersectNames(pr.FailingChecks, required),
+			checkURLs:     filterCheckURLs(pr.FailingCheckURLs, required),
 		}, nil
 	}
 	return liveMergeCIResult{
 		green:         pr.CIHasRealSuccess && pr.CIRollup == gh.CISuccess,
 		failed:        pr.CIRollup == gh.CIFailure || pr.CIRollup == gh.CIError,
 		failingChecks: append([]string(nil), pr.FailingChecks...),
+		checkURLs:     cloneCheckURLs(pr.FailingCheckURLs),
 	}, nil
 }
 
@@ -158,6 +161,30 @@ func checksContainAll(have, required []string) bool {
 
 func checksIntersect(xs, ys []string) bool {
 	return len(intersectNames(xs, ys)) > 0
+}
+
+func filterCheckURLs(urls map[string]string, names []string) map[string]string {
+	if len(urls) == 0 || len(names) == 0 {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, name := range names {
+		if url := urls[name]; url != "" {
+			out[name] = url
+		}
+	}
+	return out
+}
+
+func cloneCheckURLs(urls map[string]string) map[string]string {
+	if len(urls) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(urls))
+	for name, url := range urls {
+		out[name] = url
+	}
+	return out
 }
 
 func intersectNames(xs, ys []string) []string {
@@ -677,7 +704,7 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			return "", err
 		}
 		if ci.failed {
-			if rerr := s.store.RoutePostApprovalCIFailure(ctx, row.JobID, ci.failingChecks, s.clock.Now()); rerr != nil {
+			if rerr := s.store.RoutePostApprovalCIFailure(ctx, row.JobID, ci.failingChecks, ci.checkURLs, s.clock.Now()); rerr != nil {
 				return "", fmt.Errorf("route post-approval CI failure: %w", rerr)
 			}
 			if s.pub != nil {
