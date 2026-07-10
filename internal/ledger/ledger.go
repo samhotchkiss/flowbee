@@ -40,6 +40,7 @@ const (
 	// M6 reconcile-IN event kinds (Domain-B-driven transitions; actor='reconcile').
 	KindFactsReconciled EventKind = "facts_reconciled" // a sweep/refetch wrote Domain-B facts (audit)
 	KindSuperseded      EventKind = "superseded"       // SHA move re-armed the job to ready (I-5, §6.2.4)
+	KindAdoptRearmed    EventKind = "adopt_rearmed"    // targeted adopt observed a new PR SHA and re-armed review
 	KindBaseRefreshed   EventKind = "base_refreshed"   // a ready job's base_sha advanced to the new main after a sibling merge
 	// M7 spec-flow + project-OUT event kinds.
 	KindSpecAuthored      EventKind = "spec_authored"       // Flowbee committed spec.md, opened spec_review (§11.6)
@@ -399,6 +400,25 @@ func Fold(events []Event) (job.Job, error) {
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""
+			j.BoundLens = ""
+
+		case KindAdoptRearmed:
+			// A targeted adopt of an already-adopted PR found a new authoritative
+			// base/head. The old SHA-bound verdict is superseded, but the PR already
+			// exists, so the job re-enters code review with the refreshed diff.
+			j.State = e.ToState
+			j.Role = job.RoleCodeReviewer
+			j.Stage = "review"
+			j.RequiredCapabilities = []string{"role:code_reviewer"}
+			j.LeaseEpoch = e.LeaseEpoch
+			j.Verdict = nil
+			j.BaseSHA = e.Payload.BaseSHA
+			j.HeadSHA = e.Payload.HeadSHA
+			j.EnqueuedAt = e.CreatedAt
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+			j.BoundLens = ""
 
 		case KindSpecAuthored:
 			// Flowbee committed spec.md and opened the spec_review gate: record the

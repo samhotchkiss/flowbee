@@ -279,13 +279,14 @@ func (m *Manager) RefetchHint(ctx context.Context, repoID string, prNumber int) 
 
 // AdoptPR routes a targeted PR-adoption to the named repo's reconciler: it imports a
 // pre-existing PR (one Flowbee did not originate) into that repo's review pipeline.
-// Returns the new adopted job id ("" if the PR is already tracked). An unknown repo
-// is an explicit error (unlike the best-effort RefetchHint) — an operator adopting a
-// PR named the repo deliberately.
-func (m *Manager) AdoptPR(ctx context.Context, repoID string, prNumber int) (string, error) {
+// Returns the new/re-armed adopted job id ("" if the PR is already tracked without
+// changes) and whether an existing adopted job was re-armed. An unknown repo is an
+// explicit error (unlike the best-effort RefetchHint) — an operator adopting a PR
+// named the repo deliberately.
+func (m *Manager) AdoptPR(ctx context.Context, repoID string, prNumber int) (string, bool, error) {
 	l, ok := m.loops[repoID]
 	if !ok {
-		return "", fmt.Errorf("unknown repo %q", repoID)
+		return "", false, fmt.Errorf("unknown repo %q", repoID)
 	}
 	return l.rec.AdoptPR(ctx, prNumber)
 }

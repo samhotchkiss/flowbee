@@ -138,9 +138,12 @@ func TestAdoptPRPersistsAuthoritativeDiff(t *testing.T) {
 	f.SetPRDiff(4078, diff)
 
 	rec := reconcile.NewForRepo("russ", st, f, clock.NewFake(time.Unix(10, 0)), nil)
-	id, err := rec.AdoptPR(ctx, 4078)
+	id, rearmed, err := rec.AdoptPR(ctx, 4078)
 	if err != nil {
 		t.Fatalf("adopt: %v", err)
+	}
+	if rearmed {
+		t.Fatal("first adopt must not report re-armed")
 	}
 	if id == "" {
 		t.Fatal("expected adopted job")
@@ -162,9 +165,12 @@ func TestAdoptPREmptyDiffIsExplicit(t *testing.T) {
 	f.SetPRDiff(12, "")
 
 	rec := reconcile.NewForRepo("russ", st, f, clock.NewFake(time.Unix(10, 0)), nil)
-	id, err := rec.AdoptPR(ctx, 12)
+	id, rearmed, err := rec.AdoptPR(ctx, 12)
 	if err != nil {
 		t.Fatalf("adopt empty: %v", err)
+	}
+	if rearmed {
+		t.Fatal("first empty adopt must not report re-armed")
 	}
 	j, _ := st.GetJob(ctx, id)
 	if !j.DiffEmpty {
@@ -179,7 +185,7 @@ func TestAdoptPRFailsWithoutAuthoritativeDiff(t *testing.T) {
 	f.SetPR(gh.PullRequest{Number: 4079, HeadRefOid: "head-sha", BaseRefOid: "base-sha", CIRollup: gh.CISuccess, UpdatedAt: time.Unix(5, 0)})
 
 	rec := reconcile.NewForRepo("russ", st, f, clock.NewFake(time.Unix(10, 0)), nil)
-	if _, err := rec.AdoptPR(ctx, 4079); err == nil {
+	if _, _, err := rec.AdoptPR(ctx, 4079); err == nil {
 		t.Fatal("adoption without an authoritative diff must fail")
 	}
 	if id, ok, err := st.JobIDForPRInRepo(ctx, "russ", 4079); err != nil || ok || id != "" {
@@ -216,9 +222,12 @@ func TestAdoptPRReadsRealStateAndImports(t *testing.T) {
 	f.SetPRDiff(900, "diff --git a/adopted b/adopted\n+review me\n")
 	rec := reconcile.New(st, f, clock.NewFake(time.Unix(20, 0)), nil)
 
-	id, err := rec.AdoptPR(ctx, 900)
+	id, rearmed, err := rec.AdoptPR(ctx, 900)
 	if err != nil {
 		t.Fatalf("adopt: %v", err)
+	}
+	if rearmed {
+		t.Fatal("first adopt must not report re-armed")
 	}
 	if id == "" {
 		t.Fatal("expected a new adopted job id")
@@ -235,22 +244,22 @@ func TestAdoptPRReadsRealStateAndImports(t *testing.T) {
 	}
 
 	// idempotent
-	again, err := rec.AdoptPR(ctx, 900)
+	again, rearmed, err := rec.AdoptPR(ctx, 900)
 	if err != nil {
 		t.Fatalf("re-adopt: %v", err)
 	}
-	if again != "" {
-		t.Fatalf("re-adopt must no-op, got %q", again)
+	if again != "" || rearmed {
+		t.Fatalf("unchanged re-adopt must no-op, got id=%q rearmed=%v", again, rearmed)
 	}
 
 	// a merged PR is refused (nothing to review)
 	f.SetPR(gh.PullRequest{Number: 901, HeadRefOid: "h1", BaseRefOid: "b1", Merged: true, UpdatedAt: time.Unix(12, 0)})
-	if _, err := rec.AdoptPR(ctx, 901); err == nil {
+	if _, _, err := rec.AdoptPR(ctx, 901); err == nil {
 		t.Fatal("adopting a merged PR must error")
 	}
 
 	// a non-existent PR is refused
-	if _, err := rec.AdoptPR(ctx, 999); err == nil {
+	if _, _, err := rec.AdoptPR(ctx, 999); err == nil {
 		t.Fatal("adopting a non-existent PR must error")
 	}
 }

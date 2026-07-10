@@ -345,7 +345,7 @@ func (s *Server) SetLiveness(cfg store.LivenessConfig) { s.liveness = cfg }
 // nil when no repos are wired (single-repo/legacy or a test server), in which case
 // POST /v1/adopt returns 503.
 type PRAdopter interface {
-	AdoptPR(ctx context.Context, repoID string, prNumber int) (string, error)
+	AdoptPR(ctx context.Context, repoID string, prNumber int) (string, bool, error)
 }
 
 // SetAdopter wires the PR-adoption backend (the multi-repo Manager). Called after
@@ -622,8 +622,9 @@ func (s *Server) adoptOptIn(w http.ResponseWriter, r *http.Request) {
 // named repo's review pipeline. Flowbee reads the PR's REAL state from GitHub, binds
 // it to an opted-in adopted code_reviewer job in review_pending, and the normal
 // review/merge machinery takes over (self-merge on approval + green CI, or needs_human
-// on changes_requested). Idempotent: a PR Flowbee already tracks returns
-// already_tracked=true with no new job. 503 when no repos are wired (no adopter).
+// on changes_requested). Idempotent: an unchanged PR Flowbee already tracks returns
+// already_tracked=true with no new job. A tracked adopted PR whose head/base moved
+// returns rearmed=true. 503 when no repos are wired (no adopter).
 func (s *Server) adoptPR(w http.ResponseWriter, r *http.Request) {
 	if s.adopter == nil {
 		http.Error(w, "adoption unavailable: no repos wired (single-repo/legacy control plane)", http.StatusServiceUnavailable)
@@ -646,9 +647,13 @@ func (s *Server) adoptPR(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	id, err := s.adopter.AdoptPR(r.Context(), repo, body.PR)
+	id, rearmed, err := s.adopter.AdoptPR(r.Context(), repo, body.PR)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if rearmed {
+		writeJSON(w, http.StatusOK, map[string]any{"job_id": id, "rearmed": true, "pr": body.PR, "repo": repo})
 		return
 	}
 	if id == "" {
