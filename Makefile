@@ -1,7 +1,7 @@
 DB_URL ?= flowbee.db
 export FLOWBEE_DATABASE_URL := $(DB_URL)
 
-.PHONY: build tidy migrate serve seed fmt archcheck lint test accept clean
+.PHONY: build tidy migrate serve seed fmt archcheck llmguard lint test accept clean
 
 build:
 	CGO_ENABLED=0 go build -o bin/flowbee ./cmd/flowbee
@@ -24,7 +24,10 @@ fmt:
 archcheck:
 	go run ./tools/archcheck
 
-lint: archcheck
+llmguard:
+	go run ./tools/llmguard
+
+lint: archcheck llmguard
 	go vet ./...
 	@command -v golangci-lint >/dev/null 2>&1 && golangci-lint run || echo "golangci-lint not installed; skipping"
 

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/samhotchkiss/flowbee/internal/llm"
 )
 
 // captureStdout runs f with os.Stdout redirected to a pipe and returns what it wrote.
@@ -162,6 +164,23 @@ func TestFleetSystemdEchoesResolvedRepoURL(t *testing.T) {
 	})
 	if !strings.Contains(out, "FLOWBEE_REPO_URL=git@github.com:samhotchkiss/flowbee.git") {
 		t.Errorf("must echo the resolved repo url; got:\n%s", out)
+	}
+}
+
+// TestFleetSmokeRejectsEphemeralLLMRouter pins the production path called out in
+// review: fleet smoke tests must resolve operator-editable model_slot_binding
+// rows from the configured Flowbee database, never from a private in-memory seed.
+func TestFleetSmokeRejectsEphemeralLLMRouter(t *testing.T) {
+	llm.SetDefaultRouter(nil)
+	t.Cleanup(func() { llm.SetDefaultRouter(nil) })
+	t.Setenv("FLOWBEE_DATABASE_URL", "file:flowbee-llm-router?mode=memory&cache=shared")
+
+	err := smokeAgent("echo ok > ok.txt")
+	if err == nil {
+		t.Fatal("smokeAgent must reject an ephemeral LLM router database")
+	}
+	if !strings.Contains(err.Error(), "not persistent") {
+		t.Fatalf("smokeAgent error = %v, want persistent database guidance", err)
 	}
 }
 

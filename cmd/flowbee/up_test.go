@@ -3,6 +3,9 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/samhotchkiss/flowbee/internal/llm"
+	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
 
 // TestUpRolesMatchFleetGuarantees pins that `flowbee up` is NOT a degraded shadow of
@@ -97,6 +100,10 @@ func rolesList(rs []upRole) []string {
 // the classic un-authed / rate-limited agent — must FAIL the smoke so up errors loud
 // instead of starting a fleet that silently fails every job.
 func TestUpSmokeTestCatchesBrokenAgent(t *testing.T) {
+	st := testutil.NewStore(t)
+	llm.UseDatabaseAsDefaultRouter(st.DB)
+	t.Cleanup(func() { llm.SetDefaultRouter(nil) })
+
 	if err := smokeAgent("true"); err == nil {
 		t.Fatal("smokeAgent must reject an agent that writes no file (the un-authed-agent symptom)")
 	}
