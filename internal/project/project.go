@@ -108,11 +108,20 @@ func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedHead str
 		return liveMergeCIResult{}, err
 	}
 	if len(required) > 0 {
+		// #4165 hardening: a repo ruleset can mark only a THIN check required (russ
+		// requires just "Migration version guard"), so gating solely on required checks
+		// let a red SUBSTANTIVE non-required shard (e.g. a backend test split) self-merge
+		// while its failure was ignored. Block the merge on any failing check that is not
+		// a known-cosmetic gate (lint/format/style) in addition to the required set, while
+		// still tolerating cosmetic non-required regressions so the board does not freeze
+		// on a lint that main itself already carries. Default-deny: an unrecognized failing
+		// check is treated as substantive and blocks.
+		blocking := unionNames(intersectNames(pr.FailingChecks, required), substantiveFailures(pr.FailingChecks))
 		return liveMergeCIResult{
-			green:         pr.CIHasRealSuccess && checksContainAll(pr.PassedChecks, required),
-			failed:        checksIntersect(pr.FailingChecks, required),
-			failingChecks: intersectNames(pr.FailingChecks, required),
-			checkURLs:     filterCheckURLs(pr.FailingCheckURLs, required),
+			green:         pr.CIHasRealSuccess && checksContainAll(pr.PassedChecks, required) && len(blocking) == 0,
+			failed:        len(blocking) > 0,
+			failingChecks: blocking,
+			checkURLs:     filterCheckURLs(pr.FailingCheckURLs, blocking),
 		}, nil
 	}
 	return liveMergeCIResult{
@@ -199,6 +208,64 @@ func intersectNames(xs, ys []string) []string {
 	for _, x := range xs {
 		if set[x] {
 			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// unionNames returns the de-duplicated union of two check-name lists, preserving
+// first-seen order (all of a, then any of b not already seen).
+func unionNames(a, b []string) []string {
+	if len(a) == 0 {
+		return append([]string(nil), b...)
+	}
+	if len(b) == 0 {
+		return append([]string(nil), a...)
+	}
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, xs := range [][]string{a, b} {
+		for _, x := range xs {
+			if !seen[x] {
+				seen[x] = true
+				out = append(out, x)
+			}
+		}
+	}
+	return out
+}
+
+// cosmeticCheckPatterns are case-insensitive substrings identifying checks whose
+// failure is advisory (formatters/linters/style) rather than a substantive test or
+// build gate. A failing check matching one of these does NOT block an otherwise-
+// approved self-merge; every other failing check does. Kept as a package var so tests
+// can override and a future config can supply repo-specific patterns. Deliberately
+// tight — default-deny means an unrecognized failing check counts as substantive and
+// blocks, which is the safe error direction after #4165 (a red backend shard slipped
+// a required-only gate because the repo ruleset marked only a thin check required).
+var cosmeticCheckPatterns = []string{
+	"lint", "prettier", "eslint", "stylelint", "markdownlint",
+	"gofmt", "goimports", "gofumpt", "format",
+}
+
+func isCosmeticCheck(name string) bool {
+	n := strings.ToLower(name)
+	for _, p := range cosmeticCheckPatterns {
+		if strings.Contains(n, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// substantiveFailures returns the failing checks that are NOT known-cosmetic — the
+// gates whose failure must block a self-merge regardless of whether the repo ruleset
+// marks them required. Default-deny: an unrecognized failing check is substantive.
+func substantiveFailures(failing []string) []string {
+	var out []string
+	for _, f := range failing {
+		if !isCosmeticCheck(f) {
+			out = append(out, f)
 		}
 	}
 	return out
