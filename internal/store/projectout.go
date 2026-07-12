@@ -139,6 +139,56 @@ func (s *Store) StampPRNumber(ctx context.Context, jobID string, prNumber int, h
 	})
 }
 
+// BindReplacementPR records the PR project-OUT opened after an adopted repair had
+// to leave a foreign branch. The GitHub mutation has already completed, but every
+// Domain-A consequence of that replacement (binding, pending head, ledger, and
+// durable link request) commits together or not at all.
+func (s *Store) BindReplacementPR(ctx context.Context, jobID string, originalPR, replacementPR int, headSHA, baseSHA, headRef string, now time.Time) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		j, seq, err := loadJobTx(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		if j.PRNumber == replacementPR {
+			return nil
+		}
+		if j.PRNumber != 0 {
+			return fmt.Errorf("replacement PR #%d cannot rebind job already bound to PR #%d", replacementPR, j.PRNumber)
+		}
+		if j.PendingRepairHeadSHA != headSHA {
+			return fmt.Errorf("replacement PR #%d head %s does not match pending repair head %s", replacementPR, headSHA, j.PendingRepairHeadSHA)
+		}
+		nextSeq := seq + 1
+		ev := ledger.Event{
+			JobID: jobID, JobSeq: nextSeq, Kind: ledger.KindPRRebound,
+			FromState: j.State, ToState: j.State, LeaseEpoch: j.LeaseEpoch,
+			Actor: "project-out", CreatedAt: now,
+			Payload: ledger.Payload{
+				PRNumber: replacementPR, HeadRef: headRef, BaseSHA: baseSHA,
+				PendingRepairHeadSHA: headSHA, ReplacementForPR: originalPR,
+			},
+		}
+		if err := appendEvent(ctx, tx, ev); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs
+			   SET pr_number=?, head_ref=?, head_sha='', pending_repair_head_sha=?, updated_at=datetime('now')
+			 WHERE id=?`, replacementPR, headRef, headSHA, jobID); err != nil {
+			return fmt.Errorf("bind replacement PR: %w", err)
+		}
+		if err := enqueueOutboxTx(ctx, tx, OutboxRow{
+			JobID: jobID, Action: ActionReplacementLink, HeadSHA: headSHA,
+			Payload: outboxPayload(map[string]any{
+				"original_pr": originalPR, "replacement_pr": replacementPR,
+			}),
+		}); err != nil {
+			return fmt.Errorf("enqueue replacement PR link: %w", err)
+		}
+		return setJobSeq(ctx, tx, jobID, nextSeq)
+	})
+}
+
 // EnqueueMergeForJob enqueues the mergeQueue.enqueue action (§8.5) for a job that
 // has cleared the gate (mergeable/merge_handoff) and has a stamped PR. Both merge
 // arms (§5.4) physically merge by Flowbee enqueuing to GitHub's native queue;

@@ -33,6 +33,9 @@ const (
 	ActionCreateCheck  = "checks.create"
 	ActionEnqueueMerge = "mergeQueue.enqueue"
 	ActionComment      = "pulls.comment"
+	// ActionReplacementLink records the old adopted PR's handoff to the replacement
+	// Flowbee PR after the replacement binding commits.
+	ActionReplacementLink = "pulls.replacement_link"
 	// M11 compensation (§6.5.4, I-12): draft-back a PR opened for a now-dead epoch's
 	// attempt — never leave a revoked zombie's PR ready-for-review.
 	ActionDraftPR = "pulls.draft"

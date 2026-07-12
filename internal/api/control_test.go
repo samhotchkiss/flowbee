@@ -162,7 +162,7 @@ func TestAdoptedRebuildLeaseCarriesCumulativePRDiff(t *testing.T) {
 	ctx := context.Background()
 	st, c, clk := ctrlServer(t)
 	const cumulative = "diff --git a/feature.go b/feature.go\n--- a/feature.go\n+++ b/feature.go\n@@ -1 +1 @@\n-old\n+adopted change\n"
-	id, _, err := st.AdoptPRForReview(ctx, "", 4138, "base", "reviewed-head", cumulative, false,
+	id, _, err := st.AdoptPRForReviewWithHeadRef(ctx, "", 4138, "base", "reviewed-head", "hotfix/mail-temporal-red-main", cumulative, false,
 		false, true, false, clk.Now(), clk.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -180,6 +180,12 @@ func TestAdoptedRebuildLeaseCarriesCumulativePRDiff(t *testing.T) {
 	}
 	if !g.Context.Rebuild || g.Context.Diff != cumulative {
 		t.Fatalf("rebuild/diff=%v/%q want true/full cumulative patch", g.Context.Rebuild, g.Context.Diff)
+	}
+	if !g.Context.Adopted {
+		t.Fatal("adopted rebuild lease must prohibit force-pushing the foreign PR branch")
+	}
+	if g.Context.IssueBranch != "hotfix/mail-temporal-red-main" {
+		t.Fatalf("adopted rebuild branch=%q, want GitHub-visible PR branch", g.Context.IssueBranch)
 	}
 }
 

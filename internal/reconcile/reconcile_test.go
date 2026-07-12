@@ -229,7 +229,7 @@ func TestAdoptPRPersistsAuthoritativeDiff(t *testing.T) {
 	ctx := context.Background()
 	f := gh.NewFake()
 	const diff = "diff --git a/x.go b/x.go\nindex 1111111..2222222 100644\n--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-old\n+new\n"
-	f.SetPR(gh.PullRequest{Number: 4078, HeadRefOid: "head-sha", BaseRefOid: "base-sha", CIRollup: gh.CISuccess, UpdatedAt: time.Unix(5, 0)})
+	f.SetPR(gh.PullRequest{Number: 4078, HeadRefOid: "head-sha", HeadRefName: "hotfix/review-me", BaseRefOid: "base-sha", CIRollup: gh.CISuccess, UpdatedAt: time.Unix(5, 0)})
 	f.SetPRDiff(4078, diff)
 
 	rec := reconcile.NewForRepo("russ", st, f, clock.NewFake(time.Unix(10, 0)), nil)
@@ -244,7 +244,7 @@ func TestAdoptPRPersistsAuthoritativeDiff(t *testing.T) {
 		t.Fatal("expected adopted job")
 	}
 	j, _ := st.GetJob(ctx, id)
-	if j.BaseSHA != "base-sha" || j.HeadSHA != "head-sha" || j.Repo != "russ" {
+	if j.BaseSHA != "base-sha" || j.HeadSHA != "head-sha" || j.HeadRef != "hotfix/review-me" || j.Repo != "russ" {
 		t.Fatalf("adopted shas/repo: %+v", j)
 	}
 	if got, _ := st.JobPatchDiff(ctx, id); got != diff {

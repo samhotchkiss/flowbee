@@ -176,6 +176,11 @@ type LeaseContext struct {
 	// failures (run the linter/tests) rather than re-submit the same thing — otherwise
 	// a CI-failing change just loops to needs_human with no feedback.
 	Rebuild bool `json:"rebuild,omitempty"`
+	// Adopted marks a job bound to a pre-existing GitHub PR. Its source branch is
+	// foreign state: a repair may only fast-forward it, never force-push it. If that
+	// write cannot be made, the harness publishes a separate Flowbee branch for the
+	// control plane to materialize as a replacement PR.
+	Adopted bool `json:"adopted,omitempty"`
 	// Conflict is true for a conflict_resolver lease (resolving_conflict): the worktree
 	// is at the CURRENT main (a sibling merged a change to the same area since this work
 	// was built), and Diff carries this job's ORIGINAL intended change. The harness brief

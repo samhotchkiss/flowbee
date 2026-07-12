@@ -1071,6 +1071,9 @@ type LeaseContext struct {
 	// Rebuild signals a re-attempt after a bounce (prior CI failure / changes
 	// requested) so the build brief tells the agent to FIX what broke, not re-submit.
 	Rebuild bool `json:"rebuild,omitempty"`
+	// Adopted marks a job bound to a pre-existing GitHub PR. Workers must never
+	// force-push its foreign source branch.
+	Adopted bool `json:"adopted,omitempty"`
 	// Conflict signals a conflict_resolver lease: the worktree is at the CURRENT main
 	// (a sibling merged into the same area) and Diff carries this job's ORIGINAL intended
 	// change. The brief tells the agent to re-apply that intent on the current code,
@@ -1390,6 +1393,7 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 	}
 	grant.Context = &LeaseContext{
 		Identity: identity, ModelFamily: family, Lens: ctxLens, Role: string(j.Role),
+		Adopted:             j.Adopted,
 		BaseSHA:             j.BaseSHA,
 		Task:                j.TaskText,
 		Spec:                j.SpecText,
@@ -1403,6 +1407,9 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 	// ancestor's materialized issue. Empty until an issue is bound.
 	if reviewing || role == job.RoleEngWorker || resolvingConflict {
 		grant.Context.IssueBranch = store.IssueBranch(s.store.ResolveIssueNum(ctx, jobID), jobID)
+		if j.Adopted && j.PRNumber > 0 && j.HeadRef != "" {
+			grant.Context.IssueBranch = j.HeadRef
+		}
 		// a build that has bounced — OR that carries recorded CI failures from a prior
 		// attempt — is a re-attempt: tell the agent to fix what broke, not re-submit.
 		// (A manual `requeue` zeroes the bounce counter but preserves last_ci_failures,
@@ -2004,6 +2011,7 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 		JobID: jobID, Epoch: epoch, IdempotencyKey: idemKey, Now: s.clock.Now(),
 		PushedRef:           pushedRef,
 		PushedSHA:           body.HeadSHA,
+		PushedBranch:        body.PushedBranch,
 		PatchDiff:           body.Diff,
 		DeclaredBlastRadius: string(body.BlastRadius),
 	})

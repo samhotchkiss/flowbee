@@ -800,6 +800,8 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	if grant.Context != nil {
 		issueBranch = grant.Context.IssueBranch
 	}
+	adoptedRepair := grant.Context != nil && grant.Context.Adopted &&
+		grant.Context.Role == "eng_worker" && !strings.HasPrefix(issueBranch, "flowbee/")
 	startRef := grant.BaseSHA
 	forceIssueBranchPush := false
 	isConflict := grant.Context != nil && grant.Context.Conflict
@@ -810,7 +812,7 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		if tip, exists, terr := mirror.RemoteBranchTip(repoURL, issueBranch); terr == nil && exists && tip != "" {
 			if ferr := mirror.FetchRef(repoURL, "refs/heads/"+issueBranch, "refs/flowbee/issue-tip/"+grant.JobID); ferr == nil {
 				startRef = tip
-				if grant.BaseSHA != "" {
+				if !adoptedRepair && grant.BaseSHA != "" {
 					if containsBase, aerr := mirror.IsAncestor(grant.BaseSHA, tip); aerr == nil && !containsBase {
 						forceIssueBranchPush = true
 					}
@@ -970,16 +972,39 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 		// plain push is non-fast-forward and rejected. The resolution deliberately rebases
 		// the issue branch onto main, so replacing it is correct. Every other role
 		// fast-forwards (stacks on the branch tip).
+		pushedBranch := issueBranch
 		if perr := wt.PushTo(repoURL, issueBranch, isConflict || forceIssueBranchPush); perr != nil {
-			// the branch moved under us (e.g. a rebase-before-review force-update): the
-			// build SUCCEEDED, we just lost the fast-forward race. Re-arm WITHOUT burning
-			// an attempt (re-validation churn must not exhaust the failure budget and
-			// escalate a good change to needs_human) — the next attempt restarts from the
-			// new tip.
-			_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
-			return out, fmt.Errorf("push %s: %w", issueBranch, perr)
+			if adoptedRepair {
+				// A rejected fast-forward can mean either foreign-branch permissions or
+				// that somebody advanced the PR while this lease was running. Only the
+				// former may fork a replacement PR: a moved original head must remain
+				// authoritative and be reconciled/re-armed before another repair begins.
+				tip, exists, terr := mirror.RemoteBranchTip(repoURL, issueBranch)
+				if terr != nil || !exists || tip != startRef {
+					_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
+					if terr != nil {
+						return out, fmt.Errorf("push %s: %w (cannot verify original PR head: %v)", issueBranch, perr, terr)
+					}
+					return out, fmt.Errorf("push %s: %w (original PR head moved from %s to %s)", issueBranch, perr, startRef, tip)
+				}
+				fallbackBranch := "flowbee/" + grant.JobID
+				if ferr := wt.PushTo(repoURL, fallbackBranch, false); ferr == nil {
+					pushedBranch = fallbackBranch
+				} else {
+					_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
+					return out, fmt.Errorf("push %s: %w (replacement push %s: %v)", issueBranch, perr, fallbackBranch, ferr)
+				}
+			} else {
+				// the branch moved under us (e.g. a rebase-before-review force-update): the
+				// build SUCCEEDED, we just lost the fast-forward race. Re-arm WITHOUT burning
+				// an attempt (re-validation churn must not exhaust the failure budget and
+				// escalate a good change to needs_human) — the next attempt restarts from the
+				// new tip.
+				_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
+				return out, fmt.Errorf("push %s: %w", issueBranch, perr)
+			}
 		}
-		body["pushed_branch"] = issueBranch
+		body["pushed_branch"] = pushedBranch
 		body["head_sha"] = sha
 		out.PushedSHA = sha
 	}

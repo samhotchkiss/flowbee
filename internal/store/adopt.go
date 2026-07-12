@@ -66,12 +66,12 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 				optInI = 1
 			}
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO jobs (id, kind, flow, stage, state, role, pr_number, base_sha, head_sha,
+				INSERT INTO jobs (id, kind, flow, stage, state, role, pr_number, base_sha, head_sha, head_ref,
 				                  blocked_by, required_capabilities, enqueued_at,
 				                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 				                  adopted, opted_in, priority)
-				VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, ?, 5)`,
-				id, string(state), pr.Number, pr.BaseRefOid, pr.HeadRefOid,
+				VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, ?, 5)`,
+				id, string(state), pr.Number, pr.BaseRefOid, pr.HeadRefOid, pr.HeadRefName,
 				marshalStrings([]string{"role:code_reviewer"}), now.Format(rfc3339), optInI); err != nil {
 				return fmt.Errorf("insert adopted job pr %d: %w", pr.Number, err)
 			}
@@ -177,6 +177,10 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 // job id with rearmed=true after superseding stale review authorization and re-arming
 // code review against the refreshed diff.
 func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int, baseSHA, headSHA, patchDiff string, diffEmpty bool, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, bool, error) {
+	return s.AdoptPRForReviewWithHeadRef(ctx, repo, prNumber, baseSHA, headSHA, "", patchDiff, diffEmpty, merged, ciGreen, isDraft, updatedAt, now)
+}
+
+func (s *Store) AdoptPRForReviewWithHeadRef(ctx context.Context, repo string, prNumber int, baseSHA, headSHA, headRefName, patchDiff string, diffEmpty bool, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, bool, error) {
 	id := adoptedPRJobID(repo, prNumber)
 	replacementID := id + "-" + ulid.New()
 	adopted := ""
@@ -211,7 +215,8 @@ func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int,
 						UPDATE jobs
 						   SET state = 'review_pending', role = 'code_reviewer', stage = 'review',
 						       required_capabilities = ?,
-						       base_sha = ?, head_sha = ?, patch_diff = ?, diff_empty = ?,
+						       base_sha = ?, head_sha = ?, head_ref = COALESCE(NULLIF(?,''), head_ref),
+						       patch_diff = ?, diff_empty = ?,
 						       verdict = NULL,
 						       lease_epoch = lease_epoch + 1,
 						       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL, bound_lens = NULL,
@@ -220,7 +225,7 @@ func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int,
 						       enqueued_at = ?, updated_at = datetime('now')
 						 WHERE id = ?`,
 						marshalStrings([]string{"role:code_reviewer"}),
-						baseSHA, headSHA, patchDiff, intFromBool(diffEmpty), now.Format(rfc3339), existing); err != nil {
+						baseSHA, headSHA, headRefName, patchDiff, intFromBool(diffEmpty), now.Format(rfc3339), existing); err != nil {
 						return fmt.Errorf("re-arm adopted pr %d: %w", prNumber, err)
 					}
 					if _, err := tx.ExecContext(ctx, `
@@ -244,10 +249,11 @@ func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int,
 					// disturb state, verdict, lease, or outbox authorization.
 					if _, err := tx.ExecContext(ctx, `
 						UPDATE jobs
-						   SET base_sha = ?, head_sha = ?, patch_diff = ?, diff_empty = ?,
+						   SET base_sha = ?, head_sha = ?, head_ref = COALESCE(NULLIF(?,''), head_ref),
+						       patch_diff = ?, diff_empty = ?,
 						       updated_at = datetime('now')
 						 WHERE id = ?`,
-						baseSHA, headSHA, patchDiff, intFromBool(diffEmpty), existing); err != nil {
+						baseSHA, headSHA, headRefName, patchDiff, intFromBool(diffEmpty), existing); err != nil {
 						return fmt.Errorf("refresh adopted pr %d: %w", prNumber, err)
 					}
 				}
@@ -283,13 +289,13 @@ func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int,
 		// predates multi-repo. This targeted path is repo-scoped from the reconciler, so it
 		// always has the right repo.)
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO jobs (id, kind, flow, stage, state, role, repo, pr_number, base_sha, head_sha,
+			INSERT INTO jobs (id, kind, flow, stage, state, role, repo, pr_number, base_sha, head_sha, head_ref,
 			                  patch_diff, diff_empty,
 			                  blocked_by, required_capabilities, enqueued_at,
 			                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 			                  adopted, opted_in, priority)
-			VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, 1, 5)`,
-			id, string(job.StateReviewPending), repo, prNumber, baseSHA, headSHA, patchDiff, intFromBool(diffEmpty),
+			VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, 1, 5)`,
+			id, string(job.StateReviewPending), repo, prNumber, baseSHA, headSHA, headRefName, patchDiff, intFromBool(diffEmpty),
 			marshalStrings([]string{"role:code_reviewer"}), now.Format(rfc3339)); err != nil {
 			return fmt.Errorf("insert adopted job pr %d: %w", prNumber, err)
 		}
@@ -335,7 +341,7 @@ func (s *Store) AdoptedPatchForRebuild(ctx context.Context, jobID string) (strin
 	var patch string
 	err := s.DB.QueryRowContext(ctx, `
 		SELECT COALESCE(patch_diff,'') FROM jobs
-		 WHERE id=? AND adopted=1 AND bounces>0`, jobID).Scan(&patch)
+		 WHERE id=? AND adopted=1`, jobID).Scan(&patch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
