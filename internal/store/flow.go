@@ -305,7 +305,6 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			(j.BaseSHA != "" && facts.BaseSHA != j.BaseSHA) {
 			facts.CIGreen = false
 		}
-
 		// M9 (§9.2, I-11): run the deterministic content-integrity gate over the
 		// stored (untrusted) patch + declared blast-radius and thread the Result into
 		// the pure engine. A denylist hit / blast-radius mismatch / failed static
@@ -478,7 +477,7 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 				   SET state = 'ready', role = 'eng_worker', stage = 'build',
 				       required_capabilities = ?, bounces = bounces + ?,
 			       patch_diff = CASE WHEN adopted = 1 THEN patch_diff ELSE '' END,
-			       declared_blast_radius = CASE WHEN adopted = 1 THEN declared_blast_radius ELSE '' END,
+				       declared_blast_radius = CASE WHEN adopted = 1 THEN declared_blast_radius ELSE '' END,
 				       reservation_paths = '', reservation_wide = 0,
 				       enqueued_at = ?,
 				       last_review_notes = CASE WHEN ? <> '' THEN ? ELSE last_review_notes END,

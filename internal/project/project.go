@@ -590,20 +590,27 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 		if j.PRNumber > 0 {
 			return fmt.Sprintf("pr=%d (already open)", j.PRNumber), nil
 		}
+		replacementFor := intPayload(p, "replacement_for_pr")
+		body := s.prBody(ctx, j)
+		if replacementFor > 0 {
+			body = fmt.Sprintf("Replacement for #%d. This PR supersedes the adopted repair after its original source branch could not be updated.\n\n%s", replacementFor, body)
+		}
+		headRef := orDefault(str(p, "head_ref"), store.IssueBranch(s.resolveIssueNum(ctx, j), row.JobID))
 		number, err := s.gh.OpenPR(ctx, gh.OpenPRInput{
 			Title:   prTitle(j, row.JobID),
-			Body:    s.prBody(ctx, j),
-			HeadRef: store.IssueBranch(s.resolveIssueNum(ctx, j), row.JobID),
+			Body:    body,
+			HeadRef: headRef,
 			BaseRef: orDefault(str(p, "base_ref"), orDefault(s.baseBranch, "main")),
 			Draft:   false,
 		})
 		if err != nil {
 			return "", err
 		}
-		// seed facts with the base SHA the build was cut from (j.BaseSHA), NOT the PR
-		// base_ref name ("main") — reconcile compares facts.base_sha to the PR's base
-		// OID, so a ref name there reads as a phantom base move and supersedes.
-		if err := s.store.StampPRNumber(ctx, row.JobID, number, row.HeadSHA, j.BaseSHA, now); err != nil {
+		if replacementFor > 0 {
+			if err := s.store.BindReplacementPR(ctx, row.JobID, replacementFor, number, row.HeadSHA, j.BaseSHA, headRef, now); err != nil {
+				return "", fmt.Errorf("bind replacement pr: %w", err)
+			}
+		} else if err := s.store.StampPRNumber(ctx, row.JobID, number, row.HeadSHA, j.BaseSHA, now); err != nil {
 			return "", fmt.Errorf("stamp pr: %w", err)
 		}
 		return fmt.Sprintf("pr=%d", number), nil
@@ -666,6 +673,16 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			return "", err
 		}
 		return fmt.Sprintf("comment issue=%d", number), nil
+
+	case store.ActionReplacementLink:
+		original, replacement := intPayload(p, "original_pr"), intPayload(p, "replacement_pr")
+		if original == 0 || replacement == 0 {
+			return "replacement-link:missing-pr", nil
+		}
+		if err := s.gh.IssueComment(ctx, original, fmt.Sprintf("Superseded by replacement PR #%d.", replacement)); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("replacement-link old=%d new=%d", original, replacement), nil
 
 	case store.ActionSetLabels:
 		// Prefer the job's stamped PR number; fall back to the payload `number` (an
@@ -865,6 +882,13 @@ func str(m map[string]any, k string) string {
 		return v
 	}
 	return ""
+}
+
+func intPayload(m map[string]any, k string) int {
+	if v, ok := m[k].(float64); ok {
+		return int(v)
+	}
+	return 0
 }
 
 func strSlice(m map[string]any, k string) []string {

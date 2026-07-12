@@ -85,10 +85,12 @@ const (
 	// a CLEAN rebase advanced the base with no conflict (auto, no agent). KindConflictResolved:
 	// the resolver returned the resolved diff -> back through review + re-CI at the new head.
 	// KindStackedRebased: a parent PR merged, so this descendant auto-rebased + re-armed.
-	KindConflictDetected EventKind = "conflict_detected" // real conflict on rebase -> resolving_conflict (conflict_resolver lease)
-	KindRebased          EventKind = "rebased"           // clean rebase onto current main; re-validate at the new head (no agent)
-	KindConflictResolved EventKind = "conflict_resolved" // resolver returned the resolved diff -> review_pending (re-review + re-CI)
-	KindStackedRebased   EventKind = "stacked_rebased"   // a parent PR merged -> auto-rebase + re-arm this descendant (supersede)
+	KindConflictDetected   EventKind = "conflict_detected"   // real conflict on rebase -> resolving_conflict (conflict_resolver lease)
+	KindRebased            EventKind = "rebased"             // clean rebase onto current main; re-validate at the new head (no agent)
+	KindConflictResolved   EventKind = "conflict_resolved"   // resolver returned the resolved diff -> review_pending (re-review + re-CI)
+	KindRepairMaterialized EventKind = "repair_materialized" // GitHub observed an adopted repair at the bound PR head
+	KindPRRebound          EventKind = "pr_rebound"          // replacement PR opened and atomically rebound to an adopted repair
+	KindStackedRebased     EventKind = "stacked_rebased"     // a parent PR merged -> auto-rebase + re-arm this descendant (supersede)
 
 	// Self-unblock janitor (0023). KindJanitorUnblocked is the AUTOMATIC exit from the
 	// needs_human sink for a MECHANICAL escalation reason (currently `stall`): the
@@ -194,6 +196,12 @@ type Payload struct {
 	SpecSignoff     *job.SpecSignoff `json:",omitempty"`
 	IssueNumber     int              `json:",omitempty"`
 	PRNumber        int              `json:",omitempty"`
+	// Adopted-repair binding facts. A worker can clear the original binding when it
+	// publishes the replacement branch, but only project-OUT can bind the GitHub PR.
+	HeadRef              string `json:",omitempty"`
+	PendingRepairHeadSHA string `json:",omitempty"`
+	ClearPRBinding       bool   `json:",omitempty"`
+	ReplacementForPR     int    `json:",omitempty"`
 
 	// cost meter (M10, §6.7, I-15). The DELTA reported on a metered event (folded
 	// into the running meter at fold time) + the resulting accumulated totals.
@@ -276,6 +284,16 @@ func Fold(events []Event) (job.Job, error) {
 			// Each accepted result establishes a new artifact. A missing pushed SHA means
 			// its GitHub head is unknown, not that the prior attempt's head remains valid.
 			j.HeadSHA = e.Payload.HeadSHA
+			if e.Payload.BaseSHA != "" {
+				j.BaseSHA = e.Payload.BaseSHA
+			}
+			if e.Payload.ClearPRBinding {
+				j.PRNumber = 0
+			}
+			if e.Payload.HeadRef != "" {
+				j.HeadRef = e.Payload.HeadRef
+			}
+			j.PendingRepairHeadSHA = e.Payload.PendingRepairHeadSHA
 			// the lease is released on result: clear live lease columns, keep epoch.
 			j.LeaseID = ""
 			j.BoundIdentity = ""
@@ -569,6 +587,14 @@ func Fold(events []Event) (job.Job, error) {
 			if e.Payload.HeadSHA != "" {
 				j.HeadSHA = e.Payload.HeadSHA
 			}
+		case KindPRRebound:
+			j.PRNumber = e.Payload.PRNumber
+			j.HeadRef = e.Payload.HeadRef
+			j.HeadSHA = e.Payload.HeadSHA
+			j.PendingRepairHeadSHA = e.Payload.PendingRepairHeadSHA
+			if e.Payload.BaseSHA != "" {
+				j.BaseSHA = e.Payload.BaseSHA
+			}
 		case KindLeaseRevoked:
 			// M8 (§10.7): a two-rung kill or absolute-cap revoke. The epoch was bumped
 			// (the zombie's fence rides the event), the live lease cleared, the
@@ -720,6 +746,12 @@ func Fold(events []Event) (job.Job, error) {
 			}
 			j.LeaseID = ""
 			j.BoundIdentity = ""
+		case KindRepairMaterialized:
+			j.HeadSHA = e.Payload.HeadSHA
+			if e.Payload.BaseSHA != "" {
+				j.BaseSHA = e.Payload.BaseSHA
+			}
+			j.PendingRepairHeadSHA = ""
 			j.BoundModelFamily = ""
 		case KindConflictDetected:
 			// F8 (§E real conflict): a rebase onto current main hit overlapping edits;

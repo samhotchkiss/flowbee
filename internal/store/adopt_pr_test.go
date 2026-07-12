@@ -2,14 +2,38 @@ package store_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/lease"
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
+
+func claimAdoptedRepair(t *testing.T, ctx context.Context, st *store.Store, id string, now time.Time) int {
+	t.Helper()
+	if _, err := st.DB.ExecContext(ctx, `
+		UPDATE jobs
+		   SET state='ready', role='eng_worker', stage='build',
+		       required_capabilities='["role:eng_worker"]',
+		       enqueued_at=?
+		 WHERE id=?`, now.Format(time.RFC3339Nano), id); err != nil {
+		t.Fatalf("arm adopted repair: %v", err)
+	}
+	ls, err := st.ClaimReadyJob(ctx, store.ClaimParams{
+		JobID: id, LeaseID: "repair-" + id + "-" + now.Format(time.RFC3339Nano), Identity: "builder",
+		ModelFamily: "gpt", Role: job.RoleEngWorker,
+		Attested: []string{"role:eng_worker"}, TTL: time.Minute, Now: now,
+	})
+	if err != nil {
+		t.Fatalf("claim adopted repair: %v", err)
+	}
+	return ls.Epoch
+}
 
 // TestAdoptPRForReview covers the targeted single-PR adoption (`flowbee adopt <pr>`):
 // a pre-existing PR Flowbee did not originate is imported as an opted-in adopted
@@ -411,4 +435,314 @@ func TestAdoptedPRMissingDiffIsNotReviewCandidate(t *testing.T) {
 		}
 	}
 	t.Fatalf("backfilled adopted PR should become review candidate: %+v", cands)
+}
+
+func TestAdoptedRepairRejectsDroppedOriginalPaths(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	original := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-a\n+b\n" +
+		"diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n-a\n+b\n"
+	id, _, err := st.AdoptPRForReview(ctx, "russ", 4182, "base", "head", original, false, false, true, false, now, now)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	epoch := claimAdoptedRepair(t, ctx, st, id, now.Add(time.Minute))
+
+	repairOnly := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n b\n+limit fix\n"
+	_, err = st.Result(ctx, store.ResultParams{
+		JobID: id, Epoch: epoch, Now: now.Add(2 * time.Minute),
+		PushedSHA: "head", PatchDiff: repairOnly,
+	})
+	if err == nil || !strings.Contains(err.Error(), "dropped original changed paths") {
+		t.Fatalf("result err=%v, want dropped-path rejection", err)
+	}
+	j, _ := st.GetJob(ctx, id)
+	if j.State == job.StateReviewPending {
+		t.Fatal("dropped-path adopted repair must fail closed before review")
+	}
+	if diff, err := st.JobPatchDiff(ctx, id); err != nil || diff != original {
+		t.Fatalf("original patch not retained after rejected repair: diff=%q err=%v", diff, err)
+	}
+}
+
+func TestAdoptedRepairRejectsSamePathDroppedOriginalPatch(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	original := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1,2 +1,2 @@\n stable\n-old contract\n+new contract\n"
+	id, _, err := st.AdoptPRForReview(ctx, "russ", 4185, "base", "old-pr-head", original, false, false, true, false, now, now)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	epoch := claimAdoptedRepair(t, ctx, st, id, now.Add(time.Minute))
+
+	samePathButInverted := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1,2 +1,3 @@\n stable\n-old contract\n+base contract\n+limit fix\n"
+	_, err = st.Result(ctx, store.ResultParams{
+		JobID: id, Epoch: epoch, Now: now.Add(2 * time.Minute),
+		PushedSHA: "old-pr-head", PatchDiff: samePathButInverted,
+	})
+	if err == nil || !strings.Contains(err.Error(), "dropped original patch lines") {
+		t.Fatalf("result err=%v, want dropped-patch-line rejection", err)
+	}
+	j, _ := st.GetJob(ctx, id)
+	if j.State == job.StateReviewPending {
+		t.Fatal("same-path patch loss must fail closed before review")
+	}
+	if diff, err := st.JobPatchDiff(ctx, id); err != nil || diff != original {
+		t.Fatalf("original patch not retained after rejected same-path repair: diff=%q err=%v", diff, err)
+	}
+}
+
+func TestAdoptedRepairWorkerSHACannotBecomeAuthoritativeBeforeReconcile(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	original := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-a\n+b\n"
+	id, _, err := st.AdoptPRForReviewWithHeadRef(ctx, "russ", 4188, "base", "github-head", "hotfix/mail-temporal-red-main", original, false, false, true, false, now, now)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	epoch := claimAdoptedRepair(t, ctx, st, id, now.Add(time.Minute))
+
+	cumulative := original + "diff --git a/limit_test.go b/limit_test.go\n--- a/limit_test.go\n+++ b/limit_test.go\n@@ -0,0 +1 @@\n+zero limit\n"
+	resp, err := st.Result(ctx, store.ResultParams{
+		JobID: id, Epoch: epoch, Now: now.Add(2 * time.Minute),
+		PushedSHA: "flowbee-hidden-head", PushedBranch: "hotfix/mail-temporal-red-main",
+		PatchDiff: cumulative,
+	})
+	if err != nil || !resp.Accepted {
+		t.Fatalf("pending materialization result=%+v err=%v", resp, err)
+	}
+	j, _ := st.GetJob(ctx, id)
+	if j.HeadSHA == "flowbee-hidden-head" {
+		t.Fatalf("worker-reported SHA became authoritative before GitHub: state=%s head=%q", j.State, j.HeadSHA)
+	}
+	cands, err := st.ReviewPendingCandidates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cands {
+		if c.JobID == id {
+			t.Fatal("worker-reported SHA became code-review input before GitHub observed it")
+		}
+	}
+	var factHead string
+	if err := st.DB.QueryRowContext(ctx, `SELECT head_sha FROM domain_b_facts WHERE job_id=?`, id).Scan(&factHead); err != nil {
+		t.Fatalf("read facts: %v", err)
+	}
+	if factHead != "github-head" {
+		t.Fatalf("worker result rewrote reconciled facts to %q, want authoritative github-head", factHead)
+	}
+}
+
+func TestAdoptedRepairRejectsCorrectionAtUnchangedGitHubHeadAfterRearm(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	original := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-a\n+b\n"
+	id, _, err := st.AdoptPRForReview(ctx, "russ", 4191, "base", "old-github-head", original, false, false, true, false, now, now)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if out, err := st.ApplyReconciledPR(ctx, id, store.ReconciledPR{
+		Number: 4191, BaseSHA: "base", HeadSHA: "current-github-head", CIGreen: false,
+		UpdatedAt: now.Add(time.Minute),
+	}, now.Add(time.Minute)); err != nil {
+		t.Fatalf("reconcile moved head: %v", err)
+	} else if !out.Superseded {
+		t.Fatalf("head movement should re-arm adopted repair, got %+v", out)
+	}
+
+	rearmed, err := st.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("get rearmed job: %v", err)
+	}
+	if rearmed.State != job.StateReady || rearmed.HeadSHA != "" {
+		t.Fatalf("setup state/head=%s/%q, want ready with cleared job head", rearmed.State, rearmed.HeadSHA)
+	}
+	epoch := claimAdoptedRepair(t, ctx, st, id, now.Add(2*time.Minute))
+
+	cumulativeWithCorrection := original + "diff --git a/limit_test.go b/limit_test.go\n--- a/limit_test.go\n+++ b/limit_test.go\n@@ -0,0 +1 @@\n+zero limit\n"
+	_, err = st.Result(ctx, store.ResultParams{
+		JobID: id, Epoch: epoch, Now: now.Add(3 * time.Minute),
+		PushedSHA: "current-github-head", PatchDiff: cumulativeWithCorrection,
+	})
+	if err == nil || !strings.Contains(err.Error(), "unchanged GitHub-visible PR head") {
+		t.Fatalf("result err=%v, want unchanged-head correction rejection", err)
+	}
+	j, _ := st.GetJob(ctx, id)
+	if j.State == job.StateReviewPending || j.HeadSHA == "current-github-head" {
+		t.Fatalf("unchanged-head correction became reviewable: state=%s head=%q", j.State, j.HeadSHA)
+	}
+}
+
+func TestAdoptedRepairFastForwardWaitsForReconciledVisiblePRHead(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	original := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-a\n+b\n" +
+		"diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n-a\n+b\n" +
+		"diff --git a/c.go b/c.go\n--- a/c.go\n+++ b/c.go\n@@ -1 +1 @@\n-a\n+b\n" +
+		"diff --git a/d.go b/d.go\n--- a/d.go\n+++ b/d.go\n@@ -1 +1 @@\n-a\n+b\n" +
+		"diff --git a/e.go b/e.go\n--- a/e.go\n+++ b/e.go\n@@ -1 +1 @@\n-a\n+b\n" +
+		"diff --git a/f.go b/f.go\n--- a/f.go\n+++ b/f.go\n@@ -1 +1 @@\n-a\n+b\n" +
+		"diff --git a/g.go b/g.go\n--- a/g.go\n+++ b/g.go\n@@ -1 +1 @@\n-a\n+b\n" +
+		"diff --git a/h.go b/h.go\n--- a/h.go\n+++ b/h.go\n@@ -1 +1 @@\n-a\n+b\n"
+	id, _, err := st.AdoptPRForReviewWithHeadRef(ctx, "russ", 4187, "base", "old-pr-head", "hotfix/mail-temporal-red-main", original, false, false, true, false, now, now)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	epoch := claimAdoptedRepair(t, ctx, st, id, now.Add(time.Minute))
+
+	cumulativeWithCorrection := original + "diff --git a/limit_test.go b/limit_test.go\n--- a/limit_test.go\n+++ b/limit_test.go\n@@ -0,0 +1 @@\n+zero limit\n"
+	resp, err := st.Result(ctx, store.ResultParams{
+		JobID: id, Epoch: epoch, Now: now.Add(2 * time.Minute),
+		PushedSHA: "new-pr-head", PushedBranch: "hotfix/mail-temporal-red-main",
+		PatchDiff: cumulativeWithCorrection,
+	})
+	if err != nil || !resp.Accepted || resp.JobState != string(job.StateReviewPending) {
+		t.Fatalf("fast-forward result=%+v err=%v, want safely accepted pending visibility", resp, err)
+	}
+	j, err := st.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if j.HeadSHA == "new-pr-head" || j.State != job.StateReviewPending {
+		t.Fatalf("pending repair state/head=%s/%q, worker SHA must not yet be authoritative", j.State, j.HeadSHA)
+	}
+	cands, err := st.ReviewPendingCandidates(ctx)
+	if err != nil {
+		t.Fatalf("pre-reconcile review candidates: %v", err)
+	}
+	for _, c := range cands {
+		if c.JobID == id {
+			t.Fatal("fast-forwarded repair must not be reviewed before GitHub reports its SHA")
+		}
+	}
+
+	if _, err := st.ApplyReconciledPR(ctx, id, store.ReconciledPR{
+		Number: 4187, HeadSHA: "new-pr-head", BaseSHA: "base", CIGreen: true,
+		UpdatedAt: now.Add(3 * time.Minute),
+	}, now.Add(3*time.Minute)); err != nil {
+		t.Fatalf("reconcile fast-forwarded PR head: %v", err)
+	}
+	cands, err = st.ReviewPendingCandidates(ctx)
+	if err != nil {
+		t.Fatalf("post-reconcile review candidates: %v", err)
+	}
+	found := false
+	for _, c := range cands {
+		found = found || c.JobID == id
+	}
+	if !found {
+		t.Fatal("repair should become reviewable after GitHub reports the exact head and green CI")
+	}
+	if diff, err := st.JobPatchDiff(ctx, id); err != nil || diff != cumulativeWithCorrection {
+		t.Fatalf("stored diff=%q err=%v, want eight-file patch plus correction", diff, err)
+	}
+}
+
+func TestAdoptedRepairOriginalHeadMoveRevokesRepairLease(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	original := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-a\n+b\n"
+	id, _, err := st.AdoptPRForReviewWithHeadRef(ctx, "russ", 4189, "base", "old-pr-head", "hotfix/mail-temporal-red-main", original, false, false, true, false, now, now)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	epoch := claimAdoptedRepair(t, ctx, st, id, now.Add(time.Minute))
+
+	out, err := st.ApplyReconciledPR(ctx, id, store.ReconciledPR{
+		Number: 4189, BaseSHA: "base", HeadSHA: "foreign-head", CIGreen: false,
+		UpdatedAt: now.Add(90 * time.Second),
+	}, now.Add(90*time.Second))
+	if err != nil {
+		t.Fatalf("reconcile moved head: %v", err)
+	}
+	if !out.Superseded {
+		t.Fatalf("concurrent original-head movement must supersede active repair, got %+v", out)
+	}
+
+	cumulativeWithCorrection := original + "diff --git a/limit_test.go b/limit_test.go\n--- a/limit_test.go\n+++ b/limit_test.go\n@@ -0,0 +1 @@\n+zero limit\n"
+	_, err = st.Result(ctx, store.ResultParams{
+		JobID: id, Epoch: epoch, Now: now.Add(2 * time.Minute),
+		PushedSHA: "new-pr-head", PushedBranch: "hotfix/mail-temporal-red-main",
+		PatchDiff: cumulativeWithCorrection,
+	})
+	if !errors.Is(err, lease.ErrStaleEpoch) {
+		t.Fatalf("stale repair result err=%v, want stale epoch after head-move re-arm", err)
+	}
+	j, err := st.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if j.State != job.StateReady || j.Role != job.RoleEngWorker || j.HeadSHA != "" {
+		t.Fatalf("moved-head repair state/role/head=%s/%s/%q, want ready/eng_worker/empty", j.State, j.Role, j.HeadSHA)
+	}
+	if diff, err := st.JobPatchDiff(ctx, id); err != nil || diff != original {
+		t.Fatalf("original patch not retained for re-armed repair: diff=%q err=%v", diff, err)
+	}
+}
+
+func TestAdoptedRepairReplacementBranchClearsOldPRBinding(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(9000, 0)
+
+	original := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-a\n+b\n"
+	id, _, err := st.AdoptPRForReviewWithHeadRef(ctx, "russ", 4190, "base", "old-pr-head", "foreign/hotfix", original, false, false, true, false, now, now)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	epoch := claimAdoptedRepair(t, ctx, st, id, now.Add(time.Minute))
+
+	cumulativeWithCorrection := original + "diff --git a/limit_test.go b/limit_test.go\n--- a/limit_test.go\n+++ b/limit_test.go\n@@ -0,0 +1 @@\n+zero limit\n"
+	resp, err := st.Result(ctx, store.ResultParams{
+		JobID: id, Epoch: epoch, Now: now.Add(2 * time.Minute),
+		PushedSHA: "replacement-head", PushedBranch: store.PRBranch(id),
+		PatchDiff: cumulativeWithCorrection,
+	})
+	if err != nil {
+		t.Fatalf("replacement result: %v", err)
+	}
+	if !resp.Accepted || resp.JobState != string(job.StateReviewPending) {
+		t.Fatalf("replacement response=%+v, want accepted review_pending", resp)
+	}
+	j, err := st.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if j.PRNumber != 0 || j.HeadSHA != "" || j.HeadRef != store.PRBranch(id) || j.PendingRepairHeadSHA != "replacement-head" {
+		t.Fatalf("replacement repair binding pr/head/ref/pending=%d/%q/%q/%q, want unbound/empty/%q/replacement-head",
+			j.PRNumber, j.HeadSHA, j.HeadRef, j.PendingRepairHeadSHA, store.PRBranch(id))
+	}
+	events, err := st.LoadEvents(ctx, id)
+	if err != nil {
+		t.Fatalf("load events: %v", err)
+	}
+	folded, err := ledger.Fold(events)
+	if err != nil {
+		t.Fatalf("fold replacement result: %v", err)
+	}
+	if folded.PRNumber != j.PRNumber || folded.HeadSHA != j.HeadSHA || folded.HeadRef != j.HeadRef ||
+		folded.PendingRepairHeadSHA != j.PendingRepairHeadSHA {
+		t.Fatalf("replacement result fold != projection:\nfold=%+v\nprojection=%+v", folded, j)
+	}
+	cands, err := st.ReviewPendingCandidates(ctx)
+	if err != nil {
+		t.Fatalf("review candidates: %v", err)
+	}
+	for _, c := range cands {
+		if c.JobID == id {
+			t.Fatal("replacement repair must wait for replacement-PR reconciliation before review")
+		}
+	}
 }

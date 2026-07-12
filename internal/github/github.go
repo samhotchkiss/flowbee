@@ -53,6 +53,7 @@ type PullRequest struct {
 	Merged      bool
 	MergedAt    time.Time
 	HeadRefOid  string // Domain-B: head SHA
+	HeadRefName string // Domain-B: GitHub-visible source branch
 	BaseRefOid  string // Domain-B: base SHA
 	MergeCommit string // Domain-B: merge commit SHA (terminal fact)
 	// MergeableState is GitHub's computed mergeability status (GraphQL
@@ -455,7 +456,7 @@ func NewRealClient(owner, repo string, token func(ctx context.Context) (string, 
 const boardSweepQuery = `
 fragment prFields on PullRequest {
   number updatedAt isDraft merged mergedAt
-  headRefOid baseRefOid mergeStateStatus
+  headRefOid headRefName baseRefOid mergeStateStatus
   mergeCommit { oid }
   commits(last:1) { nodes { commit { statusCheckRollup { state
     contexts(first:100) { pageInfo { hasNextPage } nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
@@ -553,6 +554,7 @@ type prNode struct {
 	Merged         bool      `json:"merged"`
 	MergedAt       time.Time `json:"mergedAt"`
 	HeadRefOid     string    `json:"headRefOid"`
+	HeadRefName    string    `json:"headRefName"`
 	BaseRefOid     string    `json:"baseRefOid"`
 	MergeableState string    `json:"mergeStateStatus"`
 	MergeCommit    *struct {
@@ -626,7 +628,7 @@ func prFromNode(n prNode) PullRequest {
 	pr := PullRequest{
 		Number: n.Number, UpdatedAt: n.UpdatedAt, IsDraft: n.IsDraft,
 		Merged: n.Merged, MergedAt: n.MergedAt,
-		HeadRefOid: n.HeadRefOid, BaseRefOid: n.BaseRefOid,
+		HeadRefOid: n.HeadRefOid, HeadRefName: n.HeadRefName, BaseRefOid: n.BaseRefOid,
 		MergeableState: n.MergeableState,
 	}
 	if n.MergeCommit != nil {
@@ -818,7 +820,7 @@ query PR($owner:String!, $repo:String!, $number:Int!) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
       number updatedAt isDraft merged mergedAt
-      headRefOid baseRefOid mergeStateStatus
+      headRefOid headRefName baseRefOid mergeStateStatus
       mergeCommit { oid }
       commits(last:1) { nodes { commit { statusCheckRollup { state
     contexts(first:100) { pageInfo { hasNextPage } nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
@@ -838,6 +840,7 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 				Merged         bool      `json:"merged"`
 				MergedAt       time.Time `json:"mergedAt"`
 				HeadRefOid     string    `json:"headRefOid"`
+				HeadRefName    string    `json:"headRefName"`
 				BaseRefOid     string    `json:"baseRefOid"`
 				MergeableState string    `json:"mergeStateStatus"`
 				MergeCommit    *struct {
@@ -884,7 +887,7 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 	pr := PullRequest{
 		Number: n.Number, UpdatedAt: n.UpdatedAt, IsDraft: n.IsDraft,
 		Merged: n.Merged, MergedAt: n.MergedAt,
-		HeadRefOid: n.HeadRefOid, BaseRefOid: n.BaseRefOid,
+		HeadRefOid: n.HeadRefOid, HeadRefName: n.HeadRefName, BaseRefOid: n.BaseRefOid,
 		MergeableState: n.MergeableState,
 	}
 	if n.MergeCommit != nil {

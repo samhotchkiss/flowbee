@@ -311,6 +311,7 @@ type Job struct {
 	ParentJob string
 	IssueNum  int
 	PRNumber  int
+	Adopted   bool
 
 	// F4 epic grouping. EpicID groups the issues of one epic decomposition; IsEpic
 	// flags the epic-barrier job (the one the epic-level issue-review reviews as a
@@ -322,6 +323,10 @@ type Job struct {
 	// SHA binding (build)
 	BaseSHA string
 	HeadSHA string
+	HeadRef string
+	// PendingRepairHeadSHA is a worker-produced repair head awaiting GitHub
+	// reconciliation. It is never review or merge authority on its own.
+	PendingRepairHeadSHA string
 
 	// task/context (F1). The human intent folded onto the job and shipped, fully
 	// resolved, in the lease grant's context block (§B self-contained lease JSON).

@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/content"
 	"github.com/samhotchkiss/flowbee/internal/engine"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/lease"
@@ -429,6 +432,10 @@ type ResultParams struct {
 	// as Flowbee's own and does not supersede it. Distinct from PushedRef, which can be
 	// a ref NAME (legacy epoch-ref path) rather than a SHA. Empty on a diff-only result.
 	PushedSHA string
+	// PushedBranch is the GitHub branch the worker fast-forwarded. Adopted PR repairs
+	// must use the GitHub-visible PR branch stored at adoption time, never a Flowbee-only
+	// repair branch.
+	PushedBranch string
 	// PatchDiff is the eng_worker's returned diff (§7.3) — UNTRUSTED DATA the M9
 	// content-integrity gate (§9.2, I-11) judges. Stored verbatim at build-result
 	// time; the code_review gate later runs the deterministic checks over it.
@@ -442,6 +449,85 @@ type ResultParams struct {
 type ResultResponse struct {
 	Accepted bool   `json:"accepted"`
 	JobState string `json:"job_state"`
+}
+
+func missingTouchedPaths(originalDiff, rebuiltDiff string) []string {
+	rebuilt := map[string]bool{}
+	for _, p := range content.TouchedPaths(rebuiltDiff) {
+		rebuilt[p] = true
+	}
+	var missing []string
+	for _, p := range content.TouchedPaths(originalDiff) {
+		if !rebuilt[p] {
+			missing = append(missing, p)
+		}
+	}
+	return missing
+}
+
+type diffLineKey struct {
+	path string
+	op   byte
+	text string
+}
+
+func changedLineCounts(diff string) map[diffLineKey]int {
+	out := map[diffLineKey]int{}
+	path := ""
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "diff --git ") {
+			parts := strings.Fields(line)
+			if len(parts) >= 4 {
+				path = strings.TrimPrefix(parts[3], "b/")
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "+++ ") {
+			if p := strings.TrimSpace(strings.TrimPrefix(line, "+++ ")); p != "/dev/null" {
+				path = strings.TrimPrefix(p, "b/")
+			}
+			continue
+		}
+		if path == "" || line == "" || strings.HasPrefix(line, "--- ") {
+			continue
+		}
+		switch line[0] {
+		case '+', '-':
+			out[diffLineKey{path: path, op: line[0], text: line[1:]}]++
+		}
+	}
+	return out
+}
+
+func missingOriginalPatchLines(originalDiff, rebuiltDiff string) []string {
+	original := changedLineCounts(originalDiff)
+	rebuilt := changedLineCounts(rebuiltDiff)
+	var missing []string
+	for k, want := range original {
+		if got := rebuilt[k]; got < want {
+			op := "add"
+			if k.op == '-' {
+				op = "delete"
+			}
+			missing = append(missing, fmt.Sprintf("%s:%s:%q", k.path, op, k.text))
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+func adoptedRepairCorrectionsAtUnchangedVisibleHead(j job.Job, facts job.DomainBFacts, haveFacts bool, pushedSHA, originalDiff, rebuiltDiff string) bool {
+	if pushedSHA == "" || !haveFacts || !facts.PRExists || facts.HeadSHA != pushedSHA {
+		return false
+	}
+	if originalDiff == "" || rebuiltDiff == "" || rebuiltDiff == originalDiff {
+		return false
+	}
+	// A re-armed adopted repair intentionally clears jobs.head_sha while the
+	// authoritative PR head lives in domain_b_facts. Treat that cleared projection
+	// as an unchanged visible head, otherwise a worker can claim it pushed
+	// corrections to the current GitHub SHA without actually moving the PR.
+	return j.HeadSHA == "" || j.HeadSHA == pushedSHA
 }
 
 // Result applies engine.Decide for a fenced result. Idempotency: a duplicate key
@@ -473,7 +559,72 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 			return lease.ErrStaleEpoch
 		}
 		from := j.State
+		final := from
+		if n := len(dec.Transitions); n > 0 {
+			final = dec.Transitions[n-1].To
+		}
+		replacementAdoptedPR := false
+		pendingFastForwardHead := ""
+		if final == job.StateReviewPending {
+			var adopted int
+			var cumulativePatch string
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COALESCE(adopted,0), COALESCE(patch_diff,'') FROM jobs WHERE id=?`,
+				p.JobID).Scan(&adopted, &cumulativePatch); err != nil {
+				return err
+			}
+			adoptedPR := adopted == 1 && j.PRNumber > 0
+			if missing := missingTouchedPaths(cumulativePatch, p.PatchDiff); adoptedPR && len(missing) > 0 {
+				return fmt.Errorf("adopted PR repair dropped original changed paths: %v", missing)
+			}
+			if missing := missingOriginalPatchLines(cumulativePatch, p.PatchDiff); adoptedPR && len(missing) > 0 {
+				return fmt.Errorf("adopted PR repair dropped original patch lines: %v", missing)
+			}
+			facts, ok, err := domainBFactsTx(ctx, tx, p.JobID)
+			if err != nil {
+				return err
+			}
+			if adoptedPR && adoptedRepairCorrectionsAtUnchangedVisibleHead(j, facts, ok, p.PushedSHA, cumulativePatch, p.PatchDiff) {
+				return fmt.Errorf("adopted PR repair reported corrections at unchanged GitHub-visible PR head %s", p.PushedSHA)
+			}
+			if adoptedPR && p.PushedSHA != "" {
+				if !ok || !facts.PRExists || facts.PRNumber != j.PRNumber {
+					return fmt.Errorf("adopted PR repair head %s is not bound to GitHub PR #%d", p.PushedSHA, j.PRNumber)
+				}
+				if facts.HeadSHA != p.PushedSHA {
+					switch {
+					case p.PushedBranch != "" && p.PushedBranch == j.HeadRef:
+						pendingFastForwardHead = p.PushedSHA
+						// A normal adopted repair is committed on top of the head that
+						// reconciliation supplied and pushed without force to the PR's
+						// source branch. GitHub's API view necessarily lags that git push:
+						// requiring domain_b_facts to contain the new SHA here made the
+						// production path impossible (there is no reconcile between PushTo
+						// and Result). Accept the artifact, but do not treat this assertion
+						// as a Domain-B fact. ReviewPendingCandidates continues to withhold
+						// it until reconcile observes the same SHA (and green CI). If the
+						// foreign head won a race, the non-force push fails; if it moves
+						// after the push, reconcile supersedes this result.
+					case p.PushedBranch == PRBranch(p.JobID):
+						replacementAdoptedPR = true
+					default:
+						return fmt.Errorf("adopted PR repair head %s is not the GitHub-visible PR head %s", p.PushedSHA, facts.HeadSHA)
+					}
+				}
+			}
+		}
 		nextSeq := seq
+		resultHeadSHA := p.PushedSHA
+		if pendingFastForwardHead != "" {
+			resultHeadSHA = ""
+		}
+		if replacementAdoptedPR {
+			resultHeadSHA = ""
+		}
+		pendingRepairHead := pendingFastForwardHead
+		if replacementAdoptedPR {
+			pendingRepairHead = p.PushedSHA
+		}
 		for _, t := range dec.Transitions {
 			nextSeq++
 			ev := ledger.Event{
@@ -485,15 +636,20 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 				// Carry the pushed head on the event so Fold can reconstruct head_sha. An
 				// empty value explicitly means this result's GitHub head is not stamped yet;
 				// do not retain a prior attempt's head as authorization for the new result.
-				ev.Payload.HeadSHA = p.PushedSHA
+				ev.Payload.HeadSHA = resultHeadSHA
+				ev.Payload.BaseSHA = j.BaseSHA
+				ev.Payload.ClearPRBinding = replacementAdoptedPR
+				if replacementAdoptedPR {
+					ev.Payload.HeadRef = PRBranch(p.JobID)
+					ev.Payload.PendingRepairHeadSHA = p.PushedSHA
+					ev.Payload.ReplacementForPR = j.PRNumber
+				} else {
+					ev.Payload.PendingRepairHeadSHA = pendingFastForwardHead
+				}
 			}
 			if err := appendEvent(ctx, tx, ev); err != nil {
 				return err
 			}
-		}
-		final := from
-		if n := len(dec.Transitions); n > 0 {
-			final = dec.Transitions[n-1].To
 		}
 		// apply the projection: clear the live lease, advance state. When a build
 		// job lands review_pending, the NEXT stage is the code_review gate — so the
@@ -512,16 +668,24 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 				       required_capabilities = ?,
 				       builder_identity     = COALESCE(builder_identity, bound_identity),
 				       builder_model_family = COALESCE(builder_model_family, bound_model_family),
-				       head_ref = COALESCE(NULLIF(?, ''), head_ref),
-				       head_sha = NULLIF(?, ''),
+				       pr_number = CASE WHEN ? THEN NULL ELSE pr_number END,
+				       head_ref = CASE WHEN ? THEN ?
+				                       WHEN adopted=1 AND pr_number IS NOT NULL AND pr_number > 0
+				                       THEN head_ref
+				                       ELSE COALESCE(NULLIF(?, ''), head_ref)
+				                  END,
+				       head_sha = CASE WHEN ? != '' THEN head_sha ELSE NULLIF(?, '') END,
+				       pending_repair_head_sha = ?,
 				       patch_diff = ?, declared_blast_radius = ?,
 				       lease_id = NULL, bound_identity = NULL,
 				       bound_model_family = NULL, lease_hb_due = NULL,
 				       eng_worker_job = COALESCE(eng_worker_job, id),
 				       updated_at = datetime('now')
 				 WHERE id = ?`,
-				string(final), marshalStrings([]string{"role:code_reviewer"}), p.PushedRef,
-				p.PushedSHA, p.PatchDiff, p.DeclaredBlastRadius, p.JobID); err != nil {
+				string(final), marshalStrings([]string{"role:code_reviewer"}),
+				intFromBool(replacementAdoptedPR), intFromBool(replacementAdoptedPR), PRBranch(p.JobID), p.PushedRef,
+				pendingFastForwardHead, resultHeadSHA, pendingRepairHead,
+				p.PatchDiff, p.DeclaredBlastRadius, p.JobID); err != nil {
 				return fmt.Errorf("apply result projection: %w", err)
 			}
 			// A new artifact must earn CI at its own head. Clear the prior head's green
@@ -540,6 +704,18 @@ func (s *Store) Result(ctx context.Context, p ResultParams) (ResultResponse, err
 			// bumps it, making the timer a no-op.
 			if err := s.armNoEligibleTimerTx(ctx, tx, p.JobID, j.LeaseEpoch, p.Now); err != nil {
 				return fmt.Errorf("arm review alarm: %w", err)
+			}
+			if replacementAdoptedPR {
+				if err := enqueueOutboxTx(ctx, tx, OutboxRow{
+					JobID: p.JobID, Action: ActionOpenPR, HeadSHA: p.PushedSHA,
+					Payload: outboxPayload(map[string]any{
+						"head_ref":           PRBranch(p.JobID),
+						"base_ref":           "main",
+						"replacement_for_pr": j.PRNumber,
+					}),
+				}); err != nil {
+					return fmt.Errorf("enqueue replacement PR: %w", err)
+				}
 			}
 		} else if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs
@@ -722,8 +898,8 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 		SELECT j.id, j.priority, j.enqueued_at, j.required_capabilities,
 		       COALESCE(f.pr_exists,0), COALESCE(f.ci_green,0), COALESCE(f.merged,0),
 		       COALESCE(j.adopted,0), COALESCE(j.patch_diff,''), COALESCE(j.diff_empty,0),
-		       COALESCE(j.head_sha,''), COALESCE(j.base_sha,''),
-		       COALESCE(f.head_sha,''), COALESCE(f.base_sha,'')
+		       COALESCE(j.head_sha,''), COALESCE(j.base_sha,''), COALESCE(j.pr_number,0),
+		       COALESCE(f.head_sha,''), COALESCE(f.base_sha,''), COALESCE(f.pr_number,0)
 		  FROM jobs j
 		  LEFT JOIN domain_b_facts f ON f.job_id = j.id
 		 WHERE j.state='review_pending'`)
@@ -735,9 +911,9 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 	for rows.Next() {
 		var c scheduler.Candidate
 		var enqueued, reqJSON, patchDiff, jobHead, jobBase, factHead, factBase string
-		var prExists, ciGreen, merged, adopted, diffEmpty int
+		var prExists, ciGreen, merged, adopted, diffEmpty, jobPR, factPR int
 		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON, &prExists, &ciGreen, &merged,
-			&adopted, &patchDiff, &diffEmpty, &jobHead, &jobBase, &factHead, &factBase); err != nil {
+			&adopted, &patchDiff, &diffEmpty, &jobHead, &jobBase, &jobPR, &factHead, &factBase, &factPR); err != nil {
 			return nil, err
 		}
 		if ts, perr := time.Parse(rfc3339, enqueued); perr == nil {
@@ -754,6 +930,7 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 		// watchdog treats a PR-open/CI-pending review as healthy (it no longer relies on
 		// that churn to keep updated_at fresh — see ReconcileStuck).
 		c.CIReady = prExists == 1 && ciGreen == 1 && merged == 0 &&
+			(adopted == 0 || jobPR > 0 && factPR == jobPR) &&
 			factHead != "" && factBase != "" &&
 			(jobHead == "" || factHead == jobHead) && (jobBase == "" || factBase == jobBase)
 		if !c.CIReady {
@@ -1001,7 +1178,7 @@ const jobSelect = `
 	       COALESCE(task_text,''), COALESCE(spec_text,''), COALESCE(acceptance_criteria,''),
 	       COALESCE(epic_id,''), COALESCE(is_epic,0), COALESCE(epic_reviewed,0),
 	       COALESCE(repo,''), COALESCE(last_review_notes,''), COALESCE(last_ci_failures,''),
-	       COALESCE(diff_empty,0),
+	       COALESCE(diff_empty,0), COALESCE(head_ref,''), COALESCE(pending_repair_head_sha,''), COALESCE(adopted,0),
 	       COALESCE(unblock_attempts,0), COALESCE(last_progress_sha,''),
 	       COALESCE(stuck_hint,'')
 	  FROM jobs`
@@ -1013,7 +1190,7 @@ type rowScanner interface {
 func scanJob(row rowScanner) (job.Job, error) {
 	var j job.Job
 	var kind, role, blockedJSON, reqJSON, enqueued, verdictJSON, specSignoffJSON string
-	var overBudget, isEpic, epicReviewed, diffEmpty int
+	var overBudget, isEpic, epicReviewed, diffEmpty, adopted int
 	var ceiling sql.NullInt64
 	err := row.Scan(&j.ID, &kind, &j.Flow, &j.Stage, (*string)(&j.State), &role,
 		&j.BaseSHA, &j.HeadSHA, &j.Priority, &blockedJSON, &reqJSON, &enqueued,
@@ -1029,6 +1206,7 @@ func scanJob(row rowScanner) (job.Job, error) {
 		&j.TaskText, &j.SpecText, &j.AcceptanceCriteria,
 		&j.EpicID, &isEpic, &epicReviewed,
 		&j.Repo, &j.LastReviewNotes, &j.LastCIFailures, &diffEmpty,
+		&j.HeadRef, &j.PendingRepairHeadSHA, &adopted,
 		&j.UnblockAttempts, &j.LastProgressSHA, &j.StuckHint)
 	if err != nil {
 		return j, err
@@ -1036,6 +1214,7 @@ func scanJob(row rowScanner) (job.Job, error) {
 	j.IsEpic = isEpic != 0
 	j.EpicReviewed = epicReviewed != 0
 	j.DiffEmpty = diffEmpty != 0
+	j.Adopted = adopted != 0
 	if ceiling.Valid {
 		c := ceiling.Int64
 		j.CostCeilingMicroUSD = &c

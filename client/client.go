@@ -135,15 +135,18 @@ type LeaseGrant struct {
 // worker client imports no internal package). Every field is a RESOLVED fact: the
 // worker acts AS Identity and cannot choose its own (fenced by the server).
 type LeaseContext struct {
-	Identity           string         `json:"identity"`
-	ModelFamily        string         `json:"model_family,omitempty"`
-	Lens               string         `json:"lens,omitempty"`
-	Role               string         `json:"role"`
-	BaseSHA            string         `json:"base_sha,omitempty"`
-	Task               string         `json:"task,omitempty"`
-	Spec               string         `json:"spec,omitempty"`
-	AcceptanceCriteria string         `json:"acceptance_criteria,omitempty"`
-	PriorVerdict       map[string]any `json:"prior_verdict,omitempty"`
+	Identity    string `json:"identity"`
+	ModelFamily string `json:"model_family,omitempty"`
+	Lens        string `json:"lens,omitempty"`
+	Role        string `json:"role"`
+	BaseSHA     string `json:"base_sha,omitempty"`
+	// AuthoritativeHeadSHA is the reconciled GitHub PR headRefOid. Adopted repair
+	// workers must verify the foreign branch still equals it before writing.
+	AuthoritativeHeadSHA string         `json:"authoritative_head_sha,omitempty"`
+	Task                 string         `json:"task,omitempty"`
+	Spec                 string         `json:"spec,omitempty"`
+	AcceptanceCriteria   string         `json:"acceptance_criteria,omitempty"`
+	PriorVerdict         map[string]any `json:"prior_verdict,omitempty"`
 	// PriorReviewFindings is the most recent code-review's changes-requested findings,
 	// carried to a rebuild so the agent fixes what was flagged (§F compounding memory).
 	PriorReviewFindings string `json:"prior_review_findings,omitempty"`
@@ -176,6 +179,11 @@ type LeaseContext struct {
 	// failures (run the linter/tests) rather than re-submit the same thing — otherwise
 	// a CI-failing change just loops to needs_human with no feedback.
 	Rebuild bool `json:"rebuild,omitempty"`
+	// Adopted marks a job bound to a pre-existing GitHub PR. Its source branch is
+	// foreign state: a repair may only fast-forward it, never force-push it. If that
+	// write cannot be made, the harness publishes a separate Flowbee branch for the
+	// control plane to materialize as a replacement PR.
+	Adopted bool `json:"adopted,omitempty"`
 	// Conflict is true for a conflict_resolver lease (resolving_conflict): the worktree
 	// is at the CURRENT main (a sibling merged a change to the same area since this work
 	// was built), and Diff carries this job's ORIGINAL intended change. The harness brief

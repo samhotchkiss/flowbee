@@ -192,7 +192,12 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 		// with the state transition, independent of when the git push lands on GitHub.
 		// An EXTERNAL push (pr.head != j.head_sha) or main advancing PAST where we rebased
 		// (pr.base != j.base_sha) still differs from the job record -> a real move.
-		flowbeePlaced := j.HeadSHA != "" && pr.HeadSHA == j.HeadSHA &&
+		var pendingRepairHead string
+		_ = tx.QueryRowContext(ctx,
+			`SELECT COALESCE(pending_repair_head_sha,'') FROM jobs WHERE id=?`, jobID).
+			Scan(&pendingRepairHead)
+		flowbeePlaced := ((j.HeadSHA != "" && pr.HeadSHA == j.HeadSHA) ||
+			(pendingRepairHead != "" && pr.HeadSHA == pendingRepairHead)) &&
 			(j.BaseSHA == "" || pr.BaseSHA == "" || pr.BaseSHA == j.BaseSHA)
 		verdictStale := j.Verdict != nil && !j.Verdict.Verify(pr.HeadSHA, pr.BaseSHA)
 		shaMoved := !pr.Merged && !flowbeePlaced &&
@@ -204,6 +209,25 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 			return err
 		}
 		out.Applied = true
+		if pendingRepairHead != "" && pr.HeadSHA == pendingRepairHead {
+			seq++
+			if err := appendEvent(ctx, tx, ledger.Event{
+				JobID: jobID, JobSeq: seq, Kind: ledger.KindRepairMaterialized,
+				FromState: j.State, ToState: j.State, LeaseEpoch: j.LeaseEpoch,
+				Actor: "reconcile", CreatedAt: now,
+				Payload: ledger.Payload{HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA},
+			}); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE jobs SET head_sha=?, pending_repair_head_sha='' WHERE id=?`, pr.HeadSHA, jobID); err != nil {
+				return err
+			}
+			if err := setJobSeq(ctx, tx, jobID, seq); err != nil {
+				return err
+			}
+			j.HeadSHA = pr.HeadSHA
+		}
 
 		// reconcile-driven transitions (§3.4). These move STATE only as a consequence
 		// of a GitHub-owned fact changing — never a stage/role/verdict edit.
@@ -551,7 +575,8 @@ func supersedeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int, pr Reconc
 		       required_capabilities = ?,
 		       base_sha = COALESCE(NULLIF(?,''), base_sha), head_sha = '',
 		       verdict = NULL,
-		       patch_diff = '', declared_blast_radius = '',
+		       patch_diff = CASE WHEN adopted=1 THEN patch_diff ELSE '' END,
+		       declared_blast_radius = CASE WHEN adopted=1 THEN declared_blast_radius ELSE '' END,
 		       reservation_paths = '', reservation_wide = 0,
 		       lease_epoch = lease_epoch + 1,
 		       lease_id = NULL, bound_identity = NULL, bound_model_family = NULL,

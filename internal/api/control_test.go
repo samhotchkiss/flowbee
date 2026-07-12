@@ -162,7 +162,7 @@ func TestAdoptedRebuildLeaseCarriesCumulativePRDiff(t *testing.T) {
 	ctx := context.Background()
 	st, c, clk := ctrlServer(t)
 	const cumulative = "diff --git a/feature.go b/feature.go\n--- a/feature.go\n+++ b/feature.go\n@@ -1 +1 @@\n-old\n+adopted change\n"
-	id, _, err := st.AdoptPRForReview(ctx, "", 4138, "base", "reviewed-head", cumulative, false,
+	id, _, err := st.AdoptPRForReviewWithHeadRef(ctx, "", 4138, "base", "reviewed-head", "hotfix/mail-temporal-red-main", cumulative, false,
 		false, true, false, clk.Now(), clk.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -180,6 +180,61 @@ func TestAdoptedRebuildLeaseCarriesCumulativePRDiff(t *testing.T) {
 	}
 	if !g.Context.Rebuild || g.Context.Diff != cumulative {
 		t.Fatalf("rebuild/diff=%v/%q want true/full cumulative patch", g.Context.Rebuild, g.Context.Diff)
+	}
+	if !g.Context.Adopted {
+		t.Fatal("adopted rebuild lease must prohibit force-pushing the foreign PR branch")
+	}
+	if g.Context.IssueBranch != "hotfix/mail-temporal-red-main" {
+		t.Fatalf("adopted rebuild branch=%q, want GitHub-visible PR branch", g.Context.IssueBranch)
+	}
+	if g.Context.AuthoritativeHeadSHA != "reviewed-head" {
+		t.Fatalf("adopted rebuild authoritative head=%q, want reviewed-head", g.Context.AuthoritativeHeadSHA)
+	}
+}
+
+func TestAdoptedRearmedRebuildLeaseUsesReconciledGitHubHead(t *testing.T) {
+	ctx := context.Background()
+	st, c, clk := ctrlServer(t)
+	const original = "diff --git a/feature.go b/feature.go\n--- a/feature.go\n+++ b/feature.go\n@@ -1 +1 @@\n-old\n+adopted change\n"
+	id, _, err := st.AdoptPRForReviewWithHeadRef(ctx, "", 4142, "base", "old-github-head", "hotfix/foreign", original, false,
+		false, true, false, clk.Now(), clk.Now())
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	// This is a repair attempt, not first-pass review: retain the original
+	// cumulative patch for the builder while its original branch moves.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE jobs SET bounces=1 WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	// GitHub moves the original branch while Flowbee is tracking it. Supersession
+	// intentionally clears jobs.head_sha so the old review/merge authority cannot
+	// survive, while domain_b_facts now holds the new authoritative headRefOid.
+	out, err := st.ApplyReconciledPR(ctx, id, store.ReconciledPR{
+		Number: 4142, BaseSHA: "base", HeadSHA: "new-github-head", CIGreen: false,
+		UpdatedAt: clk.Now().Add(time.Minute),
+	}, clk.Now().Add(time.Minute))
+	if err != nil || !out.Superseded {
+		t.Fatalf("reconcile moved adopted head: outcome=%+v err=%v", out, err)
+	}
+	if j, err := st.GetJob(ctx, id); err != nil {
+		t.Fatal(err)
+	} else if j.HeadSHA != "" {
+		t.Fatalf("superseded adopted job head=%q, want cleared stale projection head", j.HeadSHA)
+	}
+
+	g, ok, err := c.Lease(ctx, "w", "codex", "eng_worker")
+	if err != nil || !ok || g.JobID != id || g.Context == nil {
+		t.Fatalf("lease rearmed adopted repair: ok=%v job=%s err=%v grant=%+v", ok, g.JobID, err, g)
+	}
+	if !g.Context.Rebuild || g.Context.Diff != original {
+		t.Fatalf("rearmed lease rebuild/diff=%v/%q, want true/original patch", g.Context.Rebuild, g.Context.Diff)
+	}
+	if g.Context.AuthoritativeHeadSHA != "new-github-head" {
+		t.Fatalf("rearmed lease authoritative head=%q, want reconciled GitHub head", g.Context.AuthoritativeHeadSHA)
+	}
+	if g.Context.IssueBranch != "hotfix/foreign" {
+		t.Fatalf("rearmed lease branch=%q, want original GitHub-visible branch", g.Context.IssueBranch)
 	}
 }
 

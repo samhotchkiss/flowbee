@@ -1033,6 +1033,9 @@ type LeaseContext struct {
 	Role        string `json:"role"`
 	// BaseSHA is the SHA the task applies to (echoed for the worktree checkout).
 	BaseSHA string `json:"base_sha,omitempty"`
+	// AuthoritativeHeadSHA is the reconciled GitHub PR headRefOid. Adopted repair
+	// workers compare the live foreign branch to it before provisioning.
+	AuthoritativeHeadSHA string `json:"authoritative_head_sha,omitempty"`
 	// Task / Spec / Acceptance are the human intent the agent must satisfy.
 	Task               string `json:"task,omitempty"`
 	Spec               string `json:"spec,omitempty"`
@@ -1071,6 +1074,9 @@ type LeaseContext struct {
 	// Rebuild signals a re-attempt after a bounce (prior CI failure / changes
 	// requested) so the build brief tells the agent to FIX what broke, not re-submit.
 	Rebuild bool `json:"rebuild,omitempty"`
+	// Adopted marks a job bound to a pre-existing GitHub PR. Workers must never
+	// force-push its foreign source branch.
+	Adopted bool `json:"adopted,omitempty"`
 	// Conflict signals a conflict_resolver lease: the worktree is at the CURRENT main
 	// (a sibling merged into the same area) and Diff carries this job's ORIGINAL intended
 	// change. The brief tells the agent to re-apply that intent on the current code,
@@ -1374,6 +1380,20 @@ func truthyQuery(v string) bool {
 }
 
 func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, identity, family, lens string, role job.Role, reviewing, resolvingConflict bool, leaseID string, leaseEpoch int, leaseDeadline time.Time, dryRun bool) LeaseGrant {
+	authoritativeHeadSHA := j.HeadSHA
+	// A reconciled external movement supersedes an adopted repair and deliberately
+	// clears jobs.head_sha: that field must never remain merge/review authority for
+	// the previous PR head. The re-armed builder nevertheless has to provision from
+	// the new GitHub-visible head. Read it from Domain B, which is the authority for
+	// an adopted PR's headRefOid, rather than restoring it to the Domain-A projection.
+	// If facts are absent or do not still name this PR, leave the field empty so the
+	// worker's exact-head guard fails closed before it writes anything.
+	if j.Adopted && j.PRNumber > 0 && role == job.RoleEngWorker && authoritativeHeadSHA == "" {
+		if facts, ok, err := (store.DBFactSource{DB: s.store.DB}).Facts(ctx, jobID); err == nil && ok &&
+			facts.PRExists && facts.PRNumber == j.PRNumber && facts.HeadSHA != "" {
+			authoritativeHeadSHA = facts.HeadSHA
+		}
+	}
 	grant := LeaseGrant{
 		JobID: jobID, Kind: string(j.Kind), Role: string(j.Role),
 		BaseSHA: j.BaseSHA, LeaseID: leaseID, LeaseEpoch: leaseEpoch,
@@ -1390,19 +1410,24 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 	}
 	grant.Context = &LeaseContext{
 		Identity: identity, ModelFamily: family, Lens: ctxLens, Role: string(j.Role),
-		BaseSHA:             j.BaseSHA,
-		Task:                j.TaskText,
-		Spec:                j.SpecText,
-		AcceptanceCriteria:  j.AcceptanceCriteria,
-		PriorVerdict:        j.Verdict,
-		PriorReviewFindings: j.LastReviewNotes,
-		StuckHint:           j.StuckHint,
+		Adopted:              j.Adopted,
+		BaseSHA:              j.BaseSHA,
+		AuthoritativeHeadSHA: authoritativeHeadSHA,
+		Task:                 j.TaskText,
+		Spec:                 j.SpecText,
+		AcceptanceCriteria:   j.AcceptanceCriteria,
+		PriorVerdict:         j.Verdict,
+		PriorReviewFindings:  j.LastReviewNotes,
+		StuckHint:            j.StuckHint,
 	}
 	// the per-issue branch the node commits to (worker-push): builds + reviews
 	// both target it. Resolved from the job's bound issue (adopted) or its spec
 	// ancestor's materialized issue. Empty until an issue is bound.
 	if reviewing || role == job.RoleEngWorker || resolvingConflict {
 		grant.Context.IssueBranch = store.IssueBranch(s.store.ResolveIssueNum(ctx, jobID), jobID)
+		if j.Adopted && j.PRNumber > 0 && j.HeadRef != "" {
+			grant.Context.IssueBranch = j.HeadRef
+		}
 		// a build that has bounced — OR that carries recorded CI failures from a prior
 		// attempt — is a re-attempt: tell the agent to fix what broke, not re-submit.
 		// (A manual `requeue` zeroes the bounce counter but preserves last_ci_failures,
@@ -2004,6 +2029,7 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request) {
 		JobID: jobID, Epoch: epoch, IdempotencyKey: idemKey, Now: s.clock.Now(),
 		PushedRef:           pushedRef,
 		PushedSHA:           body.HeadSHA,
+		PushedBranch:        body.PushedBranch,
 		PatchDiff:           body.Diff,
 		DeclaredBlastRadius: string(body.BlastRadius),
 	})

@@ -227,7 +227,7 @@ func (r *Reconciler) AdoptPR(ctx context.Context, prNumber int) (string, bool, e
 		return "", false, fmt.Errorf("fetch adopted pr diff repo=%q pr=%d base=%s head=%s: %w",
 			r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid, err)
 	}
-	id, rearmed, err := r.store.AdoptPRForReview(ctx, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid,
+	id, rearmed, err := r.store.AdoptPRForReviewWithHeadRef(ctx, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid, pr.HeadRefName,
 		diff, diff == "",
 		pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
 	if err != nil {

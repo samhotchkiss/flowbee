@@ -50,3 +50,29 @@ func TestBootstrapAdoptedRebuildMakesResultCumulative(t *testing.T) {
 		t.Fatalf("rebuild result is not cumulative:\n%s", diff)
 	}
 }
+
+func TestAdoptedRepairRequiresLeaseAuthoritativeHead(t *testing.T) {
+	// adoptedRepair's provisioning predicate is deliberately exact: a branch tip
+	// observed after claim may only be used when it is the reconciled GitHub
+	// headRefOid carried by the lease. Cover the movement that previously slipped
+	// through before the later compare-and-push guard could see it.
+	for _, tc := range []struct {
+		name     string
+		tip      string
+		exists   bool
+		expected string
+		valid    bool
+	}{
+		{name: "exact authoritative head", tip: "head-a", exists: true, expected: "head-a", valid: true},
+		{name: "moved before fetch", tip: "head-b", exists: true, expected: "head-a"},
+		{name: "branch disappeared", expected: "head-a"},
+		{name: "lease lacks authoritative head", tip: "head-a", exists: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			valid := adoptedRepairHeadMatches(tc.expected, tc.tip, tc.exists)
+			if valid != tc.valid {
+				t.Fatalf("authoritative tip validity=%v, want %v", valid, tc.valid)
+			}
+		})
+	}
+}
