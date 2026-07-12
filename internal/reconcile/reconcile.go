@@ -70,6 +70,28 @@ type RepoMirror interface {
 // MATERIALIZES, so a materialized issue is never re-adopted).
 const IntakeLabel = "flowbee:build"
 
+// adoptPRLabels is the set of labels that opt a foreign, not-yet-tracked PR into
+// Flowbee's review pipeline automatically on the sweep floor — no operator has to
+// run the manual `flowbee adopt <pr>` CLI. "flowbee:adopt" is the original human
+// opt-in label. "needs-claude" is applied by long-running GPT "goal" sessions when
+// they finish a PR and hand it off for Claude review; before this label was wired
+// into the sweep, a finished goal-session PR sat stranded in the queue until a
+// human happened to notice it and ran the manual adopt command — the operational
+// incident this closes. Both labels drive the exact same idempotent adopt path
+// (AdoptPR / store.AdoptPRForReview below) — a set, not copy-pasted per-label
+// logic, so a future third label is a one-line addition.
+var adoptPRLabels = []string{"flowbee:adopt", "needs-claude"}
+
+// hasAdoptLabel reports whether labels carries any label in adoptPRLabels.
+func hasAdoptLabel(labels []string) bool {
+	for _, want := range adoptPRLabels {
+		if hasLabel(labels, want) {
+			return true
+		}
+	}
+	return false
+}
+
 // WithIntake wires the integration-branch mirror + branch so Sweep adopts
 // label-opted issues as builds. Returns the reconciler for chaining.
 func (r *Reconciler) WithIntake(m RepoMirror, branch string) *Reconciler {
@@ -121,6 +143,21 @@ func (r *Reconciler) Sweep(ctx context.Context) ([]store.ReconcileOutcome, error
 		if applied {
 			outs = append(outs, out)
 		}
+	}
+	// PR intake: any OPEN, non-draft PR carrying an adopt label (flowbee:adopt or
+	// needs-claude) that Flowbee does not already track is imported into the review
+	// pipeline right here on the floor sweep — through the SAME AdoptPR path the
+	// manual `flowbee adopt <pr>` CLI drives, so its idempotency comes for free
+	// (already-tracked + unchanged is a no-op; a moved head re-arms; see AdoptPR /
+	// store.AdoptPRForReview). Merged/closed PRs are excluded — nothing to review —
+	// and a draft is excluded because it is still being worked, not ready for review.
+	// AdoptPR errors (e.g. a transient diff-fetch failure) are swallowed per-PR: one
+	// bad adopt must never abort the sweep for every other PR on the board.
+	for _, pr := range snap.PullRequests {
+		if pr.IsDraft || pr.Merged || pr.ClosedUnmerged || !hasAdoptLabel(pr.Labels) {
+			continue
+		}
+		_, _, _ = r.AdoptPR(ctx, pr.Number)
 	}
 	// GitHub-issue intake (build-list): adopt every label-opted, not-yet-tracked
 	// issue as a build cut from the current integration tip. Idempotent in the store

@@ -358,3 +358,122 @@ func TestAdoptPRReadsRealStateAndImports(t *testing.T) {
 		t.Fatal("adopting a non-existent PR must error")
 	}
 }
+
+// TestSweepAutoAdoptsNeedsClaudeLabeledPR covers the operational incident this
+// closes: a long-running GPT "goal" session finishes a PR and labels it
+// needs-claude, handing it off for Claude review. Before this, that PR sat
+// stranded in the queue until a human noticed and ran `flowbee adopt <pr>` by
+// hand. Now the floor sweep itself notices the label and adopts the PR through
+// the same AdoptPR path the manual CLI uses — no human required.
+func TestSweepAutoAdoptsNeedsClaudeLabeledPR(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+
+	f := gh.NewFake()
+	f.SetPR(gh.PullRequest{
+		Number: 500, HeadRefOid: "hh", BaseRefOid: "bb",
+		CIRollup: gh.CISuccess, CIHasRealSuccess: true, UpdatedAt: time.Unix(10, 0),
+		Labels: []string{"needs-claude"},
+	})
+	f.SetPRDiff(500, "diff --git a/goal b/goal\n+finished by gpt\n")
+	rec := reconcile.New(st, f, clock.NewFake(time.Unix(20, 0)), nil)
+
+	if _, err := rec.Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	id, ok, err := st.JobIDForPRInRepo(ctx, "", 500)
+	if err != nil || !ok {
+		t.Fatalf("expected PR #500 auto-adopted on sweep: ok=%v err=%v", ok, err)
+	}
+	j, err := st.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if j.State != job.StateReviewPending {
+		t.Fatalf("auto-adopted job state=%q, want review_pending", j.State)
+	}
+	if got, _ := st.JobPatchDiff(ctx, id); got != "diff --git a/goal b/goal\n+finished by gpt\n" {
+		t.Fatalf("auto-adopted patch_diff=%q", got)
+	}
+
+	// re-sweeping the same unchanged PR must not duplicate the adopted job (the
+	// AdoptPR idempotency the sweep reuses rather than reimplementing).
+	if _, err := rec.Sweep(ctx); err != nil {
+		t.Fatalf("second sweep: %v", err)
+	}
+	again, ok, err := st.JobIDForPRInRepo(ctx, "", 500)
+	if err != nil || !ok || again != id {
+		t.Fatalf("re-sweep must not disturb the adopted job: id=%q ok=%v err=%v", again, ok, err)
+	}
+}
+
+// TestSweepDoesNotAutoAdoptDraftNeedsClaudePR: a draft PR is still being worked —
+// even with the needs-claude label already applied (e.g. scripted ahead of "ready
+// for review"), the sweep must not pull it into the review pipeline early.
+func TestSweepDoesNotAutoAdoptDraftNeedsClaudePR(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+
+	f := gh.NewFake()
+	f.SetPR(gh.PullRequest{
+		Number: 501, HeadRefOid: "hh", BaseRefOid: "bb",
+		CIRollup: gh.CISuccess, CIHasRealSuccess: true, UpdatedAt: time.Unix(10, 0),
+		IsDraft: true, Labels: []string{"needs-claude"},
+	})
+	f.SetPRDiff(501, "diff --git a/wip b/wip\n+still working\n")
+	rec := reconcile.New(st, f, clock.NewFake(time.Unix(20, 0)), nil)
+
+	if _, err := rec.Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if _, ok, err := st.JobIDForPRInRepo(ctx, "", 501); err != nil || ok {
+		t.Fatalf("draft PR must not be auto-adopted: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestSweepIgnoresUnlabeledPR: a plain PR with no adopt label is untouched by the
+// sweep's auto-adopt (it is not Flowbee's to seize — an operator or a future
+// labeled hand-off decides).
+func TestSweepIgnoresUnlabeledPR(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+
+	f := gh.NewFake()
+	f.SetPR(gh.PullRequest{
+		Number: 502, HeadRefOid: "hh", BaseRefOid: "bb",
+		CIRollup: gh.CISuccess, CIHasRealSuccess: true, UpdatedAt: time.Unix(10, 0),
+	})
+	rec := reconcile.New(st, f, clock.NewFake(time.Unix(20, 0)), nil)
+
+	if _, err := rec.Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if _, ok, err := st.JobIDForPRInRepo(ctx, "", 502); err != nil || ok {
+		t.Fatalf("unlabeled PR must not be auto-adopted: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestSweepAutoAdoptsFlowbeeAdoptLabeledPR proves flowbee:adopt and needs-claude
+// drive the exact same sweep-time adopt path (a shared label set, not per-label
+// copy-pasted logic, §Task-A req 2) — flowbee:adopt gets identical treatment.
+func TestSweepAutoAdoptsFlowbeeAdoptLabeledPR(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+
+	f := gh.NewFake()
+	f.SetPR(gh.PullRequest{
+		Number: 503, HeadRefOid: "hh", BaseRefOid: "bb",
+		CIRollup: gh.CISuccess, CIHasRealSuccess: true, UpdatedAt: time.Unix(10, 0),
+		Labels: []string{"flowbee:adopt"},
+	})
+	f.SetPRDiff(503, "diff --git a/human b/human\n+opted in\n")
+	rec := reconcile.New(st, f, clock.NewFake(time.Unix(20, 0)), nil)
+
+	if _, err := rec.Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if _, ok, err := st.JobIDForPRInRepo(ctx, "", 503); err != nil || !ok {
+		t.Fatalf("expected flowbee:adopt PR #503 auto-adopted on sweep: ok=%v err=%v", ok, err)
+	}
+}
