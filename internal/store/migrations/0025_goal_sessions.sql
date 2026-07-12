@@ -15,6 +15,16 @@
 --                           control-plane box itself), matching the box='' == local
 --                           convention used elsewhere (Repo.DefaultBranch etc.).
 --   tmux_name             — the `tmux -t <name>` target on that box.
+--   tz                    — the BOX's IANA timezone name (e.g. "America/Denver").
+--                           The codex usage-limit message renders a BOX-local
+--                           wall-clock ("try again at 10:47 AM"); resolving that in
+--                           serve's own timezone computes blocked_until too EARLY
+--                           for any box west of serve — the watcher then resumes
+--                           into a still-live cap and burns the 3/hour budget.
+--                           '' (the default) means "ASSUME the box shares serve's
+--                           timezone" — correct for the common same-region fleet,
+--                           and the documented assumption an operator overrides
+--                           via `flowbee session add --tz <IANA name>`.
 --   repo / note           — operator-facing context only; never read by the parser.
 --   state                 — the LAST parsed status: pursuing|working|blocked|
 --                           achieved|unknown|unreachable. unknown/unreachable are
@@ -54,6 +64,7 @@ CREATE TABLE IF NOT EXISTS goal_sessions (
     id                    TEXT PRIMARY KEY,
     box                   TEXT NOT NULL DEFAULT '',
     tmux_name             TEXT NOT NULL,
+    tz                    TEXT NOT NULL DEFAULT '',
     repo                  TEXT NOT NULL DEFAULT '',
     note                  TEXT NOT NULL DEFAULT '',
     state                 TEXT NOT NULL DEFAULT 'unknown',

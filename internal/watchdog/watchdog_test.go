@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -448,6 +449,156 @@ func TestWatcher_UsageCeilingWarningThrottledHourly(t *testing.T) {
 	w.Pass(context.Background(), now.Add(90*time.Minute)) // past the hour: fires again
 	if w.lastCeilingWarnAt.Equal(firstWarnAt) {
 		t.Fatalf("ceiling warning did not re-fire after an hour")
+	}
+}
+
+// TestWatcher_UsageCeilingWarningSkipsStaleGauges: a hot-looking account whose
+// last usage report is >24h old is a FROZEN high-water gauge, not live capacity
+// news — it must not warn (review hardening #6). A fresh report still warns, and a
+// row with no reported_at at all stays on the warn path (fail toward warning).
+func TestWatcher_UsageCeilingWarningSkipsStaleGauges(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	stale := fakeAccounts{rows: []store.AccountUsageRow{
+		{AccountID: "acct-old", ModelFamily: "codex", UsagePct: 95, CeilingPct: 90,
+			ReportedAt: now.Add(-72 * time.Hour).Format(time.RFC3339Nano)},
+	}}
+	w := &Watcher{Sessions: newFakeSessions(), Accounts: stale, Runner: newFakeRunner(), Logger: testLogger()}
+	w.Pass(context.Background(), now)
+	if !w.lastCeilingWarnAt.IsZero() {
+		t.Fatalf("a >24h-stale gauge must not warn")
+	}
+
+	fresh := fakeAccounts{rows: []store.AccountUsageRow{
+		{AccountID: "acct-live", ModelFamily: "codex", UsagePct: 80, CeilingPct: 90,
+			ReportedAt: now.Add(-time.Hour).Format(time.RFC3339Nano)},
+	}}
+	w2 := &Watcher{Sessions: newFakeSessions(), Accounts: fresh, Runner: newFakeRunner(), Logger: testLogger()}
+	w2.Pass(context.Background(), now)
+	if w2.lastCeilingWarnAt.IsZero() {
+		t.Fatalf("a fresh hot gauge must still warn")
+	}
+}
+
+// TestPaneShowsUnsubmittedResume_ExactMatchOnly pins review MAJOR #2b: only the
+// EXACT unsubmitted command (optionally behind the TUI's `›`/`>` input prompt)
+// triggers the bare-Enter retry. Everything else — the blocked status line's own
+// hint text, an echoed transcript quote, and especially a HUMAN's edited input —
+// must fail toward NO keystroke.
+func TestPaneShowsUnsubmittedResume_ExactMatchOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		pane string
+		want bool
+	}{
+		{"bare unsubmitted command", "prior lines\n/goal resume", true},
+		{"prompt-prefixed ›", "prior lines\n› /goal resume", true},
+		{"prompt-prefixed >", "prior lines\n> /goal resume ", true},
+		{"blocked status line's own hint text", "  gpt-5.6-sol medium · ~/dev/russ           Goal blocked (/goal resume)", false},
+		{"submitted-and-echoed transcript quote", "you typed /goal resume earlier in this session", false},
+		{"human's edited input MUST NOT be submitted", "› /goal resume && rm -rf /", false},
+		{"trailing-extra text", "/goal resume now please", false},
+		{"empty pane", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := paneShowsUnsubmittedResume(tc.pane); got != tc.want {
+				t.Errorf("paneShowsUnsubmittedResume(%q) = %v, want %v", tc.pane, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWatcher_ScrollbackFailureNoActionThenNeedsOperator pins review hardening #4:
+// blocked-but-scrollback-unreadable takes NO action that pass (the watcher cannot
+// distinguish infra from a plain resume without the reason text — the old
+// classify-off-"" fallback typed /goal resume at genuinely infra-broken sessions
+// whenever the second capture flaked). After 3 consecutive misses it flags
+// needs_operator; a successful scrollback capture in between resets the streak.
+func TestWatcher_ScrollbackFailureNoActionThenNeedsOperator(t *testing.T) {
+	sess := store.GoalSession{ID: "s1", TmuxName: "goal-s1", Enabled: true}
+	sessions := newFakeSessions(sess)
+	runner := newFakeRunner()
+	base := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+
+	blockedPane := "  gpt-5.6-sol medium · ~/dev/russ                                     Goal blocked (/goal resume)"
+	runner.responses[capturePaneCmd("", "goal-s1")] = blockedPane
+	runner.errs[captureScrollbackCmd("", "goal-s1")] = errors.New("ssh flake mid-pass")
+
+	w := &Watcher{Sessions: sessions, Accounts: fakeAccounts{}, Runner: runner, Logger: testLogger()}
+
+	for i := 1; i <= 2; i++ {
+		w.Pass(context.Background(), base.Add(time.Duration(i)*time.Minute))
+		row := sessions.rows["s1"]
+		if containsCall(runner.calls, sendResumeCmd("", "goal-s1")) || containsCall(runner.calls, sendEnterCmd("", "goal-s1")) {
+			t.Fatalf("pass %d: no keys may be sent while scrollback is unreadable, calls: %v", i, runner.calls)
+		}
+		if row.ResumeAttempts != 0 {
+			t.Fatalf("pass %d: resume budget must not be burned on a no-action pass, attempts=%d", i, row.ResumeAttempts)
+		}
+		if strings.Contains(row.StateDetail, "needs_operator") {
+			t.Fatalf("pass %d: flagged needs_operator too early: %q", i, row.StateDetail)
+		}
+	}
+	// third consecutive miss: needs_operator, still no keys.
+	w.Pass(context.Background(), base.Add(3*time.Minute))
+	row := sessions.rows["s1"]
+	if !strings.Contains(row.StateDetail, "needs_operator") || !strings.Contains(row.StateDetail, "scrollback") {
+		t.Fatalf("expected needs_operator (scrollback) after 3 consecutive misses, got %q", row.StateDetail)
+	}
+	if containsCall(runner.calls, sendResumeCmd("", "goal-s1")) {
+		t.Fatalf("still no keys after escalation, calls: %v", runner.calls)
+	}
+
+	// a successful scrollback capture resets the streak AND resumes normal handling.
+	delete(runner.errs, captureScrollbackCmd("", "goal-s1"))
+	runner.responses[captureScrollbackCmd("", "goal-s1")] = "ready"
+	runner.responses[sendResumeCmd("", "goal-s1")] = ""
+	w.Pass(context.Background(), base.Add(4*time.Minute))
+	if !containsCall(runner.calls, sendResumeCmd("", "goal-s1")) {
+		t.Fatalf("expected a normal resume once scrollback is readable again, calls: %v", runner.calls)
+	}
+	if w.scrollbackFails["s1"] != 0 {
+		t.Fatalf("scrollback failure streak not reset on success: %d", w.scrollbackFails["s1"])
+	}
+}
+
+// TestWatcher_TimezonePlumbedFromSession pins the end-to-end MAJOR #1 fix: a
+// session registered with --tz gets its usage-limit reset resolved in the BOX's
+// zone. Serve runs in UTC; the box is America/Los_Angeles (7h west in July). The
+// message says 10:47 AM while it is 15:00 UTC == 08:00 box-local, so the correct
+// blocked_until is 17:47 UTC — the old serve-zone bug produced 10:47 UTC, already
+// in the past, i.e. an immediate wrong resume.
+func TestWatcher_TimezonePlumbedFromSession(t *testing.T) {
+	if _, err := time.LoadLocation("America/Los_Angeles"); err != nil {
+		t.Skipf("no tzdata available: %v", err)
+	}
+	sess := store.GoalSession{ID: "s1", TmuxName: "goal-s1", TZ: "America/Los_Angeles", Enabled: true}
+	sessions := newFakeSessions(sess)
+	runner := newFakeRunner()
+	now := time.Date(2026, 7, 3, 15, 0, 0, 0, time.UTC) // == 08:00 PDT
+
+	blockedPane := "  gpt-5.6-sol medium · ~/dev/russ                                     Goal blocked (/goal resume)"
+	runner.responses[capturePaneCmd("", "goal-s1")] = blockedPane
+	runner.responses[captureScrollbackCmd("", "goal-s1")] = "You've hit your usage limit, try again at 10:47 AM"
+
+	w := &Watcher{Sessions: sessions, Accounts: fakeAccounts{}, Runner: runner, Logger: testLogger()}
+	w.Pass(context.Background(), now)
+
+	if containsCall(runner.calls, sendResumeCmd("", "goal-s1")) {
+		t.Fatalf("must not resume while the box-local cap is live, calls: %v", runner.calls)
+	}
+	row := sessions.rows["s1"]
+	until, perr := time.Parse(time.RFC3339Nano, row.BlockedUntil)
+	if perr != nil {
+		t.Fatalf("blocked_until unparseable: %q (%v)", row.BlockedUntil, perr)
+	}
+	want := time.Date(2026, 7, 3, 17, 47, 0, 0, time.UTC) // 10:47 PDT
+	if !until.Equal(want) {
+		t.Fatalf("blocked_until = %v, want %v (10:47 box-local)", until.UTC(), want)
+	}
+	// the serve-zone bug's value would have been in the past — assert we're future.
+	if !until.After(now) {
+		t.Fatalf("blocked_until %v not in the future of %v — the serve-zone bug", until.UTC(), now)
 	}
 }
 

@@ -64,11 +64,26 @@ type Watcher struct {
 	Runner   Runner
 	Logger   *slog.Logger
 
+	// SettleDelay is the pause between sending `/goal resume` and the verification
+	// recapture. A zero-delay recapture routinely catches codex MID-REDRAW — an
+	// Unknown-parsing half-drawn pane that reads as a false "swallowed Enter"
+	// (review MAJOR #2a). New() defaults it to 500ms; tests set 0 to stay fast.
+	SettleDelay time.Duration
+
 	// ceilingWarnMu guards lastCeilingWarnAt — Pass is called from a single
 	// serve.go goroutine tick-by-tick, so contention is not expected, but the
 	// mutex costs nothing and removes any doubt if that ever changes.
 	ceilingWarnMu     sync.Mutex
 	lastCeilingWarnAt time.Time
+
+	// scrollbackFails counts CONSECUTIVE scrollback-capture failures per session
+	// (review hardening #4): blocked-but-scrollback-unreadable means the watcher
+	// cannot distinguish infra breakage from a plain resume — so it takes NO action
+	// that pass and retries next tick; after 3 consecutive it flags needs_operator.
+	// In-memory (not persisted): a serve restart resetting the count merely re-does
+	// up to 3 harmless no-action retries — it can never cause an unsafe resume.
+	sbFailMu        sync.Mutex
+	scrollbackFails map[string]int
 }
 
 // New builds a Watcher with the given store/runner. logger defaults to
@@ -77,7 +92,7 @@ func New(st *store.Store, runner Runner, logger *slog.Logger) *Watcher {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Watcher{Sessions: st, Accounts: st, Runner: runner, Logger: logger}
+	return &Watcher{Sessions: st, Accounts: st, Runner: runner, Logger: logger, SettleDelay: 500 * time.Millisecond}
 }
 
 // Pass runs one full watch cycle: every enabled session, plus the weekly-limit
@@ -86,6 +101,16 @@ func New(st *store.Store, runner Runner, logger *slog.Logger) *Watcher {
 // watcher to every other session (the exact "one job's failure never blocks the
 // others" posture used throughout the rest of the codebase).
 func (w *Watcher) Pass(ctx context.Context, now time.Time) {
+	// this goroutine TYPES KEYSTROKES into live agent sessions and runs inside the
+	// control plane — a panic here (a nil pane edge case, a bad IANA name, anything)
+	// must never take `flowbee serve` down with it (review hardening #5). Recover,
+	// log loudly, skip the pass; the next 2-minute tick starts clean.
+	defer func() {
+		if r := recover(); r != nil {
+			w.Logger.Error("goal-session watchdog: PANIC recovered — pass skipped", "panic", r)
+		}
+	}()
+
 	w.warnUsageCeilings(ctx, now)
 
 	sessions, err := w.Sessions.ListEnabledGoalSessions(ctx)
@@ -164,16 +189,43 @@ func (w *Watcher) handleBlocked(ctx context.Context, s store.GoalSession, now ti
 
 	scrollback, err := w.Runner.Run(ctx, captureScrollbackCmd(s.Box, s.TmuxName))
 	if err != nil {
-		// the primary pane capture just succeeded (we're only here because state
-		// parsed as blocked), so this is NOT counted as a consecutive_failures
-		// capture failure — it's a best-effort diagnostic step. Fall back to
-		// classifying off nothing, which resolves to blockAutoResume; that's the
-		// safe default (infra/usage-limit text simply wasn't visible to us).
-		w.Logger.Warn("goal-session watchdog: scrollback capture failed, classifying without it", "session", s.ID, "err", err)
-		scrollback = ""
+		// blocked-but-scrollback-unreadable = NO ACTION this pass (review hardening
+		// #4). The earlier posture — classify off "" → blockAutoResume — meant a
+		// genuinely infra-broken session got `/goal resume` typed at it whenever the
+		// SECOND capture flaked, masking the exact buncher-style incident this
+		// watchdog exists to surface. Without the reason text we cannot distinguish
+		// infra (never touch) from a plain resume, so the only safe move is none:
+		// retry next tick, and flag needs_operator after 3 consecutive misses (the
+		// primary capture works, so this isn't the unreachable path — it's its own
+		// "half-blind" mode). Not counted in consecutive_failures for that reason.
+		fails := w.bumpScrollbackFail(s.ID)
+		w.Logger.Warn("goal-session watchdog: scrollback capture failed — no action this pass",
+			"session", s.ID, "consecutive_scrollback_failures", fails, "err", err)
+		if fails >= 3 {
+			if serr := w.Sessions.SetNeedsOperator(ctx, s.ID, "blocked but scrollback unreadable (3 consecutive)", now); serr != nil {
+				w.Logger.Error("goal-session watchdog: set needs_operator (scrollback)", "session", s.ID, "err", serr)
+			}
+		}
+		return
+	}
+	w.resetScrollbackFail(s.ID)
+
+	// resolve `now` into the BOX's timezone before classification (review MAJOR #1):
+	// the usage-limit message renders a BOX-local wall clock, and parseResetTime does
+	// all its math in now.Location() — this one In() is the entire timezone fix.
+	// tz was validated loadable at registration; a load failure here (e.g. tzdata
+	// removed since) falls back to serve-local, logged so the drift is visible.
+	boxNow := now
+	if s.TZ != "" {
+		if loc, lerr := time.LoadLocation(s.TZ); lerr == nil {
+			boxNow = now.In(loc)
+		} else {
+			w.Logger.Warn("goal-session watchdog: cannot load session tz — falling back to serve-local",
+				"session", s.ID, "tz", s.TZ, "err", lerr)
+		}
 	}
 
-	class := classifyBlocked(scrollback, now)
+	class := classifyBlocked(scrollback, boxNow)
 	switch class.Kind {
 	case blockUsageLimit:
 		detail := "usage_limit"
@@ -235,8 +287,17 @@ func (w *Watcher) autoResume(ctx context.Context, s store.GoalSession, now time.
 
 	// Verify submission (the observed double-Enter lesson): the TUI's
 	// slash-command menu can swallow the first Enter, leaving "/goal resume"
-	// sitting unsubmitted in the input line. Re-capture and, if the last
-	// non-empty line still shows the unsubmitted command, send a bare Enter.
+	// sitting unsubmitted in the input line. Settle first (review MAJOR #2a): a
+	// zero-delay recapture routinely catches codex mid-redraw, which reads as a
+	// half-drawn/garbage pane and a false "swallowed Enter". Then re-capture and,
+	// only on an EXACT input-line match, send the one bare Enter.
+	if w.SettleDelay > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(w.SettleDelay):
+		}
+	}
 	pane, verr := w.Runner.Run(ctx, capturePaneCmd(s.Box, s.TmuxName))
 	if verr != nil {
 		w.Logger.Warn("goal-session watchdog: verify resume submission failed", "session", s.ID, "err", verr)
@@ -250,21 +311,43 @@ func (w *Watcher) autoResume(ctx context.Context, s store.GoalSession, now time.
 	}
 }
 
-// paneShowsUnsubmittedResume reports whether the pane's last non-empty line looks
-// like the swallowed-Enter failure mode: "/goal resume" sitting UNSUBMITTED in the
-// input line. NOTE: a legitimately blocked pane's status line is literally
-// "Goal blocked (/goal resume)" (codex's own hint text) — a naive substring check
-// against "/goal resume" would misfire on every verify-recapture of a still-blocked
-// session. So this only counts as "unsubmitted" when the line does NOT parse as any
-// KNOWN status shape (the TUI redrawing its normal status bar — recognized or not —
-// means the input line is no longer sitting there unsubmitted) AND still literally
-// contains the command text.
+// paneShowsUnsubmittedResume reports whether the pane's last non-empty line is the
+// swallowed-Enter failure mode: "/goal resume" sitting UNSUBMITTED in the input
+// line. EXACT match required (review MAJOR #2b) — after stripping the TUI's input
+// prompt glyph (`›`/`>`), the trimmed line must equal exactly "/goal resume":
+//   - a Contains check misfires on the legitimately blocked status line itself
+//     ("Goal blocked (/goal resume)" — codex's own hint text renders the substring),
+//   - on a submitted-and-ECHOED transcript line that merely quotes the command,
+//   - and worst, it would press Enter under a HUMAN's edited input like
+//     "/goal resume && x", submitting keystrokes the watcher never typed.
+//
+// Anything that is not the exact unsubmitted command → no bare Enter (fail toward
+// no keystroke; the next 2-minute pass re-evaluates from scratch).
 func paneShowsUnsubmittedResume(pane string) bool {
 	line := lastNonEmptyLine(pane)
-	if state, _ := ParseStatus(pane); state != StateUnknown {
-		return false
+	line = strings.TrimSpace(strings.TrimLeft(line, "›>")) // strip the input-prompt glyph(s)
+	return line == "/goal resume"
+}
+
+// bumpScrollbackFail / resetScrollbackFail maintain the per-session consecutive
+// scrollback-capture-failure counter (see handleBlocked). Lazily allocated so the
+// zero-value Watcher tests construct keeps working.
+func (w *Watcher) bumpScrollbackFail(id string) int {
+	w.sbFailMu.Lock()
+	defer w.sbFailMu.Unlock()
+	if w.scrollbackFails == nil {
+		w.scrollbackFails = map[string]int{}
 	}
-	return strings.Contains(line, "/goal resume")
+	w.scrollbackFails[id]++
+	return w.scrollbackFails[id]
+}
+
+func (w *Watcher) resetScrollbackFail(id string) {
+	w.sbFailMu.Lock()
+	defer w.sbFailMu.Unlock()
+	if w.scrollbackFails != nil {
+		delete(w.scrollbackFails, id)
+	}
 }
 
 // paneHash hashes the FULL captured pane text (not just the status line) so
@@ -298,9 +381,20 @@ func (w *Watcher) warnUsageCeilings(ctx context.Context, now time.Time) {
 	}
 	var hot []store.AccountUsageRow
 	for _, a := range accounts {
-		if a.UsagePct >= usageCeilingWarnPct {
-			hot = append(hot, a)
+		if a.UsagePct < usageCeilingWarnPct {
+			continue
 		}
+		// skip STALE gauges (review hardening #6): an account whose box went quiet
+		// pins its last (possibly high-water) usage_pct forever — warning on a
+		// >24h-old report is noise about capacity nobody is even using. A missing/
+		// unparseable reported_at is NOT skipped (fail toward warning: a fresh-but-
+		// odd row shouldn't silently vanish from the alert path).
+		if a.ReportedAt != "" {
+			if reported, perr := time.Parse(time.RFC3339Nano, a.ReportedAt); perr == nil && now.Sub(reported) > 24*time.Hour {
+				continue
+			}
+		}
+		hot = append(hot, a)
 	}
 	if len(hot) == 0 {
 		return

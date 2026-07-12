@@ -67,14 +67,28 @@ var usageLimitRe = regexp.MustCompile(`(?i)usage limit`)
 // testable.
 var tryAgainRe = regexp.MustCompile(`(?i)try again\s+([^.\n]+)`)
 
+// infraScanLines bounds the infra-keyword scan to the TAIL of the scrollback: the
+// reason a session is blocked NOW is at the bottom of the pane, next to the status
+// line. Scanning all 60 captured lines strands a session whose transcript merely
+// DISCUSSED an infra phrase (an agent explaining "run `gh auth login` on that other
+// box" would classify as needs_operator and never self-resume — the reviewer-shown
+// false positive). 15 lines comfortably covers a real multi-line error block.
+const infraScanLines = 15
+
 // classifyBlocked inspects scrollback text (ideally captured with `-S -60`, but the
 // caller may fall back to just the last pane on a scrollback-capture failure) and
 // returns the classification the watcher acts on.
+//
+// TIMEZONE CONTRACT: `now` must already be expressed in the BOX's local timezone
+// (the watcher passes now.In(loc) resolved from the session's registered tz). The
+// codex message renders a box-local wall clock — "try again at 10:47 AM" on a box
+// west of serve resolved in SERVE's zone would compute blocked_until too EARLY,
+// resuming into a still-live cap and burning the 3/hour budget (review MAJOR #1).
+// parseResetTime derives everything from now.Location(), so this one In() at the
+// call site is the entire fix.
 func classifyBlocked(scrollback string, now time.Time) blockedClassification {
-	lower := strings.ToLower(scrollback)
-
 	for _, kw := range infraKeywords {
-		if strings.Contains(lower, kw) {
+		if strings.Contains(strings.ToLower(tailLines(scrollback, infraScanLines)), kw) {
 			return blockedClassification{Kind: blockInfra, Reason: kw}
 		}
 	}
@@ -110,6 +124,25 @@ func classifyBlocked(scrollback string, now time.Time) blockedClassification {
 	return blockedClassification{Kind: blockAutoResume}
 }
 
+// tailLines returns the last n non-empty lines of s joined by newlines (fewer if s
+// has fewer). Blank pane-padding lines don't count against the budget.
+func tailLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	var kept []string
+	for i := len(lines) - 1; i >= 0 && len(kept) < n; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		kept = append(kept, lines[i])
+	}
+	// kept is reversed (bottom-up); order doesn't matter for substring matching,
+	// but reverse anyway so a logged/debugged value reads naturally.
+	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+		kept[i], kept[j] = kept[j], kept[i]
+	}
+	return strings.Join(kept, "\n")
+}
+
 // usageLimitFallbackCooldown is the conservative wait applied when usage-limit text
 // is detected but its reset time can't be parsed — long enough that a real cap
 // window has a decent chance of having rolled over by the next check, short enough
@@ -141,6 +174,10 @@ var weekdayNames = map[string]time.Weekday{
 // NOTE (uncertainty flagged in the report): only the daily "at <time>" shape was
 // given as an exact captured sample; the weekly shape's exact wording was not, so
 // this weekday-name parse is a best-effort heuristic pending a real sample.
+//
+// `now` carries the BOX's location (see classifyBlocked's timezone contract); all
+// wall-clock/weekday math below is done in now.Location(), and the returned
+// deadline is an absolute instant — correct regardless of serve's own zone.
 func parseResetTime(clause string, now time.Time) (t time.Time, weekly bool, ok bool) {
 	clause = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(clause), "at "))
 	clause = strings.TrimSuffix(clause, ".")

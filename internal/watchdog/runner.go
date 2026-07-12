@@ -77,15 +77,20 @@ func sendEnterCmd(box, tmuxName string) string {
 
 // remoteWrap wraps inner in an ssh invocation when box is non-empty (” == local,
 // matching the Repo.DefaultBranch-style convention used elsewhere in the store).
-// Exactly the ssh form specified in the task brief: BatchMode (never prompt/hang on
-// a password/host-key question — this runs unattended) + a short ConnectTimeout (a
-// downed box fails fast into the consecutive_failures counter instead of stalling
-// the whole watch pass).
+// The ssh form from the task brief: BatchMode (never prompt/hang on a password/
+// host-key question — this runs unattended) + a short ConnectTimeout (a downed box
+// fails fast into the consecutive_failures counter instead of stalling the whole
+// watch pass) + `--` before the host (adversarial-review MAJOR #3): shQuote stops
+// SHELL injection, but ssh's own getopt still reads a leading-dash "host" as an
+// OPTION — a box registered as `-oProxyCommand=...` would be local RCE. The `--`
+// end-of-options marker makes the next argv element unconditionally the hostname.
+// (Registration-time validation in store.AddGoalSession additionally rejects
+// leading-dash / whitespace values — defense in depth, not the primary fix.)
 func remoteWrap(box, inner string) string {
 	if box == "" {
 		return inner
 	}
-	return "ssh -o BatchMode=yes -o ConnectTimeout=5 " + shQuote(box) + " " + shQuote(inner)
+	return "ssh -o BatchMode=yes -o ConnectTimeout=5 -- " + shQuote(box) + " " + shQuote(inner)
 }
 
 // shQuote single-quotes s for safe embedding in an `sh -c` string, escaping any

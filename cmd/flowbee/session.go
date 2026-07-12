@@ -59,6 +59,9 @@ func runSessionAdd(ctx context.Context, st *store.Store, args []string) error {
 	fs := flag.NewFlagSet("session add", flag.ContinueOnError)
 	tmux := fs.String("tmux", "", "tmux session name on the target box (required)")
 	box := fs.String("box", "", "ssh host to reach the tmux session on (default: local — the control-plane box)")
+	tz := fs.String("tz", "", "the BOX's IANA timezone, e.g. America/Denver (default: assume serve's own timezone). "+
+		"Set this for any box in a different zone — codex's \"try again at 10:47 AM\" is box-local wall clock, "+
+		"and resolving it in the wrong zone makes the watchdog resume into a still-live usage cap")
 	repo := fs.String("repo", "", "repo this goal session is working on (operator-facing only)")
 	note := fs.String("note", "", "free-text note (operator-facing only)")
 	// the <id> positional can come before OR after the flags (`flowbee session add
@@ -82,14 +85,16 @@ func runSessionAdd(ctx context.Context, st *store.Store, args []string) error {
 		rest = fs.Args()[1:]
 	}
 	if id == "" {
-		return fmt.Errorf("usage: flowbee session add <id> --tmux <name> [--box <host>] [--repo <r>] [--note <s>]")
+		return fmt.Errorf("usage: flowbee session add <id> --tmux <name> [--box <host>] [--tz <IANA name>] [--repo <r>] [--note <s>]")
 	}
 	if strings.TrimSpace(*tmux) == "" {
 		return fmt.Errorf("--tmux is required (the `tmux -t <name>` target)")
 	}
 
+	// argv-safety + tz validation live in AddGoalSession (the store is the seam every
+	// caller must pass through), so the CLI just relays its errors.
 	err := st.AddGoalSession(ctx, store.GoalSession{
-		ID: id, Box: *box, TmuxName: *tmux, Repo: *repo, Note: *note,
+		ID: id, Box: *box, TmuxName: *tmux, TZ: *tz, Repo: *repo, Note: *note,
 	}, time.Now())
 	if errors.Is(err, store.ErrGoalSessionExists) {
 		return fmt.Errorf("session %q is already registered (use `flowbee session rm %s` first to re-register)", id, id)
@@ -162,18 +167,25 @@ func printSessionList(w io.Writer, sessions []store.GoalSession) {
 		return
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tBOX\tTMUX\tREPO\tSTATE\tELAPSED\tDETAIL\tWATCHING")
+	fmt.Fprintln(tw, "ID\tBOX\tTMUX\tTZ\tREPO\tSTATE\tELAPSED\tDETAIL\tWATCHING")
 	for _, g := range sessions {
 		box := g.Box
 		if box == "" {
 			box = "local"
 		}
+		// TZ surfaced so an operator can VERIFY the usage-limit reset math will run
+		// in the right zone (the west-of-serve early-resume bug); "serve" makes the
+		// ''-default assumption explicit rather than showing a blank.
+		tz := g.TZ
+		if tz == "" {
+			tz = "serve"
+		}
 		watching := "yes"
 		if !g.Enabled {
 			watching = "PAUSED"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			g.ID, box, g.TmuxName, dashIfEmpty(g.Repo), g.State, dashIfEmpty(g.GoalElapsed),
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			g.ID, box, g.TmuxName, tz, dashIfEmpty(g.Repo), g.State, dashIfEmpty(g.GoalElapsed),
 			dashIfEmpty(g.StateDetail), watching)
 	}
 	tw.Flush() //nolint:errcheck

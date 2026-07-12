@@ -20,6 +20,7 @@ type GoalSession struct {
 	ID                  string
 	Box                 string // '' = local (the control-plane box itself)
 	TmuxName            string
+	TZ                  string // box's IANA timezone; '' = assume serve's own (see 0025 schema comment)
 	Repo                string
 	Note                string
 	State               string // pursuing|working|blocked|achieved|unknown|unreachable
@@ -56,19 +57,59 @@ func (s *Store) AddGoalSession(ctx context.Context, g GoalSession, now time.Time
 	if g.TmuxName == "" {
 		return errors.New("tmux_name is required")
 	}
+	// belt-and-suspenders alongside the watcher's shell-quoting: box/tmux_name feed
+	// directly into ssh/tmux argv construction, so reject anything argv-hostile at
+	// REGISTRATION time too. shQuote already stops shell injection, but ssh's own
+	// getopt still reads a leading-dash host as an OPTION (`-oProxyCommand=...` is
+	// local RCE) — the `--` separator in remoteWrap is the primary fix; this makes
+	// such a value unregistrable in the first place. Whitespace/control chars have
+	// no legitimate use in a hostname or tmux target either.
+	if err := validateArgvSafe("box", g.Box); err != nil {
+		return err
+	}
+	if err := validateArgvSafe("tmux_name", g.TmuxName); err != nil {
+		return err
+	}
+	// a non-empty tz must be a loadable IANA name — a typo'd timezone silently
+	// falling back to serve-local at RESOLVE time would reintroduce the exact
+	// west-of-serve early-resume bug the column exists to fix. Fail loud at add.
+	if g.TZ != "" {
+		if _, err := time.LoadLocation(g.TZ); err != nil {
+			return fmt.Errorf("invalid --tz %q (want an IANA name like America/Denver): %w", g.TZ, err)
+		}
+	}
 	ts := now.Format(rfc3339)
 	_, err := s.DB.ExecContext(ctx, `
 		INSERT INTO goal_sessions
-		    (id, box, tmux_name, repo, note, state, state_detail, goal_elapsed,
+		    (id, box, tmux_name, tz, repo, note, state, state_detail, goal_elapsed,
 		     blocked_until, resume_attempts, resume_window_start, consecutive_failures,
 		     last_pane_hash, last_change_at, last_checked_at, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 'unknown', '', '', '', 0, '', 0, '', '', '', 1, ?, ?)`,
-		g.ID, g.Box, g.TmuxName, g.Repo, g.Note, ts, ts)
+		VALUES (?, ?, ?, ?, ?, ?, 'unknown', '', '', '', 0, '', 0, '', '', '', 1, ?, ?)`,
+		g.ID, g.Box, g.TmuxName, g.TZ, g.Repo, g.Note, ts, ts)
 	if err != nil {
 		if isUniqueConstraintErr(err) {
 			return ErrGoalSessionExists
 		}
 		return fmt.Errorf("add goal session %q: %w", g.ID, err)
+	}
+	return nil
+}
+
+// validateArgvSafe rejects values that could subvert ssh/tmux argv construction:
+// a leading '-' (option injection into ssh/tmux's own getopt) or any whitespace/
+// control character (argv splitting / terminal control). Empty is fine (” = local
+// box). Field names the offender in the error for a usable CLI message.
+func validateArgvSafe(field, v string) error {
+	if v == "" {
+		return nil
+	}
+	if strings.HasPrefix(v, "-") {
+		return fmt.Errorf("%s %q must not start with '-' (ssh/tmux would read it as an option)", field, v)
+	}
+	for _, r := range v {
+		if r <= ' ' || r == 0x7f { // control chars, space, tab, newline, DEL
+			return fmt.Errorf("%s %q must not contain whitespace or control characters", field, v)
+		}
 	}
 	return nil
 }
@@ -85,7 +126,7 @@ func (s *Store) GetGoalSession(ctx context.Context, id string) (GoalSession, err
 }
 
 const goalSessionSelect = `
-	SELECT id, box, tmux_name, repo, note, state, state_detail, goal_elapsed,
+	SELECT id, box, tmux_name, tz, repo, note, state, state_detail, goal_elapsed,
 	       blocked_until, resume_attempts, resume_window_start, consecutive_failures,
 	       last_pane_hash, last_change_at, last_checked_at, enabled, created_at, updated_at
 	  FROM goal_sessions`
@@ -93,7 +134,7 @@ const goalSessionSelect = `
 func scanGoalSession(row rowScanner) (GoalSession, error) {
 	var g GoalSession
 	var enabled int
-	err := row.Scan(&g.ID, &g.Box, &g.TmuxName, &g.Repo, &g.Note, &g.State, &g.StateDetail,
+	err := row.Scan(&g.ID, &g.Box, &g.TmuxName, &g.TZ, &g.Repo, &g.Note, &g.State, &g.StateDetail,
 		&g.GoalElapsed, &g.BlockedUntil, &g.ResumeAttempts, &g.ResumeWindowStart,
 		&g.ConsecutiveFailures, &g.LastPaneHash, &g.LastChangeAt, &g.LastCheckedAt,
 		&enabled, &g.CreatedAt, &g.UpdatedAt)

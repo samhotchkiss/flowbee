@@ -35,6 +35,51 @@ func TestClassifyBlocked_UsageLimitDailyAlreadyPassedRollsToTomorrow(t *testing.
 	}
 }
 
+// TestClassifyBlocked_TimezoneResolution pins the review-MAJOR-#1 contract: the
+// message's "10:47 AM" is BOX-local wall clock, so `now` must arrive already In()
+// the box's location and the returned deadline is the box-local instant. The
+// west-of-serve case is the dangerous one: serve-zone resolution would compute a
+// deadline 7h too EARLY, and the watcher would resume into a still-live cap.
+func TestClassifyBlocked_TimezoneResolution(t *testing.T) {
+	scrollback := "You've hit your usage limit, try again at 10:47 AM"
+	la, err := time.LoadLocation("America/Los_Angeles") // UTC-7 in July (PDT)
+	if err != nil {
+		t.Skipf("no tzdata available: %v", err)
+	}
+
+	// Box WEST of serve: serve-now is 15:00 UTC == 08:00 PDT, so box-local 10:47 AM
+	// is still ahead today. The correct deadline is 10:47 PDT == 17:47 UTC; the OLD
+	// serve-zone bug would have produced 10:47 UTC — 7h early, mid-cap.
+	serveNow := time.Date(2026, 7, 3, 15, 0, 0, 0, time.UTC)
+	got := classifyBlocked(scrollback, serveNow.In(la))
+	want := time.Date(2026, 7, 3, 10, 47, 0, 0, la)
+	if !got.ResetAt.Equal(want) {
+		t.Fatalf("west-of-serve resetAt = %v, want %v (10:47 box-local == 17:47 UTC)", got.ResetAt, want.UTC())
+	}
+	if got.ResetAt.Equal(time.Date(2026, 7, 3, 10, 47, 0, 0, time.UTC)) {
+		t.Fatalf("resetAt resolved in serve's zone — the exact too-early bug this fixes")
+	}
+
+	// same box, but 10:47 AM box-local has ALREADY passed (serve-now 18:30 UTC ==
+	// 11:30 PDT) → tomorrow 10:47 box-local, still in the box's zone.
+	got = classifyBlocked(scrollback, time.Date(2026, 7, 3, 18, 30, 0, 0, time.UTC).In(la))
+	want = time.Date(2026, 7, 4, 10, 47, 0, 0, la)
+	if !got.ResetAt.Equal(want) {
+		t.Fatalf("box-local already-passed resetAt = %v, want %v (tomorrow box-local)", got.ResetAt, want.UTC())
+	}
+
+	// weekly variant also resolves the weekday in the BOX's zone: at 01:00 UTC
+	// Friday it is still THURSDAY evening in LA, so "try again Monday" is the LA
+	// Monday midnight — not the UTC one.
+	weekly := "You've hit your weekly usage limit, try again Monday"
+	utcFri := time.Date(2026, 7, 3, 1, 0, 0, 0, time.UTC) // Fri 01:00 UTC == Thu 18:00 PDT
+	got = classifyBlocked(weekly, utcFri.In(la))
+	want = time.Date(2026, 7, 6, 0, 0, 0, 0, la) // Monday 00:00 box-local
+	if !got.Weekly || !got.ResetAt.Equal(want) {
+		t.Fatalf("weekly box-local resetAt = %v weekly=%v, want %v", got.ResetAt, got.Weekly, want.UTC())
+	}
+}
+
 func TestClassifyBlocked_UsageLimitWeeklyVariant(t *testing.T) {
 	// exact wording not given in the task brief — best-effort heuristic per the
 	// code comment in classify.go. now is a Thursday.
@@ -113,5 +158,25 @@ func TestClassifyBlocked_InfraKeywordsCaseInsensitive(t *testing.T) {
 	got := classifyBlocked(strings.ToUpper("gh auth required"), time.Now())
 	if got.Kind != blockInfra {
 		t.Fatalf("kind = %v, want blockInfra (case-insensitive match)", got.Kind)
+	}
+}
+
+// TestClassifyBlocked_InfraScopedToScrollbackTail: an infra phrase merely DISCUSSED
+// high up in the transcript (>15 non-empty lines above the bottom) must NOT strand
+// the session as needs_operator — the reason a session is blocked NOW lives at the
+// bottom of the pane. The same phrase within the tail still classifies as infra.
+func TestClassifyBlocked_InfraScopedToScrollbackTail(t *testing.T) {
+	// 20 filler lines push the discussion line beyond the 15-line tail window.
+	filler := strings.Repeat("just some ordinary transcript output line\n", 20)
+	discussed := "earlier we talked about running gh auth login on the other box\n" + filler
+	got := classifyBlocked(discussed, time.Now())
+	if got.Kind == blockInfra {
+		t.Fatalf("an infra phrase outside the tail window must not classify as infra")
+	}
+
+	recent := filler + "fatal: gh auth login required\n"
+	got = classifyBlocked(recent, time.Now())
+	if got.Kind != blockInfra {
+		t.Fatalf("kind = %v, want blockInfra for a tail-window match", got.Kind)
 	}
 }

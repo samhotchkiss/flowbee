@@ -34,7 +34,7 @@ func TestRunSessionAddListRmPause(t *testing.T) {
 	dbPath := newSessionTestDB(t)
 	ctx := context.Background()
 
-	if err := runSession([]string{"add", "russ-terra", "--tmux", "goal-terra", "--box", "buncher", "--repo", "russ"}); err != nil {
+	if err := runSession([]string{"add", "russ-terra", "--tmux", "goal-terra", "--box", "buncher", "--tz", "America/Denver", "--repo", "russ"}); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	// duplicate id is rejected, not silently upserted.
@@ -44,6 +44,14 @@ func TestRunSessionAddListRmPause(t *testing.T) {
 	// --tmux is required.
 	if err := runSession([]string{"add", "no-tmux"}); err == nil {
 		t.Fatalf("expected an error with no --tmux")
+	}
+	// a typo'd --tz fails at add time (not silently serve-local at resolve time).
+	if err := runSession([]string{"add", "bad-tz", "--tmux", "t", "--tz", "America/Nowhere"}); err == nil {
+		t.Fatalf("expected an error for an invalid --tz")
+	}
+	// argv-hostile box/tmux values are rejected at registration (ssh option injection).
+	if err := runSession([]string{"add", "bad-box", "--tmux", "t", "--box", "-oProxyCommand=evil"}); err == nil {
+		t.Fatalf("expected an error for a leading-dash box")
 	}
 
 	st, err := store.Open(ctx, dbPath)
@@ -55,7 +63,7 @@ func TestRunSessionAddListRmPause(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if g.Box != "buncher" || g.TmuxName != "goal-terra" || g.Repo != "russ" || !g.Enabled {
+	if g.Box != "buncher" || g.TmuxName != "goal-terra" || g.TZ != "America/Denver" || g.Repo != "russ" || !g.Enabled {
 		t.Fatalf("unexpected row: %+v", g)
 	}
 

@@ -16,7 +16,7 @@ func TestGoalSessionCRUD(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 
 	if err := st.AddGoalSession(ctx, store.GoalSession{
-		ID: "russ-terra", Box: "buncher", TmuxName: "goal-terra", Repo: "russ", Note: "epic lane phase 1",
+		ID: "russ-terra", Box: "buncher", TmuxName: "goal-terra", TZ: "America/Denver", Repo: "russ", Note: "epic lane phase 1",
 	}, now); err != nil {
 		t.Fatalf("add: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestGoalSessionCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if g.Box != "buncher" || g.TmuxName != "goal-terra" || g.State != "unknown" || !g.Enabled {
+	if g.Box != "buncher" || g.TmuxName != "goal-terra" || g.TZ != "America/Denver" || g.State != "unknown" || !g.Enabled {
 		t.Fatalf("unexpected row: %+v", g)
 	}
 
@@ -235,5 +235,59 @@ func TestGoalSessionBlockedUntilAndNeedsOperatorAndClearBlock(t *testing.T) {
 
 	if err := st.SetBlockedUntil(ctx, "nope", reset, "x", now); !errors.Is(err, store.ErrGoalSessionNotFound) {
 		t.Fatalf("expected ErrGoalSessionNotFound, got %v", err)
+	}
+}
+
+// TestAddGoalSessionRejectsArgvHostileValues: registration-time defense in depth
+// behind remoteWrap's `--` separator — a leading-dash box would otherwise be read
+// by ssh's own getopt as an OPTION (`-oProxyCommand=...` = local RCE), and
+// whitespace/control chars have no legitimate use in a hostname or tmux target.
+func TestAddGoalSessionRejectsArgvHostileValues(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+
+	bad := []store.GoalSession{
+		{ID: "b1", TmuxName: "t", Box: "-oProxyCommand=evil"},
+		{ID: "b2", TmuxName: "t", Box: "host name"},
+		{ID: "b3", TmuxName: "t", Box: "host\nname"},
+		{ID: "b4", TmuxName: "-t-evil", Box: "ok"},
+		{ID: "b5", TmuxName: "has space", Box: "ok"},
+		{ID: "b6", TmuxName: "tab\there", Box: "ok"},
+	}
+	for _, g := range bad {
+		if err := st.AddGoalSession(ctx, g, now); err == nil {
+			t.Errorf("expected rejection for %+v", g)
+		}
+	}
+	// none of them may have landed in the registry.
+	all, _ := st.ListGoalSessions(ctx)
+	if len(all) != 0 {
+		t.Fatalf("hostile values were registered: %+v", all)
+	}
+
+	// a normal hostname/tmux target still registers fine.
+	if err := st.AddGoalSession(ctx, store.GoalSession{ID: "ok", TmuxName: "goal-1", Box: "buncher.example.com"}, now); err != nil {
+		t.Fatalf("legitimate values rejected: %v", err)
+	}
+}
+
+// TestAddGoalSessionValidatesTZ: a typo'd IANA name must fail at ADD time — a
+// silent serve-local fallback at resolve time would reintroduce the exact
+// west-of-serve early-resume bug the tz column exists to fix.
+func TestAddGoalSessionValidatesTZ(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+
+	if err := st.AddGoalSession(ctx, store.GoalSession{ID: "s1", TmuxName: "t1", TZ: "America/Nowhere"}, now); err == nil {
+		t.Fatalf("expected an invalid-tz rejection")
+	}
+	if err := st.AddGoalSession(ctx, store.GoalSession{ID: "s1", TmuxName: "t1", TZ: "America/Los_Angeles"}, now); err != nil {
+		t.Fatalf("valid tz rejected: %v", err)
+	}
+	g, err := st.GetGoalSession(ctx, "s1")
+	if err != nil || g.TZ != "America/Los_Angeles" {
+		t.Fatalf("tz did not round-trip: %+v err=%v", g, err)
 	}
 }

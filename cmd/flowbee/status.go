@@ -93,9 +93,18 @@ func runStatus(args []string) error {
 	}
 	if accounts, aerr := st.AllAccountUsage(ctx); aerr == nil {
 		for _, a := range accounts {
-			if a.UsagePct >= usageCeilingWarnPct {
-				summary.UsageWarnings = append(summary.UsageWarnings, a)
+			if a.UsagePct < usageCeilingWarnPct {
+				continue
 			}
+			// skip stale gauges (>24h since the last usage report) — same rule as the
+			// watchdog's hourly WARN: an account whose box went quiet days ago pins a
+			// frozen high-water usage_pct that isn't actionable capacity news.
+			if a.ReportedAt != "" {
+				if reported, perr := time.Parse(time.RFC3339Nano, a.ReportedAt); perr == nil && now.Sub(reported) > 24*time.Hour {
+					continue
+				}
+			}
+			summary.UsageWarnings = append(summary.UsageWarnings, a)
 		}
 	}
 
