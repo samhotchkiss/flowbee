@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
@@ -52,6 +53,7 @@ type boardCard struct {
 	Flowbee      bool         // the yellow flowbee umbrella marker
 	ProjectEmoji string       // per-project glyph (replaces the generic bee on the card)
 	ProjectColor template.CSS // per-project left-stripe color (derived from the repo)
+	ShowTrace    bool         // true only for confirmed superadmin operator requests
 }
 
 type boardView struct {
@@ -157,6 +159,7 @@ func projectColor(repo string) template.CSS {
 
 func (u *UI) board(w http.ResponseWriter, r *http.Request) {
 	now := u.clock.Now()
+	showTrace := u.isSuperadmin(r)
 	cards, err := u.data.BoardCards(r.Context(), now)
 	if err != nil {
 		http.Error(w, "board error", http.StatusInternalServerError)
@@ -201,6 +204,7 @@ func (u *UI) board(w http.ResponseWriter, r *http.Request) {
 			Flowbee:      true,
 			ProjectEmoji: projectEmoji(c.Repo),
 			ProjectColor: projectColor(c.Repo),
+			ShowTrace:    showTrace,
 		}
 		if c.State == "done" {
 			done = append(done, card)
@@ -283,6 +287,26 @@ type drawerView struct {
 }
 
 func (u *UI) detail(w http.ResponseWriter, r *http.Request) {
+	u.renderDrawer(w, r)
+}
+
+func (u *UI) trace(w http.ResponseWriter, r *http.Request) {
+	if !u.isSuperadmin(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	u.renderTraceDrawer(w, r)
+}
+
+func (u *UI) renderDrawer(w http.ResponseWriter, r *http.Request) {
+	u.renderJobDrawer(w, r, "drawer.html")
+}
+
+func (u *UI) renderTraceDrawer(w http.ResponseWriter, r *http.Request) {
+	u.renderJobDrawer(w, r, "drawer.html")
+}
+
+func (u *UI) renderJobDrawer(w http.ResponseWriter, r *http.Request, templateName string) {
 	jobID := r.URL.Query().Get("job")
 	if jobID == "" {
 		http.Error(w, "missing job", http.StatusBadRequest)
@@ -294,9 +318,14 @@ func (u *UI) detail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := u.tmpl.ExecuteTemplate(w, "drawer.html", drawerView{Detail: d}); err != nil {
+	if err := u.tmpl.ExecuteTemplate(w, templateName, drawerView{Detail: d}); err != nil {
 		http.Error(w, "render error", http.StatusInternalServerError)
 	}
+}
+
+func (u *UI) isSuperadmin(r *http.Request) bool {
+	id, ok := auth.IdentityFrom(r)
+	return ok && u.admin[id]
 }
 
 // ── FLEET ──

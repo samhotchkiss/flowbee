@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/capacity"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/store"
@@ -26,11 +27,25 @@ func (c fixedClock) Now() time.Time { return c.t }
 // mountUI builds the F12 web UI over a real store and returns an http.Handler.
 func mountUI(t *testing.T, st *store.Store, clk fixedClock) http.Handler {
 	t.Helper()
-	ui := web.New(st, clk, web.Config{
+	return mountUIWithConfig(t, st, clk, web.Config{
 		StaleHB:    90 * time.Second,
 		StageAmber: 10 * time.Minute,
 		StageRed:   30 * time.Minute,
 	})
+}
+
+func mountUIWithConfig(t *testing.T, st *store.Store, clk fixedClock, cfg web.Config) http.Handler {
+	t.Helper()
+	if cfg.StaleHB == 0 {
+		cfg.StaleHB = 90 * time.Second
+	}
+	if cfg.StageAmber == 0 {
+		cfg.StageAmber = 10 * time.Minute
+	}
+	if cfg.StageRed == 0 {
+		cfg.StageRed = 30 * time.Minute
+	}
+	ui := web.New(st, clk, cfg)
 	mux := http.NewServeMux()
 	ui.Mount(mux)
 	return mux
@@ -39,6 +54,28 @@ func mountUI(t *testing.T, st *store.Store, clk fixedClock) http.Handler {
 func getBody(t *testing.T, h http.Handler, path string) (int, string) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec.Code, rec.Body.String()
+}
+
+func getBodyAs(t *testing.T, h http.Handler, path, role string) (int, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if role != "" {
+		req.Header.Set("X-Flowbee-Role", role)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec.Code, rec.Body.String()
+}
+
+func getBodyWithToken(t *testing.T, h http.Handler, path, token string) (int, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec.Code, rec.Body.String()
@@ -271,6 +308,134 @@ func TestBoardRepoFilter(t *testing.T) {
 	}
 	if !strings.Contains(body, "repo-chip active\" href=\"/board?repo=alpha\"") {
 		t.Fatalf("/board?repo=alpha must mark the alpha chip active:\n%s", body)
+	}
+}
+
+func TestBoardTraceMenuIsSuperadminOnly(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "trace-1", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, TaskText: "Trace this card", Now: now,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	authn := auth.NewBearer([]byte("server-secret"), []string{"admin", "viewer"}, false)
+	h := mountUIWithConfig(t, st, fixedClock{t: now}, web.Config{
+		Authenticator:        authn,
+		SuperadminIdentities: []string{"admin"},
+	})
+
+	code, body := getBodyWithToken(t, h, "/board", authn.Mint("admin"))
+	if code != http.StatusOK {
+		t.Fatalf("superadmin /board status = %d", code)
+	}
+	for _, want := range []string{
+		"class=\"card-menu\"",
+		"aria-label=\"card actions\"",
+		"data-trace-job=\"trace-1\"",
+		"View trace",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("superadmin board missing %q\n---\n%s", want, body)
+		}
+	}
+
+	code, body = getBodyWithToken(t, h, "/board", authn.Mint("viewer"))
+	if code != http.StatusOK {
+		t.Fatalf("non-superadmin /board status = %d", code)
+	}
+	for _, forbidden := range []string{"View trace", "data-trace-job", "card-menu", "card actions"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("non-superadmin board must hide trace affordance %q\n---\n%s", forbidden, body)
+		}
+	}
+
+	code, body = getBodyAs(t, h, "/board", "superadmin")
+	if code != http.StatusOK {
+		t.Fatalf("spoofed-header /board status = %d", code)
+	}
+	for _, forbidden := range []string{"View trace", "data-trace-job", "card-menu", "card actions"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("spoofed header must not reveal trace affordance %q\n---\n%s", forbidden, body)
+		}
+	}
+}
+
+func TestBoardTraceEndpointRequiresSuperadminAndReusesDrawer(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
+	if _, err := st.SeedJob(ctx, store.SeedParams{
+		ID: "trace-1", Kind: job.KindBuild, Flow: "build", Stage: "build",
+		Role: job.RoleEngWorker, TaskText: "Trace this card", Now: now,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.ClaimReadyJob(ctx, store.ClaimParams{
+		JobID: "trace-1", LeaseID: "trace-lease", Identity: "box-a", ModelFamily: "claude",
+		Role: job.RoleEngWorker, Attested: []string{"role:eng_worker", "model_family:claude"},
+		TTL: time.Hour, Now: now,
+	}); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	authn := auth.NewBearer([]byte("server-secret"), []string{"admin", "viewer"}, false)
+	h := mountUIWithConfig(t, st, fixedClock{t: now}, web.Config{
+		Authenticator:        authn,
+		SuperadminIdentities: []string{"admin"},
+	})
+
+	code, body := getBody(t, h, "/board/trace?job=trace-1")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /board/trace status = %d, body:\n%s", code, body)
+	}
+	if strings.Contains(body, "Stages") || strings.Contains(body, "Build history") || strings.Contains(body, "Lease claimed") {
+		t.Fatalf("forbidden trace response must not disclose drawer contents:\n%s", body)
+	}
+
+	code, body = getBodyAs(t, h, "/board/trace?job=trace-1", "superadmin")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("spoofed-header /board/trace status = %d, want 401; body:\n%s", code, body)
+	}
+	if strings.Contains(body, "Stages") || strings.Contains(body, "Build history") || strings.Contains(body, "Lease claimed") {
+		t.Fatalf("spoofed trace response must not disclose drawer contents:\n%s", body)
+	}
+
+	code, body = getBodyWithToken(t, h, "/board/trace?job=trace-1", authn.Mint("viewer"))
+	if code != http.StatusForbidden {
+		t.Fatalf("non-superadmin /board/trace status = %d, body:\n%s", code, body)
+	}
+	if strings.Contains(body, "Stages") || strings.Contains(body, "Build history") || strings.Contains(body, "Lease claimed") {
+		t.Fatalf("forbidden trace response must not disclose drawer contents:\n%s", body)
+	}
+
+	code, body = getBodyWithToken(t, h, "/board/trace?job=trace-1", authn.Mint("admin"))
+	if code != http.StatusOK {
+		t.Fatalf("superadmin /board/trace status = %d, body:\n%s", code, body)
+	}
+	for _, want := range []string{
+		"Trace this card",
+		"trace-1",
+		"Stages",
+		"ENTERED",
+		"LEFT",
+		"Build history",
+		"Lease claimed",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("superadmin trace drawer missing %q\n---\n%s", want, body)
+		}
+	}
+
+	code, js := getBody(t, h, "/assets/board.js")
+	if code != http.StatusOK {
+		t.Fatalf("/assets/board.js status = %d", code)
+	}
+	for _, want := range []string{"data-trace-job", "/board/trace", "openTraceDrawer"} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("board.js missing trace menu wiring %q\n---\n%s", want, js)
+		}
 	}
 }
 

@@ -18,8 +18,10 @@ import (
 	"embed"
 	"html/template"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/history"
 	"github.com/samhotchkiss/flowbee/internal/store"
@@ -57,13 +59,17 @@ type UI struct {
 	// to red, red beyond). Operator-tunable; sensible defaults if zero.
 	amber time.Duration
 	red   time.Duration
+	authn auth.Authenticator
+	admin map[string]bool
 }
 
 // Config carries the UI knobs.
 type Config struct {
-	StaleHB      time.Duration // the roster stale-heartbeat threshold (mirrors api).
-	StageAmber   time.Duration // a card turns amber after this long in a stage.
-	StageRed     time.Duration // a card turns red after this long in a stage.
+	StaleHB              time.Duration // the roster stale-heartbeat threshold (mirrors api).
+	StageAmber           time.Duration // a card turns amber after this long in a stage.
+	StageRed             time.Duration // a card turns red after this long in a stage.
+	Authenticator        auth.Authenticator
+	SuperadminIdentities []string
 }
 
 // New builds the UI, parsing the embedded templates with the helper funcs.
@@ -79,22 +85,47 @@ func New(data Data, clk clock.Clock, cfg Config) *UI {
 	if stale <= 0 {
 		stale = 90 * time.Second
 	}
-	u := &UI{data: data, clock: clk, staleHB: stale, amber: amber, red: red}
+	admin := make(map[string]bool, len(cfg.SuperadminIdentities))
+	for _, id := range cfg.SuperadminIdentities {
+		if id = strings.TrimSpace(id); id != "" {
+			admin[id] = true
+		}
+	}
+	u := &UI{data: data, clock: clk, staleHB: stale, amber: amber, red: red, authn: cfg.Authenticator, admin: admin}
 	u.tmpl = template.Must(template.New("web").Funcs(u.funcs()).ParseFS(tmplFS, "templates/*.html"))
 	return u
 }
 
 // Mount registers the UI routes + the embedded asset handler on a mux. The board
 // is the home page; /fleet and /dashboard are the other panes; /roster keeps the
-// legacy roster page. /board/detail serves the drawer fragment.
+// legacy roster page. /board/detail serves the normal drawer fragment, while
+// /board/trace serves the same stage-by-stage trace behind a superadmin check.
 func (u *UI) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /assets/", http.FileServer(http.FS(assetsFS)))
-	mux.HandleFunc("GET /", u.board)
-	mux.HandleFunc("GET /board", u.board)
+	mux.Handle("GET /", u.optionalAuth(http.HandlerFunc(u.board)))
+	mux.Handle("GET /board", u.optionalAuth(http.HandlerFunc(u.board)))
 	mux.HandleFunc("GET /board/detail", u.detail)
+	mux.Handle("GET /board/trace", auth.Middleware(u.authn, http.HandlerFunc(u.trace)))
 	mux.HandleFunc("GET /fleet", u.fleet)
 	mux.HandleFunc("GET /dashboard", u.dashboard)
 	mux.HandleFunc("GET /roster", u.roster)
+}
+
+// optionalAuth binds a trusted identity for UI affordances when the caller
+// presents valid credentials. Anonymous/invalid callers still get the public
+// board, but never the superadmin-only controls.
+func (u *UI) optionalAuth(next http.Handler) http.Handler {
+	if u.authn == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, err := u.authn.Authenticate(r)
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, auth.WithIdentityForRequest(r, id))
+	})
 }
 
 // stageClass maps a stage age to the per-card timer class (gray -> amber -> red).

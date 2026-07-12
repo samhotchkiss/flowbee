@@ -42,13 +42,24 @@
   // ── detail drawer ── click a card to open the drawer; click another card to
   // swap its contents in place (no board dim, no navigation).
   function openDrawer(jobID) {
+    openDrawerFrom(jobID, "/board/detail");
+  }
+
+  function openTraceDrawer(jobID) {
+    openDrawerFrom(jobID, "/board/trace");
+  }
+
+  function openDrawerFrom(jobID, path) {
     var drawer = document.getElementById("fb-drawer");
     if (!drawer) { return; }
     drawer.classList.add("open");
     var body = drawer.querySelector(".drawer-body");
     body.innerHTML = '<p class="muted">Loading ' + jobID + '…</p>';
-    fetch("/board/detail?job=" + encodeURIComponent(jobID), { headers: { "Accept": "text/html" } })
-      .then(function (r) { return r.ok ? r.text() : "<p class='over'>not found</p>"; })
+    fetch(path + "?job=" + encodeURIComponent(jobID), { headers: { "Accept": "text/html" } })
+      .then(function (r) {
+        if (r.ok) { return r.text(); }
+        return r.status === 403 ? "<p class='over'>forbidden</p>" : "<p class='over'>not found</p>";
+      })
       .then(function (html) { body.innerHTML = html; wireDrawerLinks(); })
       .catch(function () { body.innerHTML = "<p class='over'>load error</p>"; });
   }
@@ -62,6 +73,45 @@
     var cards = document.querySelectorAll(".card[data-job]");
     for (var i = 0; i < cards.length; i++) {
       cards[i].addEventListener("click", function () { openDrawer(this.getAttribute("data-job")); });
+    }
+    wireCardMenus();
+  }
+
+  function closeMenus(except) {
+    var menus = document.querySelectorAll("[data-card-menu].open");
+    for (var i = 0; i < menus.length; i++) {
+      if (menus[i] !== except) {
+        menus[i].classList.remove("open");
+        var b = menus[i].querySelector(".card-menu-button");
+        if (b) { b.setAttribute("aria-expanded", "false"); }
+      }
+    }
+  }
+
+  function wireCardMenus() {
+    var menus = document.querySelectorAll("[data-card-menu]");
+    for (var i = 0; i < menus.length; i++) {
+      (function (menu) {
+        var button = menu.querySelector(".card-menu-button");
+        if (button) {
+          button.addEventListener("click", function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var open = menu.classList.toggle("open");
+            button.setAttribute("aria-expanded", open ? "true" : "false");
+            closeMenus(open ? menu : null);
+          });
+        }
+      })(menus[i]);
+    }
+    var traceItems = document.querySelectorAll("[data-trace-job]");
+    for (var j = 0; j < traceItems.length; j++) {
+      traceItems[j].addEventListener("click", function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        closeMenus(null);
+        openTraceDrawer(this.getAttribute("data-trace-job"));
+      });
     }
   }
 
@@ -82,6 +132,12 @@
     wireCards();
     var c = document.getElementById("fb-drawer-close");
     if (c) { c.addEventListener("click", closeDrawer); }
-    document.addEventListener("keydown", function (e) { if (e.key === "Escape") { closeDrawer(); } });
+    document.addEventListener("click", function () { closeMenus(null); });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") {
+        closeMenus(null);
+        closeDrawer();
+      }
+    });
   });
 })();

@@ -189,6 +189,13 @@ func withFamily(ctx context.Context, family string) context.Context {
 	return context.WithValue(ctx, identityFamilyCtxKey{}, family)
 }
 
+// WithIdentityForRequest returns a shallow request copy with id bound in context.
+// It is for read-only optional-auth surfaces that need the same trusted identity
+// helper as Middleware without rejecting anonymous callers.
+func WithIdentityForRequest(r *http.Request, id string) *http.Request {
+	return r.WithContext(withIdentity(r.Context(), id))
+}
+
 // FamilyFrom returns the credential-bound model family stashed by Middleware, if the
 // authenticator bound one for this identity. The lease handler clamps the self-asserted
 // model_family to it (anti-affinity trust root, I-10).

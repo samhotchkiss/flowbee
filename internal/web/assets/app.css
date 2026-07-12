@@ -110,7 +110,7 @@ h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.9px;color:var(--fai
 .done-row .chip{font-family:var(--mono);background:#0c0e14;border:1px solid var(--line);border-radius:6px;padding:.05rem .4rem;color:var(--dim);font-size:.66rem;flex:0 0 auto}
 .card{
   position:relative;background:var(--inset);border:1px solid var(--line);border-radius:11px;
-  padding:.55rem .65rem .55rem .8rem;margin-bottom:.55rem;cursor:pointer;overflow:hidden;
+  padding:.55rem .65rem .55rem .8rem;margin-bottom:.55rem;cursor:pointer;overflow:visible;
   transition:transform .2s,border-color .2s,box-shadow .2s;
 }
 /* left stripe = the card's PROJECT color (--proj, set inline per card); timer
@@ -135,6 +135,25 @@ h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.9px;color:var(--fai
 .card .timer.amber{color:var(--amber);border-color:color-mix(in srgb,var(--amber) 35%,var(--line))}
 .card .timer.red{color:var(--red);border-color:color-mix(in srgb,var(--red) 35%,var(--line))}
 .card .ident{font-family:var(--mono)}
+.card-menu{position:absolute;top:.35rem;right:.35rem;z-index:5}
+.card-menu-button{
+  width:1.55rem;height:1.55rem;border:1px solid transparent;border-radius:6px;background:transparent;
+  color:var(--faint);font:700 1rem/1 var(--sans);cursor:pointer;display:grid;place-items:center;
+}
+.card-menu-button:hover,.card-menu.open .card-menu-button,.card-menu-button:focus-visible{
+  background:#1c2130;color:var(--txt);border-color:var(--line);outline:none;
+}
+.card-menu-list{
+  display:none;position:absolute;right:0;top:1.8rem;min-width:8rem;padding:.25rem;
+  background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+  box-shadow:0 16px 36px -18px rgba(0,0,0,.9);
+}
+.card-menu.open .card-menu-list{display:block}
+.card-menu-item{
+  width:100%;border:0;background:transparent;color:var(--txt);border-radius:6px;
+  padding:.35rem .55rem;text-align:left;font:600 .76rem/1.25 var(--sans);cursor:pointer;
+}
+.card-menu-item:hover,.card-menu-item:focus-visible{background:#1c2130;outline:none}
 @media (max-width:1180px){.buckets{grid-template-columns:repeat(2,1fr)}}
 @media (max-width:760px){.buckets{grid-template-columns:1fr}}
 

@@ -59,6 +59,10 @@ type Config struct {
 	// AuthLoopbackBypass lets same-box (127.0.0.1) workers skip the token even when
 	// WorkerAuthSecret is set (§12.4 "bearer fallback on loopback"). Default true.
 	AuthLoopbackBypass bool `yaml:"auth_loopback_bypass"`
+	// SuperadminIdentities names authenticated identities that may access privileged
+	// trace UI. These are matched against the credential-bound identity from the
+	// configured authenticator; caller-supplied role headers are ignored.
+	SuperadminIdentities []string `yaml:"superadmin_identities"`
 
 	// AllowSelfMerge is THE ONE DECISION (§14, F2): whether the MVP may merge without
 	// a human. Default false = Branch A (every approved job hands off to a human).
@@ -299,6 +303,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("FLOWBEE_AUTH_LOOPBACK_BYPASS"); v != "" {
 		c.AuthLoopbackBypass = v == "1" || v == "true"
+	}
+	if v := os.Getenv("FLOWBEE_SUPERADMIN_IDENTITIES"); v != "" {
+		c.SuperadminIdentities = splitCSV(v)
 	}
 	if v := os.Getenv("FLOWBEE_ALLOW_SELF_MERGE"); v != "" {
 		c.AllowSelfMerge = v == "1" || v == "true"

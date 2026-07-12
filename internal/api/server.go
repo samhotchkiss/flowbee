@@ -225,6 +225,10 @@ type Config struct {
 	// a non-loopback listener MUST set it (bearer token or mTLS). The bound,
 	// unforgeable identity it returns overrides any self-asserted query param.
 	Authenticator auth.Authenticator
+	// SuperadminIdentities are authenticated identities allowed to see privileged
+	// trace details in the operator UI. The role is derived from auth context, not
+	// client-supplied headers or UI state.
+	SuperadminIdentities []string
 	// ContentPolicy is the operator-configured content-integrity posture (F2): the
 	// size ceilings + an EXTRA denylist that AUGMENT the shipped protected set the
 	// content gate (§9.2, I-11) runs over a worker's untrusted diff. The zero value
@@ -270,7 +274,11 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 	// F2: install the operator content-integrity Policy on the store so the gate
 	// (ReviewResult / DispatchMerge) runs the configured ceilings + extra denylist.
 	st.ContentPolicy = cfg.ContentPolicy
-	ui := web.New(st, clk, web.Config{StaleHB: staleHB})
+	ui := web.New(st, clk, web.Config{
+		StaleHB:              staleHB,
+		Authenticator:        cfg.Authenticator,
+		SuperadminIdentities: cfg.SuperadminIdentities,
+	})
 	runningConfig := cfg.RunningConfig
 	runningConfig.Version = version
 	if runningConfig.PID == 0 {
