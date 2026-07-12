@@ -273,6 +273,37 @@ func (s *Store) ApplyReconciledPR(ctx context.Context, jobID string, pr Reconcil
 				return err
 			}
 			out.Applied = true
+		case j.State == job.StateNeedsHuman && pr.Merged && pr.MergeCommit != "":
+			// dead-PR sink eviction (self-correction). The prBoundActive gate above
+			// deliberately EXCLUDES needs_human from the merge->done transition so a job
+			// parked for a HUMAN DECISION is never silently un-parked. But that guard is
+			// about an OPEN, still-undecided PR: once the PR reaches a TERMINAL GitHub state
+			// the decision has already been made ON GitHub, and a parked job cannot merge
+			// its own PR (Flowbee never merges a needs_human job), so a merged PR here is an
+			// EXTERNAL/human completion — there is no gate left to erase. Complete the job so
+			// the sink self-drains instead of accumulating zombies for closed/merged PRs.
+			// Require the resolved merge commit for the same I-3 reason as the prBoundActive
+			// merge case (Merged flips before mergeCommit.oid resolves). Kept intentionally
+			// lean vs the prBoundActive path — no §F history / branch-cleanup / base-refresh:
+			// this job was never a Flowbee-driven build completion, only a parked sink exit.
+			if err := reconcileTransitionTx(ctx, tx, &j, seq, job.StateDone,
+				ledger.KindJobCompleted, now, ledger.Payload{MergeProvenance: pr.MergeCommit}); err != nil {
+				return err
+			}
+			out.Done = true
+		case j.State == job.StateNeedsHuman && pr.ClosedUnmerged:
+			// dead-PR sink eviction (self-correction): a parked job whose PR a human CLOSED
+			// without merging is terminal-dead — the change was rejected, nothing remains for
+			// a human to act on, and a requeue would fight that close. The self-unblock
+			// janitor deliberately refuses to REQUEUE a pr_closed job; this supplies the
+			// missing terminal exit (CANCEL) for a PR that is genuinely gone, so the sink
+			// self-drains rather than parking closed-PR zombies forever.
+			if err := reconcileTransitionTx(ctx, tx, &j, seq, job.StateCancelled,
+				ledger.KindStateChanged, now,
+				ledger.Payload{RevokeReason: "needs_human eviction: PR closed without merging"}); err != nil {
+				return err
+			}
+			out.Applied = true
 		case shaMoved && supersedable(j.State):
 			// I-5 / §6.2.4: a head/base move supersedes the SHA-bound verdict and
 			// re-arms review + CI. Invalidate the verdict, revoke any active lease

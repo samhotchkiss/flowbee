@@ -621,13 +621,16 @@ func TestReconcileParksOnClosedUnmergedPR(t *testing.T) {
 
 // TestMergedPRDoesNotCompleteIllegalStates locks the §6.2 edge-legality fix: a merged
 // PR completes a job ONLY from a state that legitimately owns a reviewable/merging PR
-// (prBoundActive). It must NOT drag a parked or pre-review job to `done` — most
-// importantly a `needs_human` job (escalated, pr_number not cleared) whose PR a human
-// merges, which would silently ERASE the §12.6.1 human gate; nor a superseded-back-to-
-// `ready` job (skipping re-review).
+// (prBoundActive). It must NOT drag a PRE-REVIEW job to `done` — a superseded-back-to-
+// `ready` job (skipping re-review) or one still `building`.
+//
+// `needs_human` is DELIBERATELY excluded from this list: unlike a pre-review state, a
+// terminal PR on a parked job carries no un-reviewed change to skip — the merge/close
+// already happened ON GitHub — so it is EVICTED (the dead-PR sink self-drain), covered
+// by TestNeedsHumanEvictedWhenPRMerges / TestNeedsHumanEvictedWhenPRClosed.
 func TestMergedPRDoesNotCompleteIllegalStates(t *testing.T) {
 	ctx := context.Background()
-	for _, st0 := range []string{"needs_human", "ready", "building"} {
+	for _, st0 := range []string{"ready", "building"} {
 		t.Run(st0, func(t *testing.T) {
 			st := testutil.NewStore(t)
 			seedBuildPR(t, st, "j", 9)
