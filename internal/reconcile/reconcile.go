@@ -157,6 +157,19 @@ func (r *Reconciler) Sweep(ctx context.Context) ([]store.ReconcileOutcome, error
 		if pr.IsDraft || pr.Merged || pr.ClosedUnmerged || !hasAdoptLabel(pr.Labels) {
 			continue
 		}
+		// API-storm gate: AdoptPR spends TWO GitHub round-trips (PullRequest +
+		// PullRequestDiff) BEFORE it reaches the store's idempotency check, and adopt
+		// labels never come off — so without this local pre-flight every already-adopted
+		// unchanged PR would cost 2 API calls per sweep forever (~27 calls/min at 10
+		// labeled PRs on a ~45s sweep), competing with the BoardSweep itself for the
+		// rate-limit budget. The snapshot already carries the authoritative base/head,
+		// so the store alone decides: only a genuinely-new or base/head-moved PR
+		// proceeds to AdoptPR. A gate read error skips this sweep (fail-quiet; the next
+		// sweep retries) rather than falling open into the very storm the gate prevents.
+		act, gerr := r.store.PRAdoptWouldAct(ctx, r.repo, pr.Number, pr.BaseRefOid, pr.HeadRefOid)
+		if gerr != nil || !act {
+			continue
+		}
 		_, _, _ = r.AdoptPR(ctx, pr.Number)
 	}
 	// GitHub-issue intake (build-list): adopt every label-opted, not-yet-tracked

@@ -3,6 +3,7 @@ package reconcile_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -398,13 +399,118 @@ func TestSweepAutoAdoptsNeedsClaudeLabeledPR(t *testing.T) {
 	}
 
 	// re-sweeping the same unchanged PR must not duplicate the adopted job (the
-	// AdoptPR idempotency the sweep reuses rather than reimplementing).
+	// AdoptPR idempotency the sweep reuses rather than reimplementing) — AND must
+	// make ZERO adopt-path GitHub API calls (no PullRequest / PullRequestDiff).
+	// The label never comes off, so without the local PRAdoptWouldAct gate the
+	// steady state costs 2 API calls per labeled PR per sweep forever — the API
+	// storm the gate exists to prevent. The only permitted new call is the
+	// sweep's own BoardSweep read.
+	before := len(f.Calls())
 	if _, err := rec.Sweep(ctx); err != nil {
 		t.Fatalf("second sweep: %v", err)
+	}
+	for _, call := range f.Calls()[before:] {
+		if strings.HasPrefix(call, "PullRequest") {
+			t.Fatalf("steady-state sweep made an adopt API call: %q", call)
+		}
 	}
 	again, ok, err := st.JobIDForPRInRepo(ctx, "", 500)
 	if err != nil || !ok || again != id {
 		t.Fatalf("re-sweep must not disturb the adopted job: id=%q ok=%v err=%v", again, ok, err)
+	}
+
+	// a head move must still re-arm through the gate (the gate may only skip work
+	// AdoptPRForReview would not have done — never a genuine re-arm).
+	f.SetPR(gh.PullRequest{
+		Number: 500, HeadRefOid: "hh2", BaseRefOid: "bb",
+		CIRollup: gh.CISuccess, CIHasRealSuccess: true, UpdatedAt: time.Unix(30, 0),
+		Labels: []string{"needs-claude"},
+	})
+	f.SetPRDiff(500, "diff --git a/goal b/goal\n+finished by gpt, take two\n")
+	if _, err := rec.Sweep(ctx); err != nil {
+		t.Fatalf("head-move sweep: %v", err)
+	}
+	j, err = st.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("get re-armed job: %v", err)
+	}
+	if j.State != job.StateReviewPending || j.HeadSHA != "hh2" {
+		t.Fatalf("moved head must re-arm: state=%q head=%q, want review_pending/hh2", j.State, j.HeadSHA)
+	}
+}
+
+// TestSweepDoesNotAutoAdoptMergedOrClosedLabeledPR: the sweep's snapshot includes
+// recently MERGED and CLOSED PRs (the merged->done backstop reads them), and a
+// needs-claude label survives both. Neither may adopt — a merged PR has nothing
+// left to review, and a closed-unmerged PR was rejected by a human. The guard also
+// fires BEFORE any adopt API spend (terminal labeled PRs linger on the snapshot
+// forever, so a post-fetch refusal would still be a per-sweep API storm).
+func TestSweepDoesNotAutoAdoptMergedOrClosedLabeledPR(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+
+	f := gh.NewFake()
+	f.SetPR(gh.PullRequest{
+		Number: 504, HeadRefOid: "hh", BaseRefOid: "bb", Merged: true,
+		UpdatedAt: time.Unix(10, 0), Labels: []string{"needs-claude"},
+	})
+	f.SetPR(gh.PullRequest{
+		Number: 505, HeadRefOid: "hh", BaseRefOid: "bb", ClosedUnmerged: true,
+		UpdatedAt: time.Unix(10, 0), Labels: []string{"needs-claude"},
+	})
+	rec := reconcile.New(st, f, clock.NewFake(time.Unix(20, 0)), nil)
+
+	if _, err := rec.Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	for _, pr := range []int{504, 505} {
+		if _, ok, err := st.JobIDForPRInRepo(ctx, "", pr); err != nil || ok {
+			t.Fatalf("terminal PR #%d must not be auto-adopted: ok=%v err=%v", pr, ok, err)
+		}
+	}
+	// only the adopt path's two reads are forbidden — the sweep's own BoardSweep
+	// and its one-time required-checks warm-up are legitimate infrastructure.
+	for _, call := range f.Calls() {
+		if strings.HasPrefix(call, "PullRequest") {
+			t.Fatalf("terminal labeled PR triggered an adopt API call: %q", call)
+		}
+	}
+}
+
+// TestSweepDoesNotHijackFlowbeeOriginatedLabeledPR: someone labels a PR that a
+// Flowbee-ORIGINATED job already tracks. The store's adopt path no-ops for
+// non-adopted trackers, and the gate knows that locally — so the sweep must
+// neither hijack/duplicate the job NOR pay AdoptPR's two API calls every sweep
+// just to learn the no-op (the same steady-state storm as an adopted PR).
+func TestSweepDoesNotHijackFlowbeeOriginatedLabeledPR(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	seed(t, st, "jorig", 506)
+
+	f := gh.NewFake()
+	f.SetPR(gh.PullRequest{
+		Number: 506, HeadRefOid: "hh", BaseRefOid: "bb",
+		CIRollup: gh.CISuccess, CIHasRealSuccess: true, UpdatedAt: time.Unix(10, 0),
+		Labels: []string{"needs-claude"},
+	})
+	rec := reconcile.New(st, f, clock.NewFake(time.Unix(20, 0)), nil)
+
+	if _, err := rec.Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	id, ok, err := st.JobIDForPRInRepo(ctx, "", 506)
+	if err != nil || !ok || id != "jorig" {
+		t.Fatalf("originated job must keep tracking its PR: id=%q ok=%v err=%v", id, ok, err)
+	}
+	var n, adopted int
+	if err := st.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(MAX(adopted),0) FROM jobs WHERE pr_number = 506`).Scan(&n, &adopted); err != nil || n != 1 || adopted != 0 {
+		t.Fatalf("labeled originated PR must stay a single non-adopted job: n=%d adopted=%d err=%v", n, adopted, err)
+	}
+	for _, call := range f.Calls() {
+		if strings.HasPrefix(call, "PullRequest") {
+			t.Fatalf("originated tracked PR triggered an adopt API call: %q", call)
+		}
 	}
 }
 

@@ -161,6 +161,41 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 	return adopted, nil
 }
 
+// PRAdoptWouldAct is the sweep-time PRE-FLIGHT for label-driven auto-adoption: it
+// reports, from the LOCAL store alone, whether AdoptPRForReview could possibly act
+// on this PR at the given base/head. The sweep runs continuously and adopt labels
+// (flowbee:adopt, needs-claude) never come off a PR, so gating on the store's own
+// answer is what keeps a board of already-adopted PRs from costing two GitHub API
+// round-trips (PullRequest + PullRequestDiff) per labeled PR per sweep FOREVER —
+// ~27 calls/min of pure no-op traffic at 10 labeled PRs on a ~45s sweep, real
+// rate-limit pressure on the same budget the BoardSweep itself needs. True (act)
+// exactly when AdoptPRForReview would do real work: no non-cancelled job tracks
+// the PR (fresh adopt), or the tracking job is ADOPTED and its recorded base/head
+// differs from the swept PR's (re-arm). A non-adopted (Flowbee-originated) tracker
+// is always false — AdoptPRForReview no-ops for those regardless of SHA movement,
+// so calling it would only burn the two API reads to learn nothing. The mismatch
+// condition mirrors AdoptPRForReview's own `moved` check (base OR head) exactly,
+// so this gate can never skip a re-arm the adopt path would have performed. (The
+// one thing deliberately forgone: the targeted CLI's same-SHA backfill of a
+// missing/legacy diff — sweep-adopted PRs always got their diff at adoption, and
+// an operator who needs the backfill runs `flowbee adopt <pr>`, which has no gate.)
+func (s *Store) PRAdoptWouldAct(ctx context.Context, repo string, prNumber int, baseSHA, headSHA string) (bool, error) {
+	var adopted int
+	var jobBase, jobHead string
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(adopted,0), COALESCE(base_sha,''), COALESCE(head_sha,'')
+		   FROM jobs
+		  WHERE repo = ? AND pr_number = ? AND state != 'cancelled'
+		  LIMIT 1`, repo, prNumber).Scan(&adopted, &jobBase, &jobHead)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil // untracked: a fresh adopt would insert a job
+	}
+	if err != nil {
+		return false, err
+	}
+	return adopted == 1 && (jobBase != baseSHA || jobHead != headSHA), nil
+}
+
 // AdoptPRForReview imports a SINGLE pre-existing PR (one not originated by Flowbee —
 // e.g. an external agent-pool branch) directly into Flowbee's review pipeline: an
 // opted-in adopted `code_reviewer` job in review_pending, with its Domain-B facts
