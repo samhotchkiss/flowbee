@@ -106,3 +106,61 @@ func TestFoldUsage(t *testing.T) {
 		t.Fatalf("still-hot: got pct=%d rl=%v want 95,true", pct, rl)
 	}
 }
+
+// TestFoldWindowedUsage proves the PREEMPTIVE token-budget fold (F6): incremental
+// token reports ACCUMULATE over the window and derive a rising usage_pct that
+// crosses the ceiling BEFORE the hard 429; a window reset zeroes the bucket; and
+// the 429 backstop still pins the account out regardless of the estimate.
+func TestFoldWindowedUsage(t *testing.T) {
+	const budget = 1000
+
+	// first report in a fresh window: 200/1000 = 20%.
+	wt, pct, rl := FoldWindowedUsage(Account{CeilingPct: 90}, UsageReport{TokensDelta: 200}, true, budget)
+	if wt != 200 || pct != 20 || rl {
+		t.Fatalf("fresh: got wt=%d pct=%d rl=%v want 200,20,false", wt, pct, rl)
+	}
+
+	// accumulate onto a prior window: prior 200 + 700 = 900 -> 90% (AT ceiling).
+	prior := Account{CeilingPct: 90, WindowTokens: 200, BudgetTokens: budget}
+	wt, pct, rl = FoldWindowedUsage(prior, UsageReport{TokensDelta: 700}, false, budget)
+	if wt != 900 || pct != 90 || rl {
+		t.Fatalf("accumulate: got wt=%d pct=%d rl=%v want 900,90,false", wt, pct, rl)
+	}
+	// the derived account is now AtCeiling -> gated out (the preemptive cutoff).
+	if !(Account{CeilingPct: 90, UsagePct: pct}).AtCeiling() {
+		t.Fatal("900/1000 tokens should put the account at the 90% ceiling (preemptive gate)")
+	}
+
+	// a window RESET zeroes the bucket even with a big prior: 50 tokens -> 5%, un-gated.
+	hot := Account{CeilingPct: 90, WindowTokens: 950, BudgetTokens: budget}
+	wt, pct, rl = FoldWindowedUsage(hot, UsageReport{TokensDelta: 50}, true, budget)
+	if wt != 50 || pct != 5 || rl {
+		t.Fatalf("reset: got wt=%d pct=%d rl=%v want 50,5,false", wt, pct, rl)
+	}
+	if (Account{CeilingPct: 90, UsagePct: pct}).AtCeiling() {
+		t.Fatal("after window reset the account should be below ceiling (sharing resumes)")
+	}
+
+	// the 429 BACKSTOP: even at 10% estimated usage, a 429 pins >=100% + rate_limited.
+	wt, pct, rl = FoldWindowedUsage(Account{CeilingPct: 90, WindowTokens: 50, BudgetTokens: budget},
+		UsageReport{TokensDelta: 50, RateLimited: true}, false, budget)
+	if pct < 100 || !rl {
+		t.Fatalf("429 backstop: got pct=%d rl=%v want >=100,true", pct, rl)
+	}
+	if wt != 100 {
+		t.Fatalf("429 still accumulates tokens: got wt=%d want 100", wt)
+	}
+
+	// recovery from a 429 once back under ceiling (e.g. after a window reset).
+	_, pct, rl = FoldWindowedUsage(Account{CeilingPct: 90, RateLimited: true, BudgetTokens: budget},
+		UsageReport{TokensDelta: 100}, true, budget)
+	if pct != 10 || rl {
+		t.Fatalf("recovery: got pct=%d rl=%v want 10,false", pct, rl)
+	}
+
+	// no budget configured => fall back to a directly reported provider-%.
+	_, pct, rl = FoldWindowedUsage(Account{CeilingPct: 90}, UsageReport{UsagePct: 73}, false, 0)
+	if pct != 73 || rl {
+		t.Fatalf("provider-%% fallback: got pct=%d rl=%v want 73,false", pct, rl)
+	}
+}

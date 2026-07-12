@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1319,17 +1321,33 @@ func refreshWorkerRegistration(ctx context.Context, c *client.Client, reg *clien
 // reporting (back-compat: a worker that advertises no account is never gated/metered).
 var workerAccountID = os.Getenv("FLOWBEE_ACCOUNT")
 
-// reportAccountLimit detects whether the agent's output shows its account hit a usage
-// limit / 429 and reports the account's state to the control plane (F6): rate-limited so
-// dispatch gates it OUT, or clear (a clean run after the window reset un-gates it). The
-// account is per-LOGIN and shared across boxes, so one box's report gates every box on the
-// same login. No-op when no account is configured. Best-effort: a failed report never
-// blocks the worker (the next run re-reports).
+// reportAccountLimit reports the just-finished run's usage against the worker's login
+// (per-LOGIN, shared across boxes) to the control plane (F6). It carries BOTH:
+//   - the PREEMPTIVE token-budget estimate: the tokens this run consumed (TokensDelta,
+//     parsed from the agent CLI's output) which the server accumulates over the reset
+//     window to derive a rising usage_pct, so dispatch rolls over off a near-exhausted
+//     login at the ceiling (~90%) BEFORE its hard 429. codex emits token counts, not a
+//     live %, so this estimate is how the preemptive cutoff works.
+//   - the BINARY BACKSTOP (preserved exactly): a hard usage-limit / 429 / quota phrase
+//     in the output sets RateLimited, which pins the account out regardless of the
+//     estimate — so a login that 429s before the estimated 90% is still caught. The
+//     report also carries pct=100 on a limit hit, matching the prior binary posture.
+//   - opportunistically, a provider-exposed "X% of your usage limit" line as a direct
+//     UsagePct (codex emits none today; adopted only when no budget derives the %).
+//
+// No-op when no account is configured (back-compat), or when a clean run observed
+// nothing to report (no tokens, no %, no limit) — don't churn the usage endpoint.
+// Best-effort: a failed report never blocks the worker (the next run re-reports).
 func reportAccountLimit(ctx context.Context, c *client.Client, out string) {
 	if workerAccountID == "" {
 		return
 	}
 	maxed := agentHitLimit(out)
+	tokens := parseRunTokens(out)
+	pctParsed, hasPct := parseUsagePct(out)
+	if !maxed && tokens == 0 && !hasPct {
+		return // nothing to report
+	}
 	fam := workerAccountID
 	if i := strings.IndexByte(workerAccountID, ':'); i > 0 {
 		fam = workerAccountID[:i] // "codex:s@swh.me" -> "codex"
@@ -1337,10 +1355,115 @@ func reportAccountLimit(ctx context.Context, c *client.Client, out string) {
 	pct := 0
 	if maxed {
 		pct = 100
+	} else if hasPct {
+		pct = pctParsed
 	}
 	_, _ = c.ReportUsage(ctx, []client.UsageReport{{
-		AccountID: workerAccountID, ModelFamily: fam, UsagePct: pct, RateLimited: maxed,
+		AccountID: workerAccountID, ModelFamily: fam,
+		UsagePct: pct, TokensDelta: tokens, RateLimited: maxed,
 	}})
+}
+
+// parseRunTokens returns the TOTAL tokens the agent consumed this run, from whichever
+// surface its CLI exposed (best-effort, 0 when none): codex `exec --json` emits a
+// `turn.completed` JSONL event carrying usage.{input,output,reasoning_output}_tokens;
+// claude `--output-format json` emits one object with usage.{input,output}_tokens;
+// codex plain output prints a "tokens used\nN" line. The estimate only needs to be
+// roughly proportional to consumption for the cumulative % to track real usage.
+func parseRunTokens(stdout string) int64 {
+	// claude single-object JSON (reuse the cost parser's token fields).
+	if ti, to, _, ok := parseAgentUsage(stdout); ok && (ti != 0 || to != 0) {
+		return ti + to
+	}
+	// codex JSONL: the LAST turn.completed.usage wins (the final accounting for the run).
+	var total int64
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") || !strings.Contains(line, "turn.completed") {
+			continue
+		}
+		var ev struct {
+			Type  string `json:"type"`
+			Usage struct {
+				InputTokens           int64 `json:"input_tokens"`
+				OutputTokens          int64 `json:"output_tokens"`
+				ReasoningOutputTokens int64 `json:"reasoning_output_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal([]byte(line), &ev) == nil && ev.Type == "turn.completed" {
+			total = ev.Usage.InputTokens + ev.Usage.OutputTokens + ev.Usage.ReasoningOutputTokens
+		}
+	}
+	if total > 0 {
+		return total
+	}
+	// codex plain output: a "tokens used" line followed by the count (commas allowed).
+	return parsePlainTokensUsed(stdout)
+}
+
+// parsePlainTokensUsed scans codex's non-JSON output for a "tokens used\n<N>" pair
+// (the count may carry thousands separators, e.g. "13,937"). 0 when absent.
+func parsePlainTokensUsed(stdout string) int64 {
+	lines := strings.Split(stdout, "\n")
+	for i, line := range lines {
+		if !strings.Contains(strings.ToLower(line), "tokens used") {
+			continue
+		}
+		// the count may be on the same line or the next one.
+		for _, cand := range []string{line, nextLine(lines, i)} {
+			if n := parseIntWithCommas(cand); n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func nextLine(lines []string, i int) string {
+	if i+1 < len(lines) {
+		return lines[i+1]
+	}
+	return ""
+}
+
+// parseIntWithCommas extracts the first run of digits/commas in s as an int64.
+func parseIntWithCommas(s string) int64 {
+	var b strings.Builder
+	started := false
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+			started = true
+		} else if r == ',' && started {
+			continue
+		} else if started {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return 0
+	}
+	n, err := strconv.ParseInt(b.String(), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// usagePctRe matches a provider-exposed live percentage, e.g. "73% of your usage
+// limit" or "used 73% of your weekly limit". Opportunistic: codex emits none today.
+var usagePctRe = regexp.MustCompile(`(?i)(\d{1,3})\s*%\s*of\s+your\s+[a-z ]*limit`)
+
+func parseUsagePct(stdout string) (pct int, ok bool) {
+	m := usagePctRe.FindStringSubmatch(stdout)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // agentHitLimit reports whether the agent's output indicates its ACCOUNT is usage/rate

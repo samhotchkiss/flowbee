@@ -171,6 +171,15 @@ func runServe(args []string) error {
 	if c := st.DefaultCostCeilingMicroUSD; c > 0 {
 		logger.Info("cost ceiling armed", "usd", cfg.CostCeilingUSD, "micro_usd", c)
 	}
+	// F6 preemptive account ceiling: the per-account token budget + reset window the
+	// usage fold uses to turn per-run token reports into a rising usage_pct, so a busy
+	// codex login rolls over at ~90% BEFORE its hard 429.
+	st.AccountBudgetTokens = cfg.AccountBudgetTokens
+	st.AccountWindow = cfg.AccountWindow()
+	if st.AccountBudgetTokens > 0 {
+		logger.Info("account usage budget armed",
+			"budget_tokens", st.AccountBudgetTokens, "window", st.AccountWindow)
+	}
 
 	// worker-transport mutual auth (§7.6): when a signing secret is configured the
 	// private API requires a signed per-worker bearer token bound to an enrolled

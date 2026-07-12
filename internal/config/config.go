@@ -41,6 +41,28 @@ type Config struct {
 	// worker before the no_eligible_worker alarm fires (I-6, §6.6).
 	NoEligibleWorkerS int `yaml:"no_eligible_worker_s"`
 
+	// AccountBudgetTokens is the per-account TOKEN BUDGET for the preemptive usage
+	// ceiling (F6): the server accumulates each account's reported per-run tokens over
+	// the reset window and derives usage_pct = cumulative/budget*100, so dispatch rolls
+	// over off a near-exhausted account at the ceiling (default 90%) BEFORE the hard 429.
+	// codex exposes no live %, only token counts, so this estimate is how the preemptive
+	// cutoff works. A per-account budget_tokens override (enrolled via --accounts) wins;
+	// this is the fleet-wide default. 0 disables the estimate (usage_pct then only moves
+	// on a real 429 — the old binary behavior). Env: FLOWBEE_ACCOUNT_BUDGET_TOKENS.
+	//
+	// ASSUMPTION: the default below is a placeholder the OPERATOR must confirm against
+	// codex's actual per-window quota — see the PR notes. Tune it so 90% lands a little
+	// before codex's real limit.
+	AccountBudgetTokens int64 `yaml:"account_budget_tokens"`
+	// AccountWindowS is the reset-window length over which per-account tokens accumulate
+	// before the bucket zeroes (the account un-gates and sharing resumes). It should
+	// match codex's reset cadence. Env: FLOWBEE_ACCOUNT_WINDOW_S.
+	//
+	// ASSUMPTION: codex's reset cadence is operator-confirmed; the default is 5h (the
+	// commonly observed ChatGPT/codex rolling window). A 429 still pins the account out
+	// regardless, so an over-long window only delays preemptive un-gating, never safety.
+	AccountWindowS int `yaml:"account_window_s"`
+
 	// WorkerAuthSecret is the HMAC key that signs per-worker bearer tokens
 	// (DESIGN §7.6). When set, the private worker API requires mutual auth: every
 	// call carries a signed token bound to an enrolled identity, and an unenrolled
@@ -224,12 +246,22 @@ func Default() Config {
 		LogLevel:           "info",
 		NoEligibleWorkerS:  120,
 		AuthLoopbackBypass: true,
+		// preemptive account ceiling defaults (F6). See the field docs / PR notes:
+		// these are OPERATOR-CONFIRMABLE placeholders for codex's real quota + reset.
+		AccountBudgetTokens: 50_000_000, // ~50M tokens/window (placeholder — confirm)
+		AccountWindowS:      5 * 3600,   // 5h rolling window (placeholder — confirm)
 	}
 }
 
 // NoEligibleWorker is the alarm window as a duration.
 func (c Config) NoEligibleWorker() time.Duration {
 	return time.Duration(c.NoEligibleWorkerS) * time.Second
+}
+
+// AccountWindow is the per-account usage reset window as a duration (F6 preemptive
+// ceiling). The store zeroes an account's accumulated tokens once this elapses.
+func (c Config) AccountWindow() time.Duration {
+	return time.Duration(c.AccountWindowS) * time.Second
 }
 
 // Load reads defaults, then flowbee.yaml (or $FLOWBEE_CONFIG), then FLOWBEE_* env
@@ -290,6 +322,12 @@ func applyEnv(c *Config) {
 	}
 	if v := envInt("FLOWBEE_NO_ELIGIBLE_WORKER_S"); v > 0 {
 		c.NoEligibleWorkerS = v
+	}
+	if v := envInt64("FLOWBEE_ACCOUNT_BUDGET_TOKENS"); v > 0 {
+		c.AccountBudgetTokens = v
+	}
+	if v := envInt("FLOWBEE_ACCOUNT_WINDOW_S"); v > 0 {
+		c.AccountWindowS = v
 	}
 	if v := os.Getenv("FLOWBEE_WORKER_AUTH_SECRET"); v != "" {
 		c.WorkerAuthSecret = v
@@ -376,6 +414,15 @@ func splitCSV(v string) []string {
 func envInt(key string) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+func envInt64(key string) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
 	}

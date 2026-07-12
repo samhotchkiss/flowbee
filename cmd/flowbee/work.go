@@ -56,7 +56,7 @@ func runWork(args []string) error {
 	// named per-model rollover chain (account:model:ceiling_pct:rank).
 	modelSlots := fs.String("model-slots", envOr("FLOWBEE_MODEL_SLOTS", ""), "per-model concurrency, e.g. claude:3,codex:3")
 	weight := fs.Int("weight", 0, "per-box distribution weight (default 1)")
-	accounts := fs.String("accounts", envOr("FLOWBEE_ACCOUNTS", ""), "named accounts: account:model:ceiling_pct:rank,...")
+	accounts := fs.String("accounts", envOr("FLOWBEE_ACCOUNTS", ""), "named accounts: account:model:ceiling_pct:rank[:budget_tokens],...")
 	// --remote: a build box that keeps its OWN local mirror + worktrees per job (many
 	// workers in parallel) and returns a diff for the control plane to push/PR/merge.
 	// Needs only repo READ; --mirror is its local bare mirror, --repo-url where to
@@ -245,8 +245,10 @@ func parseModelSlots(s string) map[string]int {
 	return out
 }
 
-// parseAccounts parses the F6 rollover chain "account:model:ceiling_pct:rank,..."
-// into client account specs. ceiling_pct/rank default to 90/0 when omitted.
+// parseAccounts parses the F6 rollover chain
+// "account:model:ceiling_pct:rank[:budget_tokens],..." into client account specs.
+// ceiling_pct/rank default to 90/0 when omitted; budget_tokens (optional 5th field)
+// overrides the fleet-wide per-account token budget for the preemptive usage ceiling.
 func parseAccounts(s string) []client.AccountSpecMsg {
 	if s == "" {
 		return nil
@@ -270,6 +272,11 @@ func parseAccounts(s string) []client.AccountSpecMsg {
 		if len(f) >= 4 {
 			if n, err := strconv.Atoi(f[3]); err == nil {
 				a.PreferenceRank = n
+			}
+		}
+		if len(f) >= 5 {
+			if n, err := strconv.ParseInt(f[4], 10, 64); err == nil {
+				a.BudgetTokens = n
 			}
 		}
 		out = append(out, a)

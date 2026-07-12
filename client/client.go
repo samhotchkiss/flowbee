@@ -69,16 +69,25 @@ type AccountSpecMsg struct {
 	ModelFamily    string `json:"model_family"`
 	CeilingPct     int    `json:"ceiling_pct"`
 	PreferenceRank int    `json:"preference_rank"`
+	// BudgetTokens optionally overrides the fleet-wide per-account token budget the
+	// preemptive usage ceiling derives usage_pct from (F6). 0 = use the server default.
+	BudgetTokens int64 `json:"budget_tokens,omitempty"`
 }
 
 // UsageReport is one per-account usage observation a box reports to POST
-// /v1/workers/usage (~15 min, immediate on a 429). UsagePct is the account's usage
-// percent; RateLimited marks a 429-triggered report (pins the account out of
-// dispatch until it cools).
+// /v1/workers/usage (after each run, immediate on a 429). RateLimited marks a
+// 429-triggered report (pins the account out of dispatch until it cools).
+//
+// TokensDelta is the INCREMENTAL tokens the just-finished run consumed: the control
+// plane accumulates it into the account's reset-window bucket and derives a rising
+// usage_pct from the budget (the F6 PREEMPTIVE ceiling — codex emits token counts,
+// not a live %). UsagePct is used directly only when a provider exposes a real
+// percentage (no TokensDelta); for codex it stays 0 and the server derives it.
 type UsageReport struct {
 	AccountID   string `json:"account_id"`
 	ModelFamily string `json:"model_family,omitempty"`
 	UsagePct    int    `json:"usage_pct"`
+	TokensDelta int64  `json:"tokens_delta,omitempty"`
 	RateLimited bool   `json:"rate_limited,omitempty"`
 }
 
