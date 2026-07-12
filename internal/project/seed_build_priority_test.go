@@ -18,6 +18,9 @@ func (fakeHist) CommitHistory(string, string, []gitops.HistoryFile) (string, boo
 func (fakeHist) HeadSHA(string) (string, error)             { return "mainsha", nil }
 func (fakeHist) FetchBranch(string) error                   { return nil }
 func (fakeHist) DiffBetween(string, string) (string, error) { return "", nil }
+func (fakeHist) ReadFileAtRef(string, string) (string, bool, error) {
+	return "", false, nil
+}
 
 // TestSeedBuildFromSpecInheritsPriority: a build descending from a signed-off spec inherits
 // the spec's urgency (1..10, lower = more urgent), NOT the bare INSERT default 0 — which

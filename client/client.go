@@ -190,6 +190,23 @@ type LeaseContext struct {
 	// (with its own git credential), and derives its local mirror path per repo. Empty
 	// in single-repo deployments (the worker falls back to its configured --repo-url).
 	RepoURL string `json:"repo_url,omitempty"`
+	// EpicCriteria is the epic-lane Phase 3 criteria-driven review section (task
+	// brief point 3): for a code_reviewer job bound to an epic PR (branch
+	// epic/<slug>, detected server-side via store.EpicForHeadSHA), the epic's Goal,
+	// Constraints/Non-Goals, and full ## Steps list (each with its Validate:
+	// criterion) — content that is FROZEN at epic launch (spec immutability), read
+	// once alongside EpicChecklist. Empty for every non-epic-PR review (zero
+	// behavior change).
+	EpicCriteria string `json:"epic_criteria,omitempty"`
+	// EpicChecklist is the epic's claimed ## Status checklist (each step's [x]/[ ]
+	// plus its evidence string), read AS OF the SAME PR head EpicCriteria was read
+	// from — kept SEPARATE from EpicCriteria (rather than one combined string)
+	// because it is the part that scales with step count/evidence verbosity and is
+	// therefore the part renderReviewBrief truncates first when the brief would
+	// exceed maxTotalBriefBytes (the fixed Goal/Constraints/Steps text stays intact
+	// so the reviewer always knows what it's judging against, even if the claimed
+	// status itself is cut short).
+	EpicChecklist string `json:"epic_checklist,omitempty"`
 }
 
 // Lease long-polls for a lease. ok=false means a 204 (no work this round).

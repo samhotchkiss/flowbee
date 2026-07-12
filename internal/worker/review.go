@@ -521,6 +521,7 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 		writeIf("Task", c.Task)
 		writeIf("Spec", c.Spec)
 		writeIf("Acceptance criteria", c.AcceptanceCriteria)
+		writeEpicCriteria(&b, c)
 		// Embed the diff INLINE in the brief rather than only referencing $FLOWBEE_DIFF_FILE.
 		// A file reference relies on the agent proactively reading the file; in practice the
 		// reviewer often did NOT (a 48 KB diff "reviewed" in ~70s = never opened), so it judged
@@ -559,4 +560,64 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 			"```json\n{\"decision\":\"approved|changes_requested\",\"disposition\":\"self_merge\",\"notes\":\"...\"}\n```\n")
 	}
 	return b.String()
+}
+
+// writeEpicCriteria injects the epic-lane Phase 3 criteria-driven review section
+// (task brief point 3) for a code_reviewer job the control plane detected as an epic
+// PR (internal/api/server.go's leaseGrantForJob sets c.EpicCriteria/c.EpicChecklist;
+// both are empty for a non-epic-PR review, so this is a complete no-op then — the
+// task brief's required "zero behavior change" for the common case).
+//
+// It participates in the SAME maxTotalBriefBytes cap accounting as the diff (b.Len()
+// tracks everything written so far): if the FULL section (fixed criteria + claimed
+// checklist) fits, both are embedded whole. If not, the FIXED criteria (Goal /
+// Constraints / Steps / reviewer instructions — bounded by how many steps an author
+// wrote, not by how verbose the running agent's evidence prose got) is still written
+// in full, and ONLY the CHECKLIST is truncated to whatever budget remains, with an
+// explicit note — never silently dropped, and never blowing the argv limit the way
+// an unbounded checklist appended after an already-large diff/task/spec could (see
+// the constant's doc for the argv history this guards against).
+// epicTrailingReserve reserves headroom for the FIXED boilerplate renderReviewBrief
+// always writes AFTER this section regardless of size (the "**Decision:**"/"**Output:**"
+// instructions, and — when the diff itself doesn't fit inline — its forceful
+// $FLOWBEE_DIFF_FILE fallback text): those additions are unconditional (not
+// budget-gated the way the diff/checklist bodies are), so this section's own budget
+// math must leave room for them rather than filling the cap exactly and letting the
+// unconditional tail push the TOTAL brief past maxTotalBriefBytes.
+const epicTrailingReserve = 2 * 1024
+
+func writeEpicCriteria(b *strings.Builder, c *client.LeaseContext) {
+	criteria := strings.TrimSpace(c.EpicCriteria)
+	if criteria == "" {
+		return
+	}
+	header := "## Epic Contract — judge this PR AGAINST ITS OWN SPEC, not as a generic diff\n\n"
+	checklistHeader := "### Claimed status (as of this PR's head — VERIFY, don't trust)\n\n"
+
+	full := header + criteria + "\n\n" + checklistHeader + c.EpicChecklist + "\n\n"
+	if b.Len()+len(full)+epicTrailingReserve <= maxTotalBriefBytes {
+		b.WriteString(full)
+		return
+	}
+
+	// won't fit whole: write the header + fixed criteria unconditionally (it is what
+	// tells the reviewer WHAT the epic promised — never sacrifice that), then budget
+	// whatever bytes remain for the checklist alone.
+	fixed := header + criteria + "\n\n"
+	b.WriteString(fixed)
+	const truncNote = "\n\n_...checklist TRUNCATED to fit the brief size cap — treat any step not shown above " +
+		"as UNVERIFIED, not as passing; judge primarily from the diff._\n\n"
+	budget := maxTotalBriefBytes - b.Len() - len(checklistHeader) - len(truncNote) - epicTrailingReserve
+	if budget <= 0 || strings.TrimSpace(c.EpicChecklist) == "" {
+		b.WriteString(checklistHeader)
+		b.WriteString("_(checklist omitted entirely — no room left in the brief size cap; judge from the diff alone.)_\n\n")
+		return
+	}
+	checklist := c.EpicChecklist
+	if len(checklist) > budget {
+		checklist = checklist[:budget]
+	}
+	b.WriteString(checklistHeader)
+	b.WriteString(checklist)
+	b.WriteString(truncNote)
 }

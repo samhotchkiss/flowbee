@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/content"
 	"github.com/samhotchkiss/flowbee/internal/engine"
+	"github.com/samhotchkiss/flowbee/internal/epicspec"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/lease"
@@ -1076,6 +1078,15 @@ type LeaseContext struct {
 	// change. The brief tells the agent to re-apply that intent on the current code,
 	// reconciling it with the sibling change — not to re-run the original task.
 	Conflict bool `json:"conflict,omitempty"`
+	// EpicCriteria / EpicChecklist are the epic-lane Phase 3 criteria-driven review
+	// section (task brief point 3), set ONLY for a code_reviewer job detected as an
+	// epic PR (see injectEpicCriteria) — the epic's frozen Goal/Constraints/Steps
+	// plus its claimed ## Status checklist, both read AS OF the PR head. Both stay
+	// empty for every ordinary (non-epic) review, mirrored field-for-field on
+	// client.LeaseContext (JSON is the only contract between this internal type and
+	// the worker-facing one — see that type's own doc for why they're separate).
+	EpicCriteria  string `json:"epic_criteria,omitempty"`
+	EpicChecklist string `json:"epic_checklist,omitempty"`
 }
 
 // syncPauseMarker mirrors the global pause flag onto the on-disk marker that the
@@ -1446,8 +1457,13 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 			grant.Context.Diff = d
 		}
 		grant.Context.DiffEmpty = j.DiffEmpty
+		var headSHA string
 		if f, _, ferr := s.facts.Facts(ctx, jobID); ferr == nil {
 			grant.Context.CIReady = f.PRExists && f.CIGreen && !f.Merged
+			headSHA = f.HeadSHA
+		}
+		if role == job.RoleCodeReviewer {
+			s.injectEpicCriteria(ctx, j.Repo, headSHA, grant.Context)
 		}
 	}
 	// Repo provisioning hints (§7.4): only for build jobs that carry a
@@ -1468,6 +1484,64 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 		}
 	}
 	return grant
+}
+
+// epicMirrorPathFor derives the per-repo control-plane mirror path from the server's
+// configured base mirror (s.mirrorPath), replicating cmd/flowbee/serve.go's UNEXPORTED
+// controlMirrorFor EXACTLY (sibling <dir>/<id>.git for a non-default repo id): api
+// sits BELOW cmd/flowbee in the import graph (cmd/flowbee imports internal/api, never
+// the reverse), so it cannot call that helper directly — this small, deliberately
+// duplicated derivation is the same trade every other per-repo mirror consumer in this
+// codebase already makes (each layer derives a repo's mirror path from the one shared
+// FLOWBEE_MIRROR_PATH-rooted convention independently) rather than threading a new
+// cross-package callback for a single read-only, best-effort lookup. Empty when no
+// mirror is configured at all (base == "").
+func epicMirrorPathFor(base, repoID string) string {
+	if base == "" {
+		return ""
+	}
+	if repoID == "" || repoID == "default" {
+		return base
+	}
+	return filepath.Join(filepath.Dir(base), repoID+".git")
+}
+
+// injectEpicCriteria is the epic-lane Phase 3 criteria-driven reviewer brief (task
+// brief point 3): for a code_reviewer lease, best-effort detect whether the job is
+// bound to an epic PR (store.EpicForHeadSHA, SHA-tip match against repo's registered
+// epics — see that function's doc for why a SHA, not a branch name) and, if so, read
+// the epic's contract AS OF headSHA (store.EpicContractAtHead — the SAME mirror read
+// project.go's merge-time epicDenyReason performs, so the gate and what the reviewer
+// reads always agree) and render it onto ctx.EpicCriteria/EpicChecklist
+// (renderReviewBrief embeds these, respecting its own size cap).
+//
+// Entirely best-effort and silent on any failure (no mirror configured, repo has no
+// registered epics, a transient fetch error, an unparseable epic file): the fields
+// simply stay empty and the reviewer gets an ORDINARY review brief. This is
+// deliberate — unlike the merge-time gate (which must fail CLOSED, since it is the
+// actual enforcement point), a reviewer that doesn't see the epic section still
+// reviews the diff on its own merits; nothing here can wrongly ALLOW an unmerited
+// self-merge, since epicDenyReason re-verifies independently at merge time regardless
+// of what the reviewer saw.
+func (s *Server) injectEpicCriteria(ctx context.Context, repo, headSHA string, lc *LeaseContext) {
+	if lc == nil || headSHA == "" {
+		return
+	}
+	mp := epicMirrorPathFor(s.mirrorPath, repo)
+	if mp == "" {
+		return
+	}
+	mirror := gitops.Open(mp)
+	e, ok, err := s.store.EpicForHeadSHA(ctx, mirror, repo, headSHA)
+	if err != nil || !ok {
+		return
+	}
+	spec, sb, err := s.store.EpicContractAtHead(mirror, e, headSHA)
+	if err != nil {
+		return
+	}
+	lc.EpicCriteria = epicspec.RenderCriteria(spec)
+	lc.EpicChecklist = epicspec.RenderChecklist(sb)
 }
 
 // workerRepoURL builds the per-job clone/push URL the lease ships to a worker. SSH

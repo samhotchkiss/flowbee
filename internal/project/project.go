@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/content"
+	"github.com/samhotchkiss/flowbee/internal/epicspec"
 	gh "github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
@@ -70,6 +71,51 @@ func contentDenyReason(actualDiff string, allowOwnSource bool) string {
 		return ""
 	}
 	return "content gate (actual diff) " + strings.Join(reasons, "; ")
+}
+
+// epicDenyReason is the epic-lane Phase 3 extension of the content-integrity gate
+// (task brief point 2): for an epic PR — detected via store.EpicForHeadSHA, which
+// SHA-tip-matches j.HeadSHA against every epic registered for repo (GitHub gives
+// Flowbee no fact naming a PR's head branch NAME, only its SHA — see that function's
+// doc) — judge the diff AGAINST THE EPIC'S OWN CONTRACT rather than as a generic
+// diff: every ## Steps entry must be checked with non-empty evidence, State: must be
+// exactly "done", Blockers: must be empty, AND every touched path must fall inside
+// the epic's declared scope: globs (a REAL per-file glob match, epicspec.CheckScope —
+// not the conservative launch-time overlap heuristic). The epic file is read AS OF
+// THE PR HEAD (headSHA) via the SAME mirror the generic content gate above already
+// required for this merge (s.history) — never from the epics table's own status_*
+// snapshot, which can lag the exact commit under review (task brief: "NOT from the
+// possibly-stale epics table").
+//
+// Returns "" (no denial) for the overwhelmingly common non-epic PR, when repo has no
+// registered epics at all (ZERO extra mirror I/O in that case — see
+// store.EpicForHeadSHA), or when detection itself fails transiently (fail OPEN on
+// detection: an epic PR that can't be identified this pass is treated as an ordinary
+// PR, not silently blocked — the generic content gate above already fails CLOSED to
+// handoff on anything it can't verify). Once an epic IS identified, failing to READ
+// or PARSE its contract at the PR head fails CLOSED (denied) — unlike detection, a
+// PR that own up to being epic <slug>'s PR but whose contract can't be verified must
+// never autonomously merge on the strength of an unreadable claim.
+func (s *Sender) epicDenyReason(ctx context.Context, repo, headSHA, actualDiff string) string {
+	if s.history == nil || repo == "" || headSHA == "" {
+		return ""
+	}
+	e, ok, err := s.store.EpicForHeadSHA(ctx, s.history, repo, headSHA)
+	if err != nil || !ok {
+		return "" // not an epic PR, or detection itself failed transiently — fail OPEN here
+	}
+	spec, sb, err := s.store.EpicContractAtHead(s.history, e, headSHA)
+	if err != nil {
+		return fmt.Sprintf("epic %q contract unreadable at PR head: %v", e.ID, err)
+	}
+	var reasons []string
+	if ev := epicspec.CheckEvidence(spec, sb); !ev.Clear {
+		reasons = append(reasons, fmt.Sprintf("epic %q evidence incomplete: %s", e.ID, strings.Join(ev.Failures, "; ")))
+	}
+	if out := epicspec.CheckScope(spec.Scope, content.TouchedPaths(actualDiff)); len(out) > 0 {
+		reasons = append(reasons, fmt.Sprintf("epic %q scope violation: %s", e.ID, strings.Join(out, ", ")))
+	}
+	return strings.Join(reasons, "; ")
 }
 
 type liveMergeCIResult struct {
@@ -381,6 +427,12 @@ type HistoryWriter interface {
 	// CP-computed ACTUAL change, used to re-run the WHOLE content gate against the real
 	// branch (not the worker's self-reported patch) before an autonomous merge lands.
 	DiffBetween(base, head string) (string, error)
+	// ReadFileAtRef reads a single file's bytes AS OF ref (a full ref like
+	// "refs/heads/<branch>" or a raw SHA) — the epic-lane Phase 3 evidence gate's
+	// read of an epic's own spec file AT THE PR HEAD (epicDenyReason), the same way
+	// cmd/flowbee/epic.go's ingestEpicStatuses already reads an epic file off its
+	// branch. found=false (no error) means the path does not exist at that ref.
+	ReadFileAtRef(ref, path string) (string, bool, error)
 }
 
 // WithHistory wires the local-git history writer + the branch its dedicated
@@ -759,6 +811,19 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			if reason := contentDenyReason(actualDiff, s.allowOwnSource); reason != "" {
 				if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
 					return "", fmt.Errorf("route self-merge to handoff: %w", rerr)
+				}
+				if s.pub != nil {
+					s.pub.PublishReconcile(row.JobID, "project_out:self_merge_denied")
+				}
+				return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
+			}
+			// epic-lane Phase 3 (task brief point 2): an epic PR (branch epic/<slug>,
+			// auto-adopted by Phase 0) is judged against the EPIC'S OWN CONTRACT, not as
+			// a generic diff — see epicDenyReason. "" for the overwhelmingly common
+			// non-epic PR (proven byte-identical by TestEpicDenyReasonNonEpicPRNoOp).
+			if reason := s.epicDenyReason(ctx, j.Repo, j.HeadSHA, actualDiff); reason != "" {
+				if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
+					return "", fmt.Errorf("route self-merge to handoff (epic evidence): %w", rerr)
 				}
 				if s.pub != nil {
 					s.pub.PublishReconcile(row.JobID, "project_out:self_merge_denied")

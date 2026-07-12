@@ -18,12 +18,25 @@ type fakeHistory struct {
 	diffOut    string            // scripted DiffBetween result (the actual base..head unified diff)
 	diffByHead map[string]string // per-head DiffBetween override (head -> diff); falls back to diffOut
 	diffErr    error
+	// refTips overrides HeadSHA per-ref (e.g. "refs/heads/epic/<slug>") — the
+	// epic-lane Phase 3 SHA-tip detection tests (store.EpicForHeadSHA) need distinct
+	// tips per branch, unlike the merge-conflict tests' single fixed `tip`. Falls
+	// back to tip when the ref is absent, so existing callers are unaffected.
+	refTips map[string]string
+	// files serves ReadFileAtRef content, keyed ref -> path -> content (the epic
+	// contract read AS OF the PR head).
+	files map[string]map[string]string
 }
 
 func (f *fakeHistory) CommitHistory(branch, message string, files []gitops.HistoryFile) (string, bool, error) {
 	return "", true, nil
 }
-func (f *fakeHistory) HeadSHA(ref string) (string, error) { return f.tip, nil }
+func (f *fakeHistory) HeadSHA(ref string) (string, error) {
+	if v, ok := f.refTips[ref]; ok {
+		return v, nil
+	}
+	return f.tip, nil
+}
 func (f *fakeHistory) FetchBranch(branch string) error {
 	f.fetched = append(f.fetched, branch)
 	return nil
@@ -33,6 +46,17 @@ func (f *fakeHistory) DiffBetween(base, head string) (string, error) {
 		return d, f.diffErr
 	}
 	return f.diffOut, f.diffErr
+}
+func (f *fakeHistory) ReadFileAtRef(ref, path string) (string, bool, error) {
+	if f.files == nil {
+		return "", false, nil
+	}
+	byPath, ok := f.files[ref]
+	if !ok {
+		return "", false, nil
+	}
+	content, ok := byPath[path]
+	return content, ok, nil
 }
 
 // TestMergeConflictRoutesToResolverAfterFetch: when a merge returns ErrMergeConflict,

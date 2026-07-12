@@ -126,6 +126,71 @@ func TestRenderReviewBriefCapsOversizedDiff(t *testing.T) {
 	}
 }
 
+// TestRenderReviewBriefNonEpicPRUnaffected proves the epic-lane Phase 3 brief
+// injection is a complete no-op when the lease context carries no epic criteria
+// (the overwhelmingly common, non-epic-PR review) — byte-identical to the brief a
+// pre-Phase-3 build would have rendered from the same non-epic fields.
+func TestRenderReviewBriefNonEpicPRUnaffected(t *testing.T) {
+	withEpic := &client.LeaseContext{Identity: "r", Task: "t", Diff: "d"}
+	withoutEpicFields := &client.LeaseContext{Identity: "r", Task: "t", Diff: "d"}
+	got := renderReviewBrief("job-1", "code_reviewer", withEpic)
+	want := renderReviewBrief("job-1", "code_reviewer", withoutEpicFields)
+	if got != want {
+		t.Fatalf("a lease context with no EpicCriteria must render byte-identically:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(got, "Epic Contract") {
+		t.Fatalf("brief should not mention the Epic Contract section at all when EpicCriteria is empty\n%s", got)
+	}
+}
+
+// TestRenderReviewBriefInjectsEpicCriteria: a code_reviewer job carrying epic
+// criteria gets the structured "Epic Contract" section, including the claimed status
+// checklist, when it comfortably fits the size cap.
+func TestRenderReviewBriefInjectsEpicCriteria(t *testing.T) {
+	c := &client.LeaseContext{
+		Identity: "r", Task: "t", Diff: "d",
+		EpicCriteria:  "**Goal:**\n\nShip the thing.\n\n1. step one\n   Validate: go test ./...\n",
+		EpicChecklist: "State: done\n\n- [x] Step 1 — step one (evidence: go test passed)\n",
+	}
+	brief := renderReviewBrief("job-1", "code_reviewer", c)
+	for _, want := range []string{
+		"Epic Contract", "Ship the thing.", "step one", "Validate: go test ./...",
+		"Claimed status", "State: done", "[x] Step 1", "go test passed",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("epic brief missing %q\n%s", want, brief)
+		}
+	}
+}
+
+// TestRenderReviewBriefTruncatesEpicChecklistNotCriteria: when the FULL epic section
+// (fixed criteria + checklist) would blow the total brief cap, the FIXED
+// Goal/Constraints/Steps criteria stays intact and only the CHECKLIST is truncated,
+// with an explicit note — the brief never silently drops the epic's own contract, and
+// never exceeds maxTotalBriefBytes (the argv-limit guard every brief must respect).
+func TestRenderReviewBriefTruncatesEpicChecklistNotCriteria(t *testing.T) {
+	criteria := "**Goal:**\n\nShip the thing UNIQUE_GOAL_MARKER.\n\n"
+	giantChecklist := strings.Repeat("- [x] Step N — done (evidence: blah blah blah)\n", 10000) // huge
+	c := &client.LeaseContext{
+		Identity: "r", Task: "t", Diff: "d",
+		EpicCriteria:  criteria,
+		EpicChecklist: giantChecklist,
+	}
+	brief := renderReviewBrief("job-1", "code_reviewer", c)
+	if len(brief) > maxTotalBriefBytes {
+		t.Fatalf("rendered brief (%d bytes) must never exceed maxTotalBriefBytes (%d) — argv limit", len(brief), maxTotalBriefBytes)
+	}
+	if !strings.Contains(brief, "UNIQUE_GOAL_MARKER") {
+		t.Fatalf("the FIXED criteria (Goal/Constraints/Steps) must survive truncation intact\n%s", brief[:2000])
+	}
+	if !strings.Contains(brief, "TRUNCATED") {
+		t.Fatalf("an oversized checklist must be truncated WITH an explicit note, not silently cut\n%s", brief[len(brief)-2000:])
+	}
+	if strings.Contains(brief, giantChecklist) {
+		t.Fatal("the full giant checklist must NOT be embedded whole")
+	}
+}
+
 // TestRenderReviewBriefCapsOnTotalBudgetNotDiffAlone is the regression for the escaped case
 // that TestRenderReviewBriefCapsOversizedDiff's diff-only accounting missed live: job
 // 01KWMSKDKAV3WC9QZ4Q20B0N8E had diff_bytes=96559 (comfortably under a 100KiB diff-only cap)
