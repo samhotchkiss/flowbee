@@ -43,10 +43,24 @@ type EpicRun struct {
 var (
 	ErrEpicRunNotFound = errors.New("epic not found")
 	ErrEpicRunExists   = errors.New("epic already registered")
+	// ErrEpicHostBusy / ErrEpicScopeOverlap are the launch-gate refusals AddEpicRun
+	// enforces ATOMICALLY with its insert (review m6): the CLI's own pre-checks in
+	// runEpicStart give fast feedback before the expensive ssh preflight, but two
+	// concurrent `epic start`s that both passed those reads could otherwise both
+	// insert (TOCTOU double-book) — the tx here is the authority, the CLI checks
+	// are a courtesy. Both are wrapped with detail via fmt.Errorf("%w: ...").
+	ErrEpicHostBusy     = errors.New("host already holds an active epic")
+	ErrEpicScopeOverlap = errors.New("scope overlaps an active epic")
 )
 
-// AddEpicRun registers a new epic at state='launching' (`flowbee epic start`'s
-// first write, AFTER the scope/host/quota gates pass — see cmd/flowbee/epic.go).
+// AddEpicRun registers a new epic at state='launching' — `flowbee epic start`'s
+// one durable write before the tmux launch. The one-box-one-epic occupancy gate
+// and the same-repo scope-overlap gate run INSIDE the same transaction as the
+// insert (review m6): the store pins MaxOpenConns(1), so the check-then-insert is
+// serialized against any concurrent start and can never double-book a host or a
+// scope. An epic with no host (” — not currently produced by the CLI, which
+// requires one) skips the occupancy gate only.
+//
 // Starting at 'launching' rather than 'running' means a crash between this insert
 // and the tmux session actually coming up leaves a VISIBLE half-launched row
 // instead of nothing; runEpicStart's own error path calls DeleteEpicRun to roll
@@ -57,20 +71,63 @@ func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, now time.Time) error 
 		return errors.New("epic id is required")
 	}
 	ts := now.Format(rfc3339)
-	_, err := s.DB.ExecContext(ctx, `
-		INSERT INTO epics
-		    (id, repo, file_path, title, scope_json, host, branch, tmux_name, agent,
-		     state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?)`,
-		e.ID, e.Repo, e.FilePath, e.Title, marshalStrings(e.Scope), e.Host, e.Branch,
-		e.TmuxName, e.Agent, ts, ts)
-	if err != nil {
-		if isUniqueConstraintErr(err) {
-			return ErrEpicRunExists
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		if e.Host != "" {
+			var holder string
+			err := tx.QueryRowContext(ctx,
+				`SELECT id FROM epics WHERE host = ? AND state IN `+epicActiveStatesSQL+` LIMIT 1`,
+				e.Host).Scan(&holder)
+			if err == nil {
+				return fmt.Errorf("%w: host %q is running epic %q", ErrEpicHostBusy, e.Host, holder)
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
 		}
-		return fmt.Errorf("add epic %q: %w", e.ID, err)
-	}
-	return nil
+		rows, err := tx.QueryContext(ctx,
+			`SELECT id, scope_json FROM epics WHERE repo = ? AND state IN `+epicActiveStatesSQL,
+			e.Repo)
+		if err != nil {
+			return err
+		}
+		type activeScope struct {
+			id    string
+			scope []string
+		}
+		var others []activeScope
+		for rows.Next() {
+			var id, scopeJSON string
+			if err := rows.Scan(&id, &scopeJSON); err != nil {
+				rows.Close()
+				return err
+			}
+			others = append(others, activeScope{id: id, scope: unmarshalStrings(scopeJSON)})
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, o := range others {
+			if overlaps, ga, gb := epicspec.ScopeOverlap(e.Scope, o.scope); overlaps {
+				return fmt.Errorf("%w: %q overlaps epic %q's %q in repo %q",
+					ErrEpicScopeOverlap, ga, o.id, gb, e.Repo)
+			}
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO epics
+			    (id, repo, file_path, title, scope_json, host, branch, tmux_name, agent,
+			     state, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?)`,
+			e.ID, e.Repo, e.FilePath, e.Title, marshalStrings(e.Scope), e.Host, e.Branch,
+			e.TmuxName, e.Agent, ts, ts)
+		if err != nil {
+			if isUniqueConstraintErr(err) {
+				return ErrEpicRunExists
+			}
+			return fmt.Errorf("add epic %q: %w", e.ID, err)
+		}
+		return nil
+	})
 }
 
 // DeleteEpicRun hard-deletes an epic row — ONLY used to roll back a launch that
@@ -225,24 +282,35 @@ func (s *Store) UpsertEpicStatus(ctx context.Context, id string, sb epicspec.Sta
 		ts := now.Format(rfc3339)
 		becameTerminal := (newState == "done" || newState == "achieved") &&
 			curState != "done" && curState != "achieved"
-		checklistJSON := marshalChecklist(sb.Checklist)
-		if becameTerminal {
-			_, err = tx.ExecContext(ctx, `
-				UPDATE epics SET updated_at = ?, status_updated_at = ?, status_current_step = ?,
-				    status_steps_total = ?, status_state_detail = ?, status_checklist_json = ?,
-				    status_blockers = ?, state = ?, finished_at = ?
-				 WHERE id = ?`,
-				ts, sb.UpdatedRaw, sb.CurrentStep, sb.StepsTotal, sb.State, checklistJSON,
-				sb.Blockers, newState, ts, id)
-		} else {
-			_, err = tx.ExecContext(ctx, `
-				UPDATE epics SET updated_at = ?, status_updated_at = ?, status_current_step = ?,
-				    status_steps_total = ?, status_state_detail = ?, status_checklist_json = ?,
-				    status_blockers = ?, state = ?
-				 WHERE id = ?`,
-				ts, sb.UpdatedRaw, sb.CurrentStep, sb.StepsTotal, sb.State, checklistJSON,
-				sb.Blockers, newState, id)
+
+		// an EMPTY parse (missing/garbage ## Status — sb.IsEmpty) must not clobber
+		// the last-good status_* fields with zero values (review m4; the 0026
+		// migration comment promises "these columns simply keep their prior values
+		// when a pass can't parse"). The lifecycle state machine above still ran —
+		// an empty raw State is a no-transition, but the linked session's
+		// independently-observed 'achieved' can still legitimately fire — so only
+		// the status_* column writes are conditional, never the state advance.
+		statusCols, statusArgs := "", []any{}
+		if !sb.IsEmpty() {
+			statusCols = `, status_updated_at = ?, status_current_step = ?,
+			    status_steps_total = ?, status_state_detail = ?, status_checklist_json = ?,
+			    status_blockers = ?`
+			statusArgs = []any{sb.UpdatedRaw, sb.CurrentStep, sb.StepsTotal, sb.State,
+				marshalChecklist(sb.Checklist), sb.Blockers}
 		}
+		finishedCol := ""
+		if becameTerminal {
+			finishedCol = `, finished_at = ?`
+		}
+		args := append([]any{ts}, statusArgs...)
+		args = append(args, newState)
+		if becameTerminal {
+			args = append(args, ts)
+		}
+		args = append(args, id)
+		_, err = tx.ExecContext(ctx,
+			`UPDATE epics SET updated_at = ?`+statusCols+`, state = ?`+finishedCol+` WHERE id = ?`,
+			args...)
 		return err
 	})
 }
@@ -253,19 +321,26 @@ func (s *Store) UpsertEpicStatus(ctx context.Context, id string, sb epicspec.Sta
 // leaves the CURRENT lifecycle state unchanged (fail toward "no transition" —
 // same "degrade to inert" posture the Phase 1 watchdog's own status parser uses)
 // rather than guessing or resetting to something misleading.
+//
+// EVERY match is EXACT (whole token, after trim+casefold) — never a substring
+// Contains. The lesson (review MAJOR M3): "done" is the one terminal,
+// irreversible, reservation-RELEASING transition, and a Contains("done") match
+// fired on "abandoned" (and would on "undone"): a RUNNING epic flipped terminal,
+// finished_at got set, the row dropped out of epicActiveStatesSQL, and its
+// scope+host reservation was released while the agent was still mutating the tree
+// — exactly the multi-day merge collision the reservation exists to prevent. The
+// non-terminal matches are exact too: they cost nothing extra, and an agent that
+// invents vocabulary outside the documented set should read as "no transition",
+// not as whichever documented word its invention happens to contain.
 func nextEpicState(cur, raw string) string {
-	r := strings.ToLower(strings.TrimSpace(raw))
-	switch {
-	case r == "":
-		return cur
-	case strings.Contains(r, "done"):
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "done":
 		return "done"
-	case strings.Contains(r, "blocked"):
+	case "blocked":
 		return "blocked"
-	case strings.Contains(r, "building") || strings.Contains(r, "pursuing") ||
-		strings.Contains(r, "working") || strings.Contains(r, "running"):
+	case "building", "pursuing", "working", "running":
 		return "running"
-	default:
+	default: // "", "pending", "abandoned", "undone", any invention: no transition
 		return cur
 	}
 }

@@ -41,6 +41,19 @@ type StatusBlock struct {
 	Blockers string
 }
 
+// IsEmpty reports whether the block carries NO parsed signal at all — the result
+// of running ParseStatus over a missing or fully-garbage ## Status section.
+// Consumers that persist blocks (store.UpsertEpicStatus) use this to PRESERVE the
+// last good ingested status rather than clobbering it with zero values: an agent
+// that momentarily mangles its ## Status (a mid-edit commit, a format slip) must
+// degrade to "dashboard shows the last thing it said", never to "dashboard goes
+// blank" (review m4 — the 0026 migration comment promised this; this is the seam
+// that honors it).
+func (sb StatusBlock) IsEmpty() bool {
+	return sb.UpdatedRaw == "" && sb.CurrentStep == 0 && sb.StepsTotal == 0 &&
+		sb.State == "" && len(sb.Checklist) == 0 && sb.Blockers == ""
+}
+
 var (
 	statusUpdatedRe = regexp.MustCompile(`Updated:\s*([^\s·]+)`)
 	statusCurrentRe = regexp.MustCompile(`Current:\s*step\s+(\d+)\s*/\s*(\d+)`)

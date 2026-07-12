@@ -22,6 +22,11 @@ func TestScopeOverlap(t *testing.T) {
 		{"both empty", []string{}, []string{}, false},
 		{"string-prefix false-positive is conservative by design", []string{"internal/foo*"}, []string{"internal/foobar/**"}, true},
 		{"suffix-anchored glob still uses literal prefix", []string{"cmd/bar/**.go"}, []string{"cmd/bar/**.py"}, true},
+		// review m8: case-folded comparison — on the macOS/case-insensitive boxes
+		// the control plane and launch hosts run, Backend/ and backend/ name the
+		// SAME tree and must collide, not pass as disjoint.
+		{"case-insensitive overlap (macOS filesystems)", []string{"Backend/**"}, []string{"backend/**"}, true},
+		{"case-insensitive nested overlap", []string{"Internal/Foo/**"}, []string{"internal/**"}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

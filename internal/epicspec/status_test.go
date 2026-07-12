@@ -93,3 +93,25 @@ func TestParseStatus_MissingBlockers(t *testing.T) {
 		t.Errorf("state = %q", sb.State)
 	}
 }
+
+func TestStatusBlockIsEmpty(t *testing.T) {
+	if !ParseStatus("").IsEmpty() {
+		t.Errorf("ParseStatus(\"\") should be empty")
+	}
+	if !ParseStatus("total noise, no fields at all").IsEmpty() {
+		t.Errorf("garbage parse should be empty")
+	}
+	// any single parsed signal makes the block non-empty (it carries information
+	// worth persisting over the prior status).
+	for name, body := range map[string]string{
+		"updated only":   "Updated: 2026-01-01T00:00:00Z",
+		"state only":     "State: building",
+		"current only":   "Current: step 1/3",
+		"checklist only": "- [x] Step 1 — a",
+		"blockers only":  "Blockers: something",
+	} {
+		if ParseStatus(body).IsEmpty() {
+			t.Errorf("%s: should NOT be empty", name)
+		}
+	}
+}

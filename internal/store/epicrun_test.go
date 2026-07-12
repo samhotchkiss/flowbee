@@ -213,3 +213,154 @@ func TestEpicRunDeleteRollsBackFailedLaunch(t *testing.T) {
 		t.Fatalf("expected buncher free after rollback, ok=%v err=%v", ok, err)
 	}
 }
+
+// TestEpicRunTerminalStateIsExactMatch is the M3 regression test: the raw
+// "State:" word only flips the epic terminal on an EXACT "done" — words that
+// merely CONTAIN "done" ("abandoned", "undone") must be a no-transition, because
+// a terminal flip releases the scope+host reservation while the agent may still
+// be mutating the tree.
+func TestEpicRunTerminalStateIsExactMatch(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+
+	for _, raw := range []string{"abandoned", "undone", "DONE-ish", "well done?"} {
+		id := "exact-" + raw[:2] + raw[len(raw)-2:]
+		mustAddEpicRun(t, st, ctx, store.EpicRun{ID: id, Repo: "r" + id, Host: "h" + id}, now)
+		if err := st.MarkEpicLaunched(ctx, id, now); err != nil {
+			t.Fatalf("mark launched: %v", err)
+		}
+		sb := epicspec.StatusBlock{State: raw, CurrentStep: 1, StepsTotal: 2}
+		if err := st.UpsertEpicStatus(ctx, id, sb, now); err != nil {
+			t.Fatalf("upsert (%q): %v", raw, err)
+		}
+		e, _ := st.GetEpicRun(ctx, id)
+		if e.State != "running" || e.FinishedAt != "" {
+			t.Errorf("State: %q must NOT be terminal — got state=%q finished_at=%q", raw, e.State, e.FinishedAt)
+		}
+		// the host reservation must still be held.
+		if _, held, _ := st.HostActiveEpic(ctx, "h"+id); !held {
+			t.Errorf("State: %q released the host reservation of a running epic", raw)
+		}
+	}
+
+	// the genuine exact word (case-insensitive, trimmed) IS terminal.
+	mustAddEpicRun(t, st, ctx, store.EpicRun{ID: "exact-done", Repo: "rd", Host: "hd"}, now)
+	if err := st.MarkEpicLaunched(ctx, "exact-done", now); err != nil {
+		t.Fatalf("mark launched: %v", err)
+	}
+	if err := st.UpsertEpicStatus(ctx, "exact-done", epicspec.StatusBlock{State: " Done "}, now); err != nil {
+		t.Fatalf("upsert done: %v", err)
+	}
+	e, _ := st.GetEpicRun(ctx, "exact-done")
+	if e.State != "done" || e.FinishedAt == "" {
+		t.Fatalf("exact 'Done' should be terminal: %+v", e)
+	}
+}
+
+// TestEpicRunEmptyStatusPreservesPriorFields is the m4 regression test: an empty
+// parse (missing/garbage ## Status — e.g. the agent mid-edit committed a mangled
+// section) must NOT clobber the last good ingested status with zero values.
+func TestEpicRunEmptyStatusPreservesPriorFields(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+
+	mustAddEpicRun(t, st, ctx, store.EpicRun{ID: "e-keep", Repo: "r", TmuxName: "epic-e-keep"}, now)
+	if err := st.MarkEpicLaunched(ctx, "e-keep", now); err != nil {
+		t.Fatalf("mark launched: %v", err)
+	}
+	good := epicspec.StatusBlock{
+		UpdatedRaw: "2026-07-12T11:00:00Z", CurrentStep: 3, StepsTotal: 5, State: "blocked",
+		Checklist: []epicspec.ChecklistItem{{Step: 1, Checked: true, Text: "a", Evidence: "ok"}},
+		Blockers:  "needs gh auth",
+	}
+	if err := st.UpsertEpicStatus(ctx, "e-keep", good, now); err != nil {
+		t.Fatalf("upsert good: %v", err)
+	}
+	// a later pass parses NOTHING (empty block) — the prior fields must survive.
+	if err := st.UpsertEpicStatus(ctx, "e-keep", epicspec.StatusBlock{}, now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("upsert empty: %v", err)
+	}
+	e, _ := st.GetEpicRun(ctx, "e-keep")
+	if e.StatusCurrentStep != 3 || e.StatusStepsTotal != 5 || e.StatusBlockers != "needs gh auth" ||
+		e.StatusUpdatedAt != "2026-07-12T11:00:00Z" || len(e.StatusChecklist) != 1 {
+		t.Fatalf("empty parse clobbered the last-good status: %+v", e)
+	}
+	if e.State != "blocked" {
+		t.Fatalf("empty parse changed the lifecycle state: %q", e.State)
+	}
+}
+
+// TestEpicRunEmptyStatusStillHonorsSessionAchieved: m4's preserve-on-empty must
+// not suppress the ONE state signal that doesn't come from ## Status at all —
+// the linked goal session's independently-observed 'achieved'.
+func TestEpicRunEmptyStatusStillHonorsSessionAchieved(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+
+	mustAddEpicRun(t, st, ctx, store.EpicRun{ID: "e-ach", Repo: "r", TmuxName: "epic-e-ach"}, now)
+	if err := st.MarkEpicLaunched(ctx, "e-ach", now); err != nil {
+		t.Fatalf("mark launched: %v", err)
+	}
+	if err := st.AddGoalSession(ctx, store.GoalSession{ID: "epic-e-ach", TmuxName: "epic-e-ach"}, now); err != nil {
+		t.Fatalf("add session: %v", err)
+	}
+	if err := st.UpsertObservation(ctx, "epic-e-ach", "h", "achieved", "1d", now); err != nil {
+		t.Fatalf("observe achieved: %v", err)
+	}
+	if err := st.UpsertEpicStatus(ctx, "e-ach", epicspec.StatusBlock{}, now.Add(time.Minute)); err != nil {
+		t.Fatalf("upsert empty: %v", err)
+	}
+	e, _ := st.GetEpicRun(ctx, "e-ach")
+	if e.State != "achieved" || e.FinishedAt == "" {
+		t.Fatalf("session-achieved must fire even on an empty status parse: %+v", e)
+	}
+}
+
+// TestAddEpicRunAtomicGates is the m6 regression test: the host-occupancy and
+// same-repo scope-overlap gates run INSIDE AddEpicRun's transaction, so a second
+// registration that raced past any caller-side pre-checks is still refused.
+func TestAddEpicRunAtomicGates(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+
+	mustAddEpicRun(t, st, ctx, store.EpicRun{
+		ID: "first", Repo: "russ", Host: "buncher", Scope: []string{"internal/foo/**"},
+	}, now)
+
+	// same host, disjoint scope, different repo: host occupancy refuses.
+	err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "second", Repo: "other", Host: "buncher", Scope: []string{"cmd/**"},
+	}, now)
+	if !errors.Is(err, store.ErrEpicHostBusy) {
+		t.Fatalf("expected ErrEpicHostBusy, got %v", err)
+	}
+
+	// different host, overlapping scope, SAME repo: scope reservation refuses.
+	err = st.AddEpicRun(ctx, store.EpicRun{
+		ID: "third", Repo: "russ", Host: "imac", Scope: []string{"internal/**"},
+	}, now)
+	if !errors.Is(err, store.ErrEpicScopeOverlap) {
+		t.Fatalf("expected ErrEpicScopeOverlap, got %v", err)
+	}
+
+	// different host, overlapping scope, DIFFERENT repo: allowed (scope is repo-local).
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "fourth", Repo: "other", Host: "imac", Scope: []string{"internal/**"},
+	}, now); err != nil {
+		t.Fatalf("cross-repo overlapping scope should be allowed: %v", err)
+	}
+
+	// once the first epic is terminal, its host+scope free up.
+	if err := st.AbandonEpicRun(ctx, "first", now); err != nil {
+		t.Fatalf("abandon: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "fifth", Repo: "russ", Host: "buncher", Scope: []string{"internal/foo/**"},
+	}, now); err != nil {
+		t.Fatalf("expected the abandoned epic's reservations released: %v", err)
+	}
+}

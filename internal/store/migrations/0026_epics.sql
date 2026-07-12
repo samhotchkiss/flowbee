@@ -51,7 +51,9 @@ CREATE TABLE IF NOT EXISTS epic_hosts (
 -- epics/INSTRUCTIONS.md and this migration's sibling doc contract. This column is
 -- DISTINCT from status_state_detail below, which is the raw agent-reported ## Status
 -- "State:" text — flowbee's own state machine only ADVANCES off that signal via a
--- small, documented mapping (see store.stateFromStatusDetail), it never just mirrors it.
+-- small, documented mapping (nextEpicState in store/epicrun.go — EXACT-token
+-- matches only, per review M3: a Contains("done") once fired on "abandoned" and
+-- released a live epic's reservations), it never just mirrors it.
 --
 -- scope_json is the JSON array of the epic's frontmatter `scope:` globs — the
 -- blast-radius RESERVATION (design doc: "not a suggestion"). It exists as its own

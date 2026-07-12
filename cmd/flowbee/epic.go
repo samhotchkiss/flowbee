@@ -63,6 +63,28 @@ func runEpic(args []string) error {
 // matching store.validateArgvSafe's posture for goal_sessions box/tmux_name.
 var safeSlugRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
+// safeAgentRe gates the launch agent's name (review MAJOR M2). This value can
+// come FROM THE EPIC FILE (frontmatter `agent:`) and becomes the tmux session's
+// shell-executed start command on the target box — without this gate, a committed
+// `agent: "codex; curl …|sh"` is remote code execution on the host at launch time
+// (shQuote does not help: the string is EXECUTED by a shell as tmux's session
+// command, not merely passed as an inert argument). The charset is a strict
+// binary-name allowshape: letters/digits/._- only — no spaces (so no arguments:
+// an agent needing flags gets a wrapper script on the box), no separators, no
+// path slashes (the agent must be on the box's PATH; a full path would also
+// smuggle "/" past review too easily). Mirrors safeSlugRe/validateArgvSafe.
+var safeAgentRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// validateAgent enforces safeAgentRe (see its doc — review M2) as the single seam
+// every launch path must pass the resolved agent through before it can become a
+// shell-executed tmux start command.
+func validateAgent(agent string) error {
+	if !safeAgentRe.MatchString(agent) {
+		return fmt.Errorf("agent %q has characters outside [A-Za-z0-9._-] — refusing to shell-execute it on the host (an agent needing arguments gets a wrapper script on the box)", agent)
+	}
+	return nil
+}
+
 // deriveSlug extracts the epic id from its file path (author-epic/SKILL.md:
 // "epics/YYYY-MM-DD-<slug>.md" -> the filename minus ".md"). The FULL filename
 // stem is the slug (including the date prefix) — matches store.EpicRun.ID's doc
@@ -142,6 +164,11 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	}
 
 	// ── host resolution + occupancy (one-box-one-epic) ──
+	// NOTE (review m6): the occupancy + scope checks here are FAST FEEDBACK only —
+	// they refuse an obviously-doomed launch before the expensive ssh preflight.
+	// The AUTHORITATIVE, race-free versions run inside store.AddEpicRun's
+	// transaction (check+insert atomically), so two concurrent `epic start`s that
+	// both pass these reads still cannot double-book a host or a scope.
 	host := *hostFlag
 	if host == "" {
 		host = spec.Host
@@ -179,7 +206,9 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 		}
 	}
 
-	// ── quota gate ──
+	// ── agent resolution + validation (M2: this string is shell-executed on the
+	// box as the tmux session command, and spec.Agent comes from the epic FILE —
+	// validate BEFORE it is ever used to build a command) ──
 	agent := *agentFlag
 	if agent == "" {
 		agent = spec.Agent
@@ -187,6 +216,11 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	if agent == "" {
 		agent = "codex" // author-epic/SKILL.md's documented default coding agent
 	}
+	if err := validateAgent(agent); err != nil {
+		return err
+	}
+
+	// ── quota gate ──
 	if !*forceQuota {
 		blocked, reason, qerr := epicQuotaGate(ctx, st, agent, time.Now())
 		if qerr != nil {
@@ -227,6 +261,11 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 
 	pre, err := watchdog.Preflight(ctx, runner, watchdog.PreflightParams{
 		Box: host, CheckoutPath: checkoutPath, OwnerRepo: repo.Owner + "/" + repo.Repo,
+		// disk is probed at HOME, not at the (possibly not-yet-cloned) checkout —
+		// df against a nonexistent path parses as 0 free and refused every first
+		// launch onto a fresh box (review MAJOR M1). Home always exists and shares
+		// the checkout's filesystem under the ~/epics/<repo> convention.
+		DiskProbePath: home,
 	})
 	if err != nil {
 		return fmt.Errorf("preflight on %q: %w", host, err)
@@ -236,7 +275,7 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	}
 	const minFreeKB = 10 * 1024 * 1024 // 10G, per the design doc's disk gate
 	if pre.DiskFreeKB < minFreeKB {
-		return fmt.Errorf("preflight failed: host %q has only %.1fG free at %s (need >=10G)", host, float64(pre.DiskFreeKB)/(1024*1024), checkoutPath)
+		return fmt.Errorf("preflight failed: host %q has only %.1fG free at %s (need >=10G)", host, float64(pre.DiskFreeKB)/(1024*1024), home)
 	}
 	if pre.ClonedFresh {
 		logger.Info("cloned a fresh checkout", "host", host, "path", checkoutPath, "repo", repo.Owner+"/"+repo.Repo)
@@ -250,6 +289,9 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 		ID: slug, Repo: repoID, FilePath: filePath, Title: spec.Title, Scope: spec.Scope,
 		Host: host, Branch: "epic/" + slug, TmuxName: tmuxName, Agent: agent,
 	}, now); err != nil {
+		// ErrEpicHostBusy / ErrEpicScopeOverlap here mean a CONCURRENT start won the
+		// race between our fast-feedback checks above and this atomic insert (m6) —
+		// the wrapped error already names the winning epic and the colliding glob.
 		return fmt.Errorf("register epic: %w", err)
 	}
 
@@ -262,10 +304,20 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	})
 	if launchErr != nil {
 		_ = st.DeleteEpicRun(ctx, slug) // roll back the registration — see AddEpicRun's doc
+		// best-effort kill of any half-created session (review m7): a failure AFTER
+		// tmux new-session succeeded (e.g. the goal send failed) would otherwise
+		// leak the session, and a same-slug retry would then permanently fail on
+		// tmux's duplicate-session error. Harmless when the failure was at create
+		// time (killing a nonexistent session just errors, which we log and ignore).
+		if _, kerr := runner.Run(ctx, watchdog.KillTmuxSessionCmd(host, tmuxName)); kerr != nil {
+			logger.Warn("rollback: could not kill the half-created tmux session (it may simply not exist)",
+				"epic", slug, "host", host, "tmux", tmuxName, "err", kerr)
+		}
 		return fmt.Errorf("launch failed on %q: %w (epic registration rolled back — nothing is reserved)", host, launchErr)
 	}
 	if !verified {
-		logger.Warn("could not verify the goal was submitted (pane capture failed after send) — check the tmux session by hand", "epic", slug, "host", host, "tmux", tmuxName)
+		logger.Warn("could not verify the goal was SUBMITTED (the pane neither showed the unsubmitted input line nor parsed as pursuing/working after two checks — a wrapped goal line in a narrow pane is the known blind spot). The epic is registered and the session exists; check the tmux session by hand",
+			"epic", slug, "host", host, "tmux", tmuxName)
 	}
 
 	// the tmux session IS now running the agent regardless of what happens below —

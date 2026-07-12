@@ -40,7 +40,8 @@ func TestPreflight_HappyPath_ExistingCheckout(t *testing.T) {
 	r.push("yes\n", nil)      // checkout already exists
 
 	res, err := Preflight(context.Background(), r, PreflightParams{
-		Box: "buncher", CheckoutPath: "$HOME/epics/russ", OwnerRepo: "acme/russ",
+		Box: "buncher", CheckoutPath: "/home/ops/epics/russ", DiskProbePath: "/home/ops",
+		OwnerRepo: "acme/russ",
 	})
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
@@ -50,6 +51,12 @@ func TestPreflight_HappyPath_ExistingCheckout(t *testing.T) {
 	}
 	if len(r.calls) != 3 {
 		t.Fatalf("expected 3 calls (auth, disk, exists — no clone), got %d: %v", len(r.calls), r.calls)
+	}
+	// M1: df must target the EXISTING probe path (home), never the checkout —
+	// which may not exist yet on a first launch (df against a missing path emits
+	// nothing → parsed as 0 free → a misleading refusal of every first launch).
+	if r.calls[1] != DiskFreeKBCmd("buncher", "/home/ops") {
+		t.Fatalf("disk probe targets %q, want the probe path (home): %q", r.calls[1], DiskFreeKBCmd("buncher", "/home/ops"))
 	}
 }
 
@@ -61,7 +68,8 @@ func TestPreflight_ClonesWhenMissing(t *testing.T) {
 	r.push("", nil)     // gh repo clone succeeds
 
 	res, err := Preflight(context.Background(), r, PreflightParams{
-		Box: "buncher", CheckoutPath: "$HOME/epics/russ", OwnerRepo: "acme/russ",
+		Box: "buncher", CheckoutPath: "/home/ops/epics/russ", DiskProbePath: "/home/ops",
+		OwnerRepo: "acme/russ",
 	})
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
@@ -69,10 +77,13 @@ func TestPreflight_ClonesWhenMissing(t *testing.T) {
 	if !res.ClonedFresh {
 		t.Fatalf("expected ClonedFresh=true, got %+v", res)
 	}
+	if res.DiskFreeKB != 20971520 {
+		t.Fatalf("M1 regression: the fresh-box (not-yet-cloned) launch must still read real free space from the probe path, got %d", res.DiskFreeKB)
+	}
 	if len(r.calls) != 4 {
 		t.Fatalf("expected 4 calls, got %d: %v", len(r.calls), r.calls)
 	}
-	if r.calls[3] != CloneRepoCmd("buncher", "acme/russ", "$HOME/epics/russ") {
+	if r.calls[3] != CloneRepoCmd("buncher", "acme/russ", "/home/ops/epics/russ") {
 		t.Fatalf("clone command mismatch: %q", r.calls[3])
 	}
 }
@@ -116,18 +127,19 @@ func TestPreflight_RunnerFailureIsFatal(t *testing.T) {
 	}
 }
 
-// TestLaunchEpicSession_HappyPath_NoSwallowedEnter asserts the EXACT send-keys
-// sequence: new-session, send-goal, capture-to-verify — and that a CLEAN capture
-// (the goal already submitted/echoed, not sitting bare in the input line) sends
-// NO extra Enter.
-func TestLaunchEpicSession_HappyPath_NoSwallowedEnter(t *testing.T) {
+// TestLaunchEpicSession_HappyPath_PursuingOnFirstCheck asserts the EXACT
+// send-keys sequence when the goal submits cleanly: new-session, send-goal, one
+// verify capture whose pane parses as pursuing — verified with NO extra Enter and
+// NO second capture.
+func TestLaunchEpicSession_HappyPath_PursuingOnFirstCheck(t *testing.T) {
 	r := &queuedRunner{}
-	r.push("", nil)                                           // new-session
-	r.push("", nil)                                           // send-keys goal
-	r.push("some other pane content\nnot the goal line", nil) // verify capture
+	r.push("", nil) // new-session
+	r.push("", nil) // send-keys goal
+	// verify capture: the agent is off — the status line parses as pursuing.
+	r.push("transcript...\n  gpt-5.6 high · ~/epics/russ · Main [default]   Pursuing goal (1m 2s)", nil)
 
 	verified, err := LaunchEpicSession(context.Background(), r, LaunchParams{
-		Box: "buncher", TmuxName: "epic-frob", Dir: "$HOME/epics/russ",
+		Box: "buncher", TmuxName: "epic-frob", Dir: "/home/ops/epics/russ",
 		StartCmd: "codex", Goal: "/goal execute the epic at epics/x.md",
 	})
 	if err != nil {
@@ -137,7 +149,7 @@ func TestLaunchEpicSession_HappyPath_NoSwallowedEnter(t *testing.T) {
 		t.Fatalf("expected verified=true")
 	}
 	want := []string{
-		NewTmuxSessionCmd("buncher", "epic-frob", "$HOME/epics/russ", "codex"),
+		NewTmuxSessionCmd("buncher", "epic-frob", "/home/ops/epics/russ", "codex"),
 		SendGoalCmd("buncher", "epic-frob", "/goal execute the epic at epics/x.md"),
 		capturePaneCmd("buncher", "epic-frob"),
 	}
@@ -148,6 +160,63 @@ func TestLaunchEpicSession_HappyPath_NoSwallowedEnter(t *testing.T) {
 		if r.calls[i] != w {
 			t.Errorf("call[%d] = %q, want %q", i, r.calls[i], w)
 		}
+	}
+}
+
+// TestLaunchEpicSession_SecondCheckRescuesSlowTUI: the first verify capture shows
+// neither signal (TUI still booting/rendering), the bounded second check (review
+// m5) then parses as working — verified via two captures, no Enter ever sent.
+func TestLaunchEpicSession_SecondCheckRescuesSlowTUI(t *testing.T) {
+	r := &queuedRunner{}
+	r.push("", nil)                                  // new-session
+	r.push("", nil)                                  // send-keys goal
+	r.push("still booting, blank-ish", nil)          // verify capture #1: no signal
+	r.push("• Working (5s • esc to interrupt)", nil) // verify capture #2: working
+
+	verified, err := LaunchEpicSession(context.Background(), r, LaunchParams{
+		Box: "", TmuxName: "epic-x", Dir: "/x", StartCmd: "codex", Goal: "/goal g",
+	})
+	if err != nil {
+		t.Fatalf("LaunchEpicSession: %v", err)
+	}
+	if !verified {
+		t.Fatalf("expected verified=true after the second check")
+	}
+	if len(r.calls) != 4 {
+		t.Fatalf("expected 4 calls (new-session, send-goal, capture, capture), got %d: %v", len(r.calls), r.calls)
+	}
+	if r.calls[3] != capturePaneCmd("", "epic-x") {
+		t.Errorf("call[3] = %q, want a second verify capture (never an Enter)", r.calls[3])
+	}
+}
+
+// TestLaunchEpicSession_NoSignalEitherCheck_NotVerified: neither capture shows
+// the unsubmitted line nor a pursuing/working parse (the documented wrapped-goal
+// blind spot, or a genuinely wedged TUI) — the launcher must return
+// verified=FALSE (operator gets warned) and send NO keystroke, never a false
+// verified=true (the pre-m5 bug: an epic marked running while its agent idled at
+// an unsubmitted prompt).
+func TestLaunchEpicSession_NoSignalEitherCheck_NotVerified(t *testing.T) {
+	r := &queuedRunner{}
+	r.push("", nil) // new-session
+	r.push("", nil) // send-keys goal
+	// a wrapped goal line: the tail fragment is the last line, so the exact-match
+	// unsubmitted check cannot fire, and nothing parses as a known state.
+	r.push("› /goal execute the epic at epics/x.md per\nepics/INSTRUCTIONS.md. Work on branch epic/x.", nil)
+	r.push("› /goal execute the epic at epics/x.md per\nepics/INSTRUCTIONS.md. Work on branch epic/x.", nil)
+
+	verified, err := LaunchEpicSession(context.Background(), r, LaunchParams{
+		Box: "", TmuxName: "epic-x", Dir: "/x", StartCmd: "codex",
+		Goal: "/goal execute the epic at epics/x.md per epics/INSTRUCTIONS.md. Work on branch epic/x.",
+	})
+	if err != nil {
+		t.Fatalf("LaunchEpicSession: %v", err)
+	}
+	if verified {
+		t.Fatalf("expected verified=FALSE when neither check shows a signal (wrapped-line blind spot)")
+	}
+	if len(r.calls) != 4 {
+		t.Fatalf("expected 4 calls (no Enter ever sent on ambiguity), got %d: %v", len(r.calls), r.calls)
 	}
 }
 
@@ -183,13 +252,15 @@ func TestLaunchEpicSession_SwallowedEnter_SendsBareEnter(t *testing.T) {
 // TestLaunchEpicSession_UnsubmittedCheckIsExactNotSubstring guards against the
 // same false-positive classes paneShowsUnsubmittedResume's own doc warns about:
 // a pane that merely CONTAINS the goal text (e.g. an echoed transcript line, or a
-// human's edited input with extra trailing text) must NOT trigger a bare Enter.
+// human's edited input with extra trailing text) must NOT trigger a bare Enter —
+// even across BOTH verify passes.
 func TestLaunchEpicSession_UnsubmittedCheckIsExactNotSubstring(t *testing.T) {
 	goal := "/goal execute the epic at epics/x.md"
 	r := &queuedRunner{}
 	r.push("", nil)
 	r.push("", nil)
-	r.push("echo of: "+goal+" (already ran)", nil) // substring, not an exact unsubmitted line
+	r.push("echo of: "+goal+" (already ran)", nil) // capture #1: substring, not exact
+	r.push("echo of: "+goal+" (already ran)", nil) // capture #2: same
 
 	verified, err := LaunchEpicSession(context.Background(), r, LaunchParams{
 		Box: "", TmuxName: "epic-x", Dir: "/x", StartCmd: "codex", Goal: goal,
@@ -197,11 +268,16 @@ func TestLaunchEpicSession_UnsubmittedCheckIsExactNotSubstring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LaunchEpicSession: %v", err)
 	}
-	if !verified {
-		t.Fatalf("expected verified=true")
+	if verified {
+		t.Fatalf("expected verified=FALSE: a substring echo is not positive submission evidence")
 	}
-	if len(r.calls) != 3 {
-		t.Fatalf("expected NO bare-Enter call on a substring match, got %d calls: %v", len(r.calls), r.calls)
+	if len(r.calls) != 4 {
+		t.Fatalf("expected 4 calls and NO bare-Enter on a substring match, got %d: %v", len(r.calls), r.calls)
+	}
+	for _, c := range r.calls {
+		if c == sendEnterCmd("", "epic-x") {
+			t.Fatalf("a bare Enter was sent under a non-exact match: %v", r.calls)
+		}
 	}
 }
 

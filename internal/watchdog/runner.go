@@ -81,12 +81,22 @@ func sendEnterCmd(box, tmuxName string) string {
 // Phase 1's whole surface. Phase 2 deliberately extends it — the design doc calls
 // out "this is the ONE other permitted send-keys payload" — to launch a NEW tmux
 // session and send an epic's goal text, plus a handful of read-only PREFLIGHT
-// checks (gh auth, disk space, checkout presence) that never touch tmux at all.
-// Every function below still returns a fully-formed command string built ONLY from
-// the caller's own trusted inputs (a registered host name, a validated slug/repo
-// id, a goal-text TEMPLATE the launcher builds — never raw epic file content) —
-// same posture as the Phase 1 set: Runner only ever sees a string these functions
-// constructed, never one assembled from anything read off a pane or a file.
+// checks (gh auth, disk space, checkout presence) that never touch tmux at all,
+// and a best-effort kill-session used ONLY on a failed launch's rollback path.
+//
+// TRUST BOUNDARY (corrected per review MAJOR M2 — this comment originally
+// overclaimed "never from epic file content"): most inputs are the caller's own
+// trusted values (a registered host name, a slug already gated by safeSlugRe, a
+// goal-text TEMPLATE the launcher builds), but TWO fields DO originate in the
+// epic file's frontmatter — `agent:` (which becomes NewTmuxSessionCmd's
+// shell-executed startCmd) and `host:`. Both are therefore validated by the
+// caller BEFORE they reach these builders: agent against cmd/flowbee's strict
+// safeAgentRe charset, host against the epic_hosts registry (a name an operator
+// explicitly `flowbee host add`-ed). shQuote alone is NOT sufficient for
+// startCmd — it is handed to tmux as the session's command and executed BY A
+// SHELL on the box, so a frontmatter `agent: "codex; curl …|sh"` would be remote
+// code execution without that upstream validation. Nothing here is ever
+// assembled from anything read off a pane, scrollback, or an epic file's body.
 
 // HomeDirCmd resolves a box's home directory as a LITERAL path (`echo $HOME`,
 // expanded by the target shell since it's embedded unquoted in the whole inner
@@ -148,11 +158,24 @@ func TimezoneCmd(box string) string {
 // NewTmuxSessionCmd creates a fresh DETACHED tmux session running startCmd in dir
 // — the epic launch's first step (`tmux new-session -d -s <name> -c <dir>
 // '<startCmd>'`). startCmd is the coding agent's own launch invocation (e.g.
-// "codex"), built by the caller from the epic's `agent:` frontmatter/--agent flag,
-// never from epic file body content.
+// "codex"), sourced from the epic's `agent:` frontmatter or the --agent flag —
+// i.e. PARTLY FROM EPIC FILE CONTENT, and executed by a shell on the box, so the
+// caller MUST have validated it against a strict charset first (safeAgentRe in
+// cmd/flowbee/epic.go; see the trust-boundary section doc above — review M2).
 func NewTmuxSessionCmd(box, tmuxName, dir, startCmd string) string {
 	return remoteWrap(box, "tmux new-session -d -s "+shQuote(tmuxName)+
 		" -c "+shQuote(dir)+" "+shQuote(startCmd))
+}
+
+// KillTmuxSessionCmd kills a tmux session by name — used ONLY on the failed-launch
+// ROLLBACK path (review m7): a launch that created the session but then failed to
+// send its goal would otherwise leak the session, and a same-slug retry would then
+// permanently fail on tmux's duplicate-session error. Best-effort by contract (the
+// caller logs but ignores a failure — the session may legitimately not exist when
+// the failure was at create time). NEVER used on a live epic: `flowbee epic
+// abandon` deliberately leaves the session running (operator decision).
+func KillTmuxSessionCmd(box, tmuxName string) string {
+	return remoteWrap(box, "tmux kill-session -t "+shQuote(tmuxName))
 }
 
 // SendGoalCmd sends literal text + Enter into an existing tmux pane — the ONE

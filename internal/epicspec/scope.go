@@ -22,11 +22,18 @@ import "strings"
 // A glob with NO literal prefix at all (bare "*" or "**") is conservatively
 // treated as overlapping EVERY other glob — it reserves the whole tree, mirroring
 // scheduler.WriteSet's "no declared path == wide == overlaps everything" rule.
+//
+// Prefixes are compared CASE-FOLDED (review m8): the control plane and several
+// launch hosts run macOS/case-insensitive filesystems, where "Backend/**" and
+// "backend/**" name the SAME tree — two epics declaring those must collide, not
+// pass as disjoint. On a case-SENSITIVE box this makes the rule slightly more
+// conservative (a false-positive refusal for genuinely distinct Backend/ vs
+// backend/ dirs), which is the bias this whole function already takes.
 func ScopeOverlap(a, b []string) (overlaps bool, globA, globB string) {
 	for _, ga := range a {
-		pa := globPrefix(ga)
+		pa := strings.ToLower(globPrefix(ga))
 		for _, gb := range b {
-			pb := globPrefix(gb)
+			pb := strings.ToLower(globPrefix(gb))
 			if pa == "" || pb == "" || strings.HasPrefix(pa, pb) || strings.HasPrefix(pb, pa) {
 				return true, ga, gb
 			}

