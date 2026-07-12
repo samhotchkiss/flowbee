@@ -319,13 +319,18 @@ type AccountUsageRow struct {
 	UsagePct       int    `json:"usage_pct"`
 	RateLimited    bool   `json:"rate_limited"`
 	AtCeiling      bool   `json:"at_ceiling"`
+	// ReportedAt is the RFC3339 time of the last usage report ('' = never reported).
+	// Consumers that ALERT on usage (the goal-session watchdog's 75% early warning)
+	// use it to skip stale gauges: an account whose box went quiet days ago would
+	// otherwise pin a frozen high-water usage_pct and warn forever.
+	ReportedAt string `json:"reported_at,omitempty"`
 }
 
 // AllAccountUsage returns every account's usage gauge (the §G fleet view source):
 // per-account usage with its ceiling line and whether it is currently gated out.
 func (s *Store) AllAccountUsage(ctx context.Context) ([]AccountUsageRow, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT account_id, model_family, ceiling_pct, preference_rank, usage_pct, rate_limited
+		SELECT account_id, model_family, ceiling_pct, preference_rank, usage_pct, rate_limited, reported_at
 		  FROM worker_accounts ORDER BY model_family ASC, preference_rank ASC, account_id ASC`)
 	if err != nil {
 		return nil, err
@@ -333,14 +338,19 @@ func (s *Store) AllAccountUsage(ctx context.Context) ([]AccountUsageRow, error) 
 	defer rows.Close()
 	var out []AccountUsageRow
 	for rows.Next() {
-		a, err := scanAccount(rows)
-		if err != nil {
+		var a capacity.Account
+		var rl int
+		var reportedAt sql.NullString
+		if err := rows.Scan(&a.AccountID, &a.ModelFamily, &a.CeilingPct, &a.PreferenceRank,
+			&a.UsagePct, &rl, &reportedAt); err != nil {
 			return nil, err
 		}
+		a.RateLimited = rl != 0
 		out = append(out, AccountUsageRow{
 			AccountID: a.AccountID, ModelFamily: a.ModelFamily,
 			CeilingPct: a.CeilingPct, PreferenceRank: a.PreferenceRank,
 			UsagePct: a.UsagePct, RateLimited: a.RateLimited, AtCeiling: a.AtCeiling(),
+			ReportedAt: reportedAt.String,
 		})
 	}
 	return out, rows.Err()

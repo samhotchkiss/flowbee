@@ -118,6 +118,15 @@ type Config struct {
 	// restore the old operator-only behavior — the reversible switch every rung ships with.
 	SelfUnblockDisabled bool `yaml:"self_unblock_disabled"`
 
+	// SessionWatchDisabled is the kill-switch for the goal-session watchdog (epic-lane
+	// Phase 1, 0025_goal_sessions.sql): the 2-minute-tick poller that watches registered
+	// tmux "goal" sessions (long-running codex CLI agents), self-serves `/goal resume`
+	// after a usage-limit window resets, and flags an operator for anything it must not
+	// touch on its own (infra breakage, a real weekly cap, 3-strikes rate limiting).
+	// Default false (enabled). Set FLOWBEE_SESSION_WATCH to a falsey value (0/false/off/no)
+	// to disable — mirrors FLOWBEE_SELF_UNBLOCK's reversible-switch convention exactly.
+	SessionWatchDisabled bool `yaml:"session_watch_disabled"`
+
 	// AdvisorEnabled turns on Rung E: the read-only, single-shot LLM advisor consulted for a
 	// job the deterministic janitor could not rescue (a stall past its mechanical unblock
 	// cap). It NOMINATES an action {PLAN,CORRECTION,REPROMPT,STOP}; the store re-authorizes.
@@ -338,6 +347,15 @@ func applyEnv(c *Config) {
 			c.SelfUnblockDisabled = true
 		default:
 			c.SelfUnblockDisabled = false
+		}
+	}
+	// session-watch kill-switch: same falsey-string convention as FLOWBEE_SELF_UNBLOCK.
+	if v := os.Getenv("FLOWBEE_SESSION_WATCH"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "0", "false", "off", "no", "disable", "disabled":
+			c.SessionWatchDisabled = true
+		default:
+			c.SessionWatchDisabled = false
 		}
 	}
 	// Rung-E advisor is opt-in: any truthy value enables it.

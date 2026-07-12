@@ -28,6 +28,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/project"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/ulid"
+	"github.com/samhotchkiss/flowbee/internal/watchdog"
 	"github.com/samhotchkiss/flowbee/internal/webhook"
 )
 
@@ -454,6 +455,32 @@ func runServe(args []string) error {
 			}
 		}()
 		logger.Info("🧭 Rung-E stuck-job advisor enabled", "cmd_is_default", cfg.AdvisorCmd == "")
+	}
+
+	// goal-session watchdog (epic-lane Phase 1, 0025_goal_sessions.sql): watches
+	// registered tmux "goal" sessions — long-running codex CLI agents, hours-to-days,
+	// sometimes on a remote box over ssh. Two real incidents motivated this: a goal on
+	// box `buncher` sat silently blocked ~a day on missing `gh` auth (finished work
+	// stranded, nobody knew), and sessions routinely max out usage limits and just need
+	// `/goal resume` typed once the window resets. Own goroutine on its own 2-minute
+	// ticker (mirrors the mirror-refresh/advisor cadence style above) — a wedged
+	// tmux/ssh capture must never stall the fast forward-progress watchdog. Kill-switch:
+	// FLOWBEE_SESSION_WATCH=off (mirrors FLOWBEE_SELF_UNBLOCK exactly).
+	if !cfg.SessionWatchDisabled {
+		watcher := watchdog.New(st, watchdog.NewShellRunner(), logger)
+		go func() {
+			t := time.NewTicker(2 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					watcher.Pass(ctx, time.Now())
+				}
+			}
+		}()
+		logger.Info("👁️  goal-session watchdog enabled (2m tick)")
 	}
 
 	// epic fan-out drain (§F4): once an epic's barrier review passes, its child issues

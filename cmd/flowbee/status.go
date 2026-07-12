@@ -83,12 +83,44 @@ func runStatus(args []string) error {
 			}
 		}
 	}
+	// goal-session watchdog surface (epic-lane Phase 1): every registered session's
+	// last-observed state, plus early-warning account usage — read directly from the
+	// same tables the watcher (internal/watchdog) writes/reads, so `flowbee status`
+	// never needs the serve process up or a network round-trip (matches the rest of
+	// this command's local-DB posture).
+	if sessions, serr := st.ListGoalSessions(ctx); serr == nil {
+		summary.GoalSessions = sessions
+	}
+	if accounts, aerr := st.AllAccountUsage(ctx); aerr == nil {
+		for _, a := range accounts {
+			if a.UsagePct < usageCeilingWarnPct {
+				continue
+			}
+			// skip stale gauges (>24h since the last usage report) — same rule as the
+			// watchdog's hourly WARN: an account whose box went quiet days ago pins a
+			// frozen high-water usage_pct that isn't actionable capacity news.
+			if a.ReportedAt != "" {
+				if reported, perr := time.Parse(time.RFC3339Nano, a.ReportedAt); perr == nil && now.Sub(reported) > 24*time.Hour {
+					continue
+				}
+			}
+			summary.UsageWarnings = append(summary.UsageWarnings, a)
+		}
+	}
+
 	if *jsonOut {
 		return printStatusJSON(os.Stdout, summary)
 	}
 	printStatusSummary(os.Stdout, summary)
 	return nil
 }
+
+// usageCeilingWarnPct mirrors watchdog.usageCeilingWarnPct (§ task brief point 5):
+// an account at/above this usage fraction is surfaced here BEFORE the real (~90%)
+// dispatch ceiling gates it, so the operator has runway to react. Duplicated as a
+// small untyped constant rather than importing internal/watchdog just for one
+// number — cmd/flowbee already avoids pulling watcher internals into the CLI.
+const usageCeilingWarnPct = 75
 
 // modelBreakdown renders the live-worker per-backend tally as " (codex:14, sonnet:2)"
 // (sorted, stable), so an operator sees WHICH model the fleet runs — the live complement
@@ -149,12 +181,19 @@ type statusSummary struct {
 	// starvation signal — the fleet is idle while work waits (e.g. a candidate-withholding
 	// reservation/capacity bug). Surfaced so a wedge is never silent (the merge_handoff
 	// reservation incident sat undetected for hours).
-	ReadyJobs              int      `json:"ready_jobs"`
-	ActiveJobs             int      `json:"active_jobs"`
-	Starved                bool     `json:"starved"`
-	Paused                 bool     `json:"-"`
-	ParkedRepos            []string `json:"parked_repos,omitempty"`
-	RedMainRepos           []string `json:"red_main_repos,omitempty"`
+	ReadyJobs    int      `json:"ready_jobs"`
+	ActiveJobs   int      `json:"active_jobs"`
+	Starved      bool     `json:"starved"`
+	Paused       bool     `json:"-"`
+	ParkedRepos  []string `json:"parked_repos,omitempty"`
+	RedMainRepos []string `json:"red_main_repos,omitempty"`
+	// GoalSessions / UsageWarnings are the goal-session watchdog surface (epic-lane
+	// Phase 1): every registered session's last-observed state, and any account
+	// approaching its usage ceiling — populated by runStatus directly from the DB
+	// (not by summarizeStatus, which stays a pure function over BoardJob/FleetHealth
+	// for testability; these two are appended by the caller after the fact).
+	GoalSessions           []store.GoalSession     `json:"goal_sessions,omitempty"`
+	UsageWarnings          []store.AccountUsageRow `json:"usage_warnings,omitempty"`
 	liveModelBreakdownOnly map[string]int
 }
 
@@ -284,5 +323,23 @@ func printStatusSummary(w io.Writer, summary statusSummary) {
 	if len(summary.RedMainRepos) > 0 {
 		fmt.Fprintf(w, "\n*** RED MAIN: %s — the integration branch CI is failing. Feature PRs can't be fairly judged (they're held, not bounced). FIX MAIN FIRST — file the fix as `flowbee:p1` so it jumps the queue. ***\n",
 			strings.Join(summary.RedMainRepos, ", "))
+	}
+	// goal sessions (epic-lane Phase 1 watchdog): one line per registered tmux "goal"
+	// session in the same compact `id · box · state (elapsed) [detail]` shape the
+	// watchdog itself logs, so what an operator sees here matches the serve log.
+	if len(summary.GoalSessions) > 0 {
+		fmt.Fprintln(w, "\ngoal sessions:")
+		for _, g := range summary.GoalSessions {
+			fmt.Fprintf(w, "  %s\n", formatSessionLine(g))
+		}
+	}
+	// account usage early warning (§ task brief point 5): surfaced independently of
+	// the watchdog's own hourly-throttled log line — this always shows the LIVE
+	// number, so an operator checking status mid-hour still sees it.
+	if len(summary.UsageWarnings) > 0 {
+		fmt.Fprintln(w, "\n⚠ account usage approaching ceiling:")
+		for _, a := range summary.UsageWarnings {
+			fmt.Fprintf(w, "  %s (%s): %d%% of %d%% ceiling\n", a.AccountID, a.ModelFamily, a.UsagePct, a.CeilingPct)
+		}
 	}
 }
