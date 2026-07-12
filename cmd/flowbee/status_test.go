@@ -374,3 +374,37 @@ func TestPrintStatusStarvationDetector(t *testing.T) {
 		t.Errorf("no ready work must NOT warn starvation:\n%s", buf3.String())
 	}
 }
+
+// TestPrintStatusGoalSessionsSection: the epic-lane Phase 1 watchdog surface — one
+// compact line per registered session, plus any account nearing its usage ceiling.
+// Both fields are populated by runStatus directly (not summarizeStatus), so this
+// exercises printStatusSummary directly rather than going through printStatus.
+func TestPrintStatusGoalSessionsSection(t *testing.T) {
+	summary := summarizeStatus(nil, store.FleetHealth{}, nil, false)
+	summary.GoalSessions = []store.GoalSession{
+		{ID: "russ-terra", Box: "buncher", State: "pursuing", GoalElapsed: "2d 4h 12m", Enabled: true},
+		{ID: "russ-sol", State: "blocked", StateDetail: "needs_operator: gh auth", Enabled: true},
+	}
+	summary.UsageWarnings = []store.AccountUsageRow{
+		{AccountID: "acct-a", ModelFamily: "codex", UsagePct: 82, CeilingPct: 90},
+	}
+	var buf bytes.Buffer
+	printStatusSummary(&buf, summary)
+	out := buf.String()
+	for _, want := range []string{
+		"goal sessions:", "russ-terra · buncher · pursuing (2d 4h 12m)",
+		"russ-sol · local · blocked [needs_operator: gh auth]",
+		"account usage approaching ceiling", "acct-a (codex): 82% of 90% ceiling",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected output to contain %q, got:\n%s", want, out)
+		}
+	}
+
+	// no sessions/warnings => no section at all (a clean status page for the common case).
+	var buf2 bytes.Buffer
+	printStatusSummary(&buf2, summarizeStatus(nil, store.FleetHealth{}, nil, false))
+	if strings.Contains(buf2.String(), "goal sessions:") || strings.Contains(buf2.String(), "approaching ceiling") {
+		t.Errorf("expected no goal-session section when empty:\n%s", buf2.String())
+	}
+}
