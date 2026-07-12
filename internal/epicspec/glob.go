@@ -44,9 +44,13 @@ func globRegexp(glob string) *regexp.Regexp {
 }
 
 // compileGlob translates a doublestar-style glob into an ANCHORED regexp source.
-// `**` (consecutive, in either order relative to surrounding `*`s — handled by
-// consuming greedily) becomes `.*` (crosses "/"); a lone `*` becomes `[^/]*`; `?`
-// becomes `[^/]`; every other rune is regexp-escaped literally.
+// `**/` becomes `(?:.*/)?` — ZERO or more whole segments, per real doublestar
+// semantics: a leading `**/*.go` must match a root-level `main.go`, and `a/**/b`
+// must match `a/b`, not only `a/x/b` (a naive `.*` for the pair would force the
+// following `/` to be consumed, silently flagging every root-level file as out of
+// scope — review F4). A `**` NOT followed by `/` becomes `.*` (crosses "/",
+// covering the `internal/foo/**` and `cmd/bar/**.go` author forms); a lone `*`
+// becomes `[^/]*`; `?` becomes `[^/]`; every other rune is regexp-escaped literally.
 func compileGlob(glob string) string {
 	var b strings.Builder
 	b.WriteString("^")
@@ -55,8 +59,13 @@ func compileGlob(glob string) string {
 		c := glob[i]
 		switch {
 		case c == '*' && i+1 < len(glob) && glob[i+1] == '*':
-			b.WriteString(".*")
-			i += 2
+			if i+2 < len(glob) && glob[i+2] == '/' {
+				b.WriteString("(?:.*/)?")
+				i += 3
+			} else {
+				b.WriteString(".*")
+				i += 2
+			}
 		case c == '*':
 			b.WriteString("[^/]*")
 			i++

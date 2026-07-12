@@ -87,35 +87,51 @@ func contentDenyReason(actualDiff string, allowOwnSource bool) string {
 // snapshot, which can lag the exact commit under review (task brief: "NOT from the
 // possibly-stale epics table").
 //
-// Returns "" (no denial) for the overwhelmingly common non-epic PR, when repo has no
-// registered epics at all (ZERO extra mirror I/O in that case — see
-// store.EpicForHeadSHA), or when detection itself fails transiently (fail OPEN on
-// detection: an epic PR that can't be identified this pass is treated as an ordinary
-// PR, not silently blocked — the generic content gate above already fails CLOSED to
-// handoff on anything it can't verify). Once an epic IS identified, failing to READ
-// or PARSE its contract at the PR head fails CLOSED (denied) — unlike detection, a
-// PR that own up to being epic <slug>'s PR but whose contract can't be verified must
-// never autonomously merge on the strength of an unreadable claim.
-func (s *Sender) epicDenyReason(ctx context.Context, repo, headSHA, actualDiff string) string {
-	if s.history == nil || repo == "" || headSHA == "" {
-		return ""
+// Returns ("", nil) — no denial — for the overwhelmingly common non-epic PR, and
+// when repo has no epics in the detection window at all (zero extra mirror I/O
+// then — see store.EpicForHeadSHA). Detection trouble fails CLOSED-to-RETRY
+// (review F2): a mirror fetch/rev-parse error against a live epic's branch returns
+// a non-nil error so the caller RETRIES the merge row, exactly matching the
+// generic content gate's posture when ITS DiffBetween fails — a transient mirror
+// outage must never let an unevidenced epic PR merge disguised as an ordinary one
+// (store.EpicForHeadSHA's doc details the two clean-skip exceptions: a branch
+// genuinely absent at origin, and a terminal epic's branch hiccup). Once an epic
+// IS identified, failing to READ or PARSE its contract at the PR head fails CLOSED
+// to HANDOFF (a deny reason, not an error): a PR that provably belongs to epic
+// <slug> but whose contract can't be verified must reach a human, not retry
+// forever against a file that will never parse.
+func (s *Sender) epicDenyReason(ctx context.Context, repo, headSHA, actualDiff string) (string, error) {
+	if s.history == nil || headSHA == "" {
+		return "", nil
 	}
-	e, ok, err := s.store.EpicForHeadSHA(ctx, s.history, repo, headSHA)
-	if err != nil || !ok {
-		return "" // not an epic PR, or detection itself failed transiently — fail OPEN here
+	e, ok, err := s.store.EpicForHeadSHA(ctx, s.history, repo, headSHA, s.clock.Now())
+	if err != nil {
+		return "", fmt.Errorf("epic-PR detection: %w", err)
+	}
+	if !ok {
+		return "", nil // clean non-match across every epic in the window: an ordinary PR
 	}
 	spec, sb, err := s.store.EpicContractAtHead(s.history, e, headSHA)
 	if err != nil {
-		return fmt.Sprintf("epic %q contract unreadable at PR head: %v", e.ID, err)
+		return fmt.Sprintf("epic %q contract unreadable at PR head: %v", e.ID, err), nil
 	}
 	var reasons []string
 	if ev := epicspec.CheckEvidence(spec, sb); !ev.Clear {
 		reasons = append(reasons, fmt.Sprintf("epic %q evidence incomplete: %s", e.ID, strings.Join(ev.Failures, "; ")))
 	}
-	if out := epicspec.CheckScope(spec.Scope, content.TouchedPaths(actualDiff)); len(out) > 0 {
+	// scope honesty (review F1): the epic's OWN spec file is IMPLICITLY in scope on
+	// top of the author's scope: globs. Every real epic PR necessarily touches it —
+	// epics/INSTRUCTIONS.md MANDATES ## Status updates on the epic's own branch, and
+	// the evidence check above REQUIRES those updates to be present at the PR head —
+	// so matching against the author globs alone would fail every all-green epic on
+	// its own mandatory status commits (a catch-22: the gate's two halves would
+	// contradict each other and the lane could never self-merge anything). Only e's
+	// OWN file is implicit; a diff touching a DIFFERENT epic's file still violates.
+	scope := append(append([]string{}, spec.Scope...), e.FilePath)
+	if out := epicspec.CheckScope(scope, content.TouchedPaths(actualDiff)); len(out) > 0 {
 		reasons = append(reasons, fmt.Sprintf("epic %q scope violation: %s", e.ID, strings.Join(out, ", ")))
 	}
-	return strings.Join(reasons, "; ")
+	return strings.Join(reasons, "; "), nil
 }
 
 type liveMergeCIResult struct {
@@ -819,9 +835,16 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			}
 			// epic-lane Phase 3 (task brief point 2): an epic PR (branch epic/<slug>,
 			// auto-adopted by Phase 0) is judged against the EPIC'S OWN CONTRACT, not as
-			// a generic diff — see epicDenyReason. "" for the overwhelmingly common
-			// non-epic PR (proven byte-identical by TestEpicDenyReasonNonEpicPRNoOp).
-			if reason := s.epicDenyReason(ctx, j.Repo, j.HeadSHA, actualDiff); reason != "" {
+			// a generic diff — see epicDenyReason. ("", nil) for the overwhelmingly
+			// common non-epic PR; a detection ERROR (transient mirror trouble against a
+			// live epic's branch) RETRIES the merge row — never a blind merge of a
+			// possibly-unevidenced epic PR (review F2, same posture as the DiffBetween
+			// error path above).
+			reason, eerr := s.epicDenyReason(ctx, j.Repo, j.HeadSHA, actualDiff)
+			if eerr != nil {
+				return "", fmt.Errorf("verify autonomous merge: %w", eerr)
+			}
+			if reason != "" {
 				if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
 					return "", fmt.Errorf("route self-merge to handoff (epic evidence): %w", rerr)
 				}

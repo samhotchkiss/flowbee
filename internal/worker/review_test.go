@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/samhotchkiss/flowbee/client"
 )
@@ -188,6 +189,53 @@ func TestRenderReviewBriefTruncatesEpicChecklistNotCriteria(t *testing.T) {
 	}
 	if strings.Contains(brief, giantChecklist) {
 		t.Fatal("the full giant checklist must NOT be embedded whole")
+	}
+}
+
+// TestRenderReviewBriefTruncatesGiantEpicCriteria (review F5): the criteria section
+// is only "fixed" per epic, not fixed in SIZE — a pathological Steps list can alone
+// exceed the total cap, so the criteria must ALSO truncate (with a note) rather than
+// being written unconditionally past the argv limit.
+func TestRenderReviewBriefTruncatesGiantEpicCriteria(t *testing.T) {
+	giantCriteria := "UNIQUE_CRITERIA_HEAD_MARKER\n" +
+		strings.Repeat("999. do a pathological amount of step text here\n   Validate: go test ./...\n", 8000)
+	c := &client.LeaseContext{
+		Identity: "r", Task: "t", Diff: "d",
+		EpicCriteria:  giantCriteria,
+		EpicChecklist: "State: done\n- [x] Step 1 — x (evidence: y)\n",
+	}
+	brief := renderReviewBrief("job-1", "code_reviewer", c)
+	if len(brief) > maxTotalBriefBytes {
+		t.Fatalf("rendered brief (%d bytes) must never exceed maxTotalBriefBytes (%d) even for a giant criteria", len(brief), maxTotalBriefBytes)
+	}
+	if !strings.Contains(brief, "UNIQUE_CRITERIA_HEAD_MARKER") {
+		t.Fatal("the criteria's head must survive (truncated from the tail, not dropped)")
+	}
+	if !strings.Contains(brief, "criteria TRUNCATED") {
+		t.Fatal("a truncated criteria must carry an explicit note")
+	}
+	if !strings.Contains(brief, "Claimed status") {
+		t.Fatal("the claimed-status section header must survive even when the criteria was truncated")
+	}
+}
+
+// TestRenderReviewBriefEpicTruncationIsRuneSafe (review F5): a byte-count cut can
+// land mid-rune (the epic checklist format itself uses multi-byte em dashes), and a
+// naive s[:budget] slice would leave invalid UTF-8 in the rendered brief.
+func TestRenderReviewBriefEpicTruncationIsRuneSafe(t *testing.T) {
+	// worst case: the truncatable content is ALL multi-byte runes, so any misaligned
+	// byte cut is guaranteed to split one.
+	c := &client.LeaseContext{
+		Identity: "r", Task: "t", Diff: "d",
+		EpicCriteria:  strings.Repeat("—", 200_000),
+		EpicChecklist: strings.Repeat("—", 200_000),
+	}
+	brief := renderReviewBrief("job-1", "code_reviewer", c)
+	if len(brief) > maxTotalBriefBytes {
+		t.Fatalf("rendered brief (%d bytes) exceeds the cap", len(brief))
+	}
+	if !utf8.ValidString(brief) {
+		t.Fatal("truncation split a multi-byte rune: the rendered brief is not valid UTF-8")
 	}
 }
 

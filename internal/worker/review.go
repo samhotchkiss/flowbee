@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/samhotchkiss/flowbee/client"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
@@ -569,14 +570,14 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 // task brief's required "zero behavior change" for the common case).
 //
 // It participates in the SAME maxTotalBriefBytes cap accounting as the diff (b.Len()
-// tracks everything written so far): if the FULL section (fixed criteria + claimed
-// checklist) fits, both are embedded whole. If not, the FIXED criteria (Goal /
-// Constraints / Steps / reviewer instructions — bounded by how many steps an author
-// wrote, not by how verbose the running agent's evidence prose got) is still written
-// in full, and ONLY the CHECKLIST is truncated to whatever budget remains, with an
-// explicit note — never silently dropped, and never blowing the argv limit the way
-// an unbounded checklist appended after an already-large diff/task/spec could (see
-// the constant's doc for the argv history this guards against).
+// tracks everything written so far): if the FULL section (criteria + claimed
+// checklist) fits, both embed whole. If not, the CHECKLIST truncates first (it is
+// what scales with a running agent's evidence verbosity), and — review F5 — the
+// CRITERIA is bounded too: it is only "fixed" per epic, not fixed in SIZE (a
+// pathological Steps list can alone exceed the cap), so past its own budget it also
+// truncates with a note rather than blowing the argv limit unconditionally. Every
+// cut is rune-boundary-safe (truncateRuneSafe) so a multi-byte character is never
+// split into invalid UTF-8 mid-brief.
 // epicTrailingReserve reserves headroom for the FIXED boilerplate renderReviewBrief
 // always writes AFTER this section regardless of size (the "**Decision:**"/"**Output:**"
 // instructions, and — when the diff itself doesn't fit inline — its forceful
@@ -593,6 +594,11 @@ func writeEpicCriteria(b *strings.Builder, c *client.LeaseContext) {
 	}
 	header := "## Epic Contract — judge this PR AGAINST ITS OWN SPEC, not as a generic diff\n\n"
 	checklistHeader := "### Claimed status (as of this PR's head — VERIFY, don't trust)\n\n"
+	const critTruncNote = "\n\n_...criteria TRUNCATED to fit the brief size cap — the epic file at the PR head " +
+		"carries the full contract; steps not shown are still binding._\n\n"
+	const checklistTruncNote = "\n\n_...checklist TRUNCATED to fit the brief size cap — treat any step not shown above " +
+		"as UNVERIFIED, not as passing; judge primarily from the diff._\n\n"
+	const checklistOmitNote = "_(checklist omitted entirely — no room left in the brief size cap; judge from the diff alone.)_\n\n"
 
 	full := header + criteria + "\n\n" + checklistHeader + c.EpicChecklist + "\n\n"
 	if b.Len()+len(full)+epicTrailingReserve <= maxTotalBriefBytes {
@@ -600,24 +606,51 @@ func writeEpicCriteria(b *strings.Builder, c *client.LeaseContext) {
 		return
 	}
 
-	// won't fit whole: write the header + fixed criteria unconditionally (it is what
-	// tells the reviewer WHAT the epic promised — never sacrifice that), then budget
-	// whatever bytes remain for the checklist alone.
-	fixed := header + criteria + "\n\n"
-	b.WriteString(fixed)
-	const truncNote = "\n\n_...checklist TRUNCATED to fit the brief size cap — treat any step not shown above " +
-		"as UNVERIFIED, not as passing; judge primarily from the diff._\n\n"
-	budget := maxTotalBriefBytes - b.Len() - len(checklistHeader) - len(truncNote) - epicTrailingReserve
+	// won't fit whole: bound the criteria to its own budget (review F5 — leaving
+	// room for at least the checklist section's header + omit note, so the criteria
+	// can never squeeze the claimed-status section out entirely unannounced), then
+	// give the checklist whatever remains.
+	b.WriteString(header)
+	critBudget := maxTotalBriefBytes - b.Len() - epicTrailingReserve -
+		len(critTruncNote) - len(checklistHeader) - len(checklistOmitNote)
+	if len(criteria) > critBudget {
+		b.WriteString(truncateRuneSafe(criteria, critBudget))
+		b.WriteString(critTruncNote)
+	} else {
+		b.WriteString(criteria)
+		b.WriteString("\n\n")
+	}
+	budget := maxTotalBriefBytes - b.Len() - len(checklistHeader) - len(checklistTruncNote) - epicTrailingReserve
 	if budget <= 0 || strings.TrimSpace(c.EpicChecklist) == "" {
 		b.WriteString(checklistHeader)
-		b.WriteString("_(checklist omitted entirely — no room left in the brief size cap; judge from the diff alone.)_\n\n")
+		b.WriteString(checklistOmitNote)
 		return
 	}
-	checklist := c.EpicChecklist
-	if len(checklist) > budget {
-		checklist = checklist[:budget]
+	if checklist := c.EpicChecklist; len(checklist) > budget {
+		b.WriteString(checklistHeader)
+		b.WriteString(truncateRuneSafe(checklist, budget))
+		b.WriteString(checklistTruncNote)
+	} else {
+		b.WriteString(checklistHeader)
+		b.WriteString(checklist)
+		b.WriteString("\n\n")
 	}
-	b.WriteString(checklistHeader)
-	b.WriteString(checklist)
-	b.WriteString(truncNote)
+}
+
+// truncateRuneSafe cuts s to at most max BYTES without ever splitting a multi-byte
+// UTF-8 rune (review F5: a naive s[:max] can land mid-rune — e.g. inside the em
+// dashes the epic checklist format itself uses — leaving invalid UTF-8 in the
+// rendered brief). It backs the cut up to the nearest rune start; max <= 0 returns "".
+func truncateRuneSafe(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

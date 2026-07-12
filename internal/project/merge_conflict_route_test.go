@@ -26,6 +26,10 @@ type fakeHistory struct {
 	// files serves ReadFileAtRef content, keyed ref -> path -> content (the epic
 	// contract read AS OF the PR head).
 	files map[string]map[string]string
+	// fetchErrs scripts a per-branch FetchBranch failure (epic-lane F2: a transient
+	// mirror error against a live epic's branch must RETRY the merge, not wave the
+	// PR through as ordinary).
+	fetchErrs map[string]error
 }
 
 func (f *fakeHistory) CommitHistory(branch, message string, files []gitops.HistoryFile) (string, bool, error) {
@@ -39,6 +43,9 @@ func (f *fakeHistory) HeadSHA(ref string) (string, error) {
 }
 func (f *fakeHistory) FetchBranch(branch string) error {
 	f.fetched = append(f.fetched, branch)
+	if err, ok := f.fetchErrs[branch]; ok {
+		return err
+	}
 	return nil
 }
 func (f *fakeHistory) DiffBetween(base, head string) (string, error) {

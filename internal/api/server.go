@@ -1532,7 +1532,11 @@ func (s *Server) injectEpicCriteria(ctx context.Context, repo, headSHA string, l
 		return
 	}
 	mirror := gitops.Open(mp)
-	e, ok, err := s.store.EpicForHeadSHA(ctx, mirror, repo, headSHA)
+	// a detection error is swallowed HERE (unlike project.go's merge gate, which
+	// must retry on it — see the fail-closed rationale in this function's doc): the
+	// brief is advisory, and there is no retry loop to hand an error to at
+	// lease-grant time.
+	e, ok, err := s.store.EpicForHeadSHA(ctx, mirror, repo, headSHA, s.clock.Now())
 	if err != nil || !ok {
 		return
 	}

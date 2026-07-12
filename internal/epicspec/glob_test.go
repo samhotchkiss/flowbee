@@ -23,6 +23,15 @@ func TestMatchGlob(t *testing.T) {
 		{"*", "anything", true},
 		{"*", "a/b", false}, // bare "*" is single-segment only, unlike ScopeOverlap's bare-star rule
 		{"**", "a/b/c", true},
+		// review F4: `**/` matches ZERO or more whole segments (doublestar semantics) —
+		// a leading `**/*.go` must match a root-level file, not only nested ones.
+		{"**/*.go", "main.go", true},
+		{"**/*.go", "a/b/main.go", true},
+		{"**/*.go", "main.py", false},
+		{"a/**/b", "a/b", true},
+		{"a/**/b", "a/x/b", true},
+		{"a/**/b", "a/x/y/b", true},
+		{"a/**/b", "ab", false},
 	}
 	for _, tc := range cases {
 		if got := MatchGlob(tc.glob, tc.path); got != tc.want {

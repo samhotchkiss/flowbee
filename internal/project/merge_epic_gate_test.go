@@ -2,6 +2,7 @@ package project
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -47,15 +48,21 @@ const epicAllGreenChecklist = "- [x] Step 1 — first step (evidence: go test pa
 
 // TestEpicGateAllGreenMergesAutonomously: an epic PR whose ## Status claims State:
 // done, every step checked with evidence, and no blockers, and whose diff stays
-// inside scope: — merges autonomously exactly like an ordinary clean PR.
+// inside scope: — merges autonomously exactly like an ordinary clean PR. The diff
+// deliberately INCLUDES the epic's own epics/<slug>.md (review F1): every REAL epic
+// PR touches it, because epics/INSTRUCTIONS.md mandates ## Status updates on the
+// epic's own branch — so the realistic all-green case is scope-globs + the epic
+// file, and the file must be implicitly in scope or the lane could never self-merge
+// anything (the catch-22 the review caught).
 func TestEpicGateAllGreenMergesAutonomously(t *testing.T) {
 	st, fake, sender, _ := newSender(t)
 	ctx := context.Background()
 
 	mustRegisterEpic(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
 	fh := &fakeHistory{
-		tip:     "t",
-		diffOut: diffAdding("app/foo/a.go", "// x"),
+		tip: "t",
+		diffOut: diffAdding("app/foo/a.go", "// x") +
+			diffAdding("epics/2026-07-03-foo.md", "- [x] Step 2 — second step (evidence: go test bar passed)"),
 		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
 		files:   map[string]map[string]string{"epic-head-sha": {"epics/2026-07-03-foo.md": epicFile("done", "none", epicAllGreenChecklist)}},
 	}
@@ -74,10 +81,112 @@ func TestEpicGateAllGreenMergesAutonomously(t *testing.T) {
 	}
 	if !sent {
 		j, _ := st.GetJob(ctx, "j")
-		t.Fatalf("an all-green epic PR must merge autonomously; calls=%v state=%s", fake.Calls(), j.State)
+		t.Fatalf("an all-green epic PR (own status-file commits included) must merge autonomously; calls=%v state=%s", fake.Calls(), j.State)
 	}
 	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateMerging {
 		t.Fatalf("state=%s, want merging (still in flight toward the merge queue)", j.State)
+	}
+}
+
+// TestEpicGateOtherEpicsFileIsStillOutOfScope (review F1): only the epic's OWN
+// spec file is implicitly in scope; a diff touching a DIFFERENT epic's file must
+// still fail the scope-honesty check and route to handoff.
+func TestEpicGateOtherEpicsFileIsStillOutOfScope(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+
+	mustRegisterEpic(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
+	fh := &fakeHistory{
+		tip: "t",
+		diffOut: diffAdding("epics/2026-07-03-foo.md", "- [x] Step 2 (evidence: ...)") +
+			diffAdding("epics/2026-07-01-other-epic.md", "tampered status"),
+		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
+		files:   map[string]map[string]string{"epic-head-sha": {"epics/2026-07-03-foo.md": epicFile("done", "none", epicAllGreenChecklist)}},
+	}
+	sender.WithHistory(fh, "main")
+	epicMergingJob(t, st, "j", "russ", "epic-head-sha")
+	setLiveGreenPR(fake, 42, "base-sha", "epic-head-sha")
+
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	for _, c := range fake.Calls() {
+		if c == "EnqueueMergeQueue(42)" {
+			t.Fatal("a diff touching ANOTHER epic's file must NOT self-merge")
+		}
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateMergeHandoff {
+		t.Fatalf("state=%s, want merge_handoff (another epic's file is out of scope)", j.State)
+	}
+}
+
+// TestEpicGateTransientFetchErrorRetries (review F2): a transient mirror error
+// fetching a LIVE epic's branch during detection must RETRY the merge (row stays
+// pending, job stays merging) — never merge blind (the PR might be that epic's,
+// unevidenced) and never handoff (nothing is proven wrong with it either).
+func TestEpicGateTransientFetchErrorRetries(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+
+	mustRegisterEpic(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
+	fh := &fakeHistory{
+		tip:       "t",
+		diffOut:   diffAdding("docs/notes.md", "clean ordinary change"),
+		fetchErrs: map[string]error{"epic/2026-07-03-foo": errors.New("connection reset by peer")},
+	}
+	sender.WithHistory(fh, "main")
+	epicMergingJob(t, st, "j", "russ", "some-head-sha")
+	setLiveGreenPR(fake, 42, "base-sha", "some-head-sha")
+
+	_, _ = sender.DrainOnce(ctx)
+
+	for _, c := range fake.Calls() {
+		if c == "EnqueueMergeQueue(42)" {
+			t.Fatal("merge was sent despite epic-PR detection failing — must retry, not merge blind")
+		}
+	}
+	j, _ := st.GetJob(ctx, "j")
+	if j.State != job.StateMerging {
+		t.Fatalf("state=%s, want merging (a detection error retries, not handoff/merge)", j.State)
+	}
+	row, ok, _ := st.NextPendingOutbox(ctx)
+	if !ok || row.Action != store.ActionEnqueueMerge {
+		t.Fatal("the merge row must remain pending for retry after a detection error")
+	}
+}
+
+// TestEpicGateMissingEpicBranchIsOrdinaryPR (review F2's clean-non-match half): a
+// registered epic whose branch does not exist at origin yet (git's "couldn't find
+// remote ref" — a just-launched, not-yet-pushed epic) must NOT block an ordinary
+// PR's merge; the PR merges via the ordinary path.
+func TestEpicGateMissingEpicBranchIsOrdinaryPR(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+
+	mustRegisterEpic(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
+	fh := &fakeHistory{
+		tip:     "t",
+		diffOut: diffAdding("docs/notes.md", "clean ordinary change"),
+		fetchErrs: map[string]error{
+			"epic/2026-07-03-foo": errors.New("fetch epic/2026-07-03-foo: fatal: couldn't find remote ref refs/heads/epic/2026-07-03-foo"),
+		},
+	}
+	sender.WithHistory(fh, "main")
+	epicMergingJob(t, st, "j", "russ", "some-head-sha")
+	setLiveGreenPR(fake, 42, "base-sha", "some-head-sha")
+
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	sent := false
+	for _, c := range fake.Calls() {
+		if c == "EnqueueMergeQueue(42)" {
+			sent = true
+		}
+	}
+	if !sent {
+		j, _ := st.GetJob(ctx, "j")
+		t.Fatalf("an ordinary PR must merge even while a registered epic's branch is un-pushed; calls=%v state=%s", fake.Calls(), j.State)
 	}
 }
 

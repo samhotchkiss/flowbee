@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
@@ -109,7 +110,7 @@ func TestInjectEpicCriteriaPopulatesLeaseContext(t *testing.T) {
 	// deliberate regression case: an earlier draft of EpicForHeadSHA rejected repo=="",
 	// which would have made Epic-PR detection permanently dead code for every
 	// non-F9 (single managed repo) deployment.
-	srv := &Server{store: st, mirrorPath: mirrorPath}
+	srv := &Server{store: st, mirrorPath: mirrorPath, clock: clock.Real{}}
 	lc := &LeaseContext{}
 	srv.injectEpicCriteria(context.Background(), "", headSHA, lc)
 
@@ -143,7 +144,7 @@ func TestInjectEpicCriteriaNonEpicPRNoOp(t *testing.T) {
 		t.Fatalf("register epic: %v", err)
 	}
 
-	srv := &Server{store: st, mirrorPath: mirrorPath}
+	srv := &Server{store: st, mirrorPath: mirrorPath, clock: clock.Real{}}
 	lc := &LeaseContext{}
 	srv.injectEpicCriteria(context.Background(), "", "some-ordinary-pr-head-sha", lc)
 
@@ -157,7 +158,7 @@ func TestInjectEpicCriteriaNonEpicPRNoOp(t *testing.T) {
 // no panic, no mirror I/O attempted.
 func TestInjectEpicCriteriaNoMirrorConfiguredNoOp(t *testing.T) {
 	st := testutil.NewStore(t)
-	srv := &Server{store: st, mirrorPath: ""}
+	srv := &Server{store: st, mirrorPath: "", clock: clock.Real{}}
 	lc := &LeaseContext{}
 	srv.injectEpicCriteria(context.Background(), "", "any-head-sha", lc)
 	if lc.EpicCriteria != "" || lc.EpicChecklist != "" {
