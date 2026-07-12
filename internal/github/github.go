@@ -438,7 +438,7 @@ func NewRealClient(owner, repo string, token func(ctx context.Context) (string, 
 		Owner:    owner,
 		Repo:     repo,
 		Token:    token,
-		HTTP:     &http.Client{Timeout: 30 * time.Second},
+		HTTP:     &http.Client{Timeout: 90 * time.Second},
 		Endpoint: "https://api.github.com/graphql",
 	}
 }
@@ -467,10 +467,10 @@ query BoardSweep($owner:String!, $repo:String!, $prCursor:String, $issueCursor:S
       pageInfo { hasNextPage endCursor }
       nodes { ...prFields }
     }
-    mergedPullRequests: pullRequests(first:50, states:[MERGED], orderBy:{field:UPDATED_AT, direction:DESC}) @include(if: $includeMerged) {
+    mergedPullRequests: pullRequests(first:20, states:[MERGED], orderBy:{field:UPDATED_AT, direction:DESC}) @include(if: $includeMerged) {
       nodes { ...prFields }
     }
-    closedPullRequests: pullRequests(first:50, states:[CLOSED], orderBy:{field:UPDATED_AT, direction:DESC}) @include(if: $includeMerged) {
+    closedPullRequests: pullRequests(first:20, states:[CLOSED], orderBy:{field:UPDATED_AT, direction:DESC}) @include(if: $includeMerged) {
       nodes { ...prFields }
     }
     issues(first:50, after:$issueCursor, states:[OPEN], orderBy:{field:UPDATED_AT, direction:DESC}) {
@@ -499,7 +499,16 @@ func (c *RealClient) graphQL(ctx context.Context, query string, vars map[string]
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, rerr := io.ReadAll(resp.Body)
+	if rerr != nil {
+		// A truncated body read (client timeout mid-stream, HTTP/2 stream reset, or a
+		// dropped connection under load) previously fell through with the error SILENTLY
+		// DISCARDED, so the partial body then failed json.Unmarshal as "unexpected end of
+		// JSON input" — a confusing, permanent-looking decode failure on the heavy
+		// BoardSweep read (russ, ~725KB). Surface it as a retryable read error instead so
+		// the reconcile loop simply re-sweeps next cycle rather than poisoning on a partial.
+		return fmt.Errorf("read graphql response body: %w", rerr)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("graphql %d: %s", resp.StatusCode, string(raw))
 	}
