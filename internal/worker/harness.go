@@ -85,6 +85,10 @@ func bootstrapAdoptedRebuild(wsDir string, c *client.LeaseContext) error {
 	return nil
 }
 
+func adoptedRepairHeadMatches(authoritativeHead, remoteTip string, exists bool) bool {
+	return exists && authoritativeHead != "" && remoteTip != "" && remoteTip == authoritativeHead
+}
+
 // renderTaskMarkdown renders the resolved context block as the .flowbee/task.md
 // brief the agent reads. Deterministic given the inputs (no clock).
 func renderTaskMarkdown(jobID string, c *client.LeaseContext) string {
@@ -809,7 +813,21 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 	// change), NOT the issue-branch tip — it re-applies this job's change on top of main
 	// below. Every other role stacks on the issue branch so node commits accumulate.
 	if issueBranch != "" && repoURL != "" && !isConflict {
-		if tip, exists, terr := mirror.RemoteBranchTip(repoURL, issueBranch); terr == nil && exists && tip != "" {
+		tip, exists, terr := mirror.RemoteBranchTip(repoURL, issueBranch)
+		if adoptedRepair && (terr != nil || !adoptedRepairHeadMatches(grant.Context.AuthoritativeHeadSHA, tip, exists)) {
+			// The lease's HeadSHA is the last reconciled GitHub headRefOid. Never repair
+			// whatever happens to be at the branch when provisioning: if it moved after
+			// claim, that new cumulative patch has not been reconciled into the job yet.
+			// Abandon without penalty so reconciliation can re-arm from the new
+			// authoritative PR diff; in particular, do not run the agent or create a
+			// replacement PR from stale lease context.
+			_, _ = c.ReleaseNoPenalty(ctx, grant.JobID, grant.LeaseEpoch)
+			if terr != nil {
+				return out, fmt.Errorf("verify adopted PR head %s: %w", issueBranch, terr)
+			}
+			return out, fmt.Errorf("adopted PR head %s moved from authoritative %s to %s", issueBranch, grant.Context.AuthoritativeHeadSHA, tip)
+		}
+		if terr == nil && exists && tip != "" {
 			if ferr := mirror.FetchRef(repoURL, "refs/heads/"+issueBranch, "refs/flowbee/issue-tip/"+grant.JobID); ferr == nil {
 				startRef = tip
 				if !adoptedRepair && grant.BaseSHA != "" {

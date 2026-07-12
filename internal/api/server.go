@@ -1033,6 +1033,9 @@ type LeaseContext struct {
 	Role        string `json:"role"`
 	// BaseSHA is the SHA the task applies to (echoed for the worktree checkout).
 	BaseSHA string `json:"base_sha,omitempty"`
+	// AuthoritativeHeadSHA is the reconciled GitHub PR headRefOid. Adopted repair
+	// workers compare the live foreign branch to it before provisioning.
+	AuthoritativeHeadSHA string `json:"authoritative_head_sha,omitempty"`
 	// Task / Spec / Acceptance are the human intent the agent must satisfy.
 	Task               string `json:"task,omitempty"`
 	Spec               string `json:"spec,omitempty"`
@@ -1393,14 +1396,15 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 	}
 	grant.Context = &LeaseContext{
 		Identity: identity, ModelFamily: family, Lens: ctxLens, Role: string(j.Role),
-		Adopted:             j.Adopted,
-		BaseSHA:             j.BaseSHA,
-		Task:                j.TaskText,
-		Spec:                j.SpecText,
-		AcceptanceCriteria:  j.AcceptanceCriteria,
-		PriorVerdict:        j.Verdict,
-		PriorReviewFindings: j.LastReviewNotes,
-		StuckHint:           j.StuckHint,
+		Adopted:              j.Adopted,
+		BaseSHA:              j.BaseSHA,
+		AuthoritativeHeadSHA: j.HeadSHA,
+		Task:                 j.TaskText,
+		Spec:                 j.SpecText,
+		AcceptanceCriteria:   j.AcceptanceCriteria,
+		PriorVerdict:         j.Verdict,
+		PriorReviewFindings:  j.LastReviewNotes,
+		StuckHint:            j.StuckHint,
 	}
 	// the per-issue branch the node commits to (worker-push): builds + reviews
 	// both target it. Resolved from the job's bound issue (adopted) or its spec

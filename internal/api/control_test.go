@@ -187,6 +187,9 @@ func TestAdoptedRebuildLeaseCarriesCumulativePRDiff(t *testing.T) {
 	if g.Context.IssueBranch != "hotfix/mail-temporal-red-main" {
 		t.Fatalf("adopted rebuild branch=%q, want GitHub-visible PR branch", g.Context.IssueBranch)
 	}
+	if g.Context.AuthoritativeHeadSHA != "reviewed-head" {
+		t.Fatalf("adopted rebuild authoritative head=%q, want reviewed-head", g.Context.AuthoritativeHeadSHA)
+	}
 }
 
 func TestLeaseGrantCarriesExplicitEmptyAdoptedPRDiff(t *testing.T) {
