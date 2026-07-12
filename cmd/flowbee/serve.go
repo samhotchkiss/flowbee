@@ -406,7 +406,7 @@ func runServe(args []string) error {
 					logger.Warn("🩹 forward-progress watchdog acted",
 						"resynced_projection", rep.Resynced, "escalated_to_human", rep.Escalated)
 				}
-				// self-unblock janitor (0025): the sibling that moves MECHANICALLY-recoverable
+				// self-unblock janitor (0023): the sibling that moves MECHANICALLY-recoverable
 				// jobs BACK OUT of the needs_human sink — bounded, cooled-down, breaker-gated —
 				// so a transient stall no longer needs an operator to run `flowbee requeue`. Only
 				// `stall` is auto-recovered today; semantic dead-ends stay parked for a human.

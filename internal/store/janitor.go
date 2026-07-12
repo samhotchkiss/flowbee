@@ -85,7 +85,7 @@ type unblockCandidate struct {
 	nextAt       string
 }
 
-// JanitorUnblock is the automatic exit from the needs_human sink (0025). It is the
+// JanitorUnblock is the automatic exit from the needs_human sink (0023). It is the
 // forward-progress watchdog's sibling: where ReconcileStuck ESCALATES a wedged job TO
 // needs_human, the janitor moves the MECHANICALLY-recoverable ones back OUT — bounded,
 // cooled-down, breaker-gated, and signal-preserving — so a transient stall no longer needs

@@ -110,7 +110,7 @@ type Config struct {
 	// FLOWBEE_BACKUP_KEEP.
 	BackupKeep int `yaml:"backup_keep"`
 
-	// SelfUnblockDisabled is the kill-switch for the self-unblock janitor (0025): the
+	// SelfUnblockDisabled is the kill-switch for the self-unblock janitor (0023): the
 	// forward-progress watchdog's sibling that auto-requeues MECHANICALLY-stuck jobs
 	// (currently `stall`) out of the needs_human sink, bounded + breaker-gated, so a
 	// transient stall no longer needs an operator to run `flowbee requeue`. Default false

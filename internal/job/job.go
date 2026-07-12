@@ -381,7 +381,7 @@ type Job struct {
 	MaxBounces       int
 	StallRevocations int
 
-	// self-unblock janitor bookkeeping (0025). UnblockAttempts counts how many times the
+	// self-unblock janitor bookkeeping (0023). UnblockAttempts counts how many times the
 	// forward-progress janitor has AUTO-requeued this job out of the needs_human sink for a
 	// mechanical reason (distinct from Attempts, which counts worker build attempts and is
 	// NEVER reset by the janitor). LastProgressSHA is the head||base snapshot taken at the

@@ -90,7 +90,7 @@ const (
 	KindConflictResolved EventKind = "conflict_resolved" // resolver returned the resolved diff -> review_pending (re-review + re-CI)
 	KindStackedRebased   EventKind = "stacked_rebased"   // a parent PR merged -> auto-rebase + re-arm this descendant (supersede)
 
-	// Self-unblock janitor (0025). KindJanitorUnblocked is the AUTOMATIC exit from the
+	// Self-unblock janitor (0023). KindJanitorUnblocked is the AUTOMATIC exit from the
 	// needs_human sink for a MECHANICAL escalation reason (currently `stall`): the
 	// forward-progress watchdog re-arms the parked job back to its own entry stage
 	// (ready / spec_authoring) WITHOUT resetting the attempts/bounces budget (so a job
@@ -312,7 +312,7 @@ func Fold(events []Event) (job.Job, error) {
 				}
 			}
 		case KindJanitorUnblocked:
-			// 0025: the forward-progress janitor auto-requeued a needs_human job out of the
+			// 0023: the forward-progress janitor auto-requeued a needs_human job out of the
 			// sink for a MECHANICAL reason. Re-arm to the entry stage and clear the prior
 			// attempt's artifacts (fresh build candidate) — mirroring the operator requeue —
 			// but PRESERVE attempts/bounces/stall_revocations (the janitor is bounded, not a
