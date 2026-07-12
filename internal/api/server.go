@@ -1380,6 +1380,20 @@ func truthyQuery(v string) bool {
 }
 
 func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, identity, family, lens string, role job.Role, reviewing, resolvingConflict bool, leaseID string, leaseEpoch int, leaseDeadline time.Time, dryRun bool) LeaseGrant {
+	authoritativeHeadSHA := j.HeadSHA
+	// A reconciled external movement supersedes an adopted repair and deliberately
+	// clears jobs.head_sha: that field must never remain merge/review authority for
+	// the previous PR head. The re-armed builder nevertheless has to provision from
+	// the new GitHub-visible head. Read it from Domain B, which is the authority for
+	// an adopted PR's headRefOid, rather than restoring it to the Domain-A projection.
+	// If facts are absent or do not still name this PR, leave the field empty so the
+	// worker's exact-head guard fails closed before it writes anything.
+	if j.Adopted && j.PRNumber > 0 && role == job.RoleEngWorker && authoritativeHeadSHA == "" {
+		if facts, ok, err := (store.DBFactSource{DB: s.store.DB}).Facts(ctx, jobID); err == nil && ok &&
+			facts.PRExists && facts.PRNumber == j.PRNumber && facts.HeadSHA != "" {
+			authoritativeHeadSHA = facts.HeadSHA
+		}
+	}
 	grant := LeaseGrant{
 		JobID: jobID, Kind: string(j.Kind), Role: string(j.Role),
 		BaseSHA: j.BaseSHA, LeaseID: leaseID, LeaseEpoch: leaseEpoch,
@@ -1398,7 +1412,7 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 		Identity: identity, ModelFamily: family, Lens: ctxLens, Role: string(j.Role),
 		Adopted:              j.Adopted,
 		BaseSHA:              j.BaseSHA,
-		AuthoritativeHeadSHA: j.HeadSHA,
+		AuthoritativeHeadSHA: authoritativeHeadSHA,
 		Task:                 j.TaskText,
 		Spec:                 j.SpecText,
 		AcceptanceCriteria:   j.AcceptanceCriteria,
