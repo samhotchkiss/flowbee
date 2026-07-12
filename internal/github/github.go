@@ -972,7 +972,21 @@ func (c *RealClient) PullRequestDiff(ctx context.Context, number int, baseSHA, h
 		return "", err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, rerr := io.ReadAll(resp.Body)
+	if rerr != nil {
+		// A truncated body read (client timeout mid-stream, HTTP/2 stream reset, or a
+		// dropped connection under load) previously fell through with the error SILENTLY
+		// DISCARDED, so a partial — or fully EMPTY — buffer was returned as the PR's
+		// authoritative diff with err=nil. Downstream that is catastrophic-but-quiet:
+		// AdoptPRForReview persists patch_diff='' with diff_empty=1 ("authoritatively
+		// empty") for a PR that has real changes, the review grant then ships the stored
+		// empty diff, and nothing re-heals it (the sweep's adopt gate rightly skips an
+		// already-tracked unchanged PR — the accidental per-sweep re-fetch that used to
+		// paper over this is gone). Same swallowed-ReadAll class as the BoardSweep
+		// "unexpected end of JSON input" outage. Surface the read error instead: the
+		// adopt fails cleanly (no job inserted), and the next sweep retries fresh.
+		return "", fmt.Errorf("read pr #%d diff response body: %w", number, rerr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", &ErrGitHub{StatusCode: resp.StatusCode, Method: http.MethodGet, Path: req.URL.Path, Body: string(raw)}
 	}
@@ -1027,7 +1041,7 @@ func (c *RealClient) rest(ctx context.Context, method, path string, body any, ou
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, rerr := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
 		// 403/429 with a rate-limit signal (Retry-After OR X-RateLimit-Remaining:0 + Reset)
 		// is a TEMPORARY outage, not a poison 4xx — back off until the window resets rather
@@ -1038,6 +1052,18 @@ func (c *RealClient) rest(ctx context.Context, method, path string, body any, ou
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return &ErrRetryAfter{RetryAfter: 60 * time.Second} // 429 with no headers: default backoff
 		}
+	}
+	if rerr != nil {
+		// Same swallowed-ReadAll class as the BoardSweep truncation outage (graphQL above)
+		// and the PullRequestDiff empty-diff hazard: a body truncated mid-stream previously
+		// fell through with the error DISCARDED, so a 2xx decoded a partial buffer as
+		// "unexpected end of JSON input" (a permanent-looking decode failure) and a non-2xx
+		// built its ErrGitHub from a partial body. Surface the read error as a plain
+		// (transient) error instead — the serialized sender retries it rather than
+		// dead-lettering — and only AFTER the rate-limit branch above, which needs headers
+		// alone and must still park the outbox even when the body read broke. If the status
+		// really was a permanent 4xx, the retry re-reads it intact and dead-letters then.
+		return fmt.Errorf("read %s %s response body (status %d): %w", method, path, resp.StatusCode, rerr)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &ErrGitHub{StatusCode: resp.StatusCode, Method: method, Path: path, Body: string(raw)}
