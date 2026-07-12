@@ -313,20 +313,31 @@ func (w *Watcher) autoResume(ctx context.Context, s store.GoalSession, now time.
 
 // paneShowsUnsubmittedResume reports whether the pane's last non-empty line is the
 // swallowed-Enter failure mode: "/goal resume" sitting UNSUBMITTED in the input
-// line. EXACT match required (review MAJOR #2b) — after stripping the TUI's input
-// prompt glyph (`›`/`>`), the trimmed line must equal exactly "/goal resume":
+// line. Thin wrapper over the generalized paneShowsUnsubmittedText (epic-lane
+// Phase 2 reuses the same exact-match verify mechanics for the epic launch's goal
+// text — see launch.go) — kept as its own named function since "/goal resume" is
+// the one Phase-1 payload the watchdog's OWN autoResume path sends.
+func paneShowsUnsubmittedResume(pane string) bool {
+	return paneShowsUnsubmittedText(pane, "/goal resume")
+}
+
+// paneShowsUnsubmittedText reports whether the pane's last non-empty line is
+// EXACTLY the given text sitting UNSUBMITTED in the input line (the swallowed-
+// Enter failure mode). EXACT match required (review MAJOR #2b) — after stripping
+// the TUI's input prompt glyph (`›`/`>`), the trimmed line must equal `text`
+// verbatim:
 //   - a Contains check misfires on the legitimately blocked status line itself
 //     ("Goal blocked (/goal resume)" — codex's own hint text renders the substring),
 //   - on a submitted-and-ECHOED transcript line that merely quotes the command,
 //   - and worst, it would press Enter under a HUMAN's edited input like
-//     "/goal resume && x", submitting keystrokes the watcher never typed.
+//     "<text> && x", submitting keystrokes the watcher never typed.
 //
-// Anything that is not the exact unsubmitted command → no bare Enter (fail toward
-// no keystroke; the next 2-minute pass re-evaluates from scratch).
-func paneShowsUnsubmittedResume(pane string) bool {
+// Anything that is not the exact unsubmitted text → no bare Enter (fail toward no
+// keystroke; the next tick / caller re-evaluates from scratch).
+func paneShowsUnsubmittedText(pane, text string) bool {
 	line := lastNonEmptyLine(pane)
 	line = strings.TrimSpace(strings.TrimLeft(line, "›>")) // strip the input-prompt glyph(s)
-	return line == "/goal resume"
+	return line == text
 }
 
 // bumpScrollbackFail / resetScrollbackFail maintain the per-session consecutive

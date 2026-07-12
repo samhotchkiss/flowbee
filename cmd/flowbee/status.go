@@ -107,6 +107,12 @@ func runStatus(args []string) error {
 			summary.UsageWarnings = append(summary.UsageWarnings, a)
 		}
 	}
+	// epic-lane surface (Phase 2): every ACTIVE epic (launching/running/blocked —
+	// terminal ones are noise in the at-a-glance view; `flowbee epic status` shows
+	// the full history). Same local-DB, no-network posture as goal sessions above.
+	if epics, eerr := st.ListActiveEpicRuns(ctx); eerr == nil {
+		summary.ActiveEpics = epics
+	}
 
 	if *jsonOut {
 		return printStatusJSON(os.Stdout, summary)
@@ -192,8 +198,11 @@ type statusSummary struct {
 	// approaching its usage ceiling — populated by runStatus directly from the DB
 	// (not by summarizeStatus, which stays a pure function over BoardJob/FleetHealth
 	// for testability; these two are appended by the caller after the fact).
-	GoalSessions           []store.GoalSession     `json:"goal_sessions,omitempty"`
-	UsageWarnings          []store.AccountUsageRow `json:"usage_warnings,omitempty"`
+	GoalSessions  []store.GoalSession     `json:"goal_sessions,omitempty"`
+	UsageWarnings []store.AccountUsageRow `json:"usage_warnings,omitempty"`
+	// ActiveEpics is the epic-lane (Phase 2) surface: every in-flight epic, same
+	// "appended by runStatus after the fact" posture as GoalSessions above.
+	ActiveEpics            []store.EpicRun `json:"active_epics,omitempty"`
 	liveModelBreakdownOnly map[string]int
 }
 
@@ -340,6 +349,19 @@ func printStatusSummary(w io.Writer, summary statusSummary) {
 		fmt.Fprintln(w, "\n⚠ account usage approaching ceiling:")
 		for _, a := range summary.UsageWarnings {
 			fmt.Fprintf(w, "  %s (%s): %d%% of %d%% ceiling\n", a.AccountID, a.ModelFamily, a.UsagePct, a.CeilingPct)
+		}
+	}
+	// epic lane (Phase 2): a compact "id · host · state (step N/M)" line per active
+	// epic. Full detail (blockers, session-liveness, updated-age) lives in the
+	// dedicated `flowbee epic status` table — this is the at-a-glance version.
+	if len(summary.ActiveEpics) > 0 {
+		fmt.Fprintln(w, "\nepics:")
+		for _, e := range summary.ActiveEpics {
+			step := ""
+			if e.StatusStepsTotal > 0 {
+				step = fmt.Sprintf(" (step %d/%d)", e.StatusCurrentStep, e.StatusStepsTotal)
+			}
+			fmt.Fprintf(w, "  %s · %s · %s%s\n", e.ID, dashIfEmpty(e.Host), e.State, step)
 		}
 	}
 }

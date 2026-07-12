@@ -136,6 +136,10 @@ func main() {
 		err = runResume(args)
 	case "session":
 		err = runSession(args)
+	case "host":
+		err = runHost(args)
+	case "epic":
+		err = runEpic(args)
 	case "version", "-v", "--version":
 		err = runVersion(args)
 	default:
@@ -150,5 +154,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|list|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|adopt|cancel|retry-outbox|backup|build|restore|pause|resume|session|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|list|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|adopt|cancel|retry-outbox|backup|build|restore|pause|resume|session|host|epic|seed|version>")
 }

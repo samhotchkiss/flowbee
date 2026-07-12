@@ -75,6 +75,108 @@ func sendEnterCmd(box, tmuxName string) string {
 	return remoteWrap(box, "tmux send-keys -t "+shQuote(tmuxName)+" Enter")
 }
 
+// ── epic-lane Phase 2 additions ──
+//
+// The closed verb set above (capture-pane / send "/goal resume" / bare Enter) was
+// Phase 1's whole surface. Phase 2 deliberately extends it — the design doc calls
+// out "this is the ONE other permitted send-keys payload" — to launch a NEW tmux
+// session and send an epic's goal text, plus a handful of read-only PREFLIGHT
+// checks (gh auth, disk space, checkout presence) that never touch tmux at all.
+// Every function below still returns a fully-formed command string built ONLY from
+// the caller's own trusted inputs (a registered host name, a validated slug/repo
+// id, a goal-text TEMPLATE the launcher builds — never raw epic file content) —
+// same posture as the Phase 1 set: Runner only ever sees a string these functions
+// constructed, never one assembled from anything read off a pane or a file.
+
+// HomeDirCmd resolves a box's home directory as a LITERAL path (`echo $HOME`,
+// expanded by the target shell since it's embedded unquoted in the whole inner
+// command, not inside a shQuote'd argument). The epic launcher calls this ONCE per
+// launch and builds the checkout path (home + "/epics/" + repoID) from the
+// returned literal string — deliberately NOT by embedding "$HOME" itself inside a
+// path that other commands later shQuote() as an argument, since shQuote's single
+// quotes would suppress the shell's own variable expansion right when it's needed.
+func HomeDirCmd(box string) string {
+	return remoteWrap(box, "echo $HOME")
+}
+
+// GhAuthStatusCmd checks whether the box's `gh` CLI is authenticated — the epic
+// preflight's first gate (epics/INSTRUCTIONS.md's Finish step opens a PR via `gh`,
+// so an epic that can't authenticate now will just fail hours or days later at the
+// worst possible moment). A non-nil Runner error (nonzero exit) means NOT
+// authenticated; the caller decides what to do with that.
+func GhAuthStatusCmd(box string) string {
+	return remoteWrap(box, "gh auth status")
+}
+
+// DiskFreeKBCmd reports free disk space (in KB) at path via `df`, as a bare
+// number the caller parses — the epic preflight's "disk ≥10G free" gate.
+func DiskFreeKBCmd(box, path string) string {
+	return remoteWrap(box, "df -Pk -- "+shQuote(path)+" 2>/dev/null | tail -n1 | awk '{print $4}'")
+}
+
+// RepoCheckoutExistsCmd reports "yes"/"no" for whether a git checkout already
+// exists at path — the epic preflight's "repo checkout exists or clone it fresh"
+// branch point.
+func RepoCheckoutExistsCmd(box, path string) string {
+	return remoteWrap(box, "test -d "+shQuote(path)+"/.git && echo yes || echo no")
+}
+
+// CloneRepoCmd clones ownerRepo ("owner/repo") to path via `gh repo clone` —
+// deliberately `gh`, not a raw `git clone` with a token-bearing URL: the preflight
+// already required `gh auth status` to pass, so the same credential (never placed
+// in argv, unlike a token-bearing https URL would be — `ps` on the remote box is
+// world-readable) clones the epic's checkout. mkdir -p's the parent first since
+// the ~/epics/ convention directory may not exist yet on a freshly provisioned box.
+func CloneRepoCmd(box, ownerRepo, path string) string {
+	return remoteWrap(box, "mkdir -p -- "+shQuote(parentDirUnix(path))+
+		" && gh repo clone "+shQuote(ownerRepo)+" "+shQuote(path)+" -- --quiet")
+}
+
+// TimezoneCmd probes a box's IANA timezone name (the `flowbee epic start --tz`
+// auto-detect path, per the task brief's "get tz from `ssh <host> date` zone").
+// timedatectl is the modern/reliable source on systemd Linux; /etc/timezone and a
+// bare `date +%Z` (which yields an abbreviation like "MST", NOT an IANA name, but
+// is the last-resort signal something responded at all) are fallbacks for boxes
+// without systemd. The caller validates the result via time.LoadLocation and
+// falls back to "" (assume serve-local, the documented goal_sessions default) on
+// anything that doesn't resolve — mirroring AddGoalSession's own tz validation.
+func TimezoneCmd(box string) string {
+	return remoteWrap(box, "timedatectl show --property=Timezone --value 2>/dev/null || "+
+		"cat /etc/timezone 2>/dev/null || date +%Z")
+}
+
+// NewTmuxSessionCmd creates a fresh DETACHED tmux session running startCmd in dir
+// — the epic launch's first step (`tmux new-session -d -s <name> -c <dir>
+// '<startCmd>'`). startCmd is the coding agent's own launch invocation (e.g.
+// "codex"), built by the caller from the epic's `agent:` frontmatter/--agent flag,
+// never from epic file body content.
+func NewTmuxSessionCmd(box, tmuxName, dir, startCmd string) string {
+	return remoteWrap(box, "tmux new-session -d -s "+shQuote(tmuxName)+
+		" -c "+shQuote(dir)+" "+shQuote(startCmd))
+}
+
+// SendGoalCmd sends literal text + Enter into an existing tmux pane — the ONE
+// additional send-keys payload epic-lane Phase 2 adds to the closed verb set (see
+// the section doc above). text is always the fixed "/goal execute the epic at
+// epics/<file>.md per epics/INSTRUCTIONS.md. Work on branch epic/<slug>." template
+// the launcher builds from trusted inputs (repo id, slug), mirroring sendResumeCmd's
+// shape exactly but parameterized since the payload differs per epic.
+func SendGoalCmd(box, tmuxName, text string) string {
+	return remoteWrap(box, "tmux send-keys -t "+shQuote(tmuxName)+" "+shQuote(text)+" Enter")
+}
+
+// parentDirUnix returns the parent directory of a UNIX-style (forward-slash) path,
+// without relying on path/filepath (which is OS-path-separator-aware and would be
+// wrong when this control plane runs on a different OS than the remote box). A
+// path with no "/" has no parent worth creating ("."; mkdir -p . is a harmless
+// no-op).
+func parentDirUnix(p string) string {
+	if idx := strings.LastIndexByte(p, '/'); idx > 0 {
+		return p[:idx]
+	}
+	return "."
+}
+
 // remoteWrap wraps inner in an ssh invocation when box is non-empty (” == local,
 // matching the Repo.DefaultBranch-style convention used elsewhere in the store).
 // The ssh form from the task brief: BatchMode (never prompt/hang on a password/

@@ -483,6 +483,30 @@ func runServe(args []string) error {
 		logger.Info("👁️  goal-session watchdog enabled (2m tick)")
 	}
 
+	// epic-lane status ingestion (Phase 2, § task brief point 4): reads each ACTIVE
+	// epic's own branch (epic/<slug>, never main — spec-frozen once triggered) off
+	// its repo's control-plane mirror and folds a leniently-parsed ## Status into the
+	// epics row. A PARALLEL tick, not folded into the 45s mirror-refresh loop above —
+	// that loop is gated on FLOWBEE_MIRROR_PATH (legacy single-repo path) and only
+	// walks repos.ListRepos, whereas this needs to walk ACTIVE EPICS and derive their
+	// repo from that, a different iteration shape; keeping them separate also means a
+	// wedged epic-branch fetch can never stall the base_sha refresh + rebase-before-
+	// review pass every OTHER PR in the system depends on. 2-minute cadence matches
+	// the goal-session watchdog's own tick (both walk hours-to-days-scale state, not
+	// the fast-moving per-PR pipeline the 45s loop serves).
+	go func() {
+		t := time.NewTicker(2 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				ingestEpicStatuses(ctx, logger, st, time.Now())
+			}
+		}
+	}()
+
 	// epic fan-out drain (§F4): once an epic's barrier review passes, its child issues
 	// are released from backlog into their own spec flows. Review and fan-out are kept
 	// distinct steps (barrier-before-fan-out); this drain is the trigger that releases
