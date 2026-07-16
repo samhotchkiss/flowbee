@@ -21,6 +21,10 @@ var corePackages = []string{
 	// content (the I-11 gate) is consumed by the deterministic core via
 	// EngineState.Content, so it must itself stay clock/rand/ULID/GitHub-free.
 	"github.com/samhotchkiss/flowbee/internal/content",
+	// attention (epic-lane Phase 5) is the attention-queue decision core: lease-grant,
+	// fence, and per-kind escalation are PURE functions of injected values (plan §14),
+	// wired into the store's serialized txs exactly like scheduler.Pick.
+	"github.com/samhotchkiss/flowbee/internal/attention",
 }
 
 // Forbidden import path prefixes. (time is intentionally allowed: the core uses
