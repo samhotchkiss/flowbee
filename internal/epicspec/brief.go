@@ -33,6 +33,13 @@ func RenderCriteria(spec Spec) string {
 		b.WriteString("\n")
 	}
 	b.WriteString("**Reviewer instructions for THIS epic PR — judge it against its OWN contract above:**\n\n" +
+		"- RUN THE CODE — do not judge this epic PR from the diff alone. The epic lane's trust model REQUIRES " +
+		"execution, which SUPERSEDES the generic 'you are not expected to run tests' guidance above for this PR: " +
+		"independently build the code and run targeted tests — at minimum the epic's own `Validate:` commands " +
+		"listed above — at the PR head, and judge on what you OBSERVE, not on what the checklist claims. Rigged " +
+		"tests and real bugs (a buried error path, a broken flow) surface only when the code actually runs. This " +
+		"composes with — never defers to — the automated evidence re-execution gate; if you cannot obtain the " +
+		"source to run it here, say so explicitly in notes rather than approving on a diff-read alone.\n" +
 		"- Verify EACH claimed `[x]` step below against the ACTUAL diff. A step claimed done but with NO " +
 		"corresponding change visible in the diff is the PRIMARY failure mode — flag it as `changes_requested`, " +
 		"not a nit.\n" +

@@ -23,6 +23,8 @@ func TestRenderCriteriaIncludesGoalConstraintsStepsAndInstructions(t *testing.T)
 		"2. wire the gate",
 		"Epic-Step: N/M",
 		"claimed done but with NO",
+		"RUN THE CODE",
+		"run targeted tests",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("RenderCriteria output missing %q; got:\n%s", want, out)
