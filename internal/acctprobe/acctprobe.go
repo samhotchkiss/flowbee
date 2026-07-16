@@ -135,13 +135,15 @@ func (e *HoldError) Unwrap() error { return e.Err }
 func held(reason HoldReason, err error) *HoldError { return &HoldError{Reason: reason, Err: err} }
 
 // Identity is the stable, non-secret answer to "which account is this?". Fingerprint
-// binds the account (sha256 of org uuid for Claude, account_id for Codex), so folds
-// are stable across config-dir moves. The *Digest fields bind to the actual token
-// lineage to close credential-swap TOCTOUs — they are digests, never the secret.
+// is the per-ACCOUNT fingerprint — sha256(AccountKey)[:16], i.e. the accountUuid
+// (Claude) or account_id (Codex) — so it is stable across config-dir moves AND
+// distinguishes two accounts that are seats in ONE org (org-level binding is a
+// separate concern: Result.UsageOrgFingerprint). The *Digest fields bind to the actual
+// token lineage to close credential-swap TOCTOUs — they are digests, never the secret.
 type Identity struct {
 	Provider         Provider
 	AccountKey       string // durable account id (claude accountUuid / codex account_id)
-	Fingerprint      string // sha256(orgUuid|account_id)[:16]; "" when the id was missing
+	Fingerprint      string // sha256(AccountKey)[:16]; "" when the account id was missing
 	Email            string // claude oauthAccount.emailAddress / codex account.email (live)
 	Org              string // claude oauthAccount.organizationName
 	OrgKey           string // claude oauthAccount.organizationUuid
@@ -270,6 +272,10 @@ type Result struct {
 	RetryAt    time.Time  // provider retry window for a throttled hold; else zero
 	CapturedAt time.Time  // when this reading was captured; zero when unknown
 	Source     string     // where the reading came from ("anthropic_usage_api", cache path, …)
+	// LiveUnavailableReason records WHY the live tier was skipped when this result is a
+	// cache fallback (throttled/token_expired/…). It is diagnostic ONLY and, unlike
+	// Hold, does NOT imply TrustHeld — the invariant is Hold=="" unless TrustHeld.
+	LiveUnavailableReason HoldReason
 	// UsageOrgFingerprint is the fingerprint of the org the LIVE Claude usage
 	// response was bound to (from the anthropic-organization-id header). It can
 	// legitimately differ from Identity.Fingerprint (the login's default org) on
@@ -293,12 +299,17 @@ func (r Result) Staleness(now time.Time) (time.Duration, bool) {
 }
 
 // UsageReport adapts a probe into the capacity scheduler's per-account observation
-// for modelFamily. UsagePct is the single most-constraining window percent, rounded
-// UP (a fractional 0.4% must not read as 0/idle to a ceiling gate). RateLimited
-// carries the server's hard-limit signal so the scheduler pins the account exactly
-// as a 429 would. AccountID is the durable AccountKey. NOTE: a caller should only
-// fold a Routable() result — a Held/DisplayOnly reading must not drive dispatch.
-func (r Result) UsageReport(modelFamily string) capacity.UsageReport {
+// for modelFamily, returning ok=false for any NON-routable result (Held / DisplayOnly
+// / Stale). The bool is a STRUCTURAL guard against misuse: a non-routable reading
+// folded via capacity.FoldUsage would report UsagePct=0/RateLimited=false and could
+// CLEAR a prior 429 pin — so the caller must skip a (_, false) result rather than fold
+// it. On ok=true, UsagePct is the single most-constraining window percent rounded UP
+// (a fractional 0.4% must not read as 0/idle to a ceiling gate); RateLimited carries
+// the server's hard-limit signal; AccountID is the durable AccountKey.
+func (r Result) UsageReport(modelFamily string) (capacity.UsageReport, bool) {
+	if !r.Routable() {
+		return capacity.UsageReport{}, false
+	}
 	pct := 0
 	if maxPct, ok := r.Usage.Windows.MaxPct(); ok {
 		pct = int(math.Ceil(maxPct))
@@ -308,7 +319,7 @@ func (r Result) UsageReport(modelFamily string) capacity.UsageReport {
 		ModelFamily: modelFamily,
 		UsagePct:    pct,
 		RateLimited: r.Usage.RateLimited,
-	}
+	}, true
 }
 
 // digest16 returns hex(sha256(secret))[:16] and true, or ("",false) for an empty
@@ -391,11 +402,15 @@ func (OSFS) Open(name string) (File, error) {
 	return f, nil
 }
 
-// osExec is the local ExecRunner (stdout only).
+// osExec is the local ExecRunner. It captures stdout only and DISCARDS stderr so a
+// process's stderr (which could echo an environment fragment) is never captured into
+// the returned *exec.ExitError, honouring the interface's "stderr is dropped" contract.
 type osExec struct{}
 
 func (osExec) Output(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).Output()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stderr = io.Discard
+	return cmd.Output()
 }
 
 // Prober carries the injected dependencies and exposes every entry point. Build the
@@ -422,7 +437,7 @@ func New() *Prober {
 		FS:        OSFS{},
 		Exec:      osExec{},
 		HTTP:      newNoRedirectClient(30 * time.Second),
-		AppServer: newExecAppServer(osExec{}),
+		AppServer: newExecAppServer(),
 		Clock:     clock.Real{},
 	}
 }
@@ -441,7 +456,7 @@ func NewWith(filesystem FS, runner ExecRunner, httpDoer HTTPDoer, appServer AppS
 		p.HTTP = newNoRedirectClient(30 * time.Second)
 	}
 	if p.AppServer == nil {
-		p.AppServer = newExecAppServer(p.Exec)
+		p.AppServer = newExecAppServer()
 	}
 	if p.Clock == nil {
 		p.Clock = clock.Real{}

@@ -2,7 +2,9 @@ package acctprobe
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -49,10 +51,10 @@ type claudeWindowRaw struct {
 }
 
 type claudeLimitRaw struct {
-	Kind     string  `json:"kind"`
-	Percent  float64 `json:"percent"`
-	Severity string  `json:"severity"`
-	ResetsAt string  `json:"resets_at"`
+	Kind     string   `json:"kind"`
+	Percent  *float64 `json:"percent"` // pointer: absent/null ≠ 0% (must not synthesize a fresh 0)
+	Severity string   `json:"severity"`
+	ResetsAt string   `json:"resets_at"`
 	Scope    *struct {
 		Model struct {
 			DisplayName string `json:"display_name"`
@@ -106,12 +108,7 @@ func (p *Prober) DiscoverClaudeDirs(home string) ([]string, error) {
 // (unreadable/unparsable/no account) returns a *HoldError. SECURITY: only allow-
 // listed non-secret fields are decoded; no token is read here.
 func (p *Prober) ProbeClaudeDir(dir string) (*Result, error) {
-	inner := filepath.Join(dir, ".claude.json")
-	cfg, src, err := p.readUsableClaudeConfig(inner)
-	if err != nil && filepath.Base(dir) == ".claude" {
-		legacy := filepath.Join(filepath.Dir(dir), ".claude.json")
-		cfg, src, err = p.readUsableClaudeConfig(legacy)
-	}
+	cfg, src, err := p.resolveClaudeConfig(dir)
 	if err != nil {
 		return nil, held(ReasonIdentityMissing, fmt.Errorf("probe claude dir %q: %w", dir, err))
 	}
@@ -119,7 +116,7 @@ func (p *Prober) ProbeClaudeDir(dir string) (*Result, error) {
 	id := Identity{
 		Provider:    ProviderClaude,
 		AccountKey:  cfg.OauthAccount.AccountUUID,
-		Fingerprint: fingerprint(cfg.OauthAccount.OrganizationUUID),
+		Fingerprint: fingerprint(cfg.OauthAccount.AccountUUID),
 		Email:       cfg.OauthAccount.EmailAddress,
 		Org:         cfg.OauthAccount.OrganizationName,
 		OrgKey:      cfg.OauthAccount.OrganizationUUID,
@@ -139,7 +136,9 @@ func (p *Prober) ProbeClaudeDir(dir string) (*Result, error) {
 }
 
 // stampLocalTrust sets TrustState for a LOCAL cache reading: Held when it carried no
-// usable window, else VerifiedLocal, downgraded to Stale past the freshness bound.
+// usable window; else VerifiedLocal, downgraded to Stale past the freshness bound OR
+// when the capture time is UNKNOWN (zero) — an unknown age must never read as fresh,
+// so a cache with no fetchedAtMs can never stay routable forever.
 func (p *Prober) stampLocalTrust(res *Result) {
 	if len(res.Usage.Windows) == 0 {
 		res.TrustState = TrustHeld
@@ -147,25 +146,53 @@ func (p *Prober) stampLocalTrust(res *Result) {
 		return
 	}
 	res.TrustState = TrustVerifiedLocal
-	if d, ok := res.Staleness(p.Clock.Now()); ok && d > p.staleAfter() {
+	d, ok := res.Staleness(p.Clock.Now())
+	if !ok || d > p.staleAfter() { // unknown age (ok=false) or too old ⇒ stale
 		res.TrustState = TrustStale
 	}
 }
 
-// readUsableClaudeConfig reads and allow-list-parses path, erroring unless it
-// yielded a real account (non-empty oauthAccount.accountUuid) — how a 178-byte stub
-// `.claude.json` is rejected so the caller falls back to the legacy sibling.
+// errClaudeStub marks a `.claude.json` that parsed but carried no account (the
+// 178-byte default stub). It is distinct from a missing file and from a parse error
+// so resolveClaudeConfig can fall back to the legacy sibling for the stub/missing
+// cases only — never masking a real parse error of a present, populated file.
+var errClaudeStub = errors.New("no oauthAccount.accountUuid")
+
+// resolveClaudeConfig returns the usable `.claude.json` for dir: the inner
+// `<dir>/.claude.json` normally, falling back to the legacy sibling `<home>/.claude.json`
+// ONLY for the default `.claude` dir AND only when the inner file is ABSENT or a STUB
+// (never on a parse error, which is surfaced). NOTE: if a default dir's inner file
+// were itself a valid-but-different account from the legacy sibling, this prefers the
+// inner one and does not probe the sibling; that divergence is not observed on real
+// installs (the migrated default inner is always a stub, or the legacy file is absent)
+// and a single-Result API has nowhere to surface a second account, so it is a
+// documented non-goal rather than a handled case.
+func (p *Prober) resolveClaudeConfig(dir string) (claudeConfig, string, error) {
+	cfg, src, err := p.readUsableClaudeConfig(filepath.Join(dir, ".claude.json"))
+	if err == nil {
+		return cfg, src, nil
+	}
+	if filepath.Base(dir) == ".claude" && (errors.Is(err, os.ErrNotExist) || errors.Is(err, errClaudeStub)) {
+		return p.readUsableClaudeConfig(filepath.Join(filepath.Dir(dir), ".claude.json"))
+	}
+	return cfg, "", err
+}
+
+// readUsableClaudeConfig reads and allow-list-parses path, erroring unless it yielded
+// a real account (non-empty oauthAccount.accountUuid). A stub returns errClaudeStub; a
+// missing file wraps os.ErrNotExist; a malformed file returns a parse error — three
+// distinct outcomes so resolveClaudeConfig only falls back on the first two.
 func (p *Prober) readUsableClaudeConfig(path string) (claudeConfig, string, error) {
 	var cfg claudeConfig
 	b, err := p.FS.ReadFile(path)
 	if err != nil {
-		return cfg, "", err
+		return cfg, "", err // wraps os.ErrNotExist when absent
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return cfg, "", fmt.Errorf("parse %q: %w", path, err)
 	}
 	if cfg.OauthAccount.AccountUUID == "" {
-		return cfg, "", fmt.Errorf("%q has no oauthAccount.accountUuid", path)
+		return cfg, "", fmt.Errorf("%q: %w", path, errClaudeStub)
 	}
 	return cfg, path, nil
 }
@@ -182,9 +209,15 @@ func claudeUsage(u claudeUtilization) Usage {
 	}
 	if len(u.Limits) > 0 {
 		for _, l := range u.Limits {
+			// A missing/null percent, or one out of the 0..100 range, proves nothing —
+			// SKIP it rather than synthesize a fresh 0% (which would read an exhausted
+			// account as idle). Mirrors five_hour/seven_day and Codex bucketWindow.
+			if l.Percent == nil || !validClaudePercent(*l.Percent) {
+				continue
+			}
 			usage.Windows = append(usage.Windows, LimitWindow{
 				Kind:          claudeKind(l.Kind),
-				Percent:       l.Percent,
+				Percent:       *l.Percent,
 				Severity:      severityOf(l.Severity),
 				ResetsAt:      parseRFC3339(l.ResetsAt),
 				Scope:         claudeScope(l),
@@ -193,14 +226,14 @@ func claudeUsage(u claudeUtilization) Usage {
 			})
 		}
 	} else {
-		if u.FiveHour.Utilization != nil {
+		if u.FiveHour.Utilization != nil && validClaudePercent(*u.FiveHour.Utilization) {
 			usage.Windows = append(usage.Windows, LimitWindow{
 				Kind: KindSession, Percent: *u.FiveHour.Utilization,
 				Severity: SeverityNormal, ResetsAt: parseRFC3339(u.FiveHour.ResetsAt),
 				WindowMinutes: 300, Active: true,
 			})
 		}
-		if u.SevenDay.Utilization != nil {
+		if u.SevenDay.Utilization != nil && validClaudePercent(*u.SevenDay.Utilization) {
 			usage.Windows = append(usage.Windows, LimitWindow{
 				Kind: KindWeeklyAll, Percent: *u.SevenDay.Utilization,
 				Severity: SeverityNormal, ResetsAt: parseRFC3339(u.SevenDay.ResetsAt),
@@ -213,6 +246,9 @@ func claudeUsage(u claudeUtilization) Usage {
 	}
 	return usage
 }
+
+// validClaudePercent bounds a server-reported percent to the sane 0..100 range.
+func validClaudePercent(p float64) bool { return p >= 0 && p <= 100 }
 
 func claudeKind(kind string) WindowKind {
 	switch kind {

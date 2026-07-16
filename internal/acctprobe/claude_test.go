@@ -92,6 +92,28 @@ func TestProbeClaudeStaleDowngrade(t *testing.T) {
 	}
 }
 
+// TestProbeClaudeUnknownAgeIsStale is the M2 guard: a cache with NO fetchedAtMs has an
+// UNKNOWN age (CapturedAt zero), which must never read as fresh/VerifiedLocal — it is
+// forced Stale (non-routable) so an ageless cache can't stay routable forever.
+func TestProbeClaudeUnknownAgeIsStale(t *testing.T) {
+	res, err := osProber().ProbeClaudeDir(td("claude", "no_ts_dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.CapturedAt.IsZero() {
+		t.Fatalf("fixture should have no fetchedAtMs, got CapturedAt=%v", res.CapturedAt)
+	}
+	if len(res.Usage.Windows) == 0 {
+		t.Fatal("fixture has windows; the test needs them present to exercise the age branch")
+	}
+	if res.TrustState != TrustStale {
+		t.Errorf("unknown-age cache trust=%v want stale", res.TrustState)
+	}
+	if res.Routable() {
+		t.Error("an unknown-age cache must not be routable")
+	}
+}
+
 func TestProbeClaudeVariantDir(t *testing.T) {
 	p := osProber()
 	dir := filepath.Join(td("claude", "home_default"), ".claude-work-example")

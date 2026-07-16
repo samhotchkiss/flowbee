@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -52,20 +53,16 @@ type claudeCredsFile struct {
 // SECURITY: the token is used only for the Authorization header and the credential
 // digest; it never leaves this function.
 func (p *Prober) ProbeClaudeLive(ctx context.Context, dir, pinnedOrgFP string) (*Result, error) {
-	// Identity from local metadata (no network) — the login-org fingerprint stays
-	// bound to the login even when the usage org differs (multi-org).
-	inner := filepath.Join(dir, ".claude.json")
-	cfg, _, cerr := p.readUsableClaudeConfig(inner)
-	if cerr != nil && filepath.Base(dir) == ".claude" {
-		cfg, _, cerr = p.readUsableClaudeConfig(filepath.Join(filepath.Dir(dir), ".claude.json"))
-	}
+	// Identity from local metadata (no network). Fingerprint is the per-ACCOUNT
+	// fingerprint (accountUuid) — org-level binding is UsageOrgFingerprint below.
+	cfg, _, cerr := p.resolveClaudeConfig(dir)
 	if cerr != nil {
 		return nil, held(ReasonIdentityMissing, fmt.Errorf("claude live %q: %w", dir, cerr))
 	}
 	id := Identity{
 		Provider:    ProviderClaude,
 		AccountKey:  cfg.OauthAccount.AccountUUID,
-		Fingerprint: fingerprint(cfg.OauthAccount.OrganizationUUID),
+		Fingerprint: fingerprint(cfg.OauthAccount.AccountUUID),
 		Email:       cfg.OauthAccount.EmailAddress,
 		Org:         cfg.OauthAccount.OrganizationName,
 		OrgKey:      cfg.OauthAccount.OrganizationUUID,
@@ -173,9 +170,11 @@ func (p *Prober) ProbeClaude(ctx context.Context, dir, pinnedOrgFP string) (*Res
 	if errors.As(err, &hold) {
 		switch hold.Reason {
 		case ReasonThrottled, ReasonTokenExpired, ReasonTokenRejected, ReasonCredentialsMissing:
-			// live meter unusable right now — serve the cache, tagged as such.
+			// live meter unusable right now — serve the cache, recording WHY live was
+			// unavailable in the diagnostic field (never Hold, which is reserved for a
+			// TrustHeld result; the cache reading here is VerifiedLocal/Stale).
 			if cached, cerr := p.ProbeClaudeDir(dir); cerr == nil {
-				cached.Hold = hold.Reason // why live was unavailable (diagnostic)
+				cached.LiveUnavailableReason = hold.Reason
 				cached.RetryAt = hold.RetryAt
 				return cached, nil
 			}
@@ -213,14 +212,16 @@ func (p *Prober) claudeOAuthFor(ctx context.Context, dir string) (claudeOAuth, e
 }
 
 // claudeKeychainOAuth reads the credential blob out of the macOS login Keychain via
-// `security find-generic-password -s <service> -w`, trying the per-dir namespaced
-// item(s) first, then the legacy shared item. Returns ok=false on any error (missing
-// binary, locked Keychain, absent item) so callers degrade to the fail-closed hold.
+// `security find-generic-password -s <service> -w`. It tries the per-dir NAMESPACED
+// item; the legacy SHARED item ("Claude Code-credentials") is consulted ONLY when dir
+// is the OS-default ~/.claude. A non-default CLAUDE_CONFIG_DIR with no namespaced item
+// must NOT borrow the default account's shared token (that would attribute the default
+// account's live usage to a different Identity, verified and routable, undetectable by
+// the org pin). Returns ok=false on any error so callers fail closed.
 func (p *Prober) claudeKeychainOAuth(ctx context.Context, dir string) (claudeOAuth, bool) {
-	services := []string{
-		claudeKeychainService(dir),
-		claudeKeychainService(realpath(dir)), // symlinked base dirs would otherwise miss the item
-		claudeKeychainServiceBase,
+	services := []string{claudeKeychainService(dir)}
+	if isDefaultClaudeDir(dir) {
+		services = append(services, claudeKeychainServiceBase)
 	}
 	seen := map[string]bool{}
 	for _, svc := range services {
@@ -263,13 +264,15 @@ func claudeKeychainService(dir string) string {
 	return claudeKeychainServiceBase + "-" + hex.EncodeToString(sum[:])[:8]
 }
 
-// realpath resolves symlinks best-effort (returns the input on any error), matching
-// how the CLI may have been launched with a resolved CLAUDE_CONFIG_DIR.
-func realpath(dir string) string {
-	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-		return resolved
+// isDefaultClaudeDir reports whether dir is the OS-default Claude config dir
+// (~/.claude) — the only dir whose token may live in the legacy SHARED Keychain item.
+// Uses os.UserHomeDir because the Keychain path is inherently local (darwin-only).
+func isDefaultClaudeDir(dir string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
 	}
-	return dir
+	return filepath.Clean(dir) == filepath.Join(home, ".claude")
 }
 
 // retryAfter computes the provider retry instant from a 429's Retry-After header

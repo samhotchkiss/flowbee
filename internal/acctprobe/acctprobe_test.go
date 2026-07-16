@@ -87,13 +87,17 @@ func TestWindowsFolds(t *testing.T) {
 
 func TestUsageReportBridge(t *testing.T) {
 	r := Result{
-		Identity: Identity{Provider: ProviderClaude, AccountKey: "acct-1"},
+		TrustState: TrustVerified,
+		Identity:   Identity{Provider: ProviderClaude, AccountKey: "acct-1"},
 		Usage: Usage{Windows: Windows{
 			{Kind: KindSession, Percent: 24.2},
 			{Kind: KindWeeklyAll, Percent: 60.0},
 		}},
 	}
-	rep := r.UsageReport("claude")
+	rep, ok := r.UsageReport("claude")
+	if !ok {
+		t.Fatal("a Verified result must yield ok=true")
+	}
 	if rep.AccountID != "acct-1" || rep.ModelFamily != "claude" {
 		t.Errorf("bridge identity: %+v", rep)
 	}
@@ -101,14 +105,27 @@ func TestUsageReportBridge(t *testing.T) {
 		t.Errorf("UsagePct=%d want 60", rep.UsagePct)
 	}
 	// a fractional max rounds UP so it never reads as idle to a ceiling gate.
-	r2 := Result{Usage: Usage{Windows: Windows{{Kind: KindSession, Percent: 0.4}}}}
-	if got := r2.UsageReport("x").UsagePct; got != 1 {
-		t.Errorf("ceil rounding: UsagePct=%d want 1", got)
+	r2 := Result{TrustState: TrustVerifiedLocal, Usage: Usage{Windows: Windows{{Kind: KindSession, Percent: 0.4}}}}
+	rep2, ok := r2.UsageReport("x")
+	if !ok || rep2.UsagePct != 1 {
+		t.Errorf("ceil rounding: UsagePct=%d ok=%v want 1,true", rep2.UsagePct, ok)
 	}
 	// rate-limited propagates to pin the account.
-	r3 := Result{Usage: Usage{RateLimited: true}}
-	if !r3.UsageReport("x").RateLimited {
+	r3 := Result{TrustState: TrustVerified, Usage: Usage{RateLimited: true}}
+	if rep3, ok := r3.UsageReport("x"); !ok || !rep3.RateLimited {
 		t.Error("RateLimited must propagate into the UsageReport")
+	}
+}
+
+// TestUsageReportRoutabilityGuard proves the structural guard: a non-routable result
+// (Held / DisplayOnly / Stale) returns ok=false so it can never be folded into the
+// scheduler and clear a prior 429 pin.
+func TestUsageReportRoutabilityGuard(t *testing.T) {
+	for _, state := range []TrustState{TrustHeld, TrustDisplayOnly, TrustStale} {
+		r := Result{TrustState: state, Usage: Usage{Windows: Windows{{Kind: KindWeeklyAll, Percent: 42}}}}
+		if _, ok := r.UsageReport("x"); ok {
+			t.Errorf("%s result must return ok=false from UsageReport", state)
+		}
 	}
 }
 

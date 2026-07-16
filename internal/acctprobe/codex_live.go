@@ -224,7 +224,11 @@ type execAppServer struct {
 	timeout time.Duration
 }
 
-func newExecAppServer(_ ExecRunner) *execAppServer {
+// newExecAppServer builds the default codex app-server client. NOTE: the app-server
+// is a bidirectional stdio/JSON-RPC seam, which the one-shot ExecRunner cannot drive —
+// so it deliberately spawns via exec.CommandContext directly, and the injectable seam
+// for tests/remote is the AppServerClient interface, not ExecRunner.
+func newExecAppServer() *execAppServer {
 	return &execAppServer{binary: "codex", timeout: 25 * time.Second}
 }
 
@@ -261,6 +265,12 @@ func (a *execAppServer) Read(ctx context.Context, codexHome string) (AppServerRe
 		for scanner.Scan() {
 			var msg map[string]json.RawMessage
 			if json.Unmarshal(scanner.Bytes(), &msg) != nil {
+				continue
+			}
+			// A response has an "id" and NO "method"; a server→client request/notification
+			// carries a "method" (and may reuse an id) — ignore those so a server request
+			// with id 2/3 can never be mistaken for our read's response.
+			if _, hasMethod := msg["method"]; hasMethod {
 				continue
 			}
 			if _, ok := msg["id"]; ok {
@@ -321,7 +331,11 @@ func finishAppServer(byID map[int]map[string]json.RawMessage) (AppServerResult, 
 	}
 	for _, m := range []map[string]json.RawMessage{m2, m3} {
 		if raw, ok := m["error"]; ok && len(raw) > 0 && string(raw) != "null" {
-			return AppServerResult{}, held(classifyAppServerError(raw), fmt.Errorf("codex app-server error: %s", raw))
+			// Classify on the error's shape (markers) but DO NOT embed the raw body in
+			// the returned error — a future app-server that echoed credential material
+			// into an error object must never leak it through a log of e.Err.
+			reason := classifyAppServerError(raw)
+			return AppServerResult{}, held(reason, fmt.Errorf("codex app-server returned an error classified as %s", reason))
 		}
 	}
 	return AppServerResult{RateLimits: resultOf(m2), Account: resultOf(m3)}, nil

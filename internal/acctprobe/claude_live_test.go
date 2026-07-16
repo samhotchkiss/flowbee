@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -112,6 +113,95 @@ func TestProbeClaudeLiveErrors(t *testing.T) {
 	}
 }
 
+// TestProbeClaudeLiveSkipsNullPercent is the M1 guard: a limits[] entry with a
+// missing/null (or out-of-range) percent must be SKIPPED, never synthesized as a fresh
+// 0% verified window that would read an exhausted account as idle.
+func TestProbeClaudeLiveSkipsNullPercent(t *testing.T) {
+	// session has a real percent; weekly's percent is null; a bogus entry is >100.
+	body := `{"limits":[
+	 {"kind":"session","percent":24,"severity":"normal","is_active":true},
+	 {"kind":"weekly_all","percent":null,"severity":"normal","is_active":true},
+	 {"kind":"weekly_scoped","percent":150,"scope":{"model":{"display_name":"Bad"}}}
+	]}`
+	doer := fakeHTTP{fn: func(*http.Request) (*http.Response, error) {
+		return httpResp(http.StatusOK, map[string]string{"anthropic-organization-id": "org-x"}, body), nil
+	}}
+	res, err := liveProber(doer).ProbeClaudeLive(context.Background(), td("claude", "live_dir"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := res.Usage.Windows.SessionPct(); !ok || s != 24 {
+		t.Errorf("session=%v ok=%v want 24", s, ok)
+	}
+	// the null-percent weekly must be ABSENT (unknown), not a fabricated 0%.
+	if _, ok := res.Usage.Windows.WeeklyPct(); ok {
+		t.Error("a null-percent weekly entry must be omitted, never synthesized as 0%")
+	}
+	// the out-of-range scoped entry must be dropped too.
+	for _, w := range res.Usage.Windows {
+		if w.Kind == KindWeeklyScoped {
+			t.Error("an out-of-range percent entry must be dropped")
+		}
+	}
+}
+
+// TestProbeClaudeLiveAllNullPercentHolds: if every entry is null-percent, there is no
+// usable window and the live probe holds (never a routable all-zero reading).
+func TestProbeClaudeLiveAllNullPercentHolds(t *testing.T) {
+	body := `{"limits":[{"kind":"session","percent":null},{"kind":"weekly_all","percent":null}]}`
+	doer := fakeHTTP{fn: func(*http.Request) (*http.Response, error) {
+		return httpResp(http.StatusOK, map[string]string{"anthropic-organization-id": "org-x"}, body), nil
+	}}
+	_, err := liveProber(doer).ProbeClaudeLive(context.Background(), td("claude", "live_dir"), "")
+	assertHold(t, err, ReasonUnrecognizedPayload)
+}
+
+// TestClaudeLiveTransportErrorHasNoToken is the secret-hygiene guard: a transport
+// failure returns a non-HoldError (so ProbeClaude can fall back) whose message never
+// contains the bearer token.
+func TestClaudeLiveTransportErrorHasNoToken(t *testing.T) {
+	doer := fakeHTTP{fn: func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("dial tcp 1.2.3.4:443: connect: connection refused")
+	}}
+	_, err := liveProber(doer).ProbeClaudeLive(context.Background(), td("claude", "live_dir"), "")
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	var hold *HoldError
+	if errors.As(err, &hold) {
+		t.Errorf("transport failure must not be a typed HoldError (so cache fallback runs), got %v", hold.Reason)
+	}
+	if strings.Contains(err.Error(), "FAKE-live-access-token-not-a-real-secret") {
+		t.Error("the token leaked into a transport error string")
+	}
+}
+
+// TestClaudeKeychainNonDefaultDirFailsClosed is the M4 guard: a non-default config dir
+// with no .credentials.json and no NAMESPACED Keychain item must fail closed
+// (credentials_missing) and must NEVER consult the legacy SHARED item — borrowing the
+// default account's token would misattribute its usage to this Identity.
+func TestClaudeKeychainNonDefaultDirFailsClosed(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("keychain path is darwin-only")
+	}
+	dir := t.TempDir() // a non-default dir, no .credentials.json
+	var queried []string
+	p := NewWith(OSFS{}, fakeExec{fn: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		queried = append(queried, serviceArg(args))
+		return nil, errors.New("exit status 44") // nothing found for any service
+	}}, nil, nil, fakeClock())
+
+	_, err := p.claudeOAuthFor(context.Background(), dir)
+	if err == nil {
+		t.Fatal("expected credentials_missing (fail closed)")
+	}
+	for _, svc := range queried {
+		if svc == claudeKeychainServiceBase {
+			t.Errorf("the legacy shared service must NOT be consulted for a non-default dir; queried=%v", queried)
+		}
+	}
+}
+
 func TestProbeClaudeLiveExpiredTokenNoNetwork(t *testing.T) {
 	doer := fakeHTTP{fn: func(*http.Request) (*http.Response, error) {
 		t.Fatal("HTTP must not be called for an already-expired token")
@@ -140,8 +230,11 @@ func TestProbeClaudeTieredFallsBackToCacheOnThrottle(t *testing.T) {
 	if res.TrustState != TrustVerifiedLocal {
 		t.Errorf("fresh cache fallback should be verified_local, got %v", res.TrustState)
 	}
-	if res.Hold != ReasonThrottled {
-		t.Errorf("cache carry should record why live was unavailable, got %q", res.Hold)
+	if res.Hold != "" {
+		t.Errorf("a non-Held result must have empty Hold, got %q", res.Hold)
+	}
+	if res.LiveUnavailableReason != ReasonThrottled {
+		t.Errorf("cache carry should record why live was unavailable, got %q", res.LiveUnavailableReason)
 	}
 	if res.Identity.Email != "live@example.com" {
 		t.Errorf("cache identity wrong: %q", res.Identity.Email)

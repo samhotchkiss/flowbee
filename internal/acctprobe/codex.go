@@ -61,9 +61,9 @@ type codexRolloutLine struct {
 }
 
 type codexDiskWindow struct {
-	UsedPercent   float64 `json:"used_percent"`
-	WindowMinutes int     `json:"window_minutes"`
-	ResetsAt      int64   `json:"resets_at"` // unix epoch SECONDS
+	UsedPercent   *float64 `json:"used_percent"` // pointer: absent/null ≠ 0%
+	WindowMinutes int      `json:"window_minutes"`
+	ResetsAt      int64    `json:"resets_at"` // unix epoch (seconds; ms tolerated, see unixMaybe)
 }
 
 // ProbeCodexHome reads a Codex home's identity (from auth.json + config.toml) and its
@@ -308,10 +308,10 @@ func codexTelemetryUsage(rl codexRolloutLine) Usage {
 		PlanType:      pl.RateLimits.PlanType,
 	}
 	for _, w := range []*codexDiskWindow{pl.RateLimits.Primary, pl.RateLimits.Secondary} {
-		if w == nil {
-			continue
+		if w == nil || w.UsedPercent == nil {
+			continue // absent window/percent proves nothing — never synthesize 0%
 		}
-		if lw, ok := bucketWindow(w.WindowMinutes, w.UsedPercent, unixMaybe(w.ResetsAt)); ok {
+		if lw, ok := bucketWindow(w.WindowMinutes, *w.UsedPercent, unixMaybe(w.ResetsAt)); ok {
 			usage.Windows = append(usage.Windows, lw)
 		}
 	}
@@ -352,10 +352,16 @@ func bucketWindow(minutes int, percent float64, resetsAt time.Time) (LimitWindow
 	}, true
 }
 
-// unixMaybe converts a positive unix-seconds epoch to a UTC time, or zero.
-func unixMaybe(sec int64) time.Time {
-	if sec <= 0 {
+// unixMaybe converts a positive unix epoch to a UTC time, or zero. It applies the same
+// magnitude heuristic as the Claude token-expiry check: a value > 1e11 is far too large
+// to be seconds (that is year 5138+), so it is treated as MILLISECONDS — a unit change
+// upstream can't turn a valid reset into a wildly-wrong instant.
+func unixMaybe(epoch int64) time.Time {
+	if epoch <= 0 {
 		return time.Time{}
 	}
-	return time.Unix(sec, 0).UTC()
+	if epoch > 1e11 {
+		return time.UnixMilli(epoch).UTC()
+	}
+	return time.Unix(epoch, 0).UTC()
 }

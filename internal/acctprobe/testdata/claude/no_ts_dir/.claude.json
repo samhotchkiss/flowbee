@@ -1,0 +1,20 @@
+{
+  "oauthAccount": {
+    "accountUuid": "acct-nots-0000-0000-000000000005",
+    "emailAddress": "nots@example.com",
+    "organizationName": "Example No-Timestamp Org",
+    "organizationUuid": "org-nots-0000-0000-000000000005",
+    "organizationRateLimitTier": "default_max_5x",
+    "seatTier": null
+  },
+  "cachedUsageUtilization": {
+    "accountUuid": "acct-nots-0000-0000-000000000005",
+    "utilization": {
+      "limits": [
+        {"kind": "session", "group": "session", "percent": 15, "severity": "normal", "resets_at": "2026-07-16T20:00:00+00:00", "scope": null, "is_active": true},
+        {"kind": "weekly_all", "group": "weekly", "percent": 30, "severity": "normal", "resets_at": "2026-07-22T00:00:00+00:00", "scope": null, "is_active": true}
+      ],
+      "spend": {"percent": 0, "enabled": false}
+    }
+  }
+}
