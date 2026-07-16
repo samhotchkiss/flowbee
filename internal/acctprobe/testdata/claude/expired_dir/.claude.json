@@ -1,0 +1,10 @@
+{
+  "oauthAccount": {
+    "accountUuid": "acct-exp-0000-0000-000000000004",
+    "emailAddress": "expired@example.com",
+    "organizationName": "Example Expired Org",
+    "organizationUuid": "org-exp-0000-0000-000000000004",
+    "organizationRateLimitTier": "default_pro",
+    "seatTier": null
+  }
+}

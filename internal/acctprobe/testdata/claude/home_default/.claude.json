@@ -1,0 +1,28 @@
+{
+  "accessToken": "FAKE-must-be-ignored-by-allowlist",
+  "credentials": {"apiKey": "FAKE-must-be-ignored"},
+  "numStartups": 42,
+  "oauthAccount": {
+    "accountUuid": "acct-default-0000-0000-000000000001",
+    "emailAddress": "default@example.com",
+    "organizationName": "Example Personal",
+    "organizationUuid": "org-default-0000-0000-000000000001",
+    "organizationRateLimitTier": "default_max_20x",
+    "seatTier": null
+  },
+  "cachedUsageUtilization": {
+    "fetchedAtMs": 1784200000000,
+    "accountUuid": "acct-default-0000-0000-000000000001",
+    "utilization": {
+      "five_hour": {"utilization": 24, "resets_at": "2026-07-16T23:50:00.238598+00:00"},
+      "seven_day": {"utilization": 14, "resets_at": "2026-07-22T02:00:00.238620+00:00"},
+      "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": null},
+      "limits": [
+        {"kind": "session", "group": "session", "percent": 24, "severity": "normal", "resets_at": "2026-07-16T23:50:00.238598+00:00", "scope": null, "is_active": true},
+        {"kind": "weekly_all", "group": "weekly", "percent": 14, "severity": "normal", "resets_at": "2026-07-22T02:00:00.238620+00:00", "scope": null, "is_active": false},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 2, "severity": "normal", "resets_at": "2026-07-22T02:00:00.238987+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": false}
+      ],
+      "spend": {"used": {"amount_minor": 0, "currency": "USD", "exponent": 2}, "limit": null, "percent": 0, "severity": "normal", "enabled": false}
+    }
+  }
+}
