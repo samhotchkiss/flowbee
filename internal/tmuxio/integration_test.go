@@ -25,6 +25,21 @@ var testSocketSeq atomic.Int64
 // exact-match verifier keys on (verified empirically before writing this test).
 const promptSubstrate = "printf '❯ '; while IFS= read -r line; do printf '\\nGOT[%s]\\n❯ ' \"$line\"; done"
 
+// boxSubstrate draws Claude Code's BORDERED input box: the input sits on the
+// `│ > ` line (row 4), the LAST non-empty line is a "? for shortcuts" hint, and a
+// persistent GOT[...] marker records the last submitted line on row 1. This is the
+// M1 layout — the message is never the last line — so it proves the box-aware
+// input-line location works against REAL tmux capture output. Cursor positioning
+// (\033[4;5H) drops the terminal echo inside the box; verified empirically.
+const boxSubstrate = `LAST=""; while true; do
+  printf "\033[2J\033[H"
+  printf "%s\n\n" "$LAST"
+  printf "╭──────────────────────────╮\n│ > \n╰──────────────────────────╯\n  ? for shortcuts"
+  printf "\033[4;5H"
+  IFS= read -r line
+  LAST="GOT[$line]"
+done`
+
 // newTestServer returns a Client bound to a fresh isolated tmux server socket and
 // registers its teardown. It skips the test when tmux is unavailable.
 func newTestServer(t *testing.T) *Client {
@@ -161,8 +176,8 @@ func TestIntegrationNoSubmitThenNudge(t *testing.T) {
 		t.Fatalf("NoSubmit result = %+v, want Weak/0", res)
 	}
 	raw := waitForCapture(t, c, name, "pending line", 2*time.Second)
-	if !inputLineHoldsExactly(raw, "pending line") {
-		t.Fatalf("expected 'pending line' sitting in the input box; capture=%q", raw)
+	if text, ok := extractInputLine(raw); !ok || text != "pending line" {
+		t.Fatalf("expected 'pending line' sitting in the located input box, got (%q,%v); capture=%q", text, ok, raw)
 	}
 
 	// Nudge submits it.
@@ -241,6 +256,38 @@ func TestIntegrationListPanesAndResolve(t *testing.T) {
 	}
 	if ok {
 		t.Log("ResolveAgent found an agent-like child under the shell pane (environment-dependent); acceptable")
+	}
+}
+
+// TestIntegrationBorderedBoxSend is the real-tmux proof of the M1 fix: a pane whose
+// input sits INSIDE a bordered box (not on the last line) must classify idle,
+// deliver, and verify Strong — the exact case the old last-line matcher false-Strong'd.
+func TestIntegrationBorderedBoxSend(t *testing.T) {
+	c := newTestServer(t)
+	ctx := context.Background()
+	const name = "itest-box"
+	if err := c.NewSession(ctx, SessionSpec{Name: name, Command: boxSubstrate}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	raw := waitForCapture(t, c, name, "? for shortcuts", 3*time.Second)
+	if !strings.Contains(raw, "│ >") {
+		t.Fatalf("bordered box never rendered; capture=%q", raw)
+	}
+	// The input is NOT the last non-empty line ("? for shortcuts" is) — box-aware
+	// classification must still see IDLE_AT_PROMPT.
+	if st, _ := Classify(raw); st != StateIdleAtPrompt {
+		t.Fatalf("bordered-box Classify = %q, want idle; capture=%q", st, raw)
+	}
+	res, err := c.Send(ctx, name, "run the tests", SendOptions{})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if res.Verification != Strong {
+		t.Fatalf("bordered-box Send = %q (evidence %q), want Strong — the message was not the last line, the OLD matcher would false-Strong at attempt 1 while the box could still hold it", res.Verification, res.Evidence)
+	}
+	after := waitForCapture(t, c, name, "GOT[run the tests]", 2*time.Second)
+	if !strings.Contains(after, "GOT[run the tests]") {
+		t.Fatalf("bordered-box submit not recorded; capture=%q", after)
 	}
 }
 

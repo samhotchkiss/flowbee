@@ -28,6 +28,9 @@ type Capture struct {
 // target is any tmux target (pane id "%5", "session:win.pane", or a session name);
 // it must be a caller-validated identifier and is shQuote'd regardless.
 func (c *Client) Capture(ctx context.Context, target string, history int) (Capture, error) {
+	if err := c.validateIdent("target", target); err != nil {
+		return Capture{}, err
+	}
 	sub := "capture-pane -p -t " + shQuote(target)
 	if history > 0 {
 		sub += " -S -" + strconv.Itoa(history)

@@ -35,6 +35,11 @@ func (p Pane) Target() string { return p.PaneID }
 // supervision needs. It returns an empty slice (not an error) when the server is
 // running but has no panes; a genuinely unreachable server surfaces as an error.
 func (c *Client) ListPanes(ctx context.Context) ([]Pane, error) {
+	if c.host != "" {
+		if err := assertValidIdent("host", c.host); err != nil {
+			return nil, err
+		}
+	}
 	format := strings.Join([]string{
 		"#{session_name}", "#{window_index}", "#{pane_id}", "#{pane_pid}",
 		"#{pane_current_command}", "#{pane_width}", "#{pane_height}",

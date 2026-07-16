@@ -21,22 +21,30 @@
 // `tmux send-keys "msg" Enter` is unreliable against Claude Code and Codex: the
 // Enter arrives in the same input burst as the text and is absorbed by the TUI's
 // paste handling, leaving the message sitting UNSUBMITTED in the input box. The
-// fix, proven by hand first, is to paste the text as a bracketed paste, let the
-// input box settle, send Enter as a SEPARATE key event, then VERIFY the input box
-// cleared — re-pressing Enter with backoff until it did, and reporting honestly
-// when it could not be confirmed.
+// fix, proven by hand first, is to deliver the text (literal keystrokes for a
+// short single line, a bracketed paste for long/multiline), let the input box
+// settle, send Enter as a SEPARATE key event, then VERIFY the input box cleared —
+// re-pressing Enter with backoff until it did, and reporting honestly when it
+// could not be confirmed.
 //
 // This package ports the semantics of the hand-rolled `tmux-send` skill (source
 // at ~/.local/bin/tmux-send, skill doc ~/.claude/skills/tmux-send/SKILL.md,
 // source tree /Users/sam/dev/tmux-send) into a typed, testable Go API, and folds
 // in the hard lesson internal/watchdog already learned the hard way: verify the
-// input box by an EXACT last-line match, NOT a fragment-Contains check. A
-// Contains check misfires on status-line hint text (codex renders its own
+// input box by an EXACT match of the LOCATED input line, NOT a fragment-Contains
+// check. A Contains check misfires on status-line hint text (codex renders its own
 // "Goal blocked (/goal resume)" hint) and, worse, could press Enter under a
-// human's edited input — submitting keystrokes the supervisor never typed. So the
-// exact-match is the ONLY thing that ever drives a bare-Enter retry here; the
-// skill's fragment heuristics survive solely as a confidence DOWNGRADE (to Weak),
-// never as a retry trigger. See Send and inputLineHoldsExactly.
+// human's edited input — submitting keystrokes the supervisor never typed. Two
+// polarity rules keep verification honest (see Send, verifyExact, extractInputLine):
+//   - The input line is LOCATED (the last line matching the prompt regex — Claude
+//     Code's input sits inside a bordered `│ > │` box whose LAST line is a
+//     "? for shortcuts" hint, NOT the message), and only its EXACT contents drive
+//     a decision: the message still present drives a bare-Enter RETRY; a located,
+//     EMPTY prompt is the only Strong "submitted" signal.
+//   - Absence is never success: a prompt line we cannot locate (or a
+//     wrapped/multiline message that defeats the single-line match) is WEAK, never
+//     Strong. The skill's fragment heuristics survive solely as a Weak-confidence
+//     signal, never as a retry trigger.
 //
 // # Transport (local and remote), aligned with internal/watchdog
 //
@@ -227,4 +235,37 @@ func remoteWrap(host, inner string) string {
 // command is shQuote'd again, and the nesting composes correctly.
 func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// assertValidIdent enforces the caller-supplied-identifier contract at the API
+// boundary (review m12), matching store.AddGoalSession's defense-in-depth posture:
+// session names, tmux targets, and ssh hosts must be non-empty, must not start with
+// '-' (an ssh/tmux getopt would read it as an option even behind shQuote), and must
+// contain no control characters — including NUL, which cannot cross the argv
+// boundary. Interior spaces ARE allowed (tmux session names legitimately contain
+// them). This is defense in depth: shQuote still runs on every value regardless.
+func assertValidIdent(kind, s string) error {
+	if s == "" {
+		return fmt.Errorf("tmuxio: %s must not be empty", kind)
+	}
+	if strings.HasPrefix(s, "-") {
+		return fmt.Errorf("tmuxio: %s %q must not start with '-'", kind, s)
+	}
+	for _, r := range s {
+		if r == 0 || r < 0x20 || r == 0x7f {
+			return fmt.Errorf("tmuxio: %s %q contains a control character", kind, s)
+		}
+	}
+	return nil
+}
+
+// validateIdent checks a per-call identifier (target/session name) AND this
+// Client's configured ssh host, so a bad host is caught at the first operation.
+func (c *Client) validateIdent(kind, s string) error {
+	if c.host != "" {
+		if err := assertValidIdent("host", c.host); err != nil {
+			return err
+		}
+	}
+	return assertValidIdent(kind, s)
 }

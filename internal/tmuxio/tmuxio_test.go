@@ -12,9 +12,9 @@ import (
 
 // fakeRunner records every shell command and delegates to a handler. The handler
 // inspects the (fully-formed) command string — matching on substrings like
-// "capture-pane" or "send-keys … Enter" — and returns scripted output. This is
-// how the whole delivery-verification state machine is exercised without a real
-// tmux server (the real-server exercise lives in integration_test.go).
+// "capture-pane" or a trailing " Enter" — and returns scripted output. This is how
+// the whole delivery-verification state machine is exercised without a real tmux
+// server (the real-server exercise lives in integration_test.go).
 type fakeRunner struct {
 	mu     sync.Mutex
 	calls  []string
@@ -40,6 +40,18 @@ func (f *fakeRunner) countMatching(sub string) int {
 	n := 0
 	for _, c := range f.recorded() {
 		if strings.Contains(c, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+// countEnter counts the bare-Enter key events (a send-keys command ending in
+// " Enter"), distinct from a text delivery via `send-keys -l -- '<msg>'`.
+func (f *fakeRunner) countEnter() int {
+	n := 0
+	for _, c := range f.recorded() {
+		if strings.HasSuffix(strings.TrimSpace(c), " Enter") {
 			n++
 		}
 	}
@@ -75,6 +87,17 @@ func newFakeClient(handle func(cmd string) (string, error)) (*Client, *fakeRunne
 	return New(WithRunner(r), WithClock(k)), r, k
 }
 
+// boxCapture renders Claude Code's bordered input box with interior as the text
+// SITTING in the box — crucially, the last non-empty line is a "? for shortcuts"
+// hint, NOT the input. This is the M1 layout the old last-line matcher got wrong.
+func boxCapture(interior string) string {
+	return "some prior output\n" +
+		"╭──────────────────────────╮\n" +
+		"│ > " + interior + " │\n" +
+		"╰──────────────────────────╯\n" +
+		"  ? for shortcuts"
+}
+
 // ── discovery ──
 
 func TestListPanes(t *testing.T) {
@@ -106,29 +129,25 @@ func TestListPanes(t *testing.T) {
 }
 
 func TestResolveAgentWalksChildren(t *testing.T) {
-	// shell(4242) -> node(4300) -> claude(4350). The agent is the claude grandchild.
+	// shell(4242) -> node(4300) -> claude(4350). BFS finds the node child first.
 	c, _, _ := newFakeClient(func(cmd string) (string, error) {
 		switch {
 		case strings.Contains(cmd, "pgrep -P 4242"):
 			return "4300\n", nil
 		case strings.Contains(cmd, "pgrep -P 4300"):
 			return "4350\n", nil
-		case strings.Contains(cmd, "pgrep -P 4350"):
-			return "", errNoMatch{} // pgrep exits 1 -> no children
 		case strings.Contains(cmd, "ps -o comm= -p 4300"):
 			return "node\n", nil
 		case strings.Contains(cmd, "ps -o comm= -p 4350"):
 			return "claude\n", nil
 		}
-		return "", nil
+		return "", errNoMatch{}
 	})
 	pane := Pane{PaneID: "%1", PanePID: 4242, CurrentCommand: "zsh"}
 	got, ok, err := c.ResolveAgent(context.Background(), pane)
 	if err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
 	}
-	// BFS finds the node child first (it matches agentCommands too) — that is the
-	// documented behavior: the FIRST agent-like descendant wins.
 	if !ok || got.PID != 4300 || got.Command != "node" {
 		t.Fatalf("ResolveAgent = %+v ok=%v, want node pid 4300", got, ok)
 	}
@@ -166,34 +185,38 @@ func TestNormalizeAndHashStability(t *testing.T) {
 	if normalize(a) != b {
 		t.Fatalf("normalize(%q) = %q, want %q", a, normalize(a), b)
 	}
-	// Two captures differing only in cosmetic whitespace hash identically.
 	if newCapture(a).Hash != newCapture(b).Hash {
 		t.Fatalf("hashes differ for cosmetically-equal captures")
 	}
-	// Different content hashes differently.
 	if newCapture("hello\nworld").Hash == newCapture("hello\nmars").Hash {
 		t.Fatalf("distinct content produced identical hash")
 	}
 }
 
-// ── verification helpers ──
+// ── input-line location (the M1/M2 core) ──
 
-func TestInputLineHoldsExactly(t *testing.T) {
+func TestExtractInputLine(t *testing.T) {
 	cases := []struct {
-		name    string
-		capture string
-		msg     string
-		want    bool
+		name        string
+		capture     string
+		wantText    string
+		wantLocated bool
 	}{
-		{"exact sitting in box", "out\n❯ run the tests", "run the tests", true},
-		{"box cleared", "out\n❯ ", "run the tests", false},
-		{"contains but not exact (hint text)", "Goal blocked (/goal resume)\n❯ ", "/goal resume", false},
-		{"human-edited input is not exact", "❯ /goal resume && rm -rf x", "/goal resume", false},
-		{"multiline never exact", "❯ line two", "line one\nline two", false},
+		{"bordered box with message", boxCapture("run the tests"), "run the tests", true},
+		{"bordered box empty", boxCapture(""), "", true},
+		{"bare prompt with message", "history\n❯ hello world", "hello world", true},
+		{"bare prompt empty", "history\n❯", "", true},
+		{"codex prompt", "output\n› do the thing", "do the thing", true},
+		// M2: a message that itself begins with a prompt glyph must survive — only the
+		// single matched prompt PREFIX is stripped, not a greedy glyph-class trim.
+		{"glyph-leading message on bare prompt", "out\n❯ > deploy to prod", "> deploy to prod", true},
+		{"glyph-leading message in box", boxCapture("> deploy to prod"), "> deploy to prod", true},
+		{"no prompt at all", "just some\nplain output", "", false},
 	}
 	for _, c := range cases {
-		if got := inputLineHoldsExactly(c.capture, c.msg); got != c.want {
-			t.Errorf("%s: inputLineHoldsExactly = %v, want %v", c.name, got, c.want)
+		text, ok := extractInputLine(c.capture)
+		if ok != c.wantLocated || text != c.wantText {
+			t.Errorf("%s: extractInputLine = (%q, %v), want (%q, %v)", c.name, text, ok, c.wantText, c.wantLocated)
 		}
 	}
 }
@@ -206,7 +229,8 @@ func TestClassify(t *testing.T) {
 		capture string
 		want    State
 	}{
-		{"claude idle prompt", "some prior output\n\n❯ ", StateIdleAtPrompt},
+		{"claude idle bare prompt", "some prior output\n\n❯ ", StateIdleAtPrompt},
+		{"claude idle bordered box", boxCapture(""), StateIdleAtPrompt},
 		{"codex idle prompt", "history\n› Improve documentation in @main.go", StateIdleAtPrompt},
 		{"codex goal achieved", "  gpt-5.6 · ~/dev/russ                    Goal achieved (1h 52m)", StateIdleAtPrompt},
 		{"claude working spinner", "✻ Cogitating… (12s · ↑ 2.1k tokens)\n❯ ", StateWorking},
@@ -215,7 +239,9 @@ func TestClassify(t *testing.T) {
 		{"codex pursuing goal", "  gpt-5.6 · ~/dev/russ            Pursuing goal (2d 4h 12m)", StateWorking},
 		{"claude permission dialog", "Do you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude", StateAwaitingInput},
 		{"queued messages", "❯ my next thing\nPress up to edit queued messages", StateAwaitingInput},
-		{"codex goal blocked", "  gpt-5.6 · ~/dev/russ            Goal blocked (/goal resume)", StateAwaitingInput},
+		// m8: goal blocked/paused is its OWN state, NOT a keystroke-capturing menu.
+		{"codex goal blocked", "  gpt-5.6 · ~/dev/russ            Goal blocked (/goal resume)", StateGoalBlocked},
+		{"codex goal paused", "  gpt-5.6 · ~/dev/russ            Goal paused (/goal resume)", StateGoalBlocked},
 		{"unknown garbage", "asdf qwer zxcv", StateUnknown},
 		{"empty", "", StateUnknown},
 	}
@@ -230,29 +256,71 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// m9: transcript text the agent merely PRINTED far above the input box must not
+// masquerade as the current state.
+func TestClassifyIgnoresPrintedTranscript(t *testing.T) {
+	// A long transcript that once quoted a permission prompt, now sitting idle.
+	var b strings.Builder
+	b.WriteString("assistant: earlier I asked 'Do you want to proceed?' and you said yes\n")
+	for i := 0; i < 30; i++ {
+		b.WriteString("... build log line ...\n")
+	}
+	b.WriteString("❯ ")
+	if st, _ := Classify(b.String()); st != StateIdleAtPrompt {
+		t.Fatalf("printed 'Do you want to' far up misclassified as %q, want idle", st)
+	}
+}
+
+// m8: a goal-blocked pane must NOT read as a menu hazard (so a resume send is not
+// wrongly capped at Weak).
+func TestGoalBlockedIsNotMenuHazard(t *testing.T) {
+	if isMenuHazard("  gpt-5.6 · ~/dev/russ            Goal blocked (/goal resume)") {
+		t.Fatal("Goal blocked status hint should not be a menu hazard")
+	}
+}
+
+// ── display width (m4) ──
+
+func TestDisplayWidthWideRunes(t *testing.T) {
+	if displayWidth("abc") != 3 {
+		t.Errorf("ascii width = %d, want 3", displayWidth("abc"))
+	}
+	if w := displayWidth("日本語"); w != 6 { // 3 wide CJK runes
+		t.Errorf("CJK width = %d, want 6", w)
+	}
+	if w := displayWidth("🚀🚀"); w != 4 { // 2 emoji, 2 cols each
+		t.Errorf("emoji width = %d, want 4", w)
+	}
+	// The bug m4 flags: rune count would call a 50-emoji line "narrow" on an 80-col
+	// pane; display width (100) correctly makes it a wrap risk.
+	fifty := strings.Repeat("🚀", 50)
+	if !isWrapRisk(fifty, 80) {
+		t.Errorf("50 emoji on 80 cols should be a wrap risk (display width %d)", displayWidth(fifty))
+	}
+}
+
 // ── send: the crown jewel ──
 
-// sendHandler builds a fake handler for a single-line Send. display gives the
-// pane facts; capture is a function of how many Enter events have been sent so far
-// (enters), letting a test model a box that clears after N Enters. It also records
-// whether copy-mode cancel was requested.
-func sendHandler(display string, capture func(enters int) string) (*fakeRunner, func(cmd string) (string, error)) {
+// sendHandler builds a fake handler for a Send. display gives the pane facts;
+// capture is a function of how many bare-Enter events have been sent so far
+// (enters), letting a test model a box that clears after N Enters.
+func sendHandler(display string, capture func(enters int) string) *fakeRunner {
 	var enters int
 	fr := &fakeRunner{}
 	fr.handle = func(cmd string) (string, error) {
 		switch {
 		case strings.Contains(cmd, "display-message"):
 			return display, nil
-		case strings.Contains(cmd, "send-keys") && strings.Contains(cmd, "Enter"):
+		case strings.HasSuffix(strings.TrimSpace(cmd), " Enter"):
 			enters++
 			return "", nil
 		case strings.Contains(cmd, "capture-pane"):
 			return capture(enters), nil
-		default: // set-buffer, paste-buffer, send-keys -X cancel, etc.
+		default: // set-buffer, paste-buffer, send-keys -l -- <msg>, -X cancel
 			return "", nil
 		}
 	}
-	return fr, fr.handle
+	return fr
 }
 
 func runSend(t *testing.T, fr *fakeRunner, target, msg string, opts SendOptions) SendResult {
@@ -265,11 +333,13 @@ func runSend(t *testing.T, fr *fakeRunner, target, msg string, opts SendOptions)
 	return res
 }
 
+const paneFacts80 = "%1" + fieldSep + "80" + fieldSep + "0"
+
 func TestSendStrongCleanSubmit(t *testing.T) {
 	msg := "run the test suite"
-	fr, _ := sendHandler("%1"+fieldSep+"80"+fieldSep+"0", func(enters int) string {
+	fr := sendHandler(paneFacts80, func(enters int) string {
 		if enters >= 1 {
-			return "output\n❯ " // cleared after first Enter
+			return "output\n❯ "
 		}
 		return "output\n❯ " + msg
 	})
@@ -281,9 +351,9 @@ func TestSendStrongCleanSubmit(t *testing.T) {
 
 func TestSendSwallowedEnterThenStrong(t *testing.T) {
 	msg := "deploy now"
-	fr, _ := sendHandler("%1"+fieldSep+"80"+fieldSep+"0", func(enters int) string {
+	fr := sendHandler(paneFacts80, func(enters int) string {
 		if enters >= 2 {
-			return "output\n❯ " // clears only after the SECOND Enter
+			return "output\n❯ "
 		}
 		return "output\n❯ " + msg
 	})
@@ -293,26 +363,70 @@ func TestSendSwallowedEnterThenStrong(t *testing.T) {
 	}
 }
 
+// M1/M3: the bordered-box layout. Swallowed Enter must be FAILED (retries engage),
+// never a false Strong.
+func TestSendBorderedBoxSwallowedEnterFailed(t *testing.T) {
+	msg := "run the tests"
+	fr := sendHandler(paneFacts80, func(enters int) string {
+		return boxCapture(msg) // box NEVER clears — a menu swallows every Enter
+	})
+	res := runSend(t, fr, "%1", msg, SendOptions{MaxAttempts: 3})
+	if res.Verification != Failed || res.Attempts != 3 {
+		t.Fatalf("bordered-box swallowed: got %+v, want Failed/3 (old code false-Strong'd at attempt 1)", res)
+	}
+	if fr.countEnter() != 3 {
+		t.Fatalf("retries did not engage: %d Enter presses, want 3", fr.countEnter())
+	}
+}
+
+func TestSendBorderedBoxCleanSubmit(t *testing.T) {
+	msg := "run the tests"
+	fr := sendHandler(paneFacts80, func(enters int) string {
+		if enters >= 1 {
+			return boxCapture("") // box cleared
+		}
+		return boxCapture(msg)
+	})
+	res := runSend(t, fr, "%1", msg, SendOptions{})
+	if res.Verification != Strong || res.Attempts != 1 {
+		t.Fatalf("bordered-box clean submit: got %+v, want Strong/1", res)
+	}
+}
+
+// M2/M3: a message that begins with a prompt glyph exact-matches correctly (drives
+// the retry), instead of the old greedy strip false-clearing at attempt 1.
+func TestSendGlyphLeadingMessage(t *testing.T) {
+	msg := "> deploy to prod"
+	fr := sendHandler(paneFacts80, func(enters int) string {
+		if enters >= 2 {
+			return "out\n❯ "
+		}
+		return "out\n❯ " + msg // still sitting: "❯ > deploy to prod"
+	})
+	res := runSend(t, fr, "%1", msg, SendOptions{})
+	if res.Verification != Strong || res.Attempts != 2 {
+		t.Fatalf("glyph-leading: got %+v, want Strong/2 (proves exact-match engaged the retry)", res)
+	}
+}
+
 func TestSendFailedPersistentUnsubmitted(t *testing.T) {
 	msg := "never lands"
-	fr, _ := sendHandler("%1"+fieldSep+"80"+fieldSep+"0", func(enters int) string {
-		return "output\n❯ " + msg // never clears (a menu swallows every Enter)
+	fr := sendHandler(paneFacts80, func(enters int) string {
+		return "output\n❯ " + msg // never clears
 	})
 	res := runSend(t, fr, "%1", msg, SendOptions{MaxAttempts: 3})
 	if res.Verification != Failed || res.Attempts != 3 {
 		t.Fatalf("persistent: got %+v, want Failed/3", res)
 	}
-	if fr.countMatching("send-keys") < 3 {
-		t.Errorf("expected >=3 Enter presses, got %d", fr.countMatching("send-keys"))
+	if fr.countEnter() != 3 {
+		t.Errorf("expected 3 Enter presses, got %d", fr.countEnter())
 	}
 }
 
 func TestSendWeakOnMenuHazard(t *testing.T) {
 	msg := "approve it"
-	fr, _ := sendHandler("%1"+fieldSep+"80"+fieldSep+"0", func(enters int) string {
+	fr := sendHandler(paneFacts80, func(enters int) string {
 		if enters >= 1 {
-			// box cleared, but a permission dialog is now up: our text may have gone
-			// into the dialog, not the agent.
 			return "Do you want to proceed?\n❯ 1. Yes\n  2. No"
 		}
 		return "output\n❯ " + msg
@@ -323,23 +437,23 @@ func TestSendWeakOnMenuHazard(t *testing.T) {
 	}
 }
 
-func TestSendWeakWhenPasteNeverLanded(t *testing.T) {
-	// The paste never shows up in the input box (e.g. it was swallowed by a menu
-	// that has since closed): even though the box reads clear after Enter, we could
-	// never confirm the text landed, so the verdict must NOT be a false Strong.
+func TestSendWeakWhenTextNeverLanded(t *testing.T) {
+	// The text never shows up in the box (swallowed by a menu that has since
+	// closed): the box reads empty after Enter, but we could never confirm it
+	// landed, so the verdict must NOT be a false Strong.
 	msg := "did this land?"
-	fr, _ := sendHandler("%1"+fieldSep+"80"+fieldSep+"0", func(enters int) string {
-		return "❯ " // paste never visible, box always clear — no fragment, no hazard
+	fr := sendHandler(paneFacts80, func(enters int) string {
+		return "output\n❯ " // box always empty, no fragment, no hazard
 	})
 	res := runSend(t, fr, "%1", msg, SendOptions{})
 	if res.Verification != Weak {
-		t.Fatalf("paste-never-landed: got %+v, want Weak (honest, not a false Strong)", res)
+		t.Fatalf("text-never-landed: got %+v, want Weak (honest, not a false Strong)", res)
 	}
 }
 
 func TestSendCopyModeCancel(t *testing.T) {
 	msg := "hello"
-	fr, _ := sendHandler("%1"+fieldSep+"80"+fieldSep+"1", func(enters int) string { // in_mode = 1
+	fr := sendHandler("%1"+fieldSep+"80"+fieldSep+"1", func(enters int) string { // in_mode = 1
 		if enters >= 1 {
 			return "❯ "
 		}
@@ -358,15 +472,15 @@ func TestSendWrappedMultilineWeak(t *testing.T) {
 	fr.handle = func(cmd string) (string, error) {
 		switch {
 		case strings.Contains(cmd, "display-message"):
-			return "%1" + fieldSep + "80" + fieldSep + "0", nil
+			return paneFacts80, nil
 		case strings.Contains(cmd, "paste-buffer"):
 			pasted = true
 			return "", nil
 		case strings.Contains(cmd, "capture-pane"):
 			if pasted {
-				return "the agent started working\n✻ Thinking (2s · esc to interrupt)", nil // changed, no fragment
+				return "the agent started working\n✻ Thinking (2s · esc to interrupt)", nil
 			}
-			return "❯ ", nil // pre-paste snapshot
+			return "❯ ", nil
 		default:
 			return "", nil
 		}
@@ -375,53 +489,74 @@ func TestSendWrappedMultilineWeak(t *testing.T) {
 	if res.Verification != Weak {
 		t.Fatalf("wrapped multiline: got %+v, want Weak (honest: exact-match unavailable)", res)
 	}
-	// Wrapped path must press Enter exactly once — never retry blindly.
-	if fr.countMatching("send-keys") != 1 {
-		t.Errorf("wrapped path pressed Enter %d times, want exactly 1", fr.countMatching("send-keys"))
+	if fr.countEnter() != 1 {
+		t.Errorf("wrapped path pressed Enter %d times, want exactly 1", fr.countEnter())
+	}
+	// A multiline message must be delivered via paste, not literal keys.
+	if fr.countMatching("paste-buffer") != 1 {
+		t.Errorf("multiline should deliver via paste-buffer; count=%d", fr.countMatching("paste-buffer"))
 	}
 }
 
-func TestSendWrappedFailedWhenStuck(t *testing.T) {
-	msg := strings.Repeat("x", 500) // long single line -> wrap risk
+// M3: a codex "[Pasted text #1 +N lines]" placeholder still sitting in the input
+// region means the paste is unsubmitted.
+func TestSendWrappedCodexPlaceholderFailed(t *testing.T) {
+	msg := "line one\nline two\nline three" // multiline -> wrapped path, paste delivery
 	fr := &fakeRunner{}
 	fr.handle = func(cmd string) (string, error) {
 		switch {
 		case strings.Contains(cmd, "display-message"):
-			return "%1" + fieldSep + "80" + fieldSep + "0", nil
+			return paneFacts80, nil
 		case strings.Contains(cmd, "capture-pane"):
-			// Pane never changes and still shows the pasted placeholder -> stuck.
-			return "❯ [Pasted text #1 +0 lines]", nil
+			// Pane never changes and shows the placeholder still in the box.
+			return "❯ [Pasted text #1 +2 lines]", nil
 		default:
 			return "", nil
 		}
 	}
 	res := runSend(t, fr, "%1", msg, SendOptions{})
 	if res.Verification != Failed {
-		t.Fatalf("wrapped stuck: got %+v, want Failed", res)
+		t.Fatalf("codex placeholder stuck: got %+v, want Failed", res)
+	}
+}
+
+func TestSendShortSingleLineDeliversViaKeys(t *testing.T) {
+	msg := "short line"
+	fr := sendHandler(paneFacts80, func(enters int) string {
+		if enters >= 1 {
+			return "❯ "
+		}
+		return "❯ " + msg
+	})
+	_ = runSend(t, fr, "%1", msg, SendOptions{})
+	if fr.countMatching(" -l -- ") != 1 {
+		t.Errorf("short single line should deliver via send-keys -l --; count=%d", fr.countMatching(" -l -- "))
+	}
+	if fr.countMatching("paste-buffer") != 0 {
+		t.Errorf("short single line should NOT paste; paste count=%d", fr.countMatching("paste-buffer"))
 	}
 }
 
 func TestSendNoSubmitAndNoVerify(t *testing.T) {
-	msg := "hi"
+	msg := "hi there"
 	mk := func() *fakeRunner {
-		fr, _ := sendHandler("%1"+fieldSep+"80"+fieldSep+"0", func(int) string { return "❯ " + msg })
-		return fr
+		return sendHandler(paneFacts80, func(int) string { return "❯ " + msg })
 	}
 	nsFR := mk()
 	ns := runSend(t, nsFR, "%1", msg, SendOptions{NoSubmit: true})
 	if ns.Verification != Weak || ns.Attempts != 0 {
 		t.Fatalf("NoSubmit: got %+v, want Weak/0", ns)
 	}
-	if nsFR.countMatching("send-keys") != 0 {
-		t.Errorf("NoSubmit pressed Enter %d times, want 0", nsFR.countMatching("send-keys"))
+	if nsFR.countEnter() != 0 {
+		t.Errorf("NoSubmit pressed Enter %d times, want 0", nsFR.countEnter())
 	}
 	nvFR := mk()
 	nv := runSend(t, nvFR, "%1", msg, SendOptions{NoVerify: true})
 	if nv.Verification != Weak || nv.Attempts != 1 {
 		t.Fatalf("NoVerify: got %+v, want Weak/1", nv)
 	}
-	if nvFR.countMatching("send-keys") != 1 {
-		t.Errorf("NoVerify pressed Enter %d times, want 1", nvFR.countMatching("send-keys"))
+	if nvFR.countEnter() != 1 {
+		t.Errorf("NoVerify pressed Enter %d times, want 1", nvFR.countEnter())
 	}
 }
 
@@ -432,13 +567,23 @@ func TestSendEmptyMessageErrors(t *testing.T) {
 	}
 }
 
+func TestSendRejectsNulAndOversize(t *testing.T) {
+	c := New(WithRunner(&fakeRunner{handle: func(string) (string, error) { return "", nil }}), WithClock(newFakeClock()))
+	if _, err := c.Send(context.Background(), "%1", "bad\x00byte", SendOptions{}); err == nil {
+		t.Error("expected error for NUL in message")
+	}
+	big := strings.Repeat("x", maxMessageBytes+1)
+	if _, err := c.Send(context.Background(), "%1", big, SendOptions{}); err == nil {
+		t.Error("expected error for oversize message")
+	}
+}
+
 func TestNudge(t *testing.T) {
-	// changed -> Weak
 	var enters int
 	fr := &fakeRunner{}
 	fr.handle = func(cmd string) (string, error) {
 		switch {
-		case strings.Contains(cmd, "send-keys") && strings.Contains(cmd, "Enter"):
+		case strings.HasSuffix(strings.TrimSpace(cmd), " Enter"):
 			enters++
 			return "", nil
 		case strings.Contains(cmd, "capture-pane"):
@@ -459,7 +604,6 @@ func TestNudge(t *testing.T) {
 		t.Fatalf("nudge changed: got %+v, want Weak", res)
 	}
 
-	// no change -> Failed
 	frNo := &fakeRunner{handle: func(cmd string) (string, error) {
 		if strings.Contains(cmd, "capture-pane") {
 			return "❯ stuck text", nil
@@ -470,6 +614,30 @@ func TestNudge(t *testing.T) {
 	res2, _ := c2.Nudge(context.Background(), "%1")
 	if res2.Verification != Failed {
 		t.Fatalf("nudge no-change: got %+v, want Failed", res2)
+	}
+}
+
+// ── identifier validation (m12) ──
+
+func TestValidateIdentRejectsBadNames(t *testing.T) {
+	c := New(WithRunner(&fakeRunner{handle: func(string) (string, error) { return "", nil }}), WithClock(newFakeClock()))
+	bad := []string{"", "-rf", "-oProxyCommand=x", "has\x00nul", "ctrl\x1fchar"}
+	for _, name := range bad {
+		if _, err := c.Send(context.Background(), name, "hi", SendOptions{}); err == nil {
+			t.Errorf("Send accepted invalid target %q", name)
+		}
+		if err := c.NewSession(context.Background(), SessionSpec{Name: name, Command: "codex"}); err == nil {
+			t.Errorf("NewSession accepted invalid name %q", name)
+		}
+	}
+	// A leading-dash HOST is caught at the first op.
+	badHost := New(WithRunner(&fakeRunner{handle: func(string) (string, error) { return "", nil }}), WithClock(newFakeClock()), WithHost("-oProxyCommand=x"))
+	if _, err := badHost.ListPanes(context.Background()); err == nil {
+		t.Error("ListPanes accepted a leading-dash host")
+	}
+	// A valid name with an interior space is fine (tmux session names allow it).
+	if err := assertValidIdent("session name", "my session"); err != nil {
+		t.Errorf("interior space should be valid: %v", err)
 	}
 }
 
@@ -497,7 +665,6 @@ func TestHasSession(t *testing.T) {
 }
 
 func TestNewSessionCommandConstruction(t *testing.T) {
-	// Local session.
 	local, lr, _ := newFakeClient(func(string) (string, error) { return "", nil })
 	if err := local.NewSession(context.Background(), SessionSpec{Name: "epic-x", Command: "codex", StartDir: "/tmp/wt"}); err != nil {
 		t.Fatalf("NewSession local: %v", err)
@@ -506,20 +673,6 @@ func TestNewSessionCommandConstruction(t *testing.T) {
 	for _, want := range []string{"new-session -d -s 'epic-x'", "-c '/tmp/wt'", "'codex'"} {
 		if !strings.Contains(call, want) {
 			t.Errorf("local new-session missing %q in: %s", want, call)
-		}
-	}
-
-	// Pane-level ssh wrap (RemoteHost): the pane runs interactive ssh.
-	remote, rr, _ := newFakeClient(func(string) (string, error) { return "", nil })
-	if err := remote.NewSession(context.Background(), SessionSpec{Name: "epic-y", Command: "claude", RemoteHost: "box-7"}); err != nil {
-		t.Fatalf("NewSession remote: %v", err)
-	}
-	// The pane command is shQuote'd as a whole when handed to tmux, so its inner
-	// quotes appear escaped ('\'') — assert on the structural tokens, which survive.
-	rcall := rr.recorded()[0]
-	for _, want := range []string{"ssh -tt --", "box-7", "claude"} {
-		if !strings.Contains(rcall, want) {
-			t.Errorf("remote-host new-session missing %q in: %s", want, rcall)
 		}
 	}
 }
@@ -561,7 +714,6 @@ func TestRemoteWrapGuardsHost(t *testing.T) {
 	if got := remoteWrap("", "tmux ls"); got != "tmux ls" {
 		t.Errorf("local remoteWrap should pass through, got %q", got)
 	}
-	// A leading-dash host must be behind `--` so ssh never reads it as an option.
 	got := remoteWrap("-oProxyCommand=evil", "tmux ls")
 	if !strings.Contains(got, " -- '-oProxyCommand=evil' ") {
 		t.Errorf("remoteWrap must place `--` before the host: %s", got)
