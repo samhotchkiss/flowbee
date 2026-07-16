@@ -171,9 +171,9 @@ func WithSocket(name string) Option { return func(c *Client) { c.socket = name }
 // (the internal/watchdog transport). The empty default is local. host must be a
 // pre-validated identifier (an operator-registered box name); it is shQuote'd and
 // `--`-guarded regardless. NOTE: this is distinct from a LOCAL pane whose own
-// foreground command is `ssh` (SessionSpec.RemoteHost, and the Remote flag on
-// AgentProcess) — that is an agent reached THROUGH a local pane, whereas WithHost
-// puts the whole tmux server on the far side.
+// foreground command is `ssh` (which discovery surfaces via AgentProcess.Remote) —
+// that is an agent reached THROUGH a local pane, whereas WithHost puts the whole
+// tmux server on the far side.
 func WithHost(host string) Option { return func(c *Client) { c.host = host } }
 
 // New builds a Client. With no options it drives the real tmux binary against the
