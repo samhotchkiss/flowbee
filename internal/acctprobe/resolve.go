@@ -34,7 +34,7 @@ func (p *Prober) ResolvePID(ctx context.Context, pid int, home string) (*Resolut
 	env := parseProcEnv(cmdline)
 
 	res := &Resolution{Env: map[string]string{}}
-	for _, k := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "FLOWBEE_ACCOUNT"} {
+	for _, k := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME", "FLOWBEE_ACCOUNT"} {
 		if v, ok := env[k]; ok {
 			res.Env[k] = v
 		}
@@ -49,6 +49,8 @@ func (p *Prober) ResolvePID(ctx context.Context, pid int, home string) (*Resolut
 				res.Provider = ProviderClaude
 			case ProviderCodex:
 				res.Provider = ProviderCodex
+			case ProviderGrok:
+				res.Provider = ProviderGrok
 			}
 		}
 	}
@@ -61,11 +63,15 @@ func (p *Prober) ResolvePID(ctx context.Context, pid int, home string) (*Resolut
 		res.ConfigDir = firstNonEmpty(env["CODEX_HOME"], filepath.Join(home, ".codex"))
 	case ProviderClaude:
 		res.ConfigDir = firstNonEmpty(env["CLAUDE_CONFIG_DIR"], filepath.Join(home, ".claude"))
+	case ProviderGrok:
+		res.ConfigDir = firstNonEmpty(env["GROK_HOME"], filepath.Join(home, ".grok"))
 	default:
 		// unknown provider but a dir env may still tell us where to look.
 		if v := env["CODEX_HOME"]; v != "" {
 			res.ConfigDir = v
 		} else if v := env["CLAUDE_CONFIG_DIR"]; v != "" {
+			res.ConfigDir = v
+		} else if v := env["GROK_HOME"]; v != "" {
 			res.ConfigDir = v
 		}
 	}
@@ -80,11 +86,17 @@ func inferProvider(env map[string]string, cmdline string) Provider {
 	if _, ok := env["CLAUDE_CONFIG_DIR"]; ok {
 		return ProviderClaude
 	}
+	if _, ok := env["GROK_HOME"]; ok {
+		return ProviderGrok
+	}
 	lc := strings.ToLower(cmdline)
-	// check codex first: a codex command line rarely mentions "claude", but a claude
-	// wrapper path could contain neither — codex is the more specific token here.
+	// check codex/grok first: their command tokens are specific, whereas a claude
+	// wrapper path could contain neither.
 	if strings.Contains(lc, "codex") {
 		return ProviderCodex
+	}
+	if strings.Contains(lc, "grok") {
+		return ProviderGrok
 	}
 	if strings.Contains(lc, "claude") {
 		return ProviderClaude
@@ -100,7 +112,7 @@ func inferProvider(env map[string]string, cmdline string) Provider {
 // (none of these three ever contain one), matching `ps`'s own ambiguity.
 func parseProcEnv(cmdline string) map[string]string {
 	env := map[string]string{}
-	for _, key := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "FLOWBEE_ACCOUNT"} {
+	for _, key := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME", "FLOWBEE_ACCOUNT"} {
 		prefix := key + "="
 		idx := strings.LastIndex(cmdline, prefix)
 		if idx < 0 {

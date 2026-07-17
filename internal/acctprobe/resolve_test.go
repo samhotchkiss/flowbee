@@ -51,6 +51,25 @@ func TestResolvePID(t *testing.T) {
 			wantProv: ProviderCodex,
 			wantDir:  "/home/u/.codex",
 		},
+		{
+			name:     "GROK_HOME for a grok process",
+			cmdline:  "/opt/homebrew/bin/grok --yolo GROK_HOME=/gk",
+			wantProv: ProviderGrok,
+			wantDir:  "/gk",
+		},
+		{
+			name:     "grok default home when env unset",
+			cmdline:  "/opt/homebrew/bin/grok \"do a thing\" --yolo",
+			wantProv: ProviderGrok,
+			wantDir:  "/home/u/.grok",
+		},
+		{
+			name:     "FLOWBEE_ACCOUNT grok prefix wins",
+			cmdline:  "node /x/thing GROK_HOME=/gk FLOWBEE_ACCOUNT=grok:me@x.ai",
+			wantProv: ProviderGrok,
+			wantDir:  "/gk",
+			wantAcct: "grok:me@x.ai",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
