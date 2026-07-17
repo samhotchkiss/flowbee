@@ -38,6 +38,8 @@ function sessionItems(): { value: string; label: string }[] {
 }
 
 async function focusMaster(name: string): Promise<void> {
+	// resolve against a fetched registry so a remote master's box is honored.
+	if (!flowbee.state<SessionEntry[]>("sessions").data) await flowbee.refresh("sessions");
 	const entry = masterEntry(name);
 	await focusSession({
 		tmuxName: entry?.tmux_name ?? name,
@@ -94,7 +96,7 @@ export class MasterFocusAction extends SingletonAction<FocusSettings> {
 
 	override onSendToPlugin(ev: SendToPluginEvent<{ event?: string }, FocusSettings>): void {
 		if (ev.payload?.event !== "getSessions") return;
-		void streamDeck.ui.sendToPropertyInspector({ event: "getSessions", items: sessionItems() });
+		void streamDeck.ui.sendToPropertyInspector({ event: "getSessions", items: sessionItems() }).catch(() => {});
 	}
 
 	private renderAll(): void {
@@ -126,9 +128,26 @@ const DEFAULT_PROMPT = "Give me the current status of all of our goals";
 
 @action({ UUID: "com.samhotchkiss.flowbee.master-prompt" })
 export class MasterPromptAction extends SingletonAction<PromptSettings> {
+	// subscribes to "sessions" like MasterFocusAction: masterEntry() needs the
+	// registry to resolve a remote master's box, and the PI's session picker
+	// reads the same data — without a subscription both silently see nothing
+	// whenever no goal-session/master-focus key is on the visible page.
+	private visible = new Set<string>();
+	private unsubscribe?: () => void;
+
 	override onWillAppear(ev: WillAppearEvent<PromptSettings>): void {
 		if (!ev.action.isKey()) return;
+		this.visible.add(ev.action.id);
+		if (!this.unsubscribe) this.unsubscribe = flowbee.subscribe("sessions", () => {});
 		void ev.action.setImage(promptKey({ label: ev.payload.settings.label?.trim() || "goal status" })).catch(() => {});
+	}
+
+	override onWillDisappear(ev: WillDisappearEvent<PromptSettings>): void {
+		this.visible.delete(ev.action.id);
+		if (this.visible.size === 0) {
+			this.unsubscribe?.();
+			this.unsubscribe = undefined;
+		}
 	}
 
 	override onDidReceiveSettings(ev: DidReceiveSettingsEvent<PromptSettings>): void {
@@ -142,6 +161,9 @@ export class MasterPromptAction extends SingletonAction<PromptSettings> {
 			await ev.action.showAlert();
 			return;
 		}
+		// belt-and-suspenders: make sure the registry was actually fetched before
+		// resolving box/tmux, so a remote master never falls back to local tmux.
+		if (!flowbee.state<SessionEntry[]>("sessions").data) await flowbee.refresh("sessions");
 		const entry = masterEntry(name);
 		try {
 			await sendPrompt({
@@ -159,6 +181,6 @@ export class MasterPromptAction extends SingletonAction<PromptSettings> {
 
 	override onSendToPlugin(ev: SendToPluginEvent<{ event?: string }, PromptSettings>): void {
 		if (ev.payload?.event !== "getSessions") return;
-		void streamDeck.ui.sendToPropertyInspector({ event: "getSessions", items: sessionItems() });
+		void streamDeck.ui.sendToPropertyInspector({ event: "getSessions", items: sessionItems() }).catch(() => {});
 	}
 }

@@ -25,9 +25,12 @@ function tmux(): string {
 	return tmuxPath;
 }
 
-/** Session names travel into tmux -t targets, ssh commands, and AppleScript — keep them boring. */
+/**
+ * Session names travel into tmux -t targets, ssh commands, and AppleScript —
+ * keep them boring, and never leading-dash (ssh/tmux would parse it as a flag).
+ */
 export function validSessionName(name: string): boolean {
-	return /^[A-Za-z0-9._@-]+$/.test(name);
+	return /^[A-Za-z0-9._@][A-Za-z0-9._@-]*$/.test(name);
 }
 
 function assertName(name: string): void {
@@ -160,7 +163,8 @@ export async function focusSession({ tmuxName, box, terminalApp }: FocusTarget):
 	assertName(tmuxName);
 	if (box) {
 		if (!validSessionName(box)) throw new Error(`refusing unsafe ssh host: ${JSON.stringify(box)}`);
-		await osascript(openWindowScript(terminalApp, `ssh -t ${box} tmux attach -t ${shQuote(tmuxName)}`));
+		// '=' prefix = exact session match (bare -t does prefix matching).
+		await osascript(openWindowScript(terminalApp, `ssh -t -- ${box} tmux attach -t ${shQuote(`=${tmuxName}`)}`));
 		return;
 	}
 	const sessions = await listLocalTmuxSessions();
@@ -174,7 +178,9 @@ export async function focusSession({ tmuxName, box, terminalApp }: FocusTarget):
 		}
 	}
 	// session exists but nothing is attached (or its tab is gone) — attach fresh.
-	await osascript(openWindowScript(terminalApp, `tmux attach -t ${shQuote(tmuxName)}`));
+	// absolute tmux path: the terminal runs this command directly, not via a
+	// login shell, so /opt/homebrew/bin is not on its PATH.
+	await osascript(openWindowScript(terminalApp, `${tmux()} attach -t ${shQuote(`=${tmuxName}`)}`));
 }
 
 export type PromptTarget = {
@@ -193,19 +199,27 @@ export async function sendPrompt({ tmuxName, box, text, submit = true }: PromptT
 	assertName(tmuxName);
 	const line = text.replaceAll("\r", " ").replaceAll("\n", " ").trim();
 	if (!line) throw new Error("empty prompt");
+	// '=' prefix = exact session match; bare -t prefix-matches, which could
+	// type the prompt into a DIFFERENT agent's session (flowbee → flowbee-claude).
+	const target = `=${tmuxName}`;
 	if (box) {
 		if (!validSessionName(box)) throw new Error(`refusing unsafe ssh host: ${JSON.stringify(box)}`);
-		const target = shQuote(tmuxName);
-		await exec("/usr/bin/ssh", [box, `tmux send-keys -t ${target} -l -- ${shQuote(line)}`], { timeout: 15_000 });
+		await exec("/usr/bin/ssh", ["--", box, `tmux send-keys -t ${shQuote(target)} -l -- ${shQuote(line)}`], {
+			timeout: 15_000,
+		});
 		if (submit) {
 			await new Promise((r) => setTimeout(r, 300));
-			await exec("/usr/bin/ssh", [box, `tmux send-keys -t ${target} Enter`], { timeout: 15_000 });
+			await exec("/usr/bin/ssh", ["--", box, `tmux send-keys -t ${shQuote(target)} Enter`], { timeout: 15_000 });
 		}
 		return;
 	}
-	await exec(tmux(), ["send-keys", "-t", tmuxName, "-l", "--", line], { timeout: 5_000 });
+	const sessions = await listLocalTmuxSessions();
+	if (!sessions.some((s) => s.name === tmuxName)) {
+		throw new Error(`no local tmux session named ${JSON.stringify(tmuxName)}`);
+	}
+	await exec(tmux(), ["send-keys", "-t", target, "-l", "--", line], { timeout: 5_000 });
 	if (submit) {
 		await new Promise((r) => setTimeout(r, 300));
-		await exec(tmux(), ["send-keys", "-t", tmuxName, "Enter"], { timeout: 5_000 });
+		await exec(tmux(), ["send-keys", "-t", target, "Enter"], { timeout: 5_000 });
 	}
 }

@@ -37,8 +37,12 @@ export class AttentionAction extends SingletonAction {
 		}
 	}
 
-	override async onKeyDown(_ev: KeyDownEvent): Promise<void> {
-		await openUrl(`${flowbee.api.baseUrl}/dashboard`);
+	override async onKeyDown(ev: KeyDownEvent): Promise<void> {
+		try {
+			await openUrl(`${flowbee.api.baseUrl}/dashboard`);
+		} catch {
+			await ev.action.showAlert().catch(() => {});
+		}
 	}
 
 	private renderAll(): void {

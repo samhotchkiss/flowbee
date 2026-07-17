@@ -39,8 +39,10 @@ function shortLabel(accountId: string): string {
 
 export function usageStatus(a: AccountUsage): AccountStatus {
 	if (!a.reported_at) return "never";
-	if (a.rate_limited || a.at_ceiling) return "gated";
+	// staleness FIRST: a quiet box pins a frozen high-water gauge (429 included)
+	// forever — Flowbee's house rule is never to alarm on a >24h-old report.
 	if (Date.now() - Date.parse(a.reported_at) > STALE_MS) return "stale";
+	if (a.rate_limited || a.at_ceiling) return "gated";
 	if (a.usage_pct >= 75) return "warn";
 	return "ok";
 }
@@ -80,32 +82,38 @@ export class AccountUsageAction extends SingletonAction<Settings> {
 	}
 
 	override onKeyDown(ev: KeyDownEvent<Settings>): Promise<void> {
-		return this.openFleet();
+		return this.openFleet(() => ev.action.showAlert());
 	}
 
-	override onDialDown(_ev: DialDownEvent<Settings>): Promise<void> {
-		return this.openFleet();
+	override onDialDown(ev: DialDownEvent<Settings>): Promise<void> {
+		return this.openFleet(() => ev.action.showAlert());
 	}
 
-	override onTouchTap(_ev: TouchTapEvent<Settings>): Promise<void> {
-		return this.openFleet();
+	override onTouchTap(ev: TouchTapEvent<Settings>): Promise<void> {
+		return this.openFleet(() => ev.action.showAlert());
 	}
 
 	/** Datasource for the property inspector's account picker. */
 	override onSendToPlugin(ev: SendToPluginEvent<{ event?: string }, Settings>): void {
 		if (ev.payload?.event !== "getAccounts") return;
 		const accounts = flowbee.state<AccountUsage[]>("fleet").data ?? [];
-		void streamDeck.ui.sendToPropertyInspector({
-			event: "getAccounts",
-			items: [
-				{ value: "", label: "Auto (by key column)" },
-				...accounts.map((a) => ({ value: a.account_id, label: `${a.account_id} (${a.usage_pct}%)` })),
-			],
-		});
+		void streamDeck.ui
+			.sendToPropertyInspector({
+				event: "getAccounts",
+				items: [
+					{ value: "", label: "Auto (by key column)" },
+					...accounts.map((a) => ({ value: a.account_id, label: `${a.account_id} (${a.usage_pct}%)` })),
+				],
+			})
+			.catch(() => {});
 	}
 
-	private async openFleet(): Promise<void> {
-		await openUrl(`${flowbee.api.baseUrl}/fleet`);
+	private async openFleet(alert: () => Promise<void>): Promise<void> {
+		try {
+			await openUrl(`${flowbee.api.baseUrl}/fleet`);
+		} catch {
+			await alert().catch(() => {});
+		}
 	}
 
 	private renderAll(): void {
@@ -118,7 +126,9 @@ export class AccountUsageAction extends SingletonAction<Settings> {
 
 		if (!data) {
 			if (view.action.isDial()) {
-				void view.action.setFeedback({ title: "Flowbee", value: error ? "offline" : "…", indicator: { value: 0 } });
+				void view.action
+					.setFeedback({ title: "Flowbee", value: error ? "offline" : "…", indicator: { value: 0 } })
+					.catch(() => {});
 			} else {
 				set(noteKey("FLOWBEE", error ? "no server" : "loading…"));
 			}
@@ -129,7 +139,7 @@ export class AccountUsageAction extends SingletonAction<Settings> {
 			: data[view.column];
 		if (!account) {
 			if (view.action.isDial()) {
-				void view.action.setFeedback({ title: "—", value: "no account", indicator: { value: 0 } });
+				void view.action.setFeedback({ title: "—", value: "no account", indicator: { value: 0 } }).catch(() => {});
 			} else {
 				set(noteKey("—", view.settings.account ? "gone?" : `no account #${view.column + 1}`));
 			}
@@ -137,11 +147,13 @@ export class AccountUsageAction extends SingletonAction<Settings> {
 		}
 		const status = usageStatus(account);
 		if (view.action.isDial()) {
-			void view.action.setFeedback({
-				title: shortLabel(account.account_id),
-				value: status === "never" ? "–" : `${Math.round(account.usage_pct)}%`,
-				indicator: { value: Math.max(0, Math.min(account.usage_pct, 100)), bar_fill_c: accountStatusColor(status) },
-			});
+			void view.action
+				.setFeedback({
+					title: shortLabel(account.account_id),
+					value: status === "never" ? "–" : `${Math.round(account.usage_pct)}%`,
+					indicator: { value: Math.max(0, Math.min(account.usage_pct, 100)), bar_fill_c: accountStatusColor(status) },
+				})
+				.catch(() => {});
 			return;
 		}
 		set(

@@ -116,18 +116,20 @@ export class GoalSessionAction extends SingletonAction<Settings> {
 		const entries = flowbee.state<SessionEntry[]>("sessions").data ?? [];
 		const watched = entries.filter((e) => e.state !== "unwatched");
 		const unwatched = entries.filter((e) => e.state === "unwatched");
-		void streamDeck.ui.sendToPropertyInspector({
-			event: "getSessions",
-			items: [
-				{ value: "", label: "Auto (by key column)" },
-				...(watched.length
-					? [{ label: "Goal sessions (watched)", children: watched.map((e) => ({ value: e.id, label: `${e.id} — ${e.state}` })) }]
-					: []),
-				...(unwatched.length
-					? [{ label: "Local tmux (unwatched)", children: unwatched.map((e) => ({ value: `tmux:${e.tmux_name}`, label: e.tmux_name })) }]
-					: []),
-			],
-		});
+		void streamDeck.ui
+			.sendToPropertyInspector({
+				event: "getSessions",
+				items: [
+					{ value: "", label: "Auto (by key column)" },
+					...(watched.length
+						? [{ label: "Goal sessions (watched)", children: watched.map((e) => ({ value: e.id, label: `${e.id} — ${e.state}` })) }]
+						: []),
+					...(unwatched.length
+						? [{ label: "Local tmux (unwatched)", children: unwatched.map((e) => ({ value: `tmux:${e.tmux_name}`, label: e.tmux_name })) }]
+						: []),
+				],
+			})
+			.catch(() => {});
 	}
 
 	private renderAll(): void {

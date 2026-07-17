@@ -26,7 +26,10 @@ function esc(s: string): string {
 }
 
 function truncate(s: string, max: number): string {
-	return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+	// code-point-wise: a .slice() through a surrogate pair yields a lone
+	// surrogate, which makes encodeURIComponent throw (URIError) mid-render.
+	const cps = Array.from(s);
+	return cps.length <= max ? s : `${cps.slice(0, max - 1).join("")}…`;
 }
 
 function svg(body: string, bg = COLORS.bg): string {

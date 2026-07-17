@@ -65,6 +65,10 @@ class FlowbeeService {
 				void this.refresh(key);
 			}
 		}
+		// force the SSE stream onto the (possibly new) base URL — restartSSE()
+		// alone is a no-op while a connection to the OLD server is still open.
+		this.sseAbort?.abort();
+		this.sseAbort = undefined;
 		this.restartSSE();
 	}
 
@@ -109,8 +113,13 @@ class FlowbeeService {
 			try {
 				r.state = { data: await r.fetch(), fetchedAt: Date.now() };
 			} catch (e) {
-				r.state = { ...r.state, error: e instanceof Error ? e : new Error(String(e)) };
-				logger.debug(`refresh ${key}: ${r.state.error?.message}`);
+				const error = e instanceof Error ? e : new Error(String(e));
+				// keep last-known data across a brief blip, but once the server has
+				// been gone for ~3 poll intervals, drop it — a deck showing hours-old
+				// "all clear" is worse than one showing "no server".
+				const gone = !r.state.fetchedAt || Date.now() - r.state.fetchedAt > 3 * pollMs(this.gs);
+				r.state = gone ? { error } : { ...r.state, error };
+				logger.debug(`refresh ${key}: ${error.message}`);
 			} finally {
 				r.inFlight = undefined;
 			}
@@ -181,11 +190,11 @@ class FlowbeeService {
 		const abort = new AbortController();
 		this.sseAbort = abort;
 		while (!abort.signal.aborted && this.anySubscribers) {
+			const connectedAt = Date.now();
 			try {
 				const res = await fetch(`${this.client.baseUrl}/v1/events`, { signal: abort.signal });
 				if (!res.ok || !res.body) throw new Error(`SSE HTTP ${res.status}`);
 				logger.info("SSE connected");
-				this.sseBackoffMs = 1_000;
 				// connected after an outage — re-sync everything we watch.
 				this.refreshActive();
 				const reader = res.body.getReader();
@@ -194,6 +203,9 @@ class FlowbeeService {
 				for (;;) {
 					const { done, value } = await reader.read();
 					if (done) break;
+					// only a real frame proves the stream works — resetting backoff on
+					// a bare 200 turns a connect-then-close endpoint into a 1s storm.
+					this.sseBackoffMs = 1_000;
 					buf += decoder.decode(value, { stream: true });
 					let i: number;
 					while ((i = buf.indexOf("\n\n")) >= 0) {
@@ -209,6 +221,9 @@ class FlowbeeService {
 				logger.debug(`SSE: ${e instanceof Error ? e.message : e}`);
 			}
 			if (abort.signal.aborted) break;
+			// a connection that survived a while was healthy even if the fleet was
+			// quiet (Flowbee sends no keepalives) — start the next one promptly.
+			if (Date.now() - connectedAt > 60_000) this.sseBackoffMs = 1_000;
 			await new Promise((r) => setTimeout(r, this.sseBackoffMs));
 			this.sseBackoffMs = Math.min(this.sseBackoffMs * 2, 30_000);
 		}
