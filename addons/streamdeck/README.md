@@ -47,9 +47,12 @@ row 3   [master]    [ask status] [pause/resume]  [attention] [fleet]    ← cont
   work is queued with zero live workers.
 
 Keys auto-assign by **column**: five Account Usage keys dropped across row 1
-show accounts 1–5 in the server's stable order; same for Goal Session keys in
-row 2. Pin a specific account/session in the key's property inspector instead
-whenever you want a fixed assignment.
+show accounts 1–5 in the server's stable order. Goal Session keys in auto mode
+populate from **running sessions only** — local sessions verified against live
+tmux every poll, remote ones by watchdog state — so a row of blank keys fills
+itself as sessions start and vacates as they finish ("slot N idle"); you never
+open the Stream Deck app to swap sessions. Pin a specific account/session in
+the key's property inspector only when you want a fixed assignment.
 
 ## Install
 
@@ -97,4 +100,9 @@ local-RCE foothold).
 
 Security posture: the API token is only ever attached when the base URL is
 loopback or https — a typo'd off-box `http://` host gets no credentials (a
-warning is logged instead).
+warning is logged instead). Remote goal sessions (`box` set in the registry)
+only get ssh'd to when the host is on the **SSH hosts allowed** list in the
+key settings; the default (empty) blocks all remote focus/prompt so a hostile
+registration can't open ssh to an attacker host on a keypress. Pausing the
+whole fleet takes **two presses within 3 seconds** — a bumped key can't halt
+dispatch (per-repo parking and resume stay single-press).

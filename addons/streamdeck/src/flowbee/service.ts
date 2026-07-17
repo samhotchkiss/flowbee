@@ -152,8 +152,18 @@ class FlowbeeService {
 				}
 			}
 		}
+		const localSessions = await listLocalTmuxSessions();
+		const localNames = new Set(localSessions.map((t) => t.name));
+		// liveness: a local registry entry is running iff its tmux session exists
+		// right now; a remote one can't be checked from here, so trust the
+		// watchdog's verdict (achieved / unreachable / paused-watch = not running).
+		for (const s of registry) {
+			s.running = s.box
+				? s.enabled && s.state !== "achieved" && s.state !== "unreachable"
+				: localNames.has(s.tmux_name);
+		}
 		const covered = new Set(registry.filter((s) => !s.box).map((s) => s.tmux_name));
-		const local = (await listLocalTmuxSessions())
+		const local = localSessions
 			.filter((t) => !covered.has(t.name))
 			.map((t) => ({
 				id: t.name,
@@ -161,6 +171,7 @@ class FlowbeeService {
 				state: "unwatched" as const,
 				enabled: true as const,
 				attached: t.attached,
+				running: true as const,
 			}));
 		if (registryErr && local.length === 0) throw registryErr;
 		return [...registry, ...local];

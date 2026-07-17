@@ -21,6 +21,9 @@
 			<option value="Terminal">Terminal.app</option>
 		</sdpi-select>
 	</sdpi-item>
+	<sdpi-item label="SSH hosts allowed">
+		<sdpi-textfield setting="sshAllowedHosts" global placeholder="comma-separated; empty = remote blocked"></sdpi-textfield>
+	</sdpi-item>
 	<sdpi-item label="Poll every (s)">
 		<sdpi-range setting="pollSeconds" global min="2" max="30" step="1" default="5" showlabels></sdpi-range>
 	</sdpi-item>
