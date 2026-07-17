@@ -13,7 +13,7 @@ import streamDeck from "@elgato/streamdeck";
 import { flowbee } from "../flowbee/service";
 import type { SessionEntry } from "../flowbee/types";
 import { masterKey, noteKey, promptKey } from "../render";
-import { DEFAULTS } from "../settings";
+import { DEFAULTS, assertBoxAllowed } from "../settings";
 import { focusSession, sendPrompt } from "../tmux";
 
 const logger = streamDeck.logger.createScope("Master");
@@ -41,6 +41,7 @@ async function focusMaster(name: string): Promise<void> {
 	// resolve against a fetched registry so a remote master's box is honored.
 	if (!flowbee.state<SessionEntry[]>("sessions").data) await flowbee.refresh("sessions");
 	const entry = masterEntry(name);
+	assertBoxAllowed(flowbee.settings, entry?.box);
 	await focusSession({
 		tmuxName: entry?.tmux_name ?? name,
 		box: entry?.box,
@@ -166,6 +167,7 @@ export class MasterPromptAction extends SingletonAction<PromptSettings> {
 		if (!flowbee.state<SessionEntry[]>("sessions").data) await flowbee.refresh("sessions");
 		const entry = masterEntry(name);
 		try {
+			assertBoxAllowed(flowbee.settings, entry?.box);
 			await sendPrompt({
 				tmuxName: entry?.tmux_name ?? name,
 				box: entry?.box,

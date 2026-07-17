@@ -100,4 +100,9 @@ local-RCE foothold).
 
 Security posture: the API token is only ever attached when the base URL is
 loopback or https — a typo'd off-box `http://` host gets no credentials (a
-warning is logged instead).
+warning is logged instead). Remote goal sessions (`box` set in the registry)
+only get ssh'd to when the host is on the **SSH hosts allowed** list in the
+key settings; the default (empty) blocks all remote focus/prompt so a hostile
+registration can't open ssh to an attacker host on a keypress. Pausing the
+whole fleet takes **two presses within 3 seconds** — a bumped key can't halt
+dispatch (per-repo parking and resume stay single-press).

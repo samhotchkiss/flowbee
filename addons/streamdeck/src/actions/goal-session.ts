@@ -14,7 +14,7 @@ import { flasher } from "../flash";
 import { flowbee } from "../flowbee/service";
 import type { SessionEntry } from "../flowbee/types";
 import { noteKey, sessionKey } from "../render";
-import { DEFAULTS } from "../settings";
+import { DEFAULTS, assertBoxAllowed } from "../settings";
 import { focusSession } from "../tmux";
 
 type Settings = {
@@ -108,6 +108,7 @@ export class GoalSessionAction extends SingletonAction<Settings> {
 			return;
 		}
 		try {
+			assertBoxAllowed(flowbee.settings, entry.box);
 			await focusSession({
 				tmuxName: entry.tmux_name,
 				box: entry.box,

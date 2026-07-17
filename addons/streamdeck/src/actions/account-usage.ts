@@ -79,7 +79,9 @@ export type AccountRings = {
  * to one generic ring off usage_pct.
  */
 export function accountRings(a: AccountUsage): AccountRings {
-	const windows = a.windows ?? [];
+	// digest scalars use -1 for UNKNOWN; a window that somehow carries a negative
+	// percent is unknown too — skip it rather than render a lying empty ring.
+	const windows = (a.windows ?? []).filter((w) => w.percent >= 0);
 	if (windows.length === 0) {
 		const gatedNow = a.rate_limited || a.at_ceiling;
 		return {
