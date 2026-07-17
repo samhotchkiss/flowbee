@@ -74,8 +74,8 @@ func (e envFlag) Set(v string) error {
 func runSeatAdd(ctx context.Context, st *store.Store, args []string) error {
 	fs := flag.NewFlagSet("seat add", flag.ContinueOnError)
 	box := fs.String("box", "", "registered host / ssh destination ('' = control-plane box)")
-	family := fs.String("family", "", "agent family: claude|codex (required)")
-	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR (claude seats)")
+	family := fs.String("family", "", "agent family: claude|codex|grok (required)")
+	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR (claude seats) / GROK_HOME (grok seats)")
 	codexHome := fs.String("codex-home", "", "CODEX_HOME (codex seats)")
 	account := fs.String("account-key", "", "account_windows.account_key (optional; a probe resolves it)")
 	env := envFlag{}
@@ -112,7 +112,7 @@ func runSeatList(ctx context.Context, st *store.Store, args []string) error {
 
 func printSeatList(w io.Writer, seats []store.Seat) {
 	if len(seats) == 0 {
-		fmt.Fprintln(w, "no seats registered (flowbee seat add --box <b> --family <claude|codex> --config-dir/--codex-home <dir>)")
+		fmt.Fprintln(w, "no seats registered (flowbee seat add --box <b> --family <claude|codex|grok> --config-dir/--codex-home <dir>)")
 		return
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
@@ -266,6 +266,16 @@ func discoverSeats(p *acctprobe.Prober, box, home string) []seatProposal {
 			result: res, email: res.Identity.Email, health: health,
 		})
 	}
+	// the default grok home (GROK_HOME is env-scoped; discovery checks the ~/.grok
+	// convention). grok reuses the config_dir field for its home.
+	grokHome := filepath.Join(home, ".grok")
+	if res, perr := p.ProbeGrokHome(grokHome); res != nil && res.Identity.AccountKey != "" {
+		health, _ := classifySeatHealth(res, perr)
+		out = append(out, seatProposal{
+			seat:   store.Seat{Box: box, AgentFamily: "grok", AccountKey: res.Identity.AccountKey, ConfigDir: grokHome},
+			result: res, email: res.Identity.Email, health: health,
+		})
+	}
 	return out
 }
 
@@ -278,10 +288,16 @@ func probeSeatDir(s store.Seat) (*acctprobe.Result, error) {
 	} else {
 		p = acctprobe.NewWith(sshFS{rr: &remoteRunner{box: s.Box, timeout: 15 * time.Second}}, nil, nil, nil, clock.Real{})
 	}
-	if s.AgentFamily == "codex" {
+	switch s.AgentFamily {
+	case "codex":
 		return p.ProbeCodexHome(s.CodexHome)
+	case "grok":
+		// grok's local (fallback) tier reads the unified.jsonl /usage cache; the live
+		// billing endpoint is the capacity ticker's job, mirroring claude's Dir vs Live.
+		return p.ProbeGrokHome(s.ConfigDir)
+	default: // claude
+		return p.ProbeClaudeDir(s.ConfigDir)
 	}
-	return p.ProbeClaudeDir(s.ConfigDir)
 }
 
 // classifySeatHealth maps an acctprobe reading to a seat health (plan §15.13a). A probe

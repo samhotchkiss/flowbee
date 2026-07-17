@@ -40,7 +40,7 @@ func TestPreflight_HappyPath_ExistingCheckout(t *testing.T) {
 	r.push("yes\n", nil)      // checkout already exists
 
 	res, err := Preflight(context.Background(), r, PreflightParams{
-		Box: "buncher", CheckoutPath: "/home/ops/epics/russ", DiskProbePath: "/home/ops",
+		Box: "buncher", CheckoutPath: "/home/ops/dev/russ", DiskProbePath: "/home/ops",
 		OwnerRepo: "acme/russ",
 	})
 	if err != nil {
@@ -68,7 +68,7 @@ func TestPreflight_ClonesWhenMissing(t *testing.T) {
 	r.push("", nil)     // gh repo clone succeeds
 
 	res, err := Preflight(context.Background(), r, PreflightParams{
-		Box: "buncher", CheckoutPath: "/home/ops/epics/russ", DiskProbePath: "/home/ops",
+		Box: "buncher", CheckoutPath: "/home/ops/dev/russ", DiskProbePath: "/home/ops",
 		OwnerRepo: "acme/russ",
 	})
 	if err != nil {
@@ -83,7 +83,7 @@ func TestPreflight_ClonesWhenMissing(t *testing.T) {
 	if len(r.calls) != 4 {
 		t.Fatalf("expected 4 calls, got %d: %v", len(r.calls), r.calls)
 	}
-	if r.calls[3] != CloneRepoCmd("buncher", "acme/russ", "/home/ops/epics/russ") {
+	if r.calls[3] != CloneRepoCmd("buncher", "acme/russ", "/home/ops/dev/russ") {
 		t.Fatalf("clone command mismatch: %q", r.calls[3])
 	}
 }
@@ -136,10 +136,10 @@ func TestLaunchEpicSession_HappyPath_PursuingOnFirstCheck(t *testing.T) {
 	r.push("", nil) // new-session
 	r.push("", nil) // send-keys goal
 	// verify capture: the agent is off — the status line parses as pursuing.
-	r.push("transcript...\n  gpt-5.6 high · ~/epics/russ · Main [default]   Pursuing goal (1m 2s)", nil)
+	r.push("transcript...\n  gpt-5.6 high · ~/dev/russ · Main [default]   Pursuing goal (1m 2s)", nil)
 
 	verified, err := LaunchEpicSession(context.Background(), r, LaunchParams{
-		Box: "buncher", TmuxName: "epic-frob", Dir: "/home/ops/epics/russ",
+		Box: "buncher", TmuxName: "epic-frob", Dir: "/home/ops/dev/russ",
 		StartCmd: "codex", Goal: "/goal execute the epic at epics/x.md",
 	})
 	if err != nil {
@@ -149,7 +149,7 @@ func TestLaunchEpicSession_HappyPath_PursuingOnFirstCheck(t *testing.T) {
 		t.Fatalf("expected verified=true")
 	}
 	want := []string{
-		NewTmuxSessionCmd("buncher", "epic-frob", "/home/ops/epics/russ", "codex"),
+		NewTmuxSessionCmd("buncher", "epic-frob", "/home/ops/dev/russ", "codex"),
 		SendGoalCmd("buncher", "epic-frob", "/goal execute the epic at epics/x.md"),
 		capturePaneCmd("buncher", "epic-frob"),
 	}

@@ -19,11 +19,13 @@ import (
 // no gate policy can meaningfully evaluate around.
 type PreflightParams struct {
 	Box string
-	// CheckoutPath is a fully RESOLVED literal path (e.g. "/home/ops/epics/russ"),
+	// CheckoutPath is a fully RESOLVED literal path (e.g. "/home/ops/dev/russ"),
 	// not a "$HOME/..." template — the caller resolves the box's home directory via
 	// HomeDirCmd first (see its doc for why: a "$HOME" left in the string would get
 	// shQuote'd into inertness here, since every command below embeds CheckoutPath
-	// as a quoted argument).
+	// as a quoted argument). The convention is <home>/dev/<repo> (the per-repo base
+	// checkout for the one active epic on that seat; the epic runner cuts epic/<slug>
+	// from main inside it per epics/INSTRUCTIONS.md).
 	CheckoutPath string
 	// DiskProbePath is the path `df` measures free space AT — it must be a path
 	// that ALREADY EXISTS on the box (the caller passes the resolved home
@@ -32,7 +34,7 @@ type PreflightParams struct {
 	// a nonexistent path emits nothing — parsed as 0 free KB, so every FIRST
 	// launch onto a fresh box was refused with a misleading "0.0G free" (and
 	// worse, self-healed on retry because the refused pass had already cloned).
-	// Home and the checkout live on the same filesystem under the ~/epics/<repo>
+	// Home and the checkout live on the same filesystem under the ~/dev/<repo>
 	// convention, so measuring at home answers the same question.
 	DiskProbePath string
 	OwnerRepo     string // "owner/repo", used only if a fresh clone is needed

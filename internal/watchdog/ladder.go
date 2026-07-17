@@ -86,8 +86,8 @@ const (
 // literal template over these fields and never from pane/scrollback content.
 type LaunchSeat struct {
 	Box         string // '' = a LOCAL seat (control-plane box); else the ssh destination
-	AgentFamily string // claude | codex
-	ConfigDir   string // CLAUDE_CONFIG_DIR (claude seats)
+	AgentFamily string // claude | codex | grok
+	ConfigDir   string // CLAUDE_CONFIG_DIR (claude seats) / GROK_HOME (grok seats reuse this field)
 	CodexHome   string // CODEX_HOME (codex seats)
 	Account     string // FLOWBEE_ACCOUNT value (provider:email); '' to omit
 	ExtraEnv    map[string]string
@@ -98,7 +98,13 @@ type LadderParams struct {
 	Slug     string // epic id → session name "epic-<slug>"; caller safeSlugRe-gated
 	Seat     LaunchSeat
 	SpecPath string // the committed spec path (epics/…-<slug>.md); caller-registered
-	Dir      string // the local pane's working dir (the epic checkout); optional
+	Dir      string // the LOCAL pane's working dir override; optional (Checkout supersedes it for a local seat)
+	// Checkout is the RESOLVED repo checkout path on the SEAT's box (<home>/dev/<repo>),
+	// ensured present by the caller's Preflight BEFORE RunLadder. The agent is brought up
+	// cwd'd INTO it: for a LOCAL seat via the local session's start-dir; for a REMOTE seat
+	// via the remote `tmux new -A -s … -c <checkout>`; and for grok additionally via
+	// `--cwd <checkout>` on its CLI line. '' launches in the box's default cwd (home).
+	Checkout string
 
 	// LoginShell is the interactive shell the local session runs so the ladder can type
 	// the ssh / CLI lines into it. Default "${SHELL:-/bin/sh}" (expanded by tmux's own
@@ -210,9 +216,17 @@ func RunLadder(ctx context.Context, client *tmuxio.Client, clk tmuxio.Clock, par
 	// `=name` is rejected by tmux's pane parser), so the ladder must never pre-prefix.
 	target := session
 
-	// Stage 1: create the LOCAL session running an interactive shell.
+	// Stage 1: create the LOCAL session running an interactive shell. For a LOCAL seat the
+	// checkout lives on THIS box, so start the pane inside it (the agent inherits that cwd);
+	// for a REMOTE seat the checkout is on the far box, so the local pane's cwd is
+	// irrelevant (the ssh line moves away) and MUST NOT be a remote-only path that this box
+	// lacks — the remote `tmux new … -c <checkout>` handles the far-side cwd instead.
+	startDir := p.Dir
+	if p.Seat.Box == "" && p.Checkout != "" {
+		startDir = p.Checkout
+	}
 	if err := client.NewSession(ctx, tmuxio.SessionSpec{
-		Name: session, Command: p.LoginShell, StartDir: p.Dir, WindowName: p.Slug,
+		Name: session, Command: p.LoginShell, StartDir: startDir, WindowName: p.Slug,
 	}); err != nil {
 		return LadderResult{Outcome: LaunchFailed, Stage: StageCreateLocal, Session: session}, fmt.Errorf("create local session: %w", err)
 	}
@@ -226,7 +240,7 @@ func RunLadder(ctx context.Context, client *tmuxio.Client, clk tmuxio.Clock, par
 	}
 
 	// Stage 4: send the seat env + agent CLI line into the shell.
-	cliLine := buildCLILine(p.Seat, family.Family())
+	cliLine := buildCLILine(p.Seat, family.Family(), p.Checkout)
 	if r, err := client.Send(ctx, target, cliLine, tmuxio.SendOptions{}); err != nil {
 		return killAndFail(ctx, client, session, target, StageSendCLI, "send CLI line: "+err.Error()), nil
 	} else if r.Verification == tmuxio.Failed {
@@ -269,8 +283,9 @@ func RunLadder(ctx context.Context, client *tmuxio.Client, clk tmuxio.Clock, par
 // means the remote shell arrived and the ladder should continue to stage 4.
 func runRemoteAttach(ctx context.Context, client *tmuxio.Client, clk tmuxio.Clock, p LadderParams, session, target string) (LadderResult, bool, error) {
 	// Stage 2: send the ssh attach line into the local pane. -t forces a PTY (so an auth
-	// prompt renders); tmux new -A -s creates-or-attaches by EXACT name on the far box.
-	sshLine := buildSSHAttachLine(p.Seat.Box, session)
+	// prompt renders); tmux new -A -s creates-or-attaches by EXACT name on the far box, in
+	// the epic's checkout dir (-c) so the remote agent comes up cwd'd into the repo.
+	sshLine := buildSSHAttachLine(p.Seat.Box, session, p.Checkout)
 	if r, err := client.Send(ctx, target, sshLine, tmuxio.SendOptions{}); err != nil {
 		return killAndFail(ctx, client, session, target, StageRemoteAttach, "send ssh attach: "+err.Error()), true, nil
 	} else if r.Verification == tmuxio.Failed {
@@ -461,22 +476,32 @@ func killAndFail(ctx context.Context, client *tmuxio.Client, session, target str
 }
 
 // buildSSHAttachLine builds the remote-attach shell line typed into the local pane:
-// `ssh -t -- <box> tmux new -A -s epic-<slug>`. box is argv-safe (seat registration);
-// -t forces a PTY so an auth prompt renders; `--` guards a leading-dash box; `new -A -s`
-// creates-or-attaches by EXACT name (no prefix match). CLOSED template — no pane content.
-func buildSSHAttachLine(box, session string) string {
-	return "ssh -t -- " + box + " tmux new -A -s " + session
+// `ssh -t -- <box> tmux new -A -s epic-<slug> [-c <checkout>]`. box is argv-safe (seat
+// registration); -t forces a PTY so an auth prompt renders; `--` guards a leading-dash
+// box; `new -A -s` creates-or-attaches by EXACT name (no prefix match); `-c <checkout>`
+// (when a checkout is known) starts the far-side session inside the repo so the agent
+// comes up cwd'd into it. CLOSED template — no pane content.
+func buildSSHAttachLine(box, session, checkout string) string {
+	line := "ssh -t -- " + box + " tmux new -A -s " + session
+	if checkout != "" {
+		line += " -c " + checkout
+	}
+	return line
 }
 
 // buildCLILine builds the seat's env + agent CLI launch line typed into the shell:
-// `CLAUDE_CONFIG_DIR=<dir> [FLOWBEE_ACCOUNT=<acct>] [extra…] claude` (or the codex
-// equivalent). Every interpolated value is argv-safe (seat registration), so the line
-// needs no shell quoting; the binary is a per-family literal. CLOSED template.
-func buildCLILine(seat LaunchSeat, family verbs.Family) string {
+// `CLAUDE_CONFIG_DIR=<dir> [FLOWBEE_ACCOUNT=<acct>] [extra…] claude` (or the codex/grok
+// equivalent). Every interpolated value is argv-safe (seat registration / a
+// home-resolved checkout), so the line needs no shell quoting; the binary + its launch
+// flags are per-family literals. CLOSED template.
+func buildCLILine(seat LaunchSeat, family verbs.Family, checkout string) string {
 	var parts []string
 	switch family {
 	case verbs.FamilyCodex:
 		parts = append(parts, "CODEX_HOME="+seat.CodexHome)
+	case verbs.FamilyGrok:
+		// grok reuses the seat's ConfigDir field for its GROK_HOME (no new seat column).
+		parts = append(parts, "GROK_HOME="+seat.ConfigDir)
 	default: // claude
 		parts = append(parts, "CLAUDE_CONFIG_DIR="+seat.ConfigDir)
 	}
@@ -487,15 +512,38 @@ func buildCLILine(seat LaunchSeat, family verbs.Family) string {
 		parts = append(parts, k+"="+seat.ExtraEnv[k])
 	}
 	parts = append(parts, binaryFor(family))
+	parts = append(parts, launchFlagsFor(family, checkout)...)
 	return strings.Join(parts, " ")
 }
 
 // binaryFor returns the fixed CLI binary for a family (a closed literal, never derived).
 func binaryFor(family verbs.Family) string {
-	if family == verbs.FamilyCodex {
+	switch family {
+	case verbs.FamilyCodex:
 		return "codex"
+	case verbs.FamilyGrok:
+		return "grok"
+	default: // claude
+		return "claude"
 	}
-	return "claude"
+}
+
+// launchFlagsFor returns the family-specific flags appended to the launch binary.
+//   - grok: `--yolo` (bypass approvals so an autonomous epic never stalls on a permission
+//     prompt — live-confirmed to bring grok up at its `❯` box with "always-approve"), and
+//     `--cwd <checkout>` when the checkout is known so grok is cwd'd into the repo (belt-
+//     and-suspenders with the session's own start dir, and it anchors grok's per-cwd
+//     session directory). codex/claude get their cwd from the tmux session and take the
+//     goal in-pane (Stage 6), so they append no flags here.
+func launchFlagsFor(family verbs.Family, checkout string) []string {
+	if family != verbs.FamilyGrok {
+		return nil
+	}
+	flags := []string{"--yolo"}
+	if checkout != "" {
+		flags = append(flags, "--cwd", checkout)
+	}
+	return flags
 }
 
 // sortedKeys returns a map's keys sorted, so the CLI line renders deterministically.

@@ -101,7 +101,7 @@ func sendEnterCmd(box, tmuxName string) string {
 // HomeDirCmd resolves a box's home directory as a LITERAL path (`echo $HOME`,
 // expanded by the target shell since it's embedded unquoted in the whole inner
 // command, not inside a shQuote'd argument). The epic launcher calls this ONCE per
-// launch and builds the checkout path (home + "/epics/" + repoID) from the
+// launch and builds the checkout path (home + "/dev/" + repo) from the
 // returned literal string — deliberately NOT by embedding "$HOME" itself inside a
 // path that other commands later shQuote() as an argument, since shQuote's single
 // quotes would suppress the shell's own variable expansion right when it's needed.
@@ -136,7 +136,7 @@ func RepoCheckoutExistsCmd(box, path string) string {
 // already required `gh auth status` to pass, so the same credential (never placed
 // in argv, unlike a token-bearing https URL would be — `ps` on the remote box is
 // world-readable) clones the epic's checkout. mkdir -p's the parent first since
-// the ~/epics/ convention directory may not exist yet on a freshly provisioned box.
+// the ~/dev/ convention directory may not exist yet on a freshly provisioned box.
 func CloneRepoCmd(box, ownerRepo, path string) string {
 	return remoteWrap(box, "mkdir -p -- "+shQuote(parentDirUnix(path))+
 		" && gh repo clone "+shQuote(ownerRepo)+" "+shQuote(path)+" -- --quiet")

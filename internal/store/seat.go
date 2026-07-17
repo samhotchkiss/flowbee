@@ -30,16 +30,21 @@ const (
 const (
 	seatFamilyClaude = "claude"
 	seatFamilyCodex  = "codex"
+	// seatFamilyGrok is xAI's grok. Like claude it uses a single config-dir env, so it
+	// REUSES the config_dir column for its GROK_HOME (no new seat column / migration —
+	// the family columns are free-text). The seatID folds the family in, so a grok seat
+	// and a claude seat with the same dir string on one box never collide.
+	seatFamilyGrok = "grok"
 )
 
 // Seat is one seats row.
 type Seat struct {
 	ID           string
 	Box          string // registered epic_hosts.name / ssh destination; '' = control-plane box
-	AgentFamily  string // claude | codex
+	AgentFamily  string // claude | codex | grok
 	AccountKey   string // account_windows.account_key ('' until resolved by a probe)
-	ConfigDir    string // CLAUDE_CONFIG_DIR (claude seats; '' for codex)
-	CodexHome    string // CODEX_HOME (codex seats; '' for claude)
+	ConfigDir    string // CLAUDE_CONFIG_DIR (claude) / GROK_HOME (grok); '' for codex
+	CodexHome    string // CODEX_HOME (codex seats; '' for claude/grok)
 	ExtraEnv     map[string]string
 	Enabled      bool
 	Health       string
@@ -49,8 +54,9 @@ type Seat struct {
 	UpdatedAt    string
 }
 
-// Ident returns the seat's dir identity — config_dir for a claude seat, codex_home for
-// a codex seat — the value the UNIQUE(box, config_dir, codex_home) constraint keys on.
+// Ident returns the seat's dir identity — codex_home for a codex seat, else config_dir
+// (CLAUDE_CONFIG_DIR for claude, GROK_HOME for grok) — the value the
+// UNIQUE(box, config_dir, codex_home) constraint keys on.
 func (s Seat) Ident() string {
 	if s.AgentFamily == seatFamilyCodex {
 		return s.CodexHome
@@ -124,8 +130,16 @@ func validateSeat(seat *Seat) error {
 		if seat.ConfigDir != "" {
 			return errors.New("a codex seat must not set config_dir")
 		}
+	case seatFamilyGrok:
+		// grok reuses config_dir for its GROK_HOME (no dedicated column).
+		if seat.ConfigDir == "" {
+			return errors.New("a grok seat requires config_dir (GROK_HOME)")
+		}
+		if seat.CodexHome != "" {
+			return errors.New("a grok seat must not set codex_home")
+		}
 	default:
-		return fmt.Errorf("seat agent_family %q must be %q or %q", seat.AgentFamily, seatFamilyClaude, seatFamilyCodex)
+		return fmt.Errorf("seat agent_family %q must be %q, %q, or %q", seat.AgentFamily, seatFamilyClaude, seatFamilyCodex, seatFamilyGrok)
 	}
 	if err := validateArgvSafe("seat box", seat.Box); err != nil {
 		return err
@@ -151,8 +165,8 @@ func validateSeat(seat *Seat) error {
 // folded in so a claude seat whose config_dir string happens to EQUAL a codex seat's
 // codex_home on the same box does not collide on the id (the UNIQUE(box,config_dir,
 // codex_home) constraint would allow both rows). A '|' separator is safe: box/ident are
-// argv-safe (no whitespace/control) and family is a closed {claude,codex} token, so the
-// join is injective.
+// argv-safe (no whitespace/control) and family is a closed {claude,codex,grok} token, so
+// the join is injective.
 func seatID(box, family, ident string) string {
 	return box + "|" + family + "|" + ident
 }
