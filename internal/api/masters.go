@@ -282,7 +282,7 @@ func (s *Server) mastersResolve(w http.ResponseWriter, r *http.Request) {
 	case "reply", "amend":
 		s.resolveWithSend(w, r, id, req, now)
 	case "dismiss", "ack", "escalate":
-		s.resolveNoSend(w, ctx, id, req, now)
+		s.resolveNoSend(ctx, w, id, req, now)
 	default:
 		http.Error(w, fmt.Sprintf("unknown resolve action %q (want reply|amend|dismiss|ack|escalate)", req.Action), http.StatusBadRequest)
 	}
@@ -310,6 +310,14 @@ func (s *Server) resolveWithSend(w http.ResponseWriter, r *http.Request, id stri
 	epic, err := s.store.GetEpicRun(ctx, item.EpicID)
 	if err != nil {
 		http.Error(w, "attention item has no live epic to deliver to", http.StatusConflict)
+		return
+	}
+	// m5 (pane-identity guard, plan §1.5 step 2): a steer authored against the run the item
+	// was leased under must NOT land in a since-abandoned/relaunched pane. An epic that left
+	// the active set (abandoned/done/achieved) is no longer a valid delivery target — reject
+	// before the fenced transition + send rather than type into a dead/reused session.
+	if !activeEpicState(epic.State) {
+		http.Error(w, "target epic is no longer active (abandoned/finished since lease) — not delivering", http.StatusConflict)
 		return
 	}
 
@@ -351,59 +359,42 @@ func (s *Server) resolveWithSend(w http.ResponseWriter, r *http.Request, id stri
 	if verdict == "failed" {
 		state = "open"
 	}
-	s.broker.Publish(LifeEvent{JobID: item.EpicID, State: "epics", Event: "epic_intervention"})
+	s.broker.Publish(s.epicNudge(ctx, item.EpicID, "epic_intervention"))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": id, "action": req.Action, "verdict": verdict, "state": state, "evidence": evidence,
 	})
 }
 
-// resolveNoSend runs the dismiss/ack/escalate paths (plan §1.5 "Other actions"). Each is
-// FENCED in the handler (the item must be leased by THIS master at the matching item_epoch
-// and supervisor epoch) before the store closes it — a stale incarnation cannot dismiss an
-// item it no longer holds.
-func (s *Server) resolveNoSend(w http.ResponseWriter, ctx context.Context, id string, req resolveRequest, now time.Time) {
+// resolveNoSend runs the dismiss/ack/escalate paths (plan §1.5 "Other actions"). The fence
+// (item leased by THIS master at the matching item_epoch AND supervisor epoch) and the
+// close happen ATOMICALLY in one store tx (ResolveAttentionFenced, m1) — a stale incarnation
+// cannot dismiss/escalate an item another master re-leased between a read and the write.
+//
+// NOTE (m4, Phase 7): "escalate" currently RECORDS the disposition (ledger
+// attention_escalated) and surfaces it on the queue/SSE; the human-paging NeedsHuman sink +
+// push notification land in Phase 7. So escalate does not itself page a human today — it
+// marks the item as needing one, which the Phase-7 operator drawer/alarm consumes.
+func (s *Server) resolveNoSend(ctx context.Context, w http.ResponseWriter, id string, req resolveRequest, now time.Time) {
 	item, err := s.store.GetAttentionItem(ctx, id)
 	if err != nil {
 		http.Error(w, "unknown attention item", http.StatusNotFound)
 		return
 	}
-	if ok, ferr := s.fenceLeasedByMaster(ctx, item, req.MasterID, req.Epoch, req.ItemEpoch); ferr != nil {
-		http.Error(w, ferr.Error(), http.StatusInternalServerError)
-		return
-	} else if !ok {
-		http.Error(w, "fenced: item not leased by this master at the presented epoch", http.StatusConflict)
-		return
-	}
 	resolution := map[string]string{"dismiss": "dismissed", "ack": "acked", "escalate": "escalated"}[req.Action]
-	if err := s.store.ResolveAttention(ctx, id, resolution, now); err != nil {
+	if err := s.store.ResolveAttentionFenced(ctx, id, req.MasterID, req.Epoch, req.ItemEpoch, resolution, now); err != nil {
 		s.writeAttentionErr(w, err)
 		return
 	}
-	s.broker.Publish(LifeEvent{JobID: item.EpicID, State: "epics", Event: "attention_" + resolution})
+	s.broker.Publish(s.epicNudge(ctx, item.EpicID, "attention_"+resolution))
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "action": req.Action, "state": "resolved", "resolution": resolution})
 }
 
-// fenceLeasedByMaster is the pure fence (attention.FenceOK) applied to a no-send resolve:
-// the item must be leased, held by this caller, with matching item_epoch AND the caller's
-// live supervisor epoch. Mirrors the store's fence for BeginDelivery so dismiss/ack/escalate
-// are fenced identically to a delivery.
-func (s *Server) fenceLeasedByMaster(ctx context.Context, item store.AttentionItem, masterID string, epoch, itemEpoch int) (bool, error) {
-	liveSup := -1
-	if item.LeasedBy != "" {
-		sup, err := s.store.GetSupervisor(ctx, item.LeasedBy)
-		if err != nil && !errors.Is(err, store.ErrSupervisorNotFound) {
-			return false, err
-		}
-		if err == nil {
-			liveSup = sup.Epoch
-		}
-	}
-	return attention.FenceOK(attention.Fence{
-		State: item.State, ExpectState: attention.StateLeased,
-		LeasedBy: item.LeasedBy, Caller: masterID,
-		ClaimItemEpoch: itemEpoch, LiveItemEpoch: item.ItemEpoch,
-		ClaimSupervisorEpoch: epoch, LiveSupervisorEpoch: liveSup,
-	}), nil
+// epicNudge builds an "epics"-topic SSE nudge carrying the current digest_seq (n1) so a
+// constrained consumer dedupes without a re-poll. The seq read is best-effort (a nudge is
+// lossy; poll is truth) — an error leaves it 0.
+func (s *Server) epicNudge(ctx context.Context, epicID, event string) LifeEvent {
+	seq, _ := s.store.EpicDigestSeq(ctx)
+	return LifeEvent{JobID: epicID, State: "epics", Event: event, DigestSeq: seq}
 }
 
 // writeAttentionErr maps a store attention error to its HTTP code — a fence rejection is
@@ -765,6 +756,17 @@ func nonNilMap(m map[string]string) map[string]string {
 }
 
 func etagFor(seq int64) string { return `"` + strconv.FormatInt(seq, 10) + `"` }
+
+// activeEpicState reports whether an epic is still in flight (the same active set the
+// launch gates + status ingestion use). A terminal epic (abandoned/done/achieved) or an
+// unknown state is NOT a valid delivery target (m5).
+func activeEpicState(state string) bool {
+	switch state {
+	case "launching", "running", "blocked":
+		return true
+	}
+	return false
+}
 
 func splitCSV(s string) []string {
 	if s == "" {

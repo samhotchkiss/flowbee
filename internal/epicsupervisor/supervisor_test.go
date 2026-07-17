@@ -19,6 +19,60 @@ func (p fakePane) Classify(_ context.Context, _, session string) (string, string
 }
 func (p fakePane) Deliver(_ context.Context, _, _, _ string) (string, error) { return "strong", nil }
 
+// panickyPane panics when classifying one specific session (a malformed/wedged pane), used
+// to prove the M1 per-epic recover isolates one bad epic from the rest of the batch.
+type panickyPane struct {
+	panicOn string
+	state   map[string]string
+}
+
+func (p panickyPane) Classify(_ context.Context, _, session string) (string, string, error) {
+	if session == p.panicOn {
+		panic("boom: malformed capture for " + session)
+	}
+	return p.state[session], "", nil
+}
+func (p panickyPane) Deliver(_ context.Context, _, _, _ string) (string, error) { return "strong", nil }
+
+// TestPassPerEpicPanicIsolation proves M1: a panic while observing ONE epic (a nil/wedged
+// pane) is recovered per-epic — the pass does NOT crash and every OTHER epic still
+// processes. Without the per-epic recover a single malformed epic file would crashloop the
+// whole control plane under Restart=always.
+func TestPassPerEpicPanicIsolation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	// "epic-bad" (id "bad") panics on classify; "epic-good" (id "good") is a live prompt.
+	pane := panickyPane{panicOn: "epic-bad", state: map[string]string{"epic-good": "awaiting_input"}}
+	st, supv := newSupvPanicky(t, pane)
+	for _, id := range []string{"bad", "good"} {
+		if err := st.AddEpicRun(ctx, store.EpicRun{ID: id, Repo: "r", TmuxName: "epic-" + id, Agent: "claude"}, now); err != nil {
+			t.Fatalf("add epic %s: %v", id, err)
+		}
+		_ = st.MarkEpicLaunched(ctx, id, now)
+	}
+
+	// must NOT panic out of Pass (a recover'd panic returns normally).
+	supv.Pass(ctx, now)
+
+	// the GOOD epic still produced its item despite the bad epic panicking earlier in the loop.
+	open, _ := st.ListOpenAttention(ctx, "open", nil, "")
+	found := false
+	for _, it := range open {
+		if it.EpicID == "good" && it.Kind == "needs_input" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the good epic was not processed after the bad epic panicked: %+v", open)
+	}
+}
+
+func newSupvPanicky(t *testing.T, pane Pane) (*store.Store, *Supervisor) {
+	t.Helper()
+	st := testutil.NewStore(t)
+	return st, New(st, pane, nil, Config{}, slog.Default())
+}
+
 func newSupv(t *testing.T, pane Pane) (*store.Store, *Supervisor) {
 	t.Helper()
 	st := testutil.NewStore(t)
@@ -82,6 +136,57 @@ func TestLaunchingReaper(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a launch_failed item, got %+v", open)
+	}
+}
+
+// TestAckLoopBareWorkingNotAcked proves the m3 fix: an awaiting_ack item whose epic pane was
+// ALREADY working before the steer and merely STAYS working (no transition into working
+// this pass) is NOT falsely acked — busyness is not proof the steer was processed. It stays
+// awaiting_ack until it either transitions/advances (ack) or ack-expires (reopen).
+func TestAckLoopBareWorkingNotAcked(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	pane := fakePane{state: map[string]string{"epic-m3": "working"}}
+	st, supv := newSupv(t, pane)
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "m3", Repo: "r", TmuxName: "epic-m3", Agent: "claude"}, now); err != nil {
+		t.Fatalf("add epic: %v", err)
+	}
+	_ = st.MarkEpicLaunched(ctx, "m3", now)
+	// stored prior pane state is ALREADY working, so this pass sees no transition.
+	if err := st.SetEpicRuntimeState(ctx, "m3", store.EpicRuntimeState{PaneState: "working", ContextPct: -1}, now); err != nil {
+		t.Fatalf("set runtime: %v", err)
+	}
+
+	// drive an item to awaiting_ack via a real lease + delivery.
+	reg, err := st.RegisterSupervisor(ctx, store.Supervisor{Label: "m", Kind: "claude", ModelFamily: "claude"}, now)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, _, err := st.UpsertAttentionItem(ctx, store.AttentionItem{
+		ID: ulid.New(), Kind: "drift_suspect", EpicID: "m3", Repo: "r", Priority: 15, DedupKey: "m3:drift",
+	}, now); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	leased, err := st.LeaseAttention(ctx, reg.MasterID, reg.Epoch, 5, nil, time.Hour, now)
+	if err != nil || len(leased) != 1 {
+		t.Fatalf("lease: err=%v got %d", err, len(leased))
+	}
+	it := leased[0]
+	if err := st.BeginDelivery(ctx, it.ID, reg.MasterID, reg.Epoch, it.ItemEpoch, "k", now); err != nil {
+		t.Fatalf("begin delivery: %v", err)
+	}
+	if err := st.RecordDeliveryVerdict(ctx, it.ID, reg.MasterID, reg.Epoch, it.ItemEpoch, "strong", now); err != nil {
+		t.Fatalf("record verdict: %v", err)
+	}
+	if a, _ := st.GetAttentionItem(ctx, it.ID); a.State != "awaiting_ack" {
+		t.Fatalf("precondition: want awaiting_ack, got %q", a.State)
+	}
+
+	// a pass 1 minute later (< 6m T_ack) with the pane merely STILL working must NOT ack it.
+	supv.Pass(ctx, now.Add(time.Minute))
+	after, _ := st.GetAttentionItem(ctx, it.ID)
+	if after.State != "awaiting_ack" {
+		t.Fatalf("bare-working must not ack (m3); got state=%q resolution=%q", after.State, after.Resolution)
 	}
 }
 

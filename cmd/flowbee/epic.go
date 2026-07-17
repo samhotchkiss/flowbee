@@ -209,6 +209,12 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	if serr != nil {
 		return serr
 	}
+	// --force-quota bypasses ONLY the headroom/severity refusal — never a hard no-seat (m2):
+	// launching with no seat would come up on the box's DEFAULT account with an empty
+	// builder_model, breaking the cross-family review handoff.
+	if gate.hardNoSeat {
+		return fmt.Errorf("launch refused: %s", gate.reason)
+	}
 	if !*forceQuota && gate.refuse {
 		return fmt.Errorf("launch refused: %s (pass --force-quota to override)", gate.reason)
 	}
@@ -315,13 +321,18 @@ func raiseLaunchFailed(ctx context.Context, st *store.Store, slug, repo, detail 
 	}, now)
 }
 
-// seatGate is epicSelectSeat's headroom verdict — refuse (a hard no-seat/no-headroom) with
-// a reason, or an OK seat possibly carrying a fail-open warning (a probe error / stale
-// critical is NOT a hard refusal, §4.4/§12.14).
+// seatGate is epicSelectSeat's headroom verdict — refuse (no-seat / no-headroom) with a
+// reason, or an OK seat possibly carrying a fail-open warning (a probe error / stale
+// critical is NOT a hard refusal, §4.4/§12.14). hardNoSeat marks the ONE refusal
+// --force-quota must NEVER bypass: there is no ready seat of the family at all, so a forced
+// launch would come up on the box's DEFAULT account (wrong-account launch) with an empty
+// builder_model that breaks the §5b cross-family review handoff (m2). Only the
+// headroom/severity refusal is a "you know better, override it" call.
 type seatGate struct {
-	refuse  bool
-	reason  string
-	warning string
+	refuse     bool
+	hardNoSeat bool
+	reason     string
+	warning    string
 }
 
 func gateNote(g seatGate) string {
@@ -352,7 +363,7 @@ func epicSelectSeat(ctx context.Context, st *store.Store, family, hostFilter str
 		seats = filtered
 	}
 	if len(seats) == 0 {
-		return store.Seat{}, seatGate{refuse: true,
+		return store.Seat{}, seatGate{refuse: true, hardNoSeat: true,
 			reason: fmt.Sprintf("no ready %s seat available (register one with `flowbee seat discover <box>`; a `%s` epic needs a ready `%s` seat)", family, family, family)}, nil
 	}
 	// accounts already powering an active epic (anti-collocation).

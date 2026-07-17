@@ -101,32 +101,66 @@ func New(st *store.Store, pane Pane, ctxProber ContextProber, cfg Config, logger
 // Pass runs one full consolidated supervision batch at `now`. Every sub-step is wrapped so
 // one epic's / one item's error is logged and skipped — a wedged pane must never blind the
 // whole pass (the same degrade-to-inert posture the watchdog and status ingestion take).
+//
+// PANIC HARDENING (M1, mirroring watchdog.Watcher.Pass): this pass parses UNTRUSTED
+// builder-pushed markdown (status ingestion, upstream of this call) and TYPES KEYSTROKES
+// into live panes, all inside the control-plane process. A panic here — a nil pane edge,
+// a bad IANA name, a malformed capture — must NEVER take `flowbee serve` down (with
+// Restart=always a persistent trigger would crashloop the WHOLE control plane, not just
+// epic supervision). TWO layers: a per-EPIC recover (observeEpicSafe) so one malformed
+// pane skips while the rest process, and this per-PASS recover as the backstop for the
+// non-per-epic steps. The next 2-minute tick starts clean.
 func (s *Supervisor) Pass(ctx context.Context, now time.Time) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("epic supervision: PANIC recovered — pass skipped", "panic", r)
+		}
+	}()
 	epics, err := s.store.ListActiveEpicRuns(ctx)
 	if err != nil {
 		s.logger.Error("epic supervision: list active epics", "err", err)
 		return
 	}
-	// paneStates lets the ack loop reuse this pass's classification without re-capturing.
+	// paneStates + workingTransition let the ack loop reuse this pass's classification (and
+	// whether the pane transitioned INTO working this pass) without re-capturing.
 	paneStates := map[string]string{}
+	workingTransition := map[string]bool{}
 	for _, e := range epics {
-		st := s.observeAndProduce(ctx, e, now)
+		st, transitioned := s.observeEpicSafe(ctx, e, now)
 		paneStates[e.ID] = st
+		workingTransition[e.ID] = transitioned
 	}
 	s.reapStrandedLaunches(ctx, epics, now)
 	s.recoverStrandedDeliveries(ctx, now)
 	s.reapExpiredLeases(ctx, now)
-	s.runAckLoop(ctx, paneStates, now)
+	s.runAckLoop(ctx, workingTransition, now)
 	s.reapDeadMasters(ctx, now)
 	s.pushToWake(ctx, now)
 }
 
+// observeEpicSafe wraps observeAndProduce in a PER-EPIC recover (M1): a panic while
+// classifying/producing for ONE epic (a nil pane, a malformed capture) logs and skips that
+// epic, and the loop continues with the rest — one bad pane never aborts the whole batch.
+// On panic it returns the epic's prior pane state and no transition (a safe ack-loop no-op).
+func (s *Supervisor) observeEpicSafe(ctx context.Context, e store.EpicRun, now time.Time) (state string, transitioned bool) {
+	state = e.PaneState
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("epic supervision: per-epic PANIC recovered — epic skipped", "epic", e.ID, "panic", r)
+		}
+	}()
+	return s.observeAndProduce(ctx, e, now)
+}
+
 // observeAndProduce classifies one epic's pane, writes its disk/pane-derived runtime facts,
 // and produces/auto-resolves the typed attention items for its condition (plan §2 producers
-// + §12.13 taxonomy). Returns the classified pane state (for the ack loop). A compaction
-// (a context% jump) is recognized and NOT treated as drift (plan §15.3).
-func (s *Supervisor) observeAndProduce(ctx context.Context, e store.EpicRun, now time.Time) string {
-	paneState := e.PaneState
+// + §12.13 taxonomy). Returns the classified pane state and whether the pane TRANSITIONED
+// INTO working this pass (the send-and-ack "processed, not merely busy" signal, §12.3 — a
+// pane already working that merely stays working is NOT a transition). A compaction (a
+// context% jump) is recognized and NOT treated as drift (plan §15.3).
+func (s *Supervisor) observeAndProduce(ctx context.Context, e store.EpicRun, now time.Time) (string, bool) {
+	prior := e.PaneState
+	paneState := prior
 	lastLine := ""
 	if st, ll, err := s.pane.Classify(ctx, "", e.TmuxName); err != nil {
 		s.logger.Warn("epic supervision: classify pane", "epic", e.ID, "err", err)
@@ -134,6 +168,7 @@ func (s *Supervisor) observeAndProduce(ctx context.Context, e store.EpicRun, now
 		paneState = st
 		lastLine = ll
 	}
+	transitionedToWorking := prior != string(tmuxio.StateWorking) && paneState == string(tmuxio.StateWorking)
 
 	contextPct := e.ContextPct
 	if s.ctx != nil {
@@ -154,7 +189,7 @@ func (s *Supervisor) observeAndProduce(ctx context.Context, e store.EpicRun, now
 	}
 
 	s.produceForEpic(ctx, e, paneState, lastLine, now)
-	return paneState
+	return paneState, transitionedToWorking
 }
 
 // produceForEpic upserts (or auto-resolves) the attention items a single epic's observed
@@ -268,7 +303,7 @@ func (s *Supervisor) reapExpiredLeases(ctx context.Context, now time.Time) {
 // epic ADVANCED in response (pane WORKING now, or status/commit moved since the send) →
 // resolve as acked; else if past T_ack with no change → reopen as steer_not_processed (a
 // politely-stalling agent that absorbed a nudge and kept drifting must not look handled).
-func (s *Supervisor) runAckLoop(ctx context.Context, paneStates map[string]string, now time.Time) {
+func (s *Supervisor) runAckLoop(ctx context.Context, workingTransition map[string]bool, now time.Time) {
 	items, err := s.store.ListOpenAttention(ctx, attention.StateAwaitingAck, nil, "")
 	if err != nil {
 		s.logger.Warn("epic supervision: list awaiting_ack", "err", err)
@@ -276,7 +311,7 @@ func (s *Supervisor) runAckLoop(ctx context.Context, paneStates map[string]strin
 	}
 	for _, it := range items {
 		since := store.ParseTimeOrZero(it.AwaitingSince)
-		if s.epicAdvancedSince(ctx, it.EpicID, paneStates[it.EpicID], since) {
+		if s.epicAdvancedSince(ctx, it.EpicID, workingTransition[it.EpicID], since) {
 			if aerr := s.store.AckAttention(ctx, it.ID, now); aerr != nil {
 				s.logger.Warn("epic supervision: ack", "item", it.ID, "err", aerr)
 			}
@@ -291,14 +326,17 @@ func (s *Supervisor) runAckLoop(ctx context.Context, paneStates map[string]strin
 	}
 }
 
-// epicAdvancedSince reports whether an epic showed a response to a steer since it entered
-// awaiting_ack: its pane is WORKING this pass, OR its ## Status / newest commit advanced
-// after the send. This is the "processed, not merely submitted" proof (plan §12.3).
-func (s *Supervisor) epicAdvancedSince(ctx context.Context, epicID, paneState string, since time.Time) bool {
+// epicAdvancedSince reports whether an epic PROCESSED a steer since it entered awaiting_ack:
+// its pane TRANSITIONED into working THIS pass (a real behavior change, not mere busyness —
+// m3: a pane already working that merely stays working is NOT proof it acted on the steer),
+// OR its ## Status / newest commit advanced after the send. This is the "processed, not
+// merely submitted" proof (plan §12.3); a politely-stalling agent that swallows a nudge and
+// keeps doing what it was already doing is NOT acked (it ack-expires and reopens).
+func (s *Supervisor) epicAdvancedSince(ctx context.Context, epicID string, transitionedToWorking bool, since time.Time) bool {
 	if epicID == "" {
 		return false
 	}
-	if paneState == string(tmuxio.StateWorking) {
+	if transitionedToWorking {
 		return true
 	}
 	e, err := s.store.GetEpicRun(ctx, epicID)

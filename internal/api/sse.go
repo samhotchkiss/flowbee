@@ -27,6 +27,10 @@ type LifeEvent struct {
 	State string `json:"state"`
 	Event string `json:"event"`
 	Epoch int    `json:"lease_epoch"`
+	// DigestSeq rides epic-lane ("epics"-topic) nudges so a constrained consumer (the
+	// elgato deck, §15.16b) can dedupe against the digest it last polled WITHOUT a re-poll.
+	// Zero (omitted) for non-epic lifecycle events. SSE stays a lossy nudge; poll is truth.
+	DigestSeq int64 `json:"digest_seq,omitempty"`
 }
 
 func (b *Broker) subscribe() (int, chan []byte) {

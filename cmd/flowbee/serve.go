@@ -508,11 +508,25 @@ func runServe(args []string) error {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					now := time.Now()
-					ingestEpicStatuses(ctx, logger, st, now)
-					if supv != nil {
-						supv.Pass(ctx, now)
-					}
+					// M1: this tick parses UNTRUSTED builder-pushed ## Status markdown
+					// (ingestEpicStatuses) and drives keystrokes (supv.Pass), inside the
+					// control-plane process. A panic here must NEVER crash `flowbee serve`
+					// (Restart=always would crashloop the WHOLE control plane on one bad epic
+					// file). epicsupervisor.Pass has its own per-pass + per-epic recover; this
+					// backstop additionally covers ingestEpicStatuses. Log loudly, skip the
+					// tick; the next 2-minute tick starts clean (mirrors watchdog.Pass).
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								logger.Error("epic-supervision tick: PANIC recovered — tick skipped", "panic", r)
+							}
+						}()
+						now := time.Now()
+						ingestEpicStatuses(ctx, logger, st, now)
+						if supv != nil {
+							supv.Pass(ctx, now)
+						}
+					}()
 				}
 			}
 		}()
