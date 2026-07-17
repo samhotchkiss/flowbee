@@ -14,6 +14,11 @@ import (
 // a ready seat with weekly HEADROOM is chosen; a seat whose account is weekly-CRITICAL
 // (read off account_windows.severity, NOT just worker_accounts.usage_pct) is refused; no
 // ready seat is refused; and anti-collocation prefers a non-busy account.
+//
+// Seats model the REAL fleet (per coordinator intel): a `box` is a full ssh destination
+// in user@host form (e.g. "claude1@localhost") — same host, different unix user — which
+// the ladder passes verbatim to `ssh -t -- <box>`, so the gate must carry it through
+// unchanged.
 func TestEpicSelectSeat(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -21,17 +26,21 @@ func TestEpicSelectSeat(t *testing.T) {
 	addSeat := func(st *store.Store, box, acct string) {
 		t.Helper()
 		if err := st.AddSeat(ctx, store.Seat{
-			Box: box, AgentFamily: "claude", ConfigDir: "/home/u/.claude-" + box,
+			Box: box, AgentFamily: "claude", ConfigDir: "/home/" + box + "/.claude",
 			AccountKey: acct, Health: store.SeatReady,
 		}, now); err != nil {
 			t.Fatalf("add seat %s/%s: %v", box, acct, err)
 		}
 	}
-	foldCritical := func(st *store.Store, acct string) {
+	// foldCritical folds an account reading whose ONLY critical window is `kind` — so a
+	// KindWeeklyScoped case proves the 6a concern: an account with a per-model
+	// weekly_scoped limit at 100% is severity=critical even though its aggregate
+	// worker_accounts.usage_pct (max of session/weekly_all) stays low.
+	foldCritical := func(st *store.Store, acct string, kind acctprobe.WindowKind) {
 		t.Helper()
 		if err := st.UpsertAccountLimits(ctx, acctprobe.Result{
 			Identity:   acctprobe.Identity{Provider: "claude", AccountKey: acct, Email: acct + "@x"},
-			Usage:      acctprobe.Usage{Windows: acctprobe.Windows{{Kind: acctprobe.KindWeeklyAll, Percent: 97, Severity: acctprobe.SeverityCritical}}},
+			Usage:      acctprobe.Usage{Windows: acctprobe.Windows{{Kind: kind, Percent: 100, Severity: acctprobe.SeverityCritical, Scope: "fable"}}},
 			TrustState: acctprobe.TrustVerified, CapturedAt: now,
 		}, now); err != nil {
 			t.Fatalf("fold critical %s: %v", acct, err)
@@ -40,7 +49,7 @@ func TestEpicSelectSeat(t *testing.T) {
 
 	t.Run("ready seat with headroom is chosen", func(t *testing.T) {
 		st := testutil.NewStore(t)
-		addSeat(st, "box1", "acct1")
+		addSeat(st, "claude1@localhost", "pearl@swh.me")
 		seat, gate, err := epicSelectSeat(ctx, st, "claude", "", nil)
 		if err != nil {
 			t.Fatalf("select: %v", err)
@@ -48,8 +57,8 @@ func TestEpicSelectSeat(t *testing.T) {
 		if gate.refuse {
 			t.Fatalf("expected a headroom seat, refused: %s", gate.reason)
 		}
-		if seat.AccountKey != "acct1" {
-			t.Fatalf("chose %q, want acct1", seat.AccountKey)
+		if seat.AccountKey != "pearl@swh.me" || seat.Box != "claude1@localhost" {
+			t.Fatalf("chose %+v, want claude1@localhost / pearl@swh.me", seat)
 		}
 	})
 
@@ -66,8 +75,8 @@ func TestEpicSelectSeat(t *testing.T) {
 
 	t.Run("weekly-critical account is refused (severity, not usage_pct)", func(t *testing.T) {
 		st := testutil.NewStore(t)
-		addSeat(st, "box1", "acctC")
-		foldCritical(st, "acctC")
+		addSeat(st, "claude1@localhost", "pearl@swh.me")
+		foldCritical(st, "pearl@swh.me", acctprobe.KindWeeklyAll)
 		_, gate, err := epicSelectSeat(ctx, st, "claude", "", nil)
 		if err != nil {
 			t.Fatalf("select: %v", err)
@@ -77,11 +86,29 @@ func TestEpicSelectSeat(t *testing.T) {
 		}
 	})
 
+	t.Run("weekly_SCOPED-only critical is refused (usage_pct alone would miss it)", func(t *testing.T) {
+		st := testutil.NewStore(t)
+		addSeat(st, "claude1@localhost", "pearl@swh.me")
+		foldCritical(st, "pearl@swh.me", acctprobe.KindWeeklyScoped)
+		// worker_accounts.usage_pct is low (no session/weekly_all window), yet the seat
+		// must be excluded because account_windows.severity is critical.
+		if aw, ok, _ := st.GetAccountWindow(ctx, "pearl@swh.me"); !ok || aw.Severity != "critical" {
+			t.Fatalf("precondition: want severity=critical, got %+v (ok=%v)", aw, ok)
+		}
+		_, gate, err := epicSelectSeat(ctx, st, "claude", "", nil)
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		if !gate.refuse {
+			t.Fatalf("a weekly_scoped-only critical seat must be excluded (severity, not usage_pct)")
+		}
+	})
+
 	t.Run("anti-collocation prefers a non-busy account", func(t *testing.T) {
 		st := testutil.NewStore(t)
-		addSeat(st, "box1", "acctBusy")
-		addSeat(st, "box2", "acctFree")
-		active := []store.EpicRun{{ID: "e1", AccountKey: "acctBusy", State: "running"}}
+		addSeat(st, "claude1@localhost", "pearl@swh.me")
+		addSeat(st, "claude2@localhost", "s@swh.me")
+		active := []store.EpicRun{{ID: "e1", AccountKey: "pearl@swh.me", State: "running"}}
 		seat, gate, err := epicSelectSeat(ctx, st, "claude", "", active)
 		if err != nil {
 			t.Fatalf("select: %v", err)
@@ -89,21 +116,21 @@ func TestEpicSelectSeat(t *testing.T) {
 		if gate.refuse {
 			t.Fatalf("expected a seat, refused: %s", gate.reason)
 		}
-		if seat.AccountKey != "acctFree" {
-			t.Fatalf("anti-collocation chose %q, want acctFree", seat.AccountKey)
+		if seat.AccountKey != "s@swh.me" {
+			t.Fatalf("anti-collocation chose %q, want s@swh.me", seat.AccountKey)
 		}
 	})
 
 	t.Run("host filter restricts to a box", func(t *testing.T) {
 		st := testutil.NewStore(t)
-		addSeat(st, "box1", "acct1")
-		addSeat(st, "box2", "acct2")
-		seat, gate, err := epicSelectSeat(ctx, st, "claude", "box2", nil)
+		addSeat(st, "claude1@localhost", "pearl@swh.me")
+		addSeat(st, "claude2@localhost", "s@swh.me")
+		seat, gate, err := epicSelectSeat(ctx, st, "claude", "claude2@localhost", nil)
 		if err != nil {
 			t.Fatalf("select: %v", err)
 		}
-		if gate.refuse || seat.Box != "box2" {
-			t.Fatalf("host filter chose %+v (refuse=%v), want box2", seat, gate.refuse)
+		if gate.refuse || seat.Box != "claude2@localhost" {
+			t.Fatalf("host filter chose %+v (refuse=%v), want claude2@localhost", seat, gate.refuse)
 		}
 	})
 }
