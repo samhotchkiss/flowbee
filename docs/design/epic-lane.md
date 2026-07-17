@@ -171,9 +171,12 @@ merge-of-main or scope change; INSTRUCTIONS.md line 10 already recognizes `## Am
 
 ### 1.6 No master / master death — two independent liveness sources
 - **No master, items accumulating.** Items are durable; they wait. A reaper raises `master_absent`
-  (→ existing `NeedsHuman`/`needs_operator` operator sink + optional `PushNotification`) when any
-  item at priority ≤ 15 is `open` longer than `T_absent` (10m) with no live heartbeat. Low-priority
-  items (`epic_finished`, `merge_main_suggested`) do not page.
+  (→ existing `NeedsHuman`/`needs_operator` operator sink + optional `PushNotification`) when an item
+  goes unleased past its kind's escalation window with no live heartbeat. (Original draft said a flat
+  "priority ≤ 15 / T_absent 10m" rule — SUPERSEDED by §15.4's per-kind tiers, which the implementation
+  follows: human-first kinds page immediately; master-first kinds page only after their per-kind window;
+  never-page kinds (`epic_finished`, `merge_main_suggested`, `ci_infra_incident`) do not page. With
+  multiple masters, liveness = max(last_heartbeat) over non-stale supervisors.)
 - **Heartbeat source.** Heartbeat older than `3× interval` → `state=stale`; leases reaped to `open`.
 - **Pane-idle backstop (watches the watcher), with the explicit carve-out.** The master's own pane
   is registered in `supervisors` as a lightweight watched target with its **own capture path** —
@@ -895,6 +898,84 @@ re-plan / drop / force); prolonged ineligibility surfaces as low-priority attent
 reason. (f) `flowbee epic plan` renders the queue in eligibility order with each epic's specific blocker
 ("waiting on merge of X" / "scope busy until Y" / "no headroom until <resets_at>" / "no free host").
 *Phase 9 (dispatcher + queue CLI; `dep_failed` kind lands with the Phase 5 enum), placement view extends §4.5.*
+
+**15.13 The SEAT registry — launch provisions sessions from registered account×box seats (operator,
+2026-07-16).** A **seat** = (account, box, agent family, config dir/env). The same account logged in on two
+boxes is two seats sharing ONE quota bucket (accountUuid); quota keys on the account, occupancy on the box.
+Flowbee NEVER performs logins — the human authenticates each account on each box once; the registry records
+where each account is already usable, and `auth_dead` routes re-login back to the human. (a) Schema: `seats`
+(id, box → epic_hosts, agent_family, account_key → account_windows, config_dir/codex_home, extra env,
+enabled, health: ready|limit_critical|auth_dead|unreachable, last_probe_at) — folded into migration 0028.
+(b) Registration: `flowbee seat add`, plus `flowbee seat discover <box>` — acctprobe over ssh scans the
+box's home for .claude* dirs / CODEX_HOME, resolves accountUuid/account_id + live limits, proposes seats
+for confirmation. (c) LAUNCH = SEAT SELECTION: the dispatcher/launch gate picks a ready seat matching the
+epic's `agent:` family with weekly headroom on a free box, and injects the seat's env
+(CLAUDE_CONFIG_DIR/CODEX_HOME + FLOWBEE_ACCOUNT) at tmux-session creation — the epic lane PROVISIONS
+sessions on demand (Phase 2's LaunchEpicSession, now fed by the registry); adoption of pre-existing
+sessions remains only for masters and legacy panes. (d) Seat health: the staggered capacity ticker probes
+seats (acctprobe over ssh), feeding the dashboard capacity strip as an account×box seat matrix with limits,
+health, staleness badges, and current occupant epic. Supersedes the bare `--host`/frontmatter-host flow
+(kept as an override that must name a registered seat or box). *Phase 6 (schema, discovery, launch gate);
+dashboard strip Phase 7.*
+
+**15.14 Per-epic visual explainer, rendered in the dashboard (operator, 2026-07-16).** Every epic maintains
+`epics/<slug>-explainer.html` on its branch — a self-contained HTML page (mermaid diagrams + prose, built per
+the visual-explainer method, vendored at `docs/skills/visual-explainer/` so BOTH Claude and Codex runners can
+follow it) that communicates what the epic is building and where it stands. Contract: authored with the spec
+(plan-of-record: architecture + step-flow diagram), refreshed at each step completion (progress, discoveries,
+plan deviations), finalized at finish (the as-built story — also handed to the cross-family reviewer as
+context). `## Status` stays the machine-readable truth; the explainer is the human rendering — never parsed
+by the control plane. Dashboard: the epic drawer gains an Explainer tab — flowbee reads the file off the epic
+branch via the mirror (same path as status ingestion) and serves it in a HARD-SANDBOXED iframe
+(`sandbox="allow-scripts"`, NO allow-same-origin, strict CSP; agent-authored HTML gets zero access to
+dashboard origin/cookies/API) with a staleness badge when the explainer's last commit lags status updates.
+Ingestion auto-registers it as the first standard `artifacts` kind (explainer). The epic's own explainer file
+is implicitly in scope (same F1 treatment as the epic .md). *Phase 4 (contract bullet + skill vendoring),
+Phase 7 (drawer tab + sandboxed serving), Phase 9 (artifact registration).*
+
+**15.15 The LAUNCH LADDER — supervised staged launch through a local pane (operator, 2026-07-16; DELIBERATELY
+REVERSES Phase 2's remote-tmux/BatchMode-only model).** Flowbee launches an epic by driving a LOCAL tmux
+session (named `epic-<slug>`, on the control-plane box — the operator's single attachable pane of glass)
+through a verified stage machine, each stage pane-classified before the next fires, composed entirely from
+merged tmuxio primitives (NewSession + verified Send + Classify):
+1. create local session `epic-<slug>`;
+2. (remote seat) send `ssh -t <user>@<box> tmux new -A -s epic-<slug>` — the agent lives in a REMOTE tmux
+   that survives disconnects/control-plane restarts; the local pane is only the attachment, which flowbee
+   re-establishes automatically if the pipe drops (watchdog heals attach; the agent never notices). An
+   INTERACTIVE auth prompt (password/2FA) at this stage classifies AWAITING_INPUT → a launch-stage attention
+   item routed to the human, who answers once in the pane — tolerated, not a BatchMode hard-fail;
+3. verify remote shell arrival (prompt classification, timeout);
+4. send the seat's CLI launch line (env + binary, e.g. `CLAUDE_CONFIG_DIR=~/.claude-pearl claude` or the
+   codex equivalent — built from the registered seat, closed-verb discipline);
+5. classify until IDLE_AT_PROMPT = CLI up and healthy (timeout);
+6. verified-send the goal prompt (family verb table Launch template);
+7. confirm WORKING → state running.
+Any stage timeout/misclassification → `launch_failed` attention item + rollback (kill local session, release
+seat/host/scope via the launching-reaper path). Local seats run the same ladder minus stages 2-3. FALLBACK
+CONTROL PATH: `goal_sessions.box` still records the box, so per-op `ssh -- <box> tmux ...` (the Phase-2
+remoteWrap machinery, retained) can capture/send directly against the remote tmux if the local attachment
+pane is lost — dual-path supervision. tmuxio needs no new transport API (the reviewer-endorsed deletion of
+SessionSpec.RemoteHost stands; the ladder is orchestration, not transport). *Phase 6 (launch-gate rewrite,
+replacing LaunchEpicSession's one-shot), attach-healing in the consolidated ticker.*
+
+**15.16 External status consumers are first-class (operator, 2026-07-16).** A Stream Deck plugin
+(dev/flowbee-elgato) mirrors flowbee status to physical keys; more consumers will follow. The Phase 6/7
+read-models (`/v1/epics/digest`, `/v1/board`, the `epics` SSE topic, the capacity strip) are therefore a
+PUBLIC, versioned contract, not dashboard internals: stable field names, small payloads (support a
+`?fields=` projection and/or a counts-only summary endpoint for constrained consumers), token auth matching
+the existing worker-token scheme, and SSE consumable outside the dashboard origin. The elgato session's
+needs (full doc: ~/Desktop/flowbee-elgato-api-needs.md) are ACCEPTED into the Phase 6/7 contract:
+(a) `EpicDigest` carries the tmux jump target EXPLICITLY — `tmux` session name + `host` ('' = control-plane
+box) — never joined by slug convention (with the §15.15 launch ladder, the local attachment pane IS the
+iTerm-focus target even for remote epics); (b) SSE hygiene: keepalive comment every 15-30s (half-open
+sockets on slept laptops otherwise go silently stale), named `event:` per topic, `digest_seq` in every
+payload for client dedupe — SSE is a lossy nudge, poll is truth; (c) counts-only `GET /v1/summary` with
+ETag/304: {digest_seq, attention_total + by_priority, epics_blocked/on_task, dispatch_paused, stranded,
+worst_account_severity}; (d) JSON contract: `[]` never null, stable ordering (accounts by account_key),
+account read-model includes resets_at; (e) open-tier loopback reads stay open; GET /v1/control likely joins
+the open loopback tier (small posture decision at Phase 6 wiring). NOTE: the elgato session independently
+added an open-read GET /v1/sessions (ListGoalSessions) to a flowbee checkout — locate and reconcile that
+commit through the same review train before Phase 6 lands overlapping surface. *Phases 6-7.*
 
 **15.9 Deterministic classifiers stay conservative.** The infra-flake and drift pattern registries only
 auto-act on well-known signatures; anything ambiguous routes to the master. A flake with no clean signature
