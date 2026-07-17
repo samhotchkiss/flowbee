@@ -58,6 +58,102 @@ func TestPreflight_HappyPath_ExistingCheckout(t *testing.T) {
 	if r.calls[1] != DiskFreeKBCmd("buncher", "/home/ops") {
 		t.Fatalf("disk probe targets %q, want the probe path (home): %q", r.calls[1], DiskFreeKBCmd("buncher", "/home/ops"))
 	}
+	// back-compat (Bug 2 fix): a Preflight that OMITS DefaultBranch must not issue a
+	// refresh command — the 3-call count above already guarantees it, asserted
+	// explicitly here so the guard is unmistakable.
+	for _, c := range r.calls {
+		if c == RepoRefreshCmd("buncher", "/home/ops/epics/russ", "main") {
+			t.Fatalf("no refresh must be issued when DefaultBranch is empty: %v", r.calls)
+		}
+	}
+}
+
+// TestPreflight_RefreshesReusedCheckout: when the checkout EXISTS and DefaultBranch
+// is set, Preflight refreshes the reused checkout to a clean current default branch
+// (Bug 2) — a reused seat is typically left on the prior epic's branch with a stale
+// main, so without this the epic runner cuts epic/<slug> from a stale base missing
+// the freshly-merged spec. The refresh must be the exact RepoRefreshCmd, issued as
+// the 4th call, and NO clone must occur.
+func TestPreflight_RefreshesReusedCheckout(t *testing.T) {
+	r := &queuedRunner{}
+	r.push("", nil)           // gh auth status: OK
+	r.push("20971520\n", nil) // df: 20G free
+	r.push("yes\n", nil)      // checkout already exists
+	r.push("", nil)           // git refresh succeeds
+
+	res, err := Preflight(context.Background(), r, PreflightParams{
+		Box: "buncher", CheckoutPath: "/home/ops/epics/russ", DiskProbePath: "/home/ops",
+		OwnerRepo: "acme/russ", DefaultBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	if res.ClonedFresh {
+		t.Fatalf("a reused checkout must not report ClonedFresh")
+	}
+	if len(r.calls) != 4 {
+		t.Fatalf("expected 4 calls (auth, disk, exists, refresh), got %d: %v", len(r.calls), r.calls)
+	}
+	if r.calls[3] != RepoRefreshCmd("buncher", "/home/ops/epics/russ", "main") {
+		t.Fatalf("refresh command mismatch:\n got %q\nwant %q", r.calls[3], RepoRefreshCmd("buncher", "/home/ops/epics/russ", "main"))
+	}
+	for _, c := range r.calls {
+		if c == CloneRepoCmd("buncher", "acme/russ", "/home/ops/epics/russ") {
+			t.Fatalf("a reused (existing) checkout must NOT be re-cloned: %v", r.calls)
+		}
+	}
+}
+
+// TestPreflight_RefreshFailureIsFatal: RepoRefreshCmd is fail-safe — a dirty working
+// tree makes git checkout/reset fail, and Preflight must surface that as a launch-
+// blocking error (never silently discard a half-finished epic's work).
+func TestPreflight_RefreshFailureIsFatal(t *testing.T) {
+	r := &queuedRunner{}
+	r.push("", nil)
+	r.push("20971520\n", nil)
+	r.push("yes\n", nil)
+	r.push("", errors.New("error: Your local changes would be overwritten by checkout"))
+
+	_, err := Preflight(context.Background(), r, PreflightParams{
+		Box: "buncher", CheckoutPath: "/home/ops/epics/russ", DiskProbePath: "/home/ops",
+		OwnerRepo: "acme/russ", DefaultBranch: "main",
+	})
+	if err == nil {
+		t.Fatal("expected a launch-blocking error when the reused-checkout refresh fails (dirty tree)")
+	}
+}
+
+// TestPreflight_AbsentCheckout_ClonesNeverRefreshes: an ABSENT checkout is cloned
+// (new temp-then-mv CloneRepoCmd form) and NEVER refreshed — even with DefaultBranch
+// set, a fresh clone already lands on the default branch.
+func TestPreflight_AbsentCheckout_ClonesNeverRefreshes(t *testing.T) {
+	r := &queuedRunner{}
+	r.push("", nil)
+	r.push("20971520\n", nil)
+	r.push("no\n", nil) // checkout absent
+	r.push("", nil)     // clone succeeds
+
+	res, err := Preflight(context.Background(), r, PreflightParams{
+		Box: "buncher", CheckoutPath: "/home/ops/epics/russ", DiskProbePath: "/home/ops",
+		OwnerRepo: "acme/russ", DefaultBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	if !res.ClonedFresh {
+		t.Fatalf("expected ClonedFresh=true")
+	}
+	if len(r.calls) != 4 {
+		t.Fatalf("expected 4 calls (auth, disk, exists, clone — no refresh), got %d: %v", len(r.calls), r.calls)
+	}
+	if r.calls[3] != CloneRepoCmd("buncher", "acme/russ", "/home/ops/epics/russ") {
+		t.Fatalf("clone command mismatch (temp-then-mv form):\n got %q\nwant %q", r.calls[3], CloneRepoCmd("buncher", "acme/russ", "/home/ops/epics/russ"))
+	}
+	for _, c := range r.calls {
+		if c == RepoRefreshCmd("buncher", "/home/ops/epics/russ", "main") {
+			t.Fatalf("a freshly-cloned checkout must NOT be refreshed: %v", r.calls)
+		}
+	}
 }
 
 func TestPreflight_ClonesWhenMissing(t *testing.T) {
