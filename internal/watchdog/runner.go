@@ -137,9 +137,51 @@ func RepoCheckoutExistsCmd(box, path string) string {
 // in argv, unlike a token-bearing https URL would be — `ps` on the remote box is
 // world-readable) clones the epic's checkout. mkdir -p's the parent first since
 // the ~/epics/ convention directory may not exist yet on a freshly provisioned box.
+//
+// TEMP-THEN-MV + SELF-CLEAN (Bug 1): the clone lands in a SIBLING `<path>.partial`
+// and is atomically `mv`'d into place ONLY after `gh repo clone` succeeds, so the
+// target `<path>` never appears as anything but a COMPLETE checkout. This exists
+// because a big-repo clone (the russ repo is 869 MiB packed) can exceed the
+// Runner's command timeout and be SIGKILLed mid-checkout — a clone straight into
+// `<path>` would then strand a partial directory there, and the NEXT launch attempt
+// would die with "destination path already exists and is not an empty directory".
+// The leading `rm -rf -- <path>.partial` clears any partial a prior killed attempt
+// left in the temp slot, so every attempt self-cleans and retries cleanly; the
+// real `<path>` is never touched until the mv, so a failed clone can't corrupt an
+// otherwise-good checkout either.
 func CloneRepoCmd(box, ownerRepo, path string) string {
-	return remoteWrap(box, "mkdir -p -- "+shQuote(parentDirUnix(path))+
-		" && gh repo clone "+shQuote(ownerRepo)+" "+shQuote(path)+" -- --quiet")
+	partial := shQuote(path + ".partial")
+	return remoteWrap(box, "rm -rf -- "+partial+
+		" && mkdir -p -- "+shQuote(parentDirUnix(path))+
+		" && gh repo clone "+shQuote(ownerRepo)+" "+partial+" -- --quiet"+
+		" && mv -- "+partial+" "+shQuote(path))
+}
+
+// RepoRefreshCmd refreshes an ALREADY-CLONED checkout at path onto a clean current
+// `branch` — `git fetch --quiet origin <branch> && git checkout --quiet <branch> &&
+// git reset --hard -q origin/<branch>`, run inside the checkout. The epic preflight
+// calls this when a seat's base checkout is REUSED (Bug 2): a reused seat is
+// typically left on the PRIOR epic's branch with a stale local `main`, so without
+// this refresh the epic runner would cut `epic/<slug>` from a stale base and could
+// not even find its own freshly-merged spec file.
+//
+// FAIL-SAFE CONTRACT: this is deliberately NOT a force — it does NOT `git clean` or
+// stash. If the working tree has UNCOMMITTED CHANGES, `git checkout`/`git reset`
+// fails, the Runner returns a nonzero exit, and Preflight propagates it up as a
+// launch-BLOCKING error. We never silently discard a half-finished epic's work; the
+// operator is told to resolve the dirty tree by hand. The prior epic's OWN branch
+// (already pushed as its PR) is untouched — we only move the BASE branch forward,
+// so nothing already captured in a PR is at risk.
+//
+// TRUST BOUNDARY: branch is the repo registry's default_branch — an operator-set,
+// trusted value — but is still shQuote'd like every other argument here, and the
+// `origin/<branch>` token is built as shQuote("origin/"+branch) so a branch with
+// shell metacharacters can never break out of its single argument.
+func RepoRefreshCmd(box, path, branch string) string {
+	return remoteWrap(box, "cd "+shQuote(path)+
+		" && git fetch --quiet origin "+shQuote(branch)+
+		" && git checkout --quiet "+shQuote(branch)+
+		" && git reset --hard -q "+shQuote("origin/"+branch))
 }
 
 // TimezoneCmd probes a box's IANA timezone name (the `flowbee epic start --tz`

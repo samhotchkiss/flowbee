@@ -232,7 +232,14 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	}
 
 	// ── preflight on the host (reuses the watchdog Runner abstraction) ──
-	runner := watchdog.NewShellRunner()
+	// A GENEROUS per-command timeout (not the watchdog's 15s default): this runner
+	// drives the one-shot launch, whose Preflight may `gh repo clone` a large repo
+	// (the russ repo is 869 MiB packed) that a 15s timeout SIGKILLs mid-checkout —
+	// which then stranded a partial dir and refused the launch (Bug 1). This is a
+	// launch, not the every-2-min watch pass, so a long ceiling is correct; the fast
+	// checks (gh auth, df, home, tmux) and an unreachable box (ssh ConnectTimeout=5)
+	// all still return/fail quickly regardless of this ceiling.
+	runner := watchdog.ShellRunner{Timeout: 15 * time.Minute}
 	homeOut, herr := runner.Run(ctx, watchdog.HomeDirCmd(host))
 	if herr != nil {
 		return fmt.Errorf("resolve home directory on %q: %w", host, herr)
@@ -266,6 +273,11 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 		// launch onto a fresh box (review MAJOR M1). Home always exists and shares
 		// the checkout's filesystem under the ~/epics/<repo> convention.
 		DiskProbePath: home,
+		// refresh a REUSED checkout to a clean current default branch (Bug 2) — a
+		// reused seat is typically left on the prior epic's branch with a stale main,
+		// so the runner would otherwise cut epic/<slug> from a stale base missing the
+		// freshly-merged spec. `branch` is already normalized to "main" when empty.
+		DefaultBranch: branch,
 	})
 	if err != nil {
 		return fmt.Errorf("preflight on %q: %w", host, err)

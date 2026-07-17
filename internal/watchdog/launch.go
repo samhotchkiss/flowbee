@@ -36,6 +36,14 @@ type PreflightParams struct {
 	// convention, so measuring at home answers the same question.
 	DiskProbePath string
 	OwnerRepo     string // "owner/repo", used only if a fresh clone is needed
+	// DefaultBranch is the branch a REUSED checkout is refreshed to (via
+	// RepoRefreshCmd) before the epic runner cuts epic/<slug> from it — the repo
+	// registry's default_branch (typically "main"). Empty means SKIP the refresh:
+	// a fresh clone lands on the default branch already, and tests that don't
+	// exercise the reuse path leave it unset so back-compat callers issue no
+	// refresh command. See RepoRefreshCmd for the fail-safe (dirty-tree-blocking)
+	// contract.
+	DefaultBranch string
 }
 
 type PreflightResult struct {
@@ -81,6 +89,16 @@ func Preflight(ctx context.Context, r Runner, p PreflightParams) (PreflightResul
 			return out, fmt.Errorf("clone checkout: %w", err)
 		}
 		out.ClonedFresh = true
+	} else if p.DefaultBranch != "" {
+		// REUSED checkout (Bug 2): a reused seat is typically left on the prior
+		// epic's branch with a stale local main, so refresh it to a clean current
+		// default branch — otherwise the epic runner cuts epic/<slug> from a stale
+		// base and can't even find its own freshly-merged spec file. RepoRefreshCmd
+		// is fail-safe: a dirty working tree makes the checkout/reset fail, and we
+		// surface that as a launch-blocking error rather than discard unsaved work.
+		if _, err := r.Run(ctx, RepoRefreshCmd(p.Box, p.CheckoutPath, p.DefaultBranch)); err != nil {
+			return out, fmt.Errorf("refresh reused checkout to %s: %w", p.DefaultBranch, err)
+		}
 	}
 	return out, nil
 }

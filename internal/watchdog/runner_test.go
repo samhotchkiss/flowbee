@@ -44,3 +44,35 @@ func TestAllCommandBuildersUseSeparator(t *testing.T) {
 		}
 	}
 }
+
+// TestRepoRefreshAndCloneCmdStrings pins the EXACT shell strings for the reused-
+// checkout refresh (Bug 2) and the temp-then-mv clone (Bug 1), so the shQuoting and
+// the shQuote("origin/"+branch) form can't silently drift.
+func TestRepoRefreshAndCloneCmdStrings(t *testing.T) {
+	gotRefresh := RepoRefreshCmd("", "/home/ops/epics/russ", "main")
+	wantRefresh := "cd '/home/ops/epics/russ' && git fetch --quiet origin 'main' && git checkout --quiet 'main' && git reset --hard -q 'origin/main'"
+	if gotRefresh != wantRefresh {
+		t.Fatalf("RepoRefreshCmd:\n got %q\nwant %q", gotRefresh, wantRefresh)
+	}
+
+	// temp-then-mv: clone lands in <path>.partial and is atomically mv'd in only on
+	// success; the leading rm -rf clears any partial a prior SIGKILL'd attempt left.
+	gotClone := CloneRepoCmd("", "acme/russ", "/home/ops/epics/russ")
+	wantClone := "rm -rf -- '/home/ops/epics/russ.partial' && mkdir -p -- '/home/ops/epics' && gh repo clone 'acme/russ' '/home/ops/epics/russ.partial' -- --quiet && mv -- '/home/ops/epics/russ.partial' '/home/ops/epics/russ'"
+	if gotClone != wantClone {
+		t.Fatalf("CloneRepoCmd:\n got %q\nwant %q", gotClone, wantClone)
+	}
+
+	// the origin/<branch> token must be a single shQuote'd argument — never string-
+	// concatenated with an unquoted branch, so a branch carrying shell metacharacters
+	// can't break out of its argument.
+	hostile := RepoRefreshCmd("", "/x", "main; rm -rf /")
+	if !strings.Contains(hostile, "git reset --hard -q 'origin/main; rm -rf /'") {
+		t.Fatalf("origin/<branch> must be shQuote'd as one argument, got %q", hostile)
+	}
+
+	// the ssh remote form quotes the whole inner command as one argument behind `--`.
+	if remote := RepoRefreshCmd("buncher", "/x", "main"); !strings.Contains(remote, " -- 'buncher' ") {
+		t.Fatalf("remote RepoRefreshCmd missing `-- <host>` separator: %q", remote)
+	}
+}
