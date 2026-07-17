@@ -50,6 +50,12 @@ export type GoalSession = {
 	enabled: boolean;
 	last_change_at?: string;
 	last_checked_at?: string;
+	/**
+	 * Plugin-side annotation (not on the wire): the session is live right now —
+	 * local entries verified against `tmux list-sessions`, remote ones by
+	 * watchdog state. Auto-slot keys populate from running sessions only.
+	 */
+	running?: boolean;
 };
 
 /** A local tmux session that is not in the goal-session registry (fallback listing). */
@@ -60,6 +66,7 @@ export type UnwatchedSession = {
 	enabled: true;
 	box?: undefined;
 	attached: boolean;
+	running: true;
 };
 
 export type SessionEntry = GoalSession | UnwatchedSession;

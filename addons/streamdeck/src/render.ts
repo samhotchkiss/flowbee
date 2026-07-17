@@ -185,6 +185,16 @@ export function sessionKey(opts: {
 	);
 }
 
+/** Armed-confirm frame for the global pause (a bumped key must not halt the fleet). */
+export function pauseConfirmKey(): string {
+	return svg(
+		`<rect x="12" y="12" width="120" height="120" rx="14" fill="none" stroke="${COLORS.amber}" stroke-width="4" stroke-dasharray="10 7"/>
+		 <text x="72" y="60" font-size="19" font-weight="800" fill="${COLORS.amber}" text-anchor="middle">PRESS</text>
+		 <text x="72" y="84" font-size="19" font-weight="800" fill="${COLORS.amber}" text-anchor="middle">AGAIN</text>
+		 <text x="72" y="112" font-size="12" fill="${COLORS.dim}" text-anchor="middle">pauses ALL dispatch</text>`,
+	);
+}
+
 /** Pause/resume toggle key. */
 export function pauseKey(opts: { paused: boolean; scope?: string; unknown?: boolean }): string {
 	if (opts.unknown) return noteKey("PAUSE?", "state unknown");

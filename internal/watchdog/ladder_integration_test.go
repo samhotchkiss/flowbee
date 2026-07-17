@@ -122,3 +122,43 @@ func TestIntegrationLoneEqualsTargetRejectedByRealTmux(t *testing.T) {
 		t.Fatalf("tmux rejected the =name: exact form tmuxio builds: %v (%s)", err, out)
 	}
 }
+
+// TestIntegrationConfirmSameHostDifferentUserVerifies proves the REAL fleet topology
+// against a LIVE tmux pane: a seat reached via `ssh <user>@localhost` shares the control
+// plane's HOSTNAME and differs only by USER. It shadows whoami/hostname in the pane's shell
+// so confirmRemoteHost's `$(whoami)@$(hostname)` resolves to a crafted
+// claude1@Mac-Studio.local while the control plane's LocalIdentity is sam@Mac-Studio.local
+// (SAME host, DIFFERENT user) — the case that FAILED CLOSED under hostname-only
+// discrimination and must now VERIFY. No multi-user ssh is needed: the crafted marker is
+// echoed by a real shell in a real tmux pane, and command substitution inherits the shell's
+// function definitions, so `$(whoami)@$(hostname)` yields the shimmed identity.
+func TestIntegrationConfirmSameHostDifferentUserVerifies(t *testing.T) {
+	requireTmux(t)
+	socket := fmt.Sprintf("flowbee-idtuple-%d", time.Now().UnixNano())
+	ctx := context.Background()
+	client := tmuxio.New(tmuxio.WithSocket(socket), tmuxio.WithClock(realClk{}))
+	t.Cleanup(func() { _ = client.KillServer(ctx) })
+
+	session := "epic-idtuple"
+	if err := client.NewSession(ctx, tmuxio.SessionSpec{Name: session, Command: "/bin/sh"}); err != nil {
+		t.Fatalf("create real shell session: %v", err)
+	}
+	// Shadow whoami/hostname so `$(whoami)@$(hostname)` resolves to a same-host-different-user
+	// identity. POSIX function definitions are inherited by the command-substitution subshell.
+	if _, err := client.Send(ctx, session,
+		"whoami() { echo claude1; }; hostname() { echo Mac-Studio.local; }", tmuxio.SendOptions{}); err != nil {
+		t.Fatalf("define identity shims: %v", err)
+	}
+
+	ok, ev, err := confirmRemoteHost(ctx, client, realClk{}, session, "itnonce",
+		"sam@Mac-Studio.local", 5*time.Second, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("confirmRemoteHost infra error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("a same-host-different-user seat MUST verify against real tmux (the field bug), got not-verified: %q", ev)
+	}
+	if !strings.Contains(ev, "claude1@Mac-Studio.local") {
+		t.Fatalf("evidence should name the confirmed remote identity, got %q", ev)
+	}
+}
