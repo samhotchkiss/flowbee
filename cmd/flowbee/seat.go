@@ -146,7 +146,7 @@ func runSeatProbe(ctx context.Context, st *store.Store, args []string) error {
 		if *only != "" && s.Box != *only {
 			continue
 		}
-		res, perr := probeSeatDir(s)
+		res, perr := probeSeatDir(ctx, s)
 		health, detail := classifySeatHealth(res, perr)
 		if res != nil && res.Identity.AccountKey != "" {
 			// fold identity + whatever usage the reading carried (respecting trust).
@@ -279,24 +279,37 @@ func discoverSeats(p *acctprobe.Prober, box, home string) []seatProposal {
 	return out
 }
 
-// probeSeatDir probes a registered seat's config dir/codex home for identity + cached
-// usage, using the local FS for a local seat and read-only ssh for a remote one.
-func probeSeatDir(s store.Seat) (*acctprobe.Result, error) {
+// probeSeatDir probes a registered seat's identity + usage. A LOCAL seat (box="") uses
+// the LIVE-capable tier — the authoritative reading the capacity fold + `flowbee seat
+// probe` want, not a stale on-disk cache: Claude Keychain + /api/oauth/usage, Codex
+// app-server, grok's cli-chat-proxy billing endpoint (New() wires the real HTTP + exec).
+// A REMOTE seat uses the read-only-ssh CACHE tier, because the far box's credential store
+// (Keychain / token file behind a locked session) is not reachable to make the live call,
+// so the cache (the CLI's own last write) is the best signal ssh can serve.
+func probeSeatDir(ctx context.Context, s store.Seat) (*acctprobe.Result, error) {
+	local := s.Box == ""
 	var p *acctprobe.Prober
-	if s.Box == "" {
+	if local {
 		p = acctprobe.New()
 	} else {
 		p = acctprobe.NewWith(sshFS{rr: &remoteRunner{box: s.Box, timeout: 15 * time.Second}}, nil, nil, nil, clock.Real{})
 	}
 	switch s.AgentFamily {
 	case "codex":
-		return p.ProbeCodexHome(s.CodexHome)
+		if local {
+			return p.ProbeCodex(ctx, s.CodexHome) // live app-server
+		}
+		return p.ProbeCodexHome(s.CodexHome) // cache
 	case "grok":
-		// grok's local (fallback) tier reads the unified.jsonl /usage cache; the live
-		// billing endpoint is the capacity ticker's job, mirroring claude's Dir vs Live.
-		return p.ProbeGrokHome(s.ConfigDir)
+		if local {
+			return p.ProbeGrok(ctx, s.ConfigDir) // live billing endpoint (cache fallback)
+		}
+		return p.ProbeGrokHome(s.ConfigDir) // cache (unified.jsonl /usage log line)
 	default: // claude
-		return p.ProbeClaudeDir(s.ConfigDir)
+		if local {
+			return p.ProbeClaude(ctx, s.ConfigDir, "") // live /api/oauth/usage (cache fallback)
+		}
+		return p.ProbeClaudeDir(s.ConfigDir) // cache
 	}
 }
 
