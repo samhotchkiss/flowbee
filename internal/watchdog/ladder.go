@@ -2,13 +2,27 @@ package watchdog
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/tmuxio"
 	"github.com/samhotchkiss/flowbee/internal/verbs"
 )
+
+// randNonce returns a short random hex token for the remote-host confirmation marker.
+// crypto/rand failure falls back to a fixed token — the nonce is a de-dup anchor, not a
+// secret, so a non-unique fallback only risks matching stale scrollback, never safety.
+func randNonce() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "fallback"
+	}
+	return hex.EncodeToString(b[:])
+}
 
 // The LAUNCH LADDER (plan §15.15) supervises an epic launch through a LOCAL tmux
 // session on the control-plane box — the operator's single attachable pane of glass —
@@ -26,11 +40,13 @@ import (
 // re-driven per-op against the remote tmux — dual-path supervision.
 //
 // EXACT-MATCH TARGETS: bare `tmux -t <name>` PREFIX-matches session names (`-t epic-fix`
-// can hit `epic-fix-v2`), so every target this ladder constructs is `=`-prefixed
-// (exactTarget) for an EXACT match. The remote-attach `tmux new -A -s <name>` uses -s
-// (exact create/attach), which does not prefix-match. (NOTE for the reviewer: when
-// fix/tmux-exact-match-targets merges its tmuxio helper, reconcile this manual
-// prefixing so a target is not double-`=`-wrapped.)
+// can hit `epic-fix-v2`). tmuxio.Client already forces an exact match INTERNALLY —
+// every Send/Capture/KillSession runs its target through tmuxio.exactTarget, which
+// produces the pane-parser-valid `=name:` form — so this ladder passes BARE session
+// names and must NOT pre-`=`-prefix them (a lone `=name` with no trailing colon is
+// rejected by tmux's target-pane parser: "can't find pane"). NewSession's -s create
+// name and the remote-side `tmux new -A -s <name>` are likewise bare (exact by
+// construction).
 
 // LaunchStage names each rung of the ladder, so a failure reports EXACTLY where it
 // stopped and the caller (Phase 6b) can raise launch_failed with that stage.
@@ -88,6 +104,13 @@ type LadderParams struct {
 	// sh, since the literal survives NewSession's shQuote — see the package trace).
 	LoginShell string
 
+	// LocalHostname is the control-plane box's hostname, used by the remote-host
+	// confirmation (M3) to detect an ssh drop-back to the LOCAL shell. Default os.Hostname().
+	LocalHostname string
+	// RemoteMarkerNonce makes the confirmation marker unique per launch so stale
+	// scrollback cannot match. Default a fresh random hex; tests inject a fixed value.
+	RemoteMarkerNonce string
+
 	// per-stage timeouts and the classify poll interval (sane defaults via withDefaults).
 	ShellTimeout   time.Duration
 	PromptTimeout  time.Duration
@@ -98,6 +121,12 @@ type LadderParams struct {
 func (p LadderParams) withDefaults() LadderParams {
 	if p.LoginShell == "" {
 		p.LoginShell = "${SHELL:-/bin/sh}"
+	}
+	if p.LocalHostname == "" {
+		p.LocalHostname, _ = os.Hostname() // "" on failure ⇒ confirmation can't detect a local drop-back
+	}
+	if p.RemoteMarkerNonce == "" {
+		p.RemoteMarkerNonce = randNonce()
 	}
 	if p.ShellTimeout <= 0 {
 		p.ShellTimeout = 30 * time.Second
@@ -136,7 +165,9 @@ func RunLadder(ctx context.Context, client *tmuxio.Client, clk tmuxio.Clock, par
 		return LadderResult{Outcome: LaunchFailed, Stage: StageCreateLocal}, err
 	}
 	session := "epic-" + p.Slug
-	target := exactTarget(session)
+	// BARE name: tmuxio.Client exactifies every target internally to `=name:` (a lone
+	// `=name` is rejected by tmux's pane parser), so the ladder must never pre-prefix.
+	target := session
 
 	// Stage 1: create the LOCAL session running an interactive shell.
 	if err := client.NewSession(ctx, tmuxio.SessionSpec{
@@ -220,7 +251,84 @@ func runRemoteAttach(ctx context.Context, client *tmuxio.Client, clk tmuxio.Cloc
 		return killAndFail(ctx, client, session, target, StageAwaitRemoteShell,
 			"remote shell did not arrive (last: "+last+")"), true, nil
 	}
+
+	// A shell-looking prompt appeared — but looksLikeShell CANNOT tell the remote shell
+	// from the LOCAL control-plane shell (both end in `$`/`%`). If the ssh line
+	// instant-exited (conn refused / host-key mismatch / net drop / auth exhaustion),
+	// control fell back to the LOCAL prompt; proceeding would type the CLI launch line
+	// into the WRONG (local) shell — and if the control-plane box is ALSO a seat host,
+	// claude would launch locally and reach WORKING while bound to a REMOTE seat (a
+	// wrong-box scheduling hazard). Confirm we are on the far box by echoing a per-launch
+	// marker suffixed with $(hostname) and requiring a host that DIFFERS from the local
+	// one (plan §15.15 M3).
+	confirmed, cev, cerr := confirmRemoteHost(ctx, client, clk, session, p.RemoteMarkerNonce, p.LocalHostname, p.ShellTimeout, p.PollInterval)
+	if cerr != nil {
+		return killAndFail(ctx, client, session, target, StageAwaitRemoteShell, "confirm remote host: "+cerr.Error()), true, nil
+	}
+	if !confirmed {
+		return killAndFail(ctx, client, session, target, StageAwaitRemoteShell,
+			"remote-host confirmation failed ("+cev+") — refusing to type the launch line into a possibly-local shell"), true, nil
+	}
 	return LadderResult{}, false, nil
+}
+
+// confirmRemoteHost proves the arrived shell is on the FAR box, not the local
+// control-plane shell an instant-exited ssh would drop back to (plan §15.15 M3). It
+// echoes `<marker>_$(hostname)` into the pane — $(hostname) is evaluated by whatever
+// shell we actually landed in — and reads back the resolved host: a host EQUAL to the
+// local one means ssh dropped to the local shell (confirmed=false); a DIFFERENT host is
+// the remote box (confirmed=true). The marker carries a per-launch nonce so a prior
+// launch's scrollback cannot match. Returns (confirmed, evidence, infra-error).
+func confirmRemoteHost(ctx context.Context, client *tmuxio.Client, clk tmuxio.Clock, session, nonce, localHost string, timeout, interval time.Duration) (bool, string, error) {
+	marker := remoteMarkerPrefix + nonce
+	if _, err := client.Send(ctx, session, "echo "+marker+"_$(hostname)", tmuxio.SendOptions{}); err != nil {
+		return false, "", err
+	}
+	deadline := clk.Now().Add(timeout)
+	for {
+		capt, err := client.Capture(ctx, session, 0)
+		if err != nil {
+			return false, "", err
+		}
+		if host, ok := extractMarkerHost(capt.Raw, marker); ok {
+			if localHost != "" && host == localHost {
+				return false, "resolved to the LOCAL host " + host, nil
+			}
+			return true, "remote host " + host + " confirmed", nil
+		}
+		if !clk.Now().Before(deadline) {
+			return false, "marker never appeared", nil
+		}
+		clk.Sleep(ctx, interval)
+	}
+}
+
+// remoteMarkerPrefix anchors the remote-host confirmation marker line in a capture.
+const remoteMarkerPrefix = "FLOWBEE_REMOTE_"
+
+// extractMarkerHost finds the RESOLVED marker line (`<marker>_<host>`) in a capture and
+// returns the host token. It skips the command ECHO line itself — the line still holding
+// the literal `$(hostname)` / `echo ` — so it reads the shell's OUTPUT, not the input.
+func extractMarkerHost(capture, marker string) (string, bool) {
+	needle := marker + "_"
+	for _, ln := range strings.Split(capture, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.Contains(ln, "$(") || strings.Contains(ln, "echo ") {
+			continue // the typed command, not its output
+		}
+		i := strings.Index(ln, needle)
+		if i < 0 {
+			continue
+		}
+		host := ln[i+len(needle):]
+		if sp := strings.IndexAny(host, " \t"); sp >= 0 {
+			host = host[:sp]
+		}
+		if host != "" {
+			return host, true
+		}
+	}
+	return "", false
 }
 
 // awaitRemoteShell polls until the remote shell is ready, an interactive auth prompt
@@ -343,23 +451,20 @@ func sortedKeys(m map[string]string) []string {
 	return keys
 }
 
-// exactTarget returns tmux's EXACT-match target for a session name (`=name`), so a
-// send/capture/kill can never PREFIX-match a differently-suffixed session (`epic-fix`
-// vs `epic-fix-v2`). '=' is a legal leading target char (tmuxio.assertValidIdent only
-// rejects a leading '-'), so the value still passes tmuxio's identifier gate.
-func exactTarget(session string) string { return "=" + session }
-
 // looksLikeShell reports whether a captured pane's last non-empty line looks like an
-// interactive shell prompt (ends in $, %, #, or ❯/›/» — covering bash/zsh/fish and the
-// common starship glyphs). Used only to detect the remote shell arriving; the tmuxio
-// agent-pane classifier does not model a bare shell.
+// interactive shell prompt (ends in one of the common prompt terminators $ % # > ] )
+// or the starship/powerline glyphs ❯ › »). It only GATES when to attempt the remote-host
+// confirmation (confirmRemoteHost); that marker echo — not this glyph guess — is the
+// AUTHORITATIVE arrival proof, so a false positive here merely wastes one confirmation
+// attempt (the marker will not resolve) rather than mis-driving a launch. Kept broad on
+// purpose so an unusual PS1 does not strand a legit seat.
 func looksLikeShell(capture string) bool {
 	t := lastNonEmpty(capture)
 	if t == "" {
 		return false
 	}
 	switch t[len(t)-1:] {
-	case "$", "%", "#":
+	case "$", "%", "#", ">", "]", ")":
 		return true
 	}
 	return strings.HasSuffix(t, "❯") || strings.HasSuffix(t, "›") || strings.HasSuffix(t, "»")
@@ -384,6 +489,10 @@ var authPromptPatterns = []string{
 }
 
 // looksLikeAuthPrompt reports whether the pane's bottom shows an interactive auth prompt.
+// This is a best-effort HEURISTIC, not a guarantee: a localized or unusual prompt (a bare
+// "Token:", a non-English password prompt) may miss. That is low-risk by construction —
+// an auth prompt ends in ':' (not a shell glyph), so a miss leaves the ladder timing out
+// at StageAwaitRemoteShell rather than typing the CLI line into a password field.
 func looksLikeAuthPrompt(capture string) bool {
 	lines := strings.Split(capture, "\n")
 	from := len(lines) - 6

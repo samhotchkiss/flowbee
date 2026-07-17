@@ -42,11 +42,13 @@ const SeverityCritical = "critical"
 // needs and the session_pct/weekly_pct scalars cannot express. It is the public read
 // model's window shape; a consumer's types line up field-for-field.
 type Window struct {
-	Kind     string  `json:"kind"`               // session | weekly_all | weekly_scoped
-	Percent  float64 `json:"percent"`            // real server-reported utilization, 0..100
-	Severity string  `json:"severity,omitempty"` // normal | critical
-	ResetsAt string  `json:"resets_at,omitempty"`
-	Scope    string  `json:"scope,omitempty"` // model display name for weekly_scoped; "" otherwise
+	// The elgato §15.16 contract wants stable keys — severity/resets_at/scope are always
+	// present (no omitempty) so a `[]`-consumer never has to key-check.
+	Kind     string  `json:"kind"`     // session | weekly_all | weekly_scoped
+	Percent  float64 `json:"percent"`  // real server-reported utilization, 0..100
+	Severity string  `json:"severity"` // normal | critical
+	ResetsAt string  `json:"resets_at"`
+	Scope    string  `json:"scope"` // model display name for weekly_scoped; "" otherwise
 }
 
 // AccountSummary is the digest's per-epic account panel (plan §2.1), projected from the

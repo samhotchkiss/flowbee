@@ -40,14 +40,11 @@ CREATE TABLE IF NOT EXISTS account_windows (
     -- distinct from a real 0%.
     session_pct         REAL NOT NULL DEFAULT -1,
     weekly_pct          REAL NOT NULL DEFAULT -1,
-    -- weekly_scoped_json is a JSON array of per-model weekly sub-limits
-    -- [{scope,percent,severity,resets_at}] (Claude weekly_scoped / Codex model-scoped) —
-    -- a convenience SUBSET of windows_json for consumers that only want the scoped ring.
-    weekly_scoped_json  TEXT NOT NULL DEFAULT '[]',
     -- windows_json is the AUTHORITATIVE full per-window set carried verbatim from
     -- acctprobe (plan §2.1 + §15.16): a JSON array of {kind,percent,severity,resets_at,
     -- scope}. It is the public read model's `windows[]` (session + weekly_all +
-    -- weekly_scoped in one list) — the scalar session_pct/weekly_pct stay as the
+    -- weekly_scoped all in ONE list — a scoped sub-limit is a member with
+    -- kind="weekly_scoped"); the scalar session_pct/weekly_pct stay as the
     -- convenience/fallback numbers.
     windows_json        TEXT NOT NULL DEFAULT '[]',
     severity            TEXT NOT NULL DEFAULT 'normal', -- normal | critical (server flag)

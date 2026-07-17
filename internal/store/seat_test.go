@@ -24,7 +24,7 @@ func TestSeatCRUD(t *testing.T) {
 		t.Fatalf("expected ErrSeatExists, got %v", err)
 	}
 
-	got, err := st.GetSeat(ctx, "buncher|/home/ops/.claude-pearl")
+	got, err := st.GetSeat(ctx, "buncher|claude|/home/ops/.claude-pearl")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -91,13 +91,13 @@ func TestListReadySeatsAndHealth(t *testing.T) {
 		t.Fatalf("expected 0 ready, n=%d err=%v", len(ready), err)
 	}
 
-	if err := st.UpdateSeatHealth(ctx, "b1|/c1", store.SeatReady, "weekly 30%", now); err != nil {
+	if err := st.UpdateSeatHealth(ctx, "b1|claude|/c1", store.SeatReady, "weekly 30%", now); err != nil {
 		t.Fatalf("health b1: %v", err)
 	}
-	if err := st.UpdateSeatHealth(ctx, "b2|/c2", store.SeatLimitCritical, "weekly 96%", now); err != nil {
+	if err := st.UpdateSeatHealth(ctx, "b2|claude|/c2", store.SeatLimitCritical, "weekly 96%", now); err != nil {
 		t.Fatalf("health b2: %v", err)
 	}
-	if err := st.UpdateSeatHealth(ctx, "b3|/c3", store.SeatReady, "ok", now); err != nil {
+	if err := st.UpdateSeatHealth(ctx, "b3|codex|/c3", store.SeatReady, "ok", now); err != nil {
 		t.Fatalf("health b3: %v", err)
 	}
 
@@ -105,14 +105,14 @@ func TestListReadySeatsAndHealth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ready: %v", err)
 	}
-	if len(ready) != 1 || ready[0].ID != "b1|/c1" {
+	if len(ready) != 1 || ready[0].ID != "b1|claude|/c1" {
 		t.Fatalf("expected only b1 ready for claude, got %+v", ready)
 	}
 
 	if err := st.UpdateSeatHealth(ctx, "nope", store.SeatReady, "", now); !errors.Is(err, store.ErrSeatNotFound) {
 		t.Fatalf("expected ErrSeatNotFound, got %v", err)
 	}
-	if err := st.UpdateSeatHealth(ctx, "b1|/c1", "bogus", "", now); err == nil {
+	if err := st.UpdateSeatHealth(ctx, "b1|claude|/c1", "bogus", "", now); err == nil {
 		t.Fatal("expected invalid health rejection")
 	}
 }
@@ -124,10 +124,10 @@ func TestSetSeatAccountKey(t *testing.T) {
 	if err := st.AddSeat(ctx, store.Seat{Box: "b1", AgentFamily: "codex", CodexHome: "/c1"}, now); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if err := st.SetSeatAccountKey(ctx, "b1|/c1", "acct-xyz", now); err != nil {
+	if err := st.SetSeatAccountKey(ctx, "b1|codex|/c1", "acct-xyz", now); err != nil {
 		t.Fatalf("set key: %v", err)
 	}
-	got, _ := st.GetSeat(ctx, "b1|/c1")
+	got, _ := st.GetSeat(ctx, "b1|codex|/c1")
 	if got.AccountKey != "acct-xyz" {
 		t.Fatalf("account key not set: %+v", got)
 	}

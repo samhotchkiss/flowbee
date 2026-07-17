@@ -39,10 +39,11 @@ func (c *ladderClock) Sleep(_ context.Context, d time.Duration) {
 type ladderFake struct {
 	mu            sync.Mutex
 	calls         []string
-	phase         string // shell | prompt | working | auth | limbo
+	phase         string // shell | marker | prompt | working | auth | limbo
+	hostname      string // what $(hostname) resolves to in the pane (default "remote-box")
+	markerOut     string // the resolved remote-host marker line, set on the marker echo
 	newSessionErr error
 	goalStuck     bool
-	shellArrival  string // "" = normal shell; else force this capture during the shell wait
 }
 
 func (f *ladderFake) Run(_ context.Context, cmd string) (string, error) {
@@ -62,6 +63,15 @@ func (f *ladderFake) Run(_ context.Context, cmd string) (string, error) {
 	case strings.Contains(cmd, "set-buffer"), strings.Contains(cmd, "paste-buffer"):
 		return "", nil
 	case strings.Contains(cmd, "send-keys"):
+		if strings.Contains(cmd, "FLOWBEE_REMOTE_") && strings.Contains(cmd, "$(hostname)") {
+			// model the shell evaluating `echo <marker>_$(hostname)`.
+			host := f.hostname
+			if host == "" {
+				host = "remote-box"
+			}
+			f.markerOut = extractFakeMarker(cmd) + "_" + host
+			f.phase = "marker"
+		}
 		if strings.Contains(cmd, "CLAUDE_CONFIG_DIR") || strings.Contains(cmd, "CODEX_HOME") {
 			f.phase = "prompt"
 		}
@@ -79,8 +89,26 @@ func (f *ladderFake) Run(_ context.Context, cmd string) (string, error) {
 	return "", nil
 }
 
+// extractFakeMarker pulls "FLOWBEE_REMOTE_<nonce>" out of an `echo <marker>_$(hostname)`
+// send-keys command, mirroring the ladder's own marker construction.
+func extractFakeMarker(cmd string) string {
+	i := strings.Index(cmd, "FLOWBEE_REMOTE_")
+	if i < 0 {
+		return "FLOWBEE_REMOTE_"
+	}
+	rest := cmd[i:]
+	if j := strings.Index(rest, "_$("); j >= 0 {
+		return rest[:j]
+	}
+	return "FLOWBEE_REMOTE_"
+}
+
 func (f *ladderFake) captureFor() string {
 	switch f.phase {
+	case "marker":
+		// the shell's OUTPUT line for the confirmation echo (no `$(`/`echo ` — the
+		// ladder skips the command-echo line).
+		return "ops@remote-box:~$ echo cmd\n" + f.markerOut + "\nops@remote-box:~$"
 	case "prompt":
 		return "booting the agent…\n❯"
 	case "working":
@@ -122,10 +150,11 @@ func remoteSeat() LaunchSeat {
 }
 
 func TestRunLadder_RemoteHappyPath(t *testing.T) {
-	f := &ladderFake{}
+	f := &ladderFake{hostname: "remote-box"}
 	client, clk := newLadderClient(f)
 	res, err := RunLadder(context.Background(), client, clk, LadderParams{
 		Slug: "frob", Seat: remoteSeat(), SpecPath: "epics/2026-07-16-frob.md", Dir: "/home/ops/epics/frob",
+		LocalHostname: "control-plane", RemoteMarkerNonce: "testnonce",
 	})
 	if err != nil {
 		t.Fatalf("RunLadder: %v", err)
@@ -140,18 +169,57 @@ func TestRunLadder_RemoteHappyPath(t *testing.T) {
 	if f.countMatching("ssh -t -- buncher tmux new -A -s epic-frob") == 0 {
 		t.Fatalf("ssh attach line missing: %v", f.recorded())
 	}
-	// every tmux target the ladder built is exact-match (=epic-frob), never bare.
+	// the remote-host confirmation ran and matched a host != the local one.
+	if f.countMatching("echo FLOWBEE_REMOTE_testnonce_$(hostname)") == 0 {
+		t.Fatalf("remote-host confirmation echo missing: %v", f.recorded())
+	}
+	// M2: tmuxio.Client exactifies targets to the pane-valid `=epic-frob:` form; the
+	// ladder must never emit a bare `-t 'epic-frob'` NOR a lone (colon-less) `=epic-frob`.
 	for _, c := range f.recorded() {
 		if strings.Contains(c, "-t 'epic-frob'") {
 			t.Fatalf("a BARE (prefix-matching) target was used: %q", c)
 		}
+		if strings.Contains(c, "'=epic-frob'") {
+			t.Fatalf("a lone (colon-less) =epic-frob target — tmux's pane parser rejects it: %q", c)
+		}
 	}
-	if f.countMatching("=epic-frob") == 0 {
-		t.Fatalf("expected exact-match targets: %v", f.recorded())
+	if f.countMatching("'=epic-frob:'") == 0 {
+		t.Fatalf("expected the pane-valid =epic-frob: exact target: %v", f.recorded())
 	}
 	// no rollback kill on a clean launch.
 	if f.countMatching("kill-session") != 0 {
 		t.Fatalf("a verified launch must not kill the session")
+	}
+}
+
+// TestRunLadder_SSHExitToLocalShell_NotVerified is the §15.15 M3 guard: if the ssh line
+// instant-exits, control drops to the LOCAL control-plane shell (which also looks like a
+// shell). The remote-host confirmation resolves $(hostname) to the LOCAL host, so the
+// ladder must REFUSE to type the launch line there — LaunchFailed, never LaunchVerified,
+// with rollback.
+func TestRunLadder_SSHExitToLocalShell_NotVerified(t *testing.T) {
+	f := &ladderFake{hostname: "control-plane"} // $(hostname) == the local host: an ssh drop-back
+	client, clk := newLadderClient(f)
+	res, err := RunLadder(context.Background(), client, clk, LadderParams{
+		Slug: "frob", Seat: remoteSeat(), SpecPath: "epics/x.md",
+		LocalHostname: "control-plane", RemoteMarkerNonce: "testnonce",
+		ShellTimeout: 6 * time.Second, PollInterval: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunLadder: %v", err)
+	}
+	if res.Outcome == LaunchVerified {
+		t.Fatalf("M3 regression: a launch into the LOCAL shell must NOT verify: %+v", res)
+	}
+	if res.Outcome != LaunchFailed || res.Stage != StageAwaitRemoteShell {
+		t.Fatalf("expected failed at await_remote_shell, got %+v", res)
+	}
+	// it must NOT have typed the CLI launch line into the local shell.
+	if f.countMatching("CLAUDE_CONFIG_DIR=") != 0 {
+		t.Fatalf("the CLI launch line was typed into a possibly-local shell: %v", f.recorded())
+	}
+	if f.countMatching("kill-session") == 0 {
+		t.Fatalf("a confirmation failure must roll back the local session")
 	}
 }
 
@@ -268,7 +336,16 @@ func TestBuildCLILineAndSSHAttach(t *testing.T) {
 	if got := buildSSHAttachLine("buncher", "epic-frob"); got != "ssh -t -- buncher tmux new -A -s epic-frob" {
 		t.Fatalf("ssh attach: %q", got)
 	}
-	if exactTarget("epic-frob") != "=epic-frob" {
-		t.Fatalf("exactTarget")
+}
+
+func TestExtractMarkerHost(t *testing.T) {
+	cap := "ops@remote-box:~$ echo FLOWBEE_REMOTE_n1_$(hostname)\nFLOWBEE_REMOTE_n1_remote-box\nops@remote-box:~$"
+	host, ok := extractMarkerHost(cap, "FLOWBEE_REMOTE_n1")
+	if !ok || host != "remote-box" {
+		t.Fatalf("extractMarkerHost = %q,%v — the command-echo line must be skipped and only the OUTPUT read", host, ok)
+	}
+	// a capture with ONLY the command echo (no output yet) must not resolve.
+	if _, ok := extractMarkerHost("$ echo FLOWBEE_REMOTE_n1_$(hostname)", "FLOWBEE_REMOTE_n1"); ok {
+		t.Fatal("the command-echo line alone must not resolve a host")
 	}
 }

@@ -80,7 +80,7 @@ func (s *Store) AddSeat(ctx context.Context, seat Seat, now time.Time) error {
 	if err := validateSeat(&seat); err != nil {
 		return err
 	}
-	seat.ID = seatID(seat.Box, seat.Ident())
+	seat.ID = seatID(seat.Box, seat.AgentFamily, seat.Ident())
 	ts := now.Format(rfc3339)
 	envJSON, err := marshalEnv(seat.ExtraEnv)
 	if err != nil {
@@ -147,10 +147,14 @@ func validateSeat(seat *Seat) error {
 	return nil
 }
 
-// seatID composes the deterministic seat id from box and dir-ident. A '|' separator is
-// safe: both operands are argv-safe (no whitespace/control), so the join is injective.
-func seatID(box, ident string) string {
-	return box + "|" + ident
+// seatID composes the deterministic seat id from box, family, and dir-ident. Family is
+// folded in so a claude seat whose config_dir string happens to EQUAL a codex seat's
+// codex_home on the same box does not collide on the id (the UNIQUE(box,config_dir,
+// codex_home) constraint would allow both rows). A '|' separator is safe: box/ident are
+// argv-safe (no whitespace/control) and family is a closed {claude,codex} token, so the
+// join is injective.
+func seatID(box, family, ident string) string {
+	return box + "|" + family + "|" + ident
 }
 
 func marshalEnv(env map[string]string) (string, error) {

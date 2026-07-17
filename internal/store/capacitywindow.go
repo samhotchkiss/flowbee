@@ -23,28 +23,19 @@ import (
 // absent window is never a real 0% — acctprobe's own "absent ≠ zero" invariant).
 const unknownPct = -1.0
 
-// ScopedWindow is one per-model weekly sub-limit stored in account_windows.
-// weekly_scoped_json (Claude weekly_scoped / a Codex model-scoped bucket).
-type ScopedWindow struct {
-	Scope    string  `json:"scope"`
-	Percent  float64 `json:"percent"`
-	Severity string  `json:"severity"`
-	ResetsAt string  `json:"resets_at,omitempty"`
-}
-
 // AccountWindow is one account_windows row (a read model). Percentages carry -1 for
 // UNKNOWN; ProbeStale is the §12.14 flag (true = the reading is old/untrustworthy for
 // gating). It joins 1:1 to worker_accounts on AccountKey == account_id.
 type AccountWindow struct {
-	AccountKey   string
-	Provider     string
-	Email        string
-	ModelFamily  string
-	SessionPct   float64 // -1 = unknown
-	WeeklyPct    float64 // -1 = unknown
-	WeeklyScoped []ScopedWindow
+	AccountKey  string
+	Provider    string
+	Email       string
+	ModelFamily string
+	SessionPct  float64 // -1 = unknown
+	WeeklyPct   float64 // -1 = unknown
 	// Windows is acctprobe's FULL per-window set carried verbatim (plan §2.1 + §15.16) —
-	// the public `windows[]` the digest/capacity-strip emit. Never nil.
+	// the AUTHORITATIVE public `windows[]` the digest/capacity-strip emit (a weekly_scoped
+	// sub-limit is a member here, kind="weekly_scoped"). Never nil.
 	Windows         []epicdigest.Window
 	Severity        string // normal | critical
 	ResetsSessionAt string // RFC3339; '' = unknown
@@ -130,33 +121,31 @@ func (s *Store) UpsertAccountLimits(ctx context.Context, res acctprobe.Result, n
 	if res.Usage.Windows.Critical() {
 		severity = string(acctprobe.SeverityCritical)
 	}
-	scopedJSON := marshalScopedWindows(res.Usage.Windows)
 	windowsJSON := marshalWindows(res.Usage.Windows)
 
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO account_windows
 			    (account_key, provider, email, model_family, session_pct, weekly_pct,
-			     weekly_scoped_json, windows_json, severity, resets_session_at, resets_weekly_at,
+			     windows_json, severity, resets_session_at, resets_weekly_at,
 			     trust_state, probe_stale, fetched_at_ms, reported_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
 			ON CONFLICT(account_key) DO UPDATE SET
-			    provider           = excluded.provider,
-			    email              = excluded.email,
-			    model_family       = excluded.model_family,
-			    session_pct        = excluded.session_pct,
-			    weekly_pct         = excluded.weekly_pct,
-			    weekly_scoped_json = excluded.weekly_scoped_json,
-			    windows_json       = excluded.windows_json,
-			    severity           = excluded.severity,
-			    resets_session_at  = excluded.resets_session_at,
-			    resets_weekly_at   = excluded.resets_weekly_at,
-			    trust_state        = excluded.trust_state,
-			    probe_stale        = 0,
-			    fetched_at_ms      = excluded.fetched_at_ms,
-			    reported_at        = excluded.reported_at`,
+			    provider          = excluded.provider,
+			    email             = excluded.email,
+			    model_family      = excluded.model_family,
+			    session_pct       = excluded.session_pct,
+			    weekly_pct        = excluded.weekly_pct,
+			    windows_json      = excluded.windows_json,
+			    severity          = excluded.severity,
+			    resets_session_at = excluded.resets_session_at,
+			    resets_weekly_at  = excluded.resets_weekly_at,
+			    trust_state       = excluded.trust_state,
+			    probe_stale       = 0,
+			    fetched_at_ms     = excluded.fetched_at_ms,
+			    reported_at       = excluded.reported_at`,
 			key, provider, res.Identity.Email, model, sessionPct, weeklyPct,
-			scopedJSON, windowsJSON, severity, sessionResets, weeklyResets, trust, fetchedMs, ts); err != nil {
+			windowsJSON, severity, sessionResets, weeklyResets, trust, fetchedMs, ts); err != nil {
 			return err
 		}
 		return syncWorkerAccountUsageTx(ctx, tx, key, model, sessionPct, weeklyPct, res.Usage.RateLimited, ts)
@@ -211,6 +200,12 @@ func unmarshalWindows(s string) []epicdigest.Window {
 // and a fresh sub-ceiling reading clears a prior 429), auto-enrolling an account that
 // is not yet in worker_accounts — mirroring RecordUsage's first-report auto-enroll so
 // a seat's account is selectable without a separate enroll step.
+//
+// LIMITATION (Phase 6b MUST honor): usage_pct is max(session,weekly) ONLY — an account
+// whose sole critical window is a weekly_SCOPED sub-limit stays BELOW-ceiling here and
+// capacity.SelectAccount would still pick it. account_windows.severity DOES capture the
+// scoped critical (Windows.Critical() folds every window), so the Phase 6b launch/usage
+// gate MUST read account_windows.severity + seat health, NOT just worker_accounts.usage_pct.
 func syncWorkerAccountUsageTx(ctx context.Context, tx *sql.Tx, accountKey, modelFamily string, sessionPct, weeklyPct float64, rateLimited bool, ts string) error {
 	pct := maxKnownPct(sessionPct, weeklyPct)
 	report := capacity.UsageReport{
@@ -275,51 +270,22 @@ func pickWindowPct(w acctprobe.Windows, kind acctprobe.WindowKind) (float64, str
 	return best, resets
 }
 
-func marshalScopedWindows(w acctprobe.Windows) string {
-	var out []ScopedWindow
-	for _, win := range w {
-		if win.Kind != acctprobe.KindWeeklyScoped {
-			continue
-		}
-		sw := ScopedWindow{Scope: win.Scope, Percent: win.Percent, Severity: string(win.Severity)}
-		if !win.ResetsAt.IsZero() {
-			sw.ResetsAt = win.ResetsAt.UTC().Format(rfc3339)
-		}
-		out = append(out, sw)
-	}
-	if len(out) == 0 {
-		return "[]"
-	}
-	b, _ := json.Marshal(out)
-	return string(b)
-}
-
-func unmarshalScopedWindows(s string) []ScopedWindow {
-	if s == "" || s == "[]" {
-		return nil
-	}
-	var out []ScopedWindow
-	_ = json.Unmarshal([]byte(s), &out)
-	return out
-}
-
 const accountWindowSelect = `
 	SELECT account_key, provider, email, model_family, session_pct, weekly_pct,
-	       weekly_scoped_json, windows_json, severity, resets_session_at, resets_weekly_at,
+	       windows_json, severity, resets_session_at, resets_weekly_at,
 	       trust_state, probe_stale, fetched_at_ms, reported_at
 	  FROM account_windows`
 
 func scanAccountWindow(row rowScanner) (AccountWindow, error) {
 	var a AccountWindow
-	var scopedJSON, windowsJSON string
+	var windowsJSON string
 	var stale int
 	err := row.Scan(&a.AccountKey, &a.Provider, &a.Email, &a.ModelFamily, &a.SessionPct,
-		&a.WeeklyPct, &scopedJSON, &windowsJSON, &a.Severity, &a.ResetsSessionAt, &a.ResetsWeeklyAt,
+		&a.WeeklyPct, &windowsJSON, &a.Severity, &a.ResetsSessionAt, &a.ResetsWeeklyAt,
 		&a.TrustState, &stale, &a.FetchedAtMs, &a.ReportedAt)
 	if err != nil {
 		return AccountWindow{}, err
 	}
-	a.WeeklyScoped = unmarshalScopedWindows(scopedJSON)
 	a.Windows = unmarshalWindows(windowsJSON)
 	a.ProbeStale = stale != 0
 	return a, nil
