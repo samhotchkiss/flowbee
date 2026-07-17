@@ -31,7 +31,7 @@ func (c *Client) Capture(ctx context.Context, target string, history int) (Captu
 	if err := c.validateIdent("target", target); err != nil {
 		return Capture{}, err
 	}
-	sub := "capture-pane -p -t " + shQuote(target)
+	sub := "capture-pane -p -t " + shQuote(exactTarget(target))
 	if history > 0 {
 		sub += " -S -" + strconv.Itoa(history)
 	}

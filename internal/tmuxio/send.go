@@ -163,7 +163,7 @@ func (c *Client) Send(ctx context.Context, target, message string, opts SendOpti
 
 	// Exit copy/scroll mode — otherwise the delivery and Enter go nowhere.
 	if pane.inMode {
-		_, _ = c.run(ctx, "send-keys -t "+shQuote(target)+" -X cancel")
+		_, _ = c.run(ctx, "send-keys -t "+shQuote(exactTarget(target))+" -X cancel")
 	}
 
 	// Deliver the text (keys or paste). A failure HERE means nothing was submitted
@@ -333,19 +333,19 @@ func (c *Client) Nudge(ctx context.Context, target string) (SendResult, error) {
 // literally and guards a leading-dash payload.
 func (c *Client) deliverText(ctx context.Context, target, message, bufferName string) error {
 	if !strings.Contains(message, "\n") && displayWidth(message) <= keysDeliveryMaxWidth {
-		_, err := c.run(ctx, "send-keys -t "+shQuote(target)+" -l -- "+shQuote(message))
+		_, err := c.run(ctx, "send-keys -t "+shQuote(exactTarget(target))+" -l -- "+shQuote(message))
 		return err
 	}
 	if _, err := c.run(ctx, "set-buffer -b "+shQuote(bufferName)+" -- "+shQuote(message)); err != nil {
 		return err
 	}
-	_, err := c.run(ctx, "paste-buffer -p -d -b "+shQuote(bufferName)+" -t "+shQuote(target))
+	_, err := c.run(ctx, "paste-buffer -p -d -b "+shQuote(bufferName)+" -t "+shQuote(exactTarget(target)))
 	return err
 }
 
 // sendEnter sends a single bare Enter key event to target.
 func (c *Client) sendEnter(ctx context.Context, target string) error {
-	_, err := c.run(ctx, "send-keys -t "+shQuote(target)+" Enter")
+	_, err := c.run(ctx, "send-keys -t "+shQuote(exactTarget(target))+" Enter")
 	return err
 }
 
@@ -361,7 +361,7 @@ type resolvedPane struct {
 // here, before any keystroke is sent).
 func (c *Client) resolvePane(ctx context.Context, target string) (resolvedPane, error) {
 	format := strings.Join([]string{"#{pane_id}", "#{pane_width}", "#{pane_in_mode}"}, fieldSep)
-	out, err := c.run(ctx, "display-message -p -t "+shQuote(target)+" "+shQuote(format))
+	out, err := c.run(ctx, "display-message -p -t "+shQuote(exactTarget(target))+" "+shQuote(format))
 	if err != nil {
 		return resolvedPane{}, err
 	}

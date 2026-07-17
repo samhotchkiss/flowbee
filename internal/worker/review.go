@@ -513,12 +513,20 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 	case "code_reviewer":
 		b.WriteString("You are the code-reviewer. Judge whether the unified diff (included in full below) correctly, " +
 			"completely, and safely implements the task/spec below.\n\n")
-		b.WriteString("**How to review (READ THIS):** You are given ONLY the diff (the changed lines) — by design. " +
-			"The full source tree is NOT provided and you do NOT need it. Automated tests run SEPARATELY in CI and " +
-			"gate the merge on their own: you are NOT expected to run tests, execute code, or inspect unchanged files, " +
-			"and you MUST NOT withhold approval merely because you 'could not verify against the source tree', " +
-			"'could not run the tests', or any similar unverifiable caveat. Judge the change FROM THE DIFF plus the " +
-			"task/spec as written.\n\n")
+		// The generic diff-only framing ("you are NOT expected to run tests … judge FROM THE
+		// DIFF") is the WRONG posture for an epic PR, whose trust model REQUIRES building and
+		// running the epic's Validate: commands (see the epic-specific Decision block below).
+		// It is already superseded twice downstream (the Epic Contract section + the overriding
+		// Decision), but absence beats supersession — suppress this top block entirely for an
+		// epic PR so a top-to-bottom read never even encounters a "don't run anything" framing.
+		if strings.TrimSpace(c.EpicCriteria) == "" {
+			b.WriteString("**How to review (READ THIS):** You are given ONLY the diff (the changed lines) — by design. " +
+				"The full source tree is NOT provided and you do NOT need it. Automated tests run SEPARATELY in CI and " +
+				"gate the merge on their own: you are NOT expected to run tests, execute code, or inspect unchanged files, " +
+				"and you MUST NOT withhold approval merely because you 'could not verify against the source tree', " +
+				"'could not run the tests', or any similar unverifiable caveat. Judge the change FROM THE DIFF plus the " +
+				"task/spec as written.\n\n")
+		}
 		writeIf("Task", c.Task)
 		writeIf("Spec", c.Spec)
 		writeIf("Acceptance criteria", c.AcceptanceCriteria)

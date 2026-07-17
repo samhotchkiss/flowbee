@@ -3,6 +3,7 @@ package project
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,15 @@ import (
 // the epic-PR detection (store.EpicForHeadSHA) has a repo to match against.
 func epicMergingJob(t *testing.T, st *store.Store, id, repo, headSHA string) {
 	t.Helper()
+	epicMergingJobWithBase(t, st, id, repo, "base-sha", headSHA)
+}
+
+// epicMergingJobWithBase is epicMergingJob with an explicit merge-authorization base SHA,
+// so a test can drive the empty-base fail-closed path (base == "") — the verdict is minted
+// bound to that base, so an empty base skips the (base-guarded) content re-verify and
+// leaves the epic gate as the sole remaining check.
+func epicMergingJobWithBase(t *testing.T, st *store.Store, id, repo, base, headSHA string) {
+	t.Helper()
 	ctx := context.Background()
 	if _, err := st.SeedJob(ctx, store.SeedParams{
 		ID: id, Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
@@ -21,7 +31,7 @@ func epicMergingJob(t *testing.T, st *store.Store, id, repo, headSHA string) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	setMergingAuthorization(t, st, id, "base-sha", headSHA)
+	setMergingAuthorization(t, st, id, base, headSHA)
 	if _, err := st.DB.ExecContext(ctx,
 		`UPDATE jobs SET issue_number=42 WHERE id=?`, id); err != nil {
 		t.Fatal(err)
@@ -513,6 +523,92 @@ func TestEpicGateNonEpicPRUnaffected(t *testing.T) {
 	}
 	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateMerging {
 		t.Fatalf("state=%s, want merging", j.State)
+	}
+}
+
+// TestEpicGateEmptyBaseFailsClosedToHandoff (review m4, phase-4 residue): an epic-DETECTED
+// PR whose BaseSHA is empty cannot be contract-verified — there is no launch-pinned ref to
+// read the frozen ## Steps / scope from, and no base..head diff to scope-check. epicDenyReason
+// runs OUTSIDE the base-guarded content re-verify block (project.go), so the epic gate STILL
+// fires on an empty base and routes the PR to merge_handoff with the explicit "no base SHA"
+// reason rather than silently skipping its own gate and merging blind.
+func TestEpicGateEmptyBaseFailsClosedToHandoff(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+
+	mustRegisterEpic(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
+	// the head SHA matches the epic's branch tip, so detection FINDS the epic; but with no
+	// base SHA the gate has no launch-pinned contract to verify against and must fail closed.
+	fh := &fakeHistory{
+		tip:     "t",
+		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
+	}
+	sender.WithHistory(fh, "main")
+	epicMergingJobWithBase(t, st, "j", "russ", "", "epic-head-sha")
+	setLiveGreenPR(fake, 42, "", "epic-head-sha")
+
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	for _, c := range fake.Calls() {
+		if c == "EnqueueMergeQueue(42)" {
+			t.Fatal("an epic PR with NO base SHA must NOT self-merge — it cannot be contract-verified")
+		}
+	}
+	j, _ := st.GetJob(ctx, "j")
+	if j.State != job.StateMergeHandoff {
+		t.Fatalf("state=%s, want merge_handoff (empty base fails closed)", j.State)
+	}
+	// the handoff reason must name the no-base cause (epicDenyReason's empty-base branch),
+	// proving it routed via the EPIC gate specifically and not some incidental path.
+	events, err := st.LoadEvents(ctx, "j")
+	if err != nil {
+		t.Fatalf("load events: %v", err)
+	}
+	var reason string
+	for _, ev := range events {
+		if ev.ToState == job.StateMergeHandoff {
+			reason = ev.Payload.RevokeReason
+		}
+	}
+	if !strings.Contains(reason, "no base SHA") {
+		t.Fatalf("handoff reason must name the missing base SHA, got %q", reason)
+	}
+}
+
+// TestEpicGateNonEpicEmptyBaseUnaffected (phase-4 residue control): a NON-epic PR with an
+// empty base SHA is NOT routed to handoff by the EPIC gate — epicDenyReason returns a clean
+// non-match, so the PR proceeds to the merge queue exactly as it would with the epic gate
+// absent. This isolates the empty-base fail-closed behavior above to epic-DETECTED PRs only
+// (the empty base itself is not what routes to handoff).
+func TestEpicGateNonEpicEmptyBaseUnaffected(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+
+	mustRegisterEpic(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
+	fh := &fakeHistory{
+		tip:     "t",
+		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"}, // unrelated epic tip
+	}
+	sender.WithHistory(fh, "main")
+	epicMergingJobWithBase(t, st, "j", "russ", "", "ordinary-pr-head-sha") // NOT the epic's tip
+	setLiveGreenPR(fake, 42, "", "ordinary-pr-head-sha")
+
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	sent := false
+	for _, c := range fake.Calls() {
+		if c == "EnqueueMergeQueue(42)" {
+			sent = true
+		}
+	}
+	if !sent {
+		j, _ := st.GetJob(ctx, "j")
+		t.Fatalf("a non-epic empty-base PR must not be blocked by the epic gate; calls=%v state=%s", fake.Calls(), j.State)
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateMerging {
+		t.Fatalf("state=%s, want merging (epic gate did not touch a non-epic empty-base PR)", j.State)
 	}
 }
 

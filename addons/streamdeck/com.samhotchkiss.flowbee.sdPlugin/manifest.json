@@ -1,0 +1,98 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "UUID": "com.samhotchkiss.flowbee",
+  "Name": "Flowbee",
+  "Version": "0.1.0.0",
+  "Author": "Sam Hotchkiss",
+  "Description": "Drive a Flowbee fleet from your Stream Deck: per-account usage gauges, goal-session (epic) status with one-tap jump to the tmux window, master-session prompts, pause/resume, and attention alerts.",
+  "URL": "https://github.com/samhotchkiss/flowbee",
+  "Category": "Flowbee",
+  "CategoryIcon": "imgs/plugin/category-icon",
+  "Icon": "imgs/plugin/marketplace",
+  "CodePath": "bin/plugin.js",
+  "SDKVersion": 3,
+  "Software": {
+    "MinimumVersion": "6.9"
+  },
+  "OS": [
+    {
+      "Platform": "mac",
+      "MinimumVersion": "12"
+    }
+  ],
+  "Nodejs": {
+    "Version": "20"
+  },
+  "Actions": [
+    {
+      "Name": "Account Usage",
+      "UUID": "com.samhotchkiss.flowbee.account-usage",
+      "Icon": "imgs/actions/account-usage/icon",
+      "Tooltip": "Usage gauge for one agent account (auto-picks by key column, or pin an account). Press to open the fleet dashboard.",
+      "PropertyInspectorPath": "ui/account-usage.html",
+      "Controllers": ["Keypad", "Encoder"],
+      "Encoder": {
+        "layout": "$B1",
+        "TriggerDescription": {
+          "Push": "Open fleet dashboard",
+          "Touch": "Open fleet dashboard"
+        }
+      },
+      "States": [{ "Image": "imgs/actions/account-usage/key" }]
+    },
+    {
+      "Name": "Goal Session",
+      "UUID": "com.samhotchkiss.flowbee.goal-session",
+      "Icon": "imgs/actions/goal-session/icon",
+      "Tooltip": "State of one goal session / epic — flashes red when blocked. Press to jump to its tmux window.",
+      "PropertyInspectorPath": "ui/goal-session.html",
+      "Controllers": ["Keypad"],
+      "States": [{ "Image": "imgs/actions/goal-session/key" }]
+    },
+    {
+      "Name": "Go to Master",
+      "UUID": "com.samhotchkiss.flowbee.master-focus",
+      "Icon": "imgs/actions/master-focus/icon",
+      "Tooltip": "Jump to the master session's tmux window.",
+      "PropertyInspectorPath": "ui/master-focus.html",
+      "Controllers": ["Keypad"],
+      "States": [{ "Image": "imgs/actions/master-focus/key" }]
+    },
+    {
+      "Name": "Prompt Master",
+      "UUID": "com.samhotchkiss.flowbee.master-prompt",
+      "Icon": "imgs/actions/master-prompt/icon",
+      "Tooltip": "Type a configured prompt into the master session (e.g. “give me the current status of all of our goals”).",
+      "PropertyInspectorPath": "ui/master-prompt.html",
+      "Controllers": ["Keypad"],
+      "States": [{ "Image": "imgs/actions/master-prompt/key" }]
+    },
+    {
+      "Name": "Pause / Resume",
+      "UUID": "com.samhotchkiss.flowbee.pause-toggle",
+      "Icon": "imgs/actions/pause-toggle/icon",
+      "Tooltip": "Toggle Flowbee dispatch: pause everything (or park one repo) and resume it.",
+      "PropertyInspectorPath": "ui/pause-toggle.html",
+      "Controllers": ["Keypad"],
+      "States": [{ "Image": "imgs/actions/pause-toggle/key" }]
+    },
+    {
+      "Name": "Attention",
+      "UUID": "com.samhotchkiss.flowbee.attention",
+      "Icon": "imgs/actions/attention/icon",
+      "Tooltip": "Jobs waiting on a human (needs-human, merge handoff, needs-input). Flashes when anything needs you. Press to open the dashboard.",
+      "PropertyInspectorPath": "ui/attention.html",
+      "Controllers": ["Keypad"],
+      "States": [{ "Image": "imgs/actions/attention/key" }]
+    },
+    {
+      "Name": "Fleet Health",
+      "UUID": "com.samhotchkiss.flowbee.fleet-health",
+      "Icon": "imgs/actions/fleet-health/icon",
+      "Tooltip": "Live vs stale workers and waiting jobs; flashes red when work is stranded with no live workers. Press to open the fleet pane.",
+      "PropertyInspectorPath": "ui/fleet-health.html",
+      "Controllers": ["Keypad"],
+      "States": [{ "Image": "imgs/actions/fleet-health/key" }]
+    }
+  ]
+}
