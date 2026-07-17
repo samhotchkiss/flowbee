@@ -40,6 +40,19 @@ Blockers: <none, or what's stopping you and what you need>
 Liveness is monitored separately (heartbeat) — `## Status` is for MEANING,
 not a keepalive ping. Don't touch it just to bump the timestamp.
 
+## Explainer
+
+Maintain `epics/<slug>-explainer.html` on your branch: a single self-contained
+HTML page (mermaid diagram + prose — follow the vendored method at
+`docs/skills/visual-explainer/SKILL.md`) that tells a human what this epic is
+building and where it stands. Write it with your FIRST commit as the
+plan-of-record (what you're building and the step flow); refresh it when a step
+completes or the plan deviates; finalize it at finish as the as-built story —
+reviewers read it. It is for humans: `## Status` stays the machine truth (the
+dashboard and gate parse it), and the explainer is NEVER parsed by automation.
+The explainer file is in scope implicitly, exactly like the epic `.md` itself,
+so keeping it current never counts as widening scope.
+
 ## Commits
 
 Commit at natural boundaries, not one giant commit at the end. Every
@@ -85,9 +98,12 @@ independent — halt instead. Do not silently widen scope.
   `go test ./...` — this must include `test/acceptance`, not just unit
   packages. A step that only ran unit tests is not validated.
 - Migrations: never renumber or reuse a filename already applied anywhere
-  (main or another live epic branch). New migrations take the next free
-  number after what's on main when you write them — check main right
-  before adding one, since another epic may have taken a number meanwhile.
+  (main or another live epic branch). Never hand-pick a migration number —
+  reserve one with `flowbee migration reserve <slug>` (it appends the next
+  free number to `internal/store/migrations/LADDER.md` under a lock and
+  prints the filename to create). Parallel epics that both guess a number
+  collide; the allocator + the `laddercheck` CI gate exist to stop exactly
+  that. Create the file the allocator names, and nothing else.
 - Never print, log, cat, or echo `serve.env` or `fleet.env` — secrets. If a
   step seems to require reading one, that's a blocker, not a workaround.
 

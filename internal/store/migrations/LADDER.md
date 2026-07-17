@@ -18,8 +18,14 @@ flowbee migration reserve <slug>
 
 from the repo root. It takes an exclusive lock on this file, appends the next
 free number, and prints the reserved filename (e.g. `0031_my_thing.sql`). Then
-create exactly that file under `internal/store/migrations/`. Reserving before
-writing is what serializes parallel builders onto distinct numbers.
+create exactly that file under `internal/store/migrations/`.
+
+The file lock only serializes reservations made on the SAME host (flock is
+same-host advisory locking). Across separate machines or worktrees, the real
+backstops are the git merge — two branches that each appended a different slug
+at the same number produce a merge conflict in this file — and `laddercheck`,
+which fails CI if any migration's number is unreserved or duplicated. Reserving
+before writing keeps those conflicts rare and legible instead of silent.
 
 `tools/laddercheck` (run in CI alongside archcheck/providerlint, and via
 `make laddercheck`) fails the build if any `migrations/*.sql` carries a number
