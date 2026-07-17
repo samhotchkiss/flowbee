@@ -39,19 +39,27 @@ const (
 
 // Seat is one seats row.
 type Seat struct {
-	ID           string
-	Box          string // registered epic_hosts.name / ssh destination; '' = control-plane box
-	AgentFamily  string // claude | codex | grok
-	AccountKey   string // account_windows.account_key ('' until resolved by a probe)
-	ConfigDir    string // CLAUDE_CONFIG_DIR (claude) / GROK_HOME (grok); '' for codex
-	CodexHome    string // CODEX_HOME (codex seats; '' for claude/grok)
-	ExtraEnv     map[string]string
-	Enabled      bool
-	Health       string
-	HealthDetail string
-	LastProbeAt  string // RFC3339; '' = never probed
-	CreatedAt    string
-	UpdatedAt    string
+	ID          string
+	Box         string // registered epic_hosts.name / ssh destination; '' = control-plane box
+	AgentFamily string // claude | codex | grok
+	AccountKey  string // account_windows.account_key ('' until resolved by a probe)
+	ConfigDir   string // CLAUDE_CONFIG_DIR (claude) / GROK_HOME (grok); '' for codex
+	CodexHome   string // CODEX_HOME (codex seats; '' for claude/grok)
+	ExtraEnv    map[string]string
+	// MaxConcurrent is how many ACTIVE epics this seat's BOX may hold at once
+	// (0031 migration). DEFAULT 1 preserves the original one-box-one-epic rule
+	// (claude/grok seats stay 1-wide); an operator raises it (a codex box gets 2).
+	// AddEpicRun's launch gate reads it as the cap for its count-then-insert. A zero
+	// value read off a row that predates the column, or a caller that leaves it unset,
+	// is normalized to 1 at the enforcement seam — never a cap of 0 (which would refuse
+	// every launch onto the seat).
+	MaxConcurrent int
+	Enabled       bool
+	Health        string
+	HealthDetail  string
+	LastProbeAt   string // RFC3339; '' = never probed
+	CreatedAt     string
+	UpdatedAt     string
 }
 
 // Ident returns the seat's dir identity — codex_home for a codex seat, else config_dir
@@ -86,7 +94,7 @@ func (s *Store) AddSeat(ctx context.Context, seat Seat, now time.Time) error {
 	if err := validateSeat(&seat); err != nil {
 		return err
 	}
-	seat.ID = seatID(seat.Box, seat.AgentFamily, seat.Ident())
+	seat.ID = seat.ComposeID()
 	ts := now.Format(rfc3339)
 	envJSON, err := marshalEnv(seat.ExtraEnv)
 	if err != nil {
@@ -96,13 +104,19 @@ func (s *Store) AddSeat(ctx context.Context, seat Seat, now time.Time) error {
 	if health == "" {
 		health = SeatUnreachable // never probed yet
 	}
+	// an unset (0) or negative MaxConcurrent means "the safe default" — one epic at a
+	// time — never a cap of 0 that would refuse every launch onto the seat.
+	maxConc := seat.MaxConcurrent
+	if maxConc < 1 {
+		maxConc = 1
+	}
 	_, err = s.DB.ExecContext(ctx, `
 		INSERT INTO seats
 		    (id, box, agent_family, account_key, config_dir, codex_home, extra_env_json,
-		     enabled, health, health_detail, last_probe_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+		     max_concurrent, enabled, health, health_detail, last_probe_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
 		seat.ID, seat.Box, seat.AgentFamily, seat.AccountKey, seat.ConfigDir, seat.CodexHome,
-		envJSON, health, seat.HealthDetail, seat.LastProbeAt, ts, ts)
+		envJSON, maxConc, health, seat.HealthDetail, seat.LastProbeAt, ts, ts)
 	if err != nil {
 		if isUniqueConstraintErr(err) {
 			return ErrSeatExists
@@ -171,6 +185,15 @@ func seatID(box, family, ident string) string {
 	return box + "|" + family + "|" + ident
 }
 
+// ComposeID is the exported deterministic seat id for this seat's identity
+// (box, family, dir-ident) — the same "<box>|<family>|<ident>" AddSeat mints. Callers
+// that need to ADDRESS an already-registered seat by its identity (the `flowbee seat
+// set-max-concurrent` CLI, which has the box/family/dir flags but not the raw id) use
+// this so the id-composition rule lives in exactly one place.
+func (s Seat) ComposeID() string {
+	return seatID(s.Box, s.AgentFamily, s.Ident())
+}
+
 func marshalEnv(env map[string]string) (string, error) {
 	if len(env) == 0 {
 		return "{}", nil
@@ -193,7 +216,7 @@ func unmarshalEnv(s string) map[string]string {
 
 const seatSelect = `
 	SELECT id, box, agent_family, account_key, config_dir, codex_home, extra_env_json,
-	       enabled, health, health_detail, last_probe_at, created_at, updated_at
+	       max_concurrent, enabled, health, health_detail, last_probe_at, created_at, updated_at
 	  FROM seats`
 
 func scanSeat(row rowScanner) (Seat, error) {
@@ -201,7 +224,7 @@ func scanSeat(row rowScanner) (Seat, error) {
 	var enabled int
 	var envJSON string
 	err := row.Scan(&seat.ID, &seat.Box, &seat.AgentFamily, &seat.AccountKey, &seat.ConfigDir,
-		&seat.CodexHome, &envJSON, &enabled, &seat.Health, &seat.HealthDetail,
+		&seat.CodexHome, &envJSON, &seat.MaxConcurrent, &enabled, &seat.Health, &seat.HealthDetail,
 		&seat.LastProbeAt, &seat.CreatedAt, &seat.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Seat{}, ErrSeatNotFound
@@ -278,6 +301,29 @@ func (s *Store) SetSeatAccountKey(ctx context.Context, id, accountKey string, no
 	ts := now.Format(rfc3339)
 	res, err := s.DB.ExecContext(ctx,
 		`UPDATE seats SET account_key = ?, updated_at = ? WHERE id = ?`, accountKey, ts, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrSeatNotFound
+	}
+	return nil
+}
+
+// SetSeatMaxConcurrent updates a seat's concurrent-epic cap (`flowbee seat
+// set-max-concurrent`) — the operational write that turns a codex box into a 2-wide seat
+// after `flowbee seat discover` registered it at the default 1, without re-adding it. A
+// cap below 1 is rejected (a seat that can hold zero epics is a `flowbee seat rm`, not a
+// cap). ErrSeatNotFound if the seat is gone. It never touches an ACTIVE epic, so lowering
+// the cap below the current occupancy simply stops NEW launches onto the box until the
+// running epics finish (the launch gate is a count-at-launch, not a live constraint).
+func (s *Store) SetSeatMaxConcurrent(ctx context.Context, id string, maxConcurrent int, now time.Time) error {
+	if maxConcurrent < 1 {
+		return fmt.Errorf("max_concurrent must be >= 1 (got %d) — to retire a seat use `flowbee seat rm`", maxConcurrent)
+	}
+	ts := now.Format(rfc3339)
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE seats SET max_concurrent = ?, updated_at = ? WHERE id = ?`, maxConcurrent, ts, id)
 	if err != nil {
 		return err
 	}

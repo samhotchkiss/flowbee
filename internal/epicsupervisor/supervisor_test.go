@@ -45,7 +45,7 @@ func TestPassPerEpicPanicIsolation(t *testing.T) {
 	pane := panickyPane{panicOn: "epic-bad", state: map[string]string{"epic-good": "awaiting_input"}}
 	st, supv := newSupvPanicky(t, pane)
 	for _, id := range []string{"bad", "good"} {
-		if err := st.AddEpicRun(ctx, store.EpicRun{ID: id, Repo: "r", TmuxName: "epic-" + id, Agent: "claude"}, now); err != nil {
+		if err := st.AddEpicRun(ctx, store.EpicRun{ID: id, Repo: "r", TmuxName: "epic-" + id, Agent: "claude"}, 1, now); err != nil {
 			t.Fatalf("add epic %s: %v", id, err)
 		}
 		_ = st.MarkEpicLaunched(ctx, id, now)
@@ -86,7 +86,7 @@ func TestProducerNeedsInputAndClear(t *testing.T) {
 	now := time.Now()
 	pane := fakePane{state: map[string]string{"epic-a": "awaiting_input"}}
 	st, supv := newSupv(t, pane)
-	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "a", Repo: "r", TmuxName: "epic-a", Agent: "claude"}, now); err != nil {
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "a", Repo: "r", TmuxName: "epic-a", Agent: "claude"}, 1, now); err != nil {
 		t.Fatalf("add epic: %v", err)
 	}
 	_ = st.MarkEpicLaunched(ctx, "a", now)
@@ -114,7 +114,7 @@ func TestLaunchingReaper(t *testing.T) {
 	pane := fakePane{state: map[string]string{}}
 	st, supv := newSupv(t, pane)
 	// created_at = past → older than the 10m strand window.
-	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "b", Repo: "r", Host: "box1", TmuxName: "epic-b", Agent: "claude"}, past); err != nil {
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "b", Repo: "r", Host: "box1", TmuxName: "epic-b", Agent: "claude"}, 1, past); err != nil {
 		t.Fatalf("add epic: %v", err)
 	}
 
@@ -148,7 +148,7 @@ func TestAckLoopBareWorkingNotAcked(t *testing.T) {
 	now := time.Now()
 	pane := fakePane{state: map[string]string{"epic-m3": "working"}}
 	st, supv := newSupv(t, pane)
-	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "m3", Repo: "r", TmuxName: "epic-m3", Agent: "claude"}, now); err != nil {
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "m3", Repo: "r", TmuxName: "epic-m3", Agent: "claude"}, 1, now); err != nil {
 		t.Fatalf("add epic: %v", err)
 	}
 	_ = st.MarkEpicLaunched(ctx, "m3", now)

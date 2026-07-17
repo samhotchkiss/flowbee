@@ -47,6 +47,21 @@ func TestEpicSelectSeat(t *testing.T) {
 		}
 	}
 
+	// addCapSeat registers a ready seat of the given family with an explicit per-box
+	// concurrency cap — the input to the 2-concurrent-epics-per-seat placement tests.
+	addCapSeat := func(st *store.Store, box, acct, family string, cap int) {
+		t.Helper()
+		seat := store.Seat{Box: box, AgentFamily: family, AccountKey: acct, Health: store.SeatReady, MaxConcurrent: cap}
+		if family == "codex" {
+			seat.CodexHome = "/home/" + box + "/.codex"
+		} else {
+			seat.ConfigDir = "/home/" + box + "/." + family
+		}
+		if err := st.AddSeat(ctx, seat, now); err != nil {
+			t.Fatalf("add cap seat %s/%s: %v", box, acct, err)
+		}
+	}
+
 	t.Run("ready seat with headroom is chosen", func(t *testing.T) {
 		st := testutil.NewStore(t)
 		addSeat(st, "claude1@localhost", "pearl@swh.me")
@@ -131,6 +146,72 @@ func TestEpicSelectSeat(t *testing.T) {
 		}
 		if gate.refuse || seat.Box != "claude2@localhost" {
 			t.Fatalf("host filter chose %+v (refuse=%v), want claude2@localhost", seat, gate.refuse)
+		}
+	})
+
+	// ── 2-concurrent-epics-per-seat: capacity-aware placement (0029) ──
+
+	t.Run("a cap-2 seat keeps capacity with one active epic on its box", func(t *testing.T) {
+		st := testutil.NewStore(t)
+		addCapSeat(st, "codex1@localhost", "acc-c1", "codex", 2)
+		// one active epic already on this box+account (boxLoad=1, below the cap of 2).
+		active := []store.EpicRun{{ID: "e1", Host: "codex1@localhost", AccountKey: "acc-c1", State: "running"}}
+		seat, gate, err := epicSelectSeat(ctx, st, "codex", "", active)
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		// the box still has a free slot, so the seat is placed (a cap-1 box would be refused
+		// here — see the next subtest). The seat's account already powers e1, so it comes
+		// back as a collocated pick with a warning, not a hard refusal.
+		if gate.refuse || seat.Box != "codex1@localhost" {
+			t.Fatalf("a cap-2 box with one epic must still place (got refuse=%v seat=%+v)", gate.refuse, seat)
+		}
+	})
+
+	t.Run("a cap-1 seat with an active epic on its box is refused (one-box-one-epic)", func(t *testing.T) {
+		st := testutil.NewStore(t)
+		addCapSeat(st, "codex1@localhost", "acc-c1", "codex", 1)
+		active := []store.EpicRun{{ID: "e1", Host: "codex1@localhost", AccountKey: "acc-c1", State: "running"}}
+		_, gate, err := epicSelectSeat(ctx, st, "codex", "", active)
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		if !gate.refuse || !gate.hardNoSeat {
+			t.Fatalf("a cap-1 box already holding an epic must hard-refuse (got %+v)", gate)
+		}
+	})
+
+	t.Run("least-loaded box is preferred (spread load)", func(t *testing.T) {
+		st := testutil.NewStore(t)
+		addCapSeat(st, "codexA@localhost", "acc-A", "codex", 2)
+		addCapSeat(st, "codexB@localhost", "acc-B", "codex", 2)
+		// an active epic on codexA under a THIRD account, so NEITHER seat is anti-collocated
+		// — this isolates the least-loaded-box preference from anti-collocation. boxLoad:
+		// codexA=1, codexB=0, both under cap 2, so both land in the headroom bucket.
+		active := []store.EpicRun{{ID: "e1", Host: "codexA@localhost", AccountKey: "acc-external", State: "running"}}
+		seat, gate, err := epicSelectSeat(ctx, st, "codex", "", active)
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		if gate.refuse || seat.Box != "codexB@localhost" {
+			t.Fatalf("least-loaded should pick the empty box codexB, got refuse=%v seat=%+v", gate.refuse, seat)
+		}
+	})
+
+	t.Run("every box at cap is a hard refusal", func(t *testing.T) {
+		st := testutil.NewStore(t)
+		addCapSeat(st, "codexA@localhost", "acc-A", "codex", 1)
+		addCapSeat(st, "codexB@localhost", "acc-B", "codex", 1)
+		active := []store.EpicRun{
+			{ID: "e1", Host: "codexA@localhost", AccountKey: "acc-A", State: "running"},
+			{ID: "e2", Host: "codexB@localhost", AccountKey: "acc-B", State: "running"},
+		}
+		_, gate, err := epicSelectSeat(ctx, st, "codex", "", active)
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		if !gate.refuse || !gate.hardNoSeat {
+			t.Fatalf("all boxes at cap must hard-refuse (--force-quota must not conjure a slot), got %+v", gate)
 		}
 	})
 }

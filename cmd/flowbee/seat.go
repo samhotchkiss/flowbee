@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -53,8 +54,10 @@ func runSeat(args []string) error {
 		return runSeatProbe(ctx, st, rest)
 	case "discover":
 		return runSeatDiscover(ctx, st, rest)
+	case "set-max-concurrent":
+		return runSeatSetMaxConcurrent(ctx, st, rest)
 	default:
-		return fmt.Errorf("unknown `flowbee seat` subcommand %q (want add|list|probe|discover)", sub)
+		return fmt.Errorf("unknown `flowbee seat` subcommand %q (want add|list|probe|discover|set-max-concurrent)", sub)
 	}
 }
 
@@ -78,14 +81,19 @@ func runSeatAdd(ctx context.Context, st *store.Store, args []string) error {
 	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR (claude seats) / GROK_HOME (grok seats)")
 	codexHome := fs.String("codex-home", "", "CODEX_HOME (codex seats)")
 	account := fs.String("account-key", "", "account_windows.account_key (optional; a probe resolves it)")
+	maxConc := fs.Int("max-concurrent", 1, "how many epics may run on this seat's box at once (default 1 = one-box-one-epic; a fast codex box can take 2)")
 	env := envFlag{}
 	fs.Var(env, "env", "extra launch env KEY=VALUE (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *maxConc < 1 {
+		return fmt.Errorf("--max-concurrent must be >= 1 (got %d)", *maxConc)
+	}
 	seat := store.Seat{
 		Box: *box, AgentFamily: *family, AccountKey: *account,
 		ConfigDir: *configDir, CodexHome: *codexHome, ExtraEnv: map[string]string(env),
+		MaxConcurrent: *maxConc,
 	}
 	if err := st.AddSeat(ctx, seat, time.Now()); err != nil {
 		if errors.Is(err, store.ErrSeatExists) {
@@ -93,7 +101,43 @@ func runSeatAdd(ctx context.Context, st *store.Store, args []string) error {
 		}
 		return err
 	}
-	fmt.Printf("✓ registered %s seat on box %q (%s)\n", *family, boxLabel(*box), seatDirOf(seat))
+	fmt.Printf("✓ registered %s seat on box %q (%s, max-concurrent %d)\n", *family, boxLabel(*box), seatDirOf(seat), *maxConc)
+	return nil
+}
+
+// runSeatSetMaxConcurrent is `flowbee seat set-max-concurrent --box B --family F
+// [--config-dir D | --codex-home D] <N>` — the operational write that turns a
+// discovered seat into an N-wide seat (a codex box gets 2) without re-registering it.
+// It addresses the seat by the SAME identity flags as `seat add` (the raw composite id
+// is not printed anywhere), reconstructs the id via Seat.ComposeID, and updates the cap.
+// Lowering it below the current active occupancy simply stops NEW launches onto the box
+// until the running epics finish (the cap is a count-at-launch, never a live constraint).
+func runSeatSetMaxConcurrent(ctx context.Context, st *store.Store, args []string) error {
+	fs := flag.NewFlagSet("seat set-max-concurrent", flag.ContinueOnError)
+	box := fs.String("box", "", "registered host / ssh destination ('' = control-plane box)")
+	family := fs.String("family", "", "agent family: claude|codex|grok (required)")
+	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR (claude seats) / GROK_HOME (grok seats)")
+	codexHome := fs.String("codex-home", "", "CODEX_HOME (codex seats)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: flowbee seat set-max-concurrent --box <b> --family <claude|codex|grok> [--config-dir D | --codex-home D] <N>")
+	}
+	n, err := strconv.Atoi(fs.Arg(0))
+	if err != nil {
+		return fmt.Errorf("max-concurrent %q is not an integer: %w", fs.Arg(0), err)
+	}
+	id := store.Seat{
+		Box: *box, AgentFamily: *family, ConfigDir: *configDir, CodexHome: *codexHome,
+	}.ComposeID()
+	if err := st.SetSeatMaxConcurrent(ctx, id, n, time.Now()); err != nil {
+		if errors.Is(err, store.ErrSeatNotFound) {
+			return fmt.Errorf("no such seat (box %q, family %q, dir %q) — see `flowbee seat list`", boxLabel(*box), *family, seatDirOf(store.Seat{AgentFamily: *family, ConfigDir: *configDir, CodexHome: *codexHome}))
+		}
+		return err
+	}
+	fmt.Printf("✓ %s seat on box %q max-concurrent set to %d\n", *family, boxLabel(*box), n)
 	return nil
 }
 

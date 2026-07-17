@@ -61,39 +61,52 @@ var (
 	// concurrent `epic start`s that both passed those reads could otherwise both
 	// insert (TOCTOU double-book) — the tx here is the authority, the CLI checks
 	// are a courtesy. Both are wrapped with detail via fmt.Errorf("%w: ...").
-	ErrEpicHostBusy     = errors.New("host already holds an active epic")
+	ErrEpicHostBusy     = errors.New("host is at its concurrent-epic cap")
 	ErrEpicScopeOverlap = errors.New("scope overlaps an active epic")
 )
 
 // AddEpicRun registers a new epic at state='launching' — `flowbee epic start`'s
-// one durable write before the tmux launch. The one-box-one-epic occupancy gate
-// and the same-repo scope-overlap gate run INSIDE the same transaction as the
-// insert (review m6): the store pins MaxOpenConns(1), so the check-then-insert is
-// serialized against any concurrent start and can never double-book a host or a
-// scope. An epic with no host (” — not currently produced by the CLI, which
-// requires one) skips the occupancy gate only.
+// one durable write before the tmux launch. The per-box CONCURRENCY-CAP gate and the
+// same-repo scope-overlap gate run INSIDE the same transaction as the insert (review
+// m6): the store pins MaxOpenConns(1), so the count-then-insert is serialized against
+// any concurrent start and can never over-book a box or double-book a scope. An epic
+// with no host (” — not currently produced by the CLI, which requires one) skips the
+// occupancy gate only.
+//
+// hostCap is the selected seat's max_concurrent (seats.max_concurrent, resolved by the
+// caller from the box's seat). The gate COUNTS the active epics on the box and refuses
+// when that count is already >= hostCap — DEFAULT 1 reproduces the original
+// one-box-one-epic rule exactly, a codex box set to 2 admits a second epic and refuses
+// the third. A hostCap < 1 is normalized to 1 here so a caller that forgot to resolve it
+// (or a seat row predating the column, read back as 0) can never accidentally open the
+// box to unbounded epics. Because the whole count-then-insert is one tx on a
+// single-connection store, a cap-2 box with two concurrent starts admits exactly one of
+// them past the second slot — it can never end with 3 active epics.
 //
 // Starting at 'launching' rather than 'running' means a crash between this insert
 // and the tmux session actually coming up leaves a VISIBLE half-launched row
 // instead of nothing; runEpicStart's own error path calls DeleteEpicRun to roll
 // this back cleanly on any preflight/launch failure, so in steady state a row only
 // ever reaches 'launching' for the few seconds a launch is actually in flight.
-func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, now time.Time) error {
+func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, hostCap int, now time.Time) error {
 	if e.ID == "" {
 		return errors.New("epic id is required")
+	}
+	if hostCap < 1 {
+		hostCap = 1
 	}
 	ts := now.Format(rfc3339)
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		if e.Host != "" {
-			var holder string
-			err := tx.QueryRowContext(ctx,
-				`SELECT id FROM epics WHERE host = ? AND state IN `+epicActiveStatesSQL+` LIMIT 1`,
-				e.Host).Scan(&holder)
-			if err == nil {
-				return fmt.Errorf("%w: host %q is running epic %q", ErrEpicHostBusy, e.Host, holder)
-			}
-			if !errors.Is(err, sql.ErrNoRows) {
+			var active int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM epics WHERE host = ? AND state IN `+epicActiveStatesSQL,
+				e.Host).Scan(&active); err != nil {
 				return err
+			}
+			if active >= hostCap {
+				return fmt.Errorf("%w: host %q already runs %d active epic(s) (cap %d)",
+					ErrEpicHostBusy, e.Host, active, hostCap)
 			}
 		}
 		rows, err := tx.QueryContext(ctx,

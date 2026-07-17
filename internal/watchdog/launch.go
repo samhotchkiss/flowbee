@@ -87,6 +87,49 @@ func Preflight(ctx context.Context, r Runner, p PreflightParams) (PreflightResul
 	return out, nil
 }
 
+// EpicBasePath is the SHARED per-repo base checkout on a seat's box — the documented
+// <home>/dev/<repo> convention (the one Preflight clones/refreshes). Every epic on the box,
+// of any slug, shares this single checkout's .git object store; the launch gate's disk math
+// and the clone all target it, so it is derived in ONE place here to keep epicPreflight and
+// the abandon-cleanup path from inventing a second notion of it.
+func EpicBasePath(home, repo string) string {
+	return home + "/dev/" + repo
+}
+
+// EpicWorktreePath is one epic's PRIVATE working tree, kept OUTSIDE the base checkout (a
+// sibling under <home>/dev/.flowbee-wt/<repo>/<slug>) so `git worktree add` never nests a
+// worktree inside its own base and two epics on one box get fully isolated trees + branches
+// while sharing only the base's .git objects. It is derived per SLUG, so two epics on the
+// same box (same repo) resolve to DISTINCT paths and can never collide. Callers pass this —
+// never the base — to the launch ladder as the epic's checkout/cwd.
+func EpicWorktreePath(home, repo, slug string) string {
+	return home + "/dev/.flowbee-wt/" + repo + "/" + slug
+}
+
+// ProvisionEpicWorktree creates the epic's private worktree (WorktreeAddCmd) on the box via
+// the SAME Runner abstraction as everything else here. A non-nil error is launch-BLOCKING
+// by contract — the caller refuses the launch and rolls back; there is DELIBERATELY no
+// fallback to the shared base tree, because letting two epics share one working tree is
+// precisely the corruption the worktree isolates against.
+func ProvisionEpicWorktree(ctx context.Context, r Runner, box, base, worktree, branch string) error {
+	if _, err := r.Run(ctx, WorktreeAddCmd(box, base, worktree, branch)); err != nil {
+		return fmt.Errorf("create per-epic worktree at %s: %w", worktree, err)
+	}
+	return nil
+}
+
+// RemoveEpicWorktree tears down an epic's private worktree (WorktreeRemoveCmd). It is called
+// BEST-EFFORT on the launch-failure rollback path and on `flowbee epic abandon` — a leftover
+// worktree would otherwise block a same-slug retry — so the caller logs but does not fail on
+// its error (an unreachable box, or a worktree git never actually created, must not fail the
+// rollback/abandon it is cleaning up after).
+func RemoveEpicWorktree(ctx context.Context, r Runner, box, base, worktree string) error {
+	if _, err := r.Run(ctx, WorktreeRemoveCmd(box, base, worktree)); err != nil {
+		return fmt.Errorf("remove per-epic worktree at %s: %w", worktree, err)
+	}
+	return nil
+}
+
 // LaunchParams / LaunchEpicSession start the coding agent and hand it the epic's
 // goal, reusing the Phase-1 double-Enter submit-verify mechanics
 // (Watcher.autoResume): settle, recapture, and if the input line still shows the

@@ -34,14 +34,42 @@ func TestRemoteWrapSSHOptionInjection(t *testing.T) {
 // remoteWrap, so each constructed remote command carries the `--`.
 func TestAllCommandBuildersUseSeparator(t *testing.T) {
 	for name, cmd := range map[string]string{
-		"capture":    capturePaneCmd("box1", "sess"),
-		"scrollback": captureScrollbackCmd("box1", "sess"),
-		"resume":     sendResumeCmd("box1", "sess"),
-		"enter":      sendEnterCmd("box1", "sess"),
+		"capture":      capturePaneCmd("box1", "sess"),
+		"scrollback":   captureScrollbackCmd("box1", "sess"),
+		"resume":       sendResumeCmd("box1", "sess"),
+		"enter":        sendEnterCmd("box1", "sess"),
+		"worktree-add": WorktreeAddCmd("box1", "/base", "/wt", "main"),
+		"worktree-rm":  WorktreeRemoveCmd("box1", "/base", "/wt"),
 	} {
 		if !strings.Contains(cmd, " -- 'box1' ") {
 			t.Errorf("%s: missing `-- <host>` separator: %q", name, cmd)
 		}
+	}
+}
+
+// TestWorktreeCmdStrings pins the EXACT shell strings for the per-epic worktree add/remove
+// builders — the shQuoting, the shQuote("origin/"+branch) checkout target, and the parent
+// mkdir can't silently drift, and a branch carrying shell metacharacters must stay inside
+// its single argument.
+func TestWorktreeCmdStrings(t *testing.T) {
+	gotAdd := WorktreeAddCmd("", "/home/ops/dev/russ", "/home/ops/dev/.flowbee-wt/russ/2026-07-16-widget", "main")
+	wantAdd := "git -C '/home/ops/dev/russ' fetch --quiet origin 'main'" +
+		" && mkdir -p -- '/home/ops/dev/.flowbee-wt/russ'" +
+		" && git -C '/home/ops/dev/russ' worktree add --detach '/home/ops/dev/.flowbee-wt/russ/2026-07-16-widget' 'origin/main'"
+	if gotAdd != wantAdd {
+		t.Fatalf("WorktreeAddCmd:\n got %q\nwant %q", gotAdd, wantAdd)
+	}
+
+	gotRm := WorktreeRemoveCmd("", "/home/ops/dev/russ", "/home/ops/dev/.flowbee-wt/russ/2026-07-16-widget")
+	wantRm := "git -C '/home/ops/dev/russ' worktree remove --force '/home/ops/dev/.flowbee-wt/russ/2026-07-16-widget'"
+	if gotRm != wantRm {
+		t.Fatalf("WorktreeRemoveCmd:\n got %q\nwant %q", gotRm, wantRm)
+	}
+
+	// the origin/<branch> checkout target must be one shQuote'd argument.
+	hostile := WorktreeAddCmd("", "/b", "/w", "main; rm -rf /")
+	if !strings.Contains(hostile, "worktree add --detach '/w' 'origin/main; rm -rf /'") {
+		t.Fatalf("origin/<branch> must be shQuote'd as one argument, got %q", hostile)
 	}
 }
 

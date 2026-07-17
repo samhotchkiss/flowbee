@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -251,10 +252,18 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	// silently-stranded host reservation. ──
 	now := time.Now()
 	tmuxName := "epic-" + slug
+	// the selected seat's cap governs how many epics its BOX may hold at once (seats.
+	// max_concurrent; default 1 = one-box-one-epic). AddEpicRun's atomic count-then-insert
+	// is the race-free authority — epicSelectSeat already excluded a full box, but a
+	// concurrent start could have filled the last slot between selection and here.
+	hostCap := seat.MaxConcurrent
+	if hostCap < 1 {
+		hostCap = 1
+	}
 	if err := st.AddEpicRun(ctx, store.EpicRun{
 		ID: slug, Repo: repoID, FilePath: filePath, Title: spec.Title, Scope: spec.Scope,
 		Host: seat.Box, Branch: "epic/" + slug, TmuxName: tmuxName, Agent: family,
-	}, now); err != nil {
+	}, hostCap, now); err != nil {
 		return fmt.Errorf("register epic: %w", err)
 	}
 	// bind the seat/account/builder_model_family from the RESOLVED seat (not config intent —
@@ -264,27 +273,42 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	}
 
 	// ── PREFLIGHT the seat's box BEFORE the ladder: resolve its home, ensure the repo is
-	// cloned at <home>/dev/<repo>, and verify gh auth + free disk. The fresh seat accounts
-	// have only the `gh` CLI (no repo cloned), and the 6b launch gate previously ran the
-	// ladder with NO checkout — so the agent came up in the seat's empty home. This clones
-	// the checkout and hands its path to the ladder as the working dir. A failure rolls
-	// back the 'launching' row (never run the ladder into a missing checkout). ──
-	checkout, perr := epicPreflight(ctx, watchdog.NewShellRunner(), seat.Box, repo)
+	// cloned at <home>/dev/<repo>, verify gh auth + free disk, and cut this epic's PRIVATE
+	// per-slug worktree from that base (the isolation that lets two epics coexist on one
+	// box). The fresh seat accounts have only the `gh` CLI (no repo cloned), and the 6b
+	// launch gate previously ran the ladder with NO checkout — so the agent came up in the
+	// seat's empty home. epicPreflight returns the WORKTREE (what the ladder cwds into) and
+	// the base (what the rollback path removes the worktree against). A failure rolls back
+	// the 'launching' row (never run the ladder into a missing/shared checkout). ──
+	runner := watchdog.NewShellRunner()
+	worktree, base, perr := epicPreflight(ctx, runner, seat.Box, repo, slug)
 	if perr != nil {
 		raiseLaunchFailed(ctx, st, slug, repoID, "preflight failed: "+perr.Error(), now)
 		_ = st.DeleteEpicRun(ctx, slug)
 		return fmt.Errorf("launch refused: %w (epic registration rolled back — nothing reserved)", perr)
 	}
+	// rollback releases everything past the 'launching' row that a failed ladder leaves
+	// behind: the row itself AND this epic's private worktree (best-effort — a leftover
+	// worktree at this slug's path would otherwise block a retry; an unreachable box must
+	// not mask the underlying launch error). Used by both ladder-failure paths below.
+	rollback := func() {
+		_ = st.DeleteEpicRun(ctx, slug)
+		if rerr := watchdog.RemoveEpicWorktree(ctx, runner, seat.Box, base, worktree); rerr != nil {
+			logger.Warn("rollback: could not remove the per-epic worktree (leftover tree may block a same-slug retry)",
+				"epic", slug, "box", seat.Box, "worktree", worktree, "err", rerr)
+		}
+	}
 
 	// ── THE LAUNCH LADDER (plan §15.15): drive a LOCAL tmux session through the staged,
 	// pane-classified launch machine, composed from tmuxio primitives + the family verb
 	// table. The local pane is the attach; a remote seat lives in a remote tmux the ssh
-	// line creates. The agent comes up cwd'd into the preflighted checkout. ──
+	// line creates. The agent comes up cwd'd into the epic's PRIVATE worktree (never the
+	// shared base) — it cuts epic/<slug> from the detached HEAD there. ──
 	client := tmuxio.New()
 	res, lerr := watchdog.RunLadder(ctx, client, realTmuxClock{}, watchdog.LadderParams{
 		Slug:     slug,
 		SpecPath: filePath,
-		Checkout: checkout,
+		Checkout: worktree,
 		Seat: watchdog.LaunchSeat{
 			Box: seat.Box, AgentFamily: seat.AgentFamily, ConfigDir: seat.ConfigDir,
 			CodexHome: seat.CodexHome, Account: seat.AccountKey, ExtraEnv: seat.ExtraEnv,
@@ -292,20 +316,20 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	})
 	if lerr != nil {
 		raiseLaunchFailed(ctx, st, slug, repoID, "ladder infra error at stage "+string(res.Stage)+": "+lerr.Error(), now)
-		_ = st.DeleteEpicRun(ctx, slug)
+		rollback()
 		return fmt.Errorf("launch ladder infra error at stage %q: %w (epic registration rolled back)", res.Stage, lerr)
 	}
 	switch res.Outcome {
 	case watchdog.LaunchAwaitingAuth:
 		// interactive auth at the ssh stage — a HUMAN answers once in the LOCAL pane. Leave
-		// the session + the 'launching' row alive; raise a human-facing item. The reaper
-		// releases it only if the human never completes it (LaunchStrandAfter).
+		// the session + the 'launching' row + the worktree alive; raise a human-facing item.
+		// The reaper releases it only if the human never completes it (LaunchStrandAfter).
 		raiseLaunchFailed(ctx, st, slug, repoID, "awaiting interactive auth: "+res.Evidence, now)
 		fmt.Printf("⏸ epic %q launch is AWAITING INTERACTIVE AUTH in local tmux %q — answer the prompt in the pane, then it will proceed.\n   %s\n", slug, res.Session, res.Evidence)
 		return nil
 	case watchdog.LaunchFailed:
 		raiseLaunchFailed(ctx, st, slug, repoID, "launch ladder failed at stage "+string(res.Stage)+": "+res.Evidence, now)
-		_ = st.DeleteEpicRun(ctx, slug) // roll back — the ladder already killed the local session
+		rollback() // roll back the row + worktree — the ladder already killed the local session
 		return fmt.Errorf("launch ladder failed at stage %q: %s (epic registration rolled back — nothing reserved)", res.Stage, res.Evidence)
 	}
 
@@ -325,40 +349,57 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	return nil
 }
 
-// epicPreflight ensures the seat's box is launch-ready BEFORE the ladder runs. It resolves
-// the box's home over the SAME Runner the goal-session watchdog uses (local for box="",
-// ssh otherwise), computes the per-repo checkout path (<home>/dev/<repo> — the one-active-
-// epic-per-seat base checkout; the epic runner cuts epic/<slug> from main INSIDE it per
-// epics/INSTRUCTIONS.md), and runs watchdog.Preflight (gh auth + free disk + clone the repo
-// if absent). It returns the resolved checkout so the ladder can bring the agent up cwd'd
-// into it. A non-nil error is launch-blocking (unreachable box / failed clone / gh not
-// authenticated) — the caller rolls back the 'launching' registration.
-func epicPreflight(ctx context.Context, r watchdog.Runner, box string, repo store.Repo) (string, error) {
+// epicPreflight ensures the seat's box is launch-ready BEFORE the ladder runs and cuts this
+// epic's PRIVATE worktree. It resolves the box's home over the SAME Runner the goal-session
+// watchdog uses (local for box="", ssh otherwise), computes the SHARED per-repo base
+// checkout (<home>/dev/<repo>) and this epic's per-slug worktree (<home>/dev/.flowbee-wt/
+// <repo>/<slug>), runs watchdog.Preflight (gh auth + free disk + clone the base if absent),
+// then cuts the worktree DETACHED at origin/<defaultBranch> so the agent gets a fully
+// isolated tree (the epic runner cuts epic/<slug> inside it per epics/INSTRUCTIONS.md; two
+// epics on one box never share a working tree). It returns (worktree, base): the ladder cwds
+// into the worktree, and the caller's rollback removes the worktree against the base. A
+// non-nil error is launch-blocking (unreachable box / failed clone / gh not authenticated /
+// failed worktree-add — NEVER a fallback to the shared base) — the caller rolls back the
+// 'launching' registration.
+func epicPreflight(ctx context.Context, r watchdog.Runner, box string, repo store.Repo, slug string) (worktree, base string, err error) {
 	if repo.Owner == "" || repo.Repo == "" {
-		return "", fmt.Errorf("repo %q is missing its github owner/repo — cannot resolve the checkout to clone", repo.ID)
+		return "", "", fmt.Errorf("repo %q is missing its github owner/repo — cannot resolve the checkout to clone", repo.ID)
 	}
 	homeOut, err := r.Run(ctx, watchdog.HomeDirCmd(box))
 	if err != nil {
-		return "", fmt.Errorf("resolve home on box %q: %w", boxLabel(box), err)
+		return "", "", fmt.Errorf("resolve home on box %q: %w", boxLabel(box), err)
 	}
 	home := strings.TrimSpace(homeOut)
 	if home == "" {
-		return "", fmt.Errorf("box %q reported an empty $HOME", boxLabel(box))
+		return "", "", fmt.Errorf("box %q reported an empty $HOME", boxLabel(box))
 	}
-	checkout := home + "/dev/" + repo.Repo
+	base = watchdog.EpicBasePath(home, repo.Repo)
+	worktree = watchdog.EpicWorktreePath(home, repo.Repo, slug)
 	pf, err := watchdog.Preflight(ctx, r, watchdog.PreflightParams{
 		Box:           box,
-		CheckoutPath:  checkout,
+		CheckoutPath:  base,
 		DiskProbePath: home,
 		OwnerRepo:     repo.Owner + "/" + repo.Repo,
 	})
 	if err != nil {
-		return "", fmt.Errorf("preflight on box %q: %w", boxLabel(box), err)
+		return "", "", fmt.Errorf("preflight on box %q: %w", boxLabel(box), err)
 	}
 	if !pf.GhAuthOK {
-		return "", fmt.Errorf("box %q: gh is not authenticated (the epic's Finish step opens a PR via gh) — run `gh auth login` on the box", boxLabel(box))
+		return "", "", fmt.Errorf("box %q: gh is not authenticated (the epic's Finish step opens a PR via gh) — run `gh auth login` on the box", boxLabel(box))
 	}
-	return checkout, nil
+	// cut the epic's private worktree from the freshly-ensured base, DETACHED at
+	// origin/<defaultBranch>. A failure is launch-blocking — a best-effort remove clears any
+	// partial worktree registration so a same-slug retry isn't blocked, then the error
+	// propagates (we NEVER fall back to the shared base tree).
+	branch := repo.DefaultBranch
+	if branch == "" {
+		branch = "main"
+	}
+	if werr := watchdog.ProvisionEpicWorktree(ctx, r, box, base, worktree, branch); werr != nil {
+		_ = watchdog.RemoveEpicWorktree(ctx, r, box, base, worktree)
+		return "", "", werr
+	}
+	return worktree, base, nil
 }
 
 // raiseLaunchFailed upserts a launch_failed attention item (plan §1.3) so a master/operator
@@ -392,11 +433,17 @@ func gateNote(g seatGate) string {
 	return ""
 }
 
-// epicSelectSeat picks a ready seat of the epic's family with weekly headroom (plan §15.13c
-// + §4.3), reading account_windows.severity + seat HEALTH — NOT just worker_accounts.usage_pct
-// (a weekly_scoped-only critical is invisible there; the 0028 capacity-store note requires
-// this). Anti-collocation prefers a seat whose account is not already powering an active
-// epic. hostFilter (if set) restricts to seats on that box. Refuses on no-seat / no-headroom;
+// epicSelectSeat picks a ready seat of the epic's family with weekly headroom AND spare
+// per-box CONCURRENCY (plan §15.13c + §4.3), reading account_windows.severity + seat HEALTH
+// — NOT just worker_accounts.usage_pct (a weekly_scoped-only critical is invisible there;
+// the 0028 capacity-store note requires this). A seat is CAPACITY-ELIGIBLE iff the number of
+// active epics already on its box is below the seat's max_concurrent (0031) — the
+// 2-concurrent-epics-per-seat gate: a codex box set to 2 stays eligible with one epic
+// running, a claude/grok box at the default 1 does not. Among eligible seats it prefers the
+// LEAST-LOADED box (spread epics across boxes/accounts rather than piling onto one), with
+// the existing anti-collocation (prefer a seat whose account is not already powering an
+// active epic) and the ListReadySeats id-order as the deterministic tiebreak. hostFilter (if
+// set) restricts to seats on that box. Refuses on no-seat / all-boxes-at-cap / no-headroom;
 // a probe error / stale critical fails OPEN (a flaky ssh must not ground the fleet).
 func epicSelectSeat(ctx context.Context, st *store.Store, family, hostFilter string, active []store.EpicRun) (store.Seat, seatGate, error) {
 	seats, err := st.ListReadySeats(ctx, family)
@@ -416,16 +463,32 @@ func epicSelectSeat(ctx context.Context, st *store.Store, family, hostFilter str
 		return store.Seat{}, seatGate{refuse: true, hardNoSeat: true,
 			reason: fmt.Sprintf("no ready %s seat available (register one with `flowbee seat discover <box>`; a `%s` epic needs a ready `%s` seat)", family, family, family)}, nil
 	}
-	// accounts already powering an active epic (anti-collocation).
+	// per-box active-epic count (the CAPACITY dimension the cap gates on) and the set of
+	// accounts already powering an active epic (anti-collocation). Both read off the one
+	// active snapshot the caller passed.
+	boxLoad := map[string]int{}
 	busy := map[string]bool{}
 	for _, e := range active {
+		boxLoad[e.Host]++
 		if e.AccountKey != "" {
 			busy[e.AccountKey] = true
 		}
 	}
 	var headroom, collocated []store.Seat
 	sawCriticalHeadroom := false
+	sawAtCap := false
 	for _, s := range seats {
+		// CAPACITY first: a seat whose box already holds its max_concurrent active epics is
+		// ineligible (a cap<1 read off a row predating 0031, or an unset field, normalizes
+		// to 1 — never an unbounded box). This is the 2-per-seat gate.
+		cap := s.MaxConcurrent
+		if cap < 1 {
+			cap = 1
+		}
+		if boxLoad[s.Box] >= cap {
+			sawAtCap = true
+			continue
+		}
 		// Read account_windows.severity directly (belt-and-suspenders over seat health):
 		// a weekly_scoped-only critical excludes the seat even though usage_pct is below
 		// ceiling. A probe error / stale critical (CriticalNonStale=false) does NOT exclude
@@ -442,11 +505,18 @@ func epicSelectSeat(ctx context.Context, st *store.Store, family, hostFilter str
 		}
 		headroom = append(headroom, s)
 	}
+	// prefer the LEAST-LOADED box within each bucket (spread load), stable so the
+	// ListReadySeats id-order stays the deterministic tiebreak among equal loads.
+	byLoad := func(list []store.Seat) func(i, j int) bool {
+		return func(i, j int) bool { return boxLoad[list[i].Box] < boxLoad[list[j].Box] }
+	}
+	sort.SliceStable(headroom, byLoad(headroom))
+	sort.SliceStable(collocated, byLoad(collocated))
 	pick := func(list []store.Seat) (store.Seat, bool) {
 		if len(list) == 0 {
 			return store.Seat{}, false
 		}
-		return list[0], true // ListReadySeats is ordered by id — a deterministic pick
+		return list[0], true
 	}
 	if seat, ok := pick(headroom); ok {
 		return seat, seatGate{}, nil
@@ -458,6 +528,14 @@ func epicSelectSeat(ctx context.Context, st *store.Store, family, hostFilter str
 	if sawCriticalHeadroom {
 		return store.Seat{}, seatGate{refuse: true,
 			reason: fmt.Sprintf("every ready %s seat's account is weekly-critical (severity=critical) — no weekly headroom to finish an epic", family)}, nil
+	}
+	if sawAtCap {
+		// every ready seat of the family has capacity, but every eligible box is already at
+		// its concurrent-epic cap. This is hardNoSeat: there is no seat to place onto, and
+		// --force-quota must not conjure one (AddEpicRun's atomic cap gate would refuse a
+		// forced over-book anyway).
+		return store.Seat{}, seatGate{refuse: true, hardNoSeat: true,
+			reason: fmt.Sprintf("every ready %s seat's box is at its concurrent-epic cap — wait for an active epic to finish, or raise a seat's cap with `flowbee seat set-max-concurrent`", family)}, nil
 	}
 	return store.Seat{}, seatGate{refuse: true,
 		reason: fmt.Sprintf("no ready %s seat with weekly headroom", family)}, nil
@@ -634,18 +712,64 @@ func runEpicAbandon(ctx context.Context, st *store.Store, args []string) error {
 		return fmt.Errorf("usage: flowbee epic abandon <id>")
 	}
 	id := args[0]
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	// read the row BEFORE abandoning it so we still know its host/repo — needed to tear
+	// down the per-epic worktree (abandon releases the reservation, but a leftover worktree
+	// at this slug's path would block a same-slug retry). A missing row is reported the same
+	// way AbandonEpicRun would.
+	e, gerr := st.GetEpicRun(ctx, id)
+	if errors.Is(gerr, store.ErrEpicRunNotFound) {
+		return fmt.Errorf("no such epic %q", id)
+	}
+	if gerr != nil {
+		return gerr
+	}
 	if err := st.AbandonEpicRun(ctx, id, time.Now()); err != nil {
 		if errors.Is(err, store.ErrEpicRunNotFound) {
 			return fmt.Errorf("no such epic %q", id)
 		}
 		return err
 	}
+	// tear down the per-epic worktree BEST-EFFORT (matches the launch-failure rollback):
+	// resolve the repo's github name + the box's home, then `git worktree remove --force`.
+	// An unknown repo, an unreachable box, or a worktree that was never created must NOT
+	// fail the abandon — the reservation is already released; this only frees disk +
+	// unblocks a same-slug retry.
+	removeEpicWorktreeBestEffort(ctx, st, logger, e)
 	// operator decision, called out explicitly (§ task brief): abandon releases the
 	// scope/host reservation and stops the watchdog watching it, but the tmux
 	// session itself (and any still-running agent inside it) is left alone.
 	fmt.Printf("epic %q abandoned — scope + host reservation released, goal-session watch disabled.\n"+
 		"the tmux session was NOT killed; if it's still running, stop it by hand (`tmux kill-session -t epic-%s` on its host).\n", id, id)
 	return nil
+}
+
+// removeEpicWorktreeBestEffort tears down an abandoned epic's private worktree. It resolves
+// the repo's github name (the checkout path uses <home>/dev/<repo.Repo>, NOT the registry
+// key epics.repo) and the box's home, then issues WorktreeRemoveCmd. EVERY failure is logged
+// and swallowed — the abandon has already succeeded, and this is pure cleanup (free disk +
+// unblock a retry). box="" is a valid LOCAL seat, so it is handled like any other.
+func removeEpicWorktreeBestEffort(ctx context.Context, st *store.Store, logger *slog.Logger, e store.EpicRun) {
+	repo, rerr := st.GetRepo(ctx, e.Repo)
+	if rerr != nil || repo.Repo == "" {
+		logger.Warn("abandon: could not resolve the repo's github name to remove the per-epic worktree (leftover tree may block a same-slug retry)",
+			"epic", e.ID, "repo", e.Repo, "err", rerr)
+		return
+	}
+	runner := watchdog.NewShellRunner()
+	homeOut, herr := runner.Run(ctx, watchdog.HomeDirCmd(e.Host))
+	home := strings.TrimSpace(homeOut)
+	if herr != nil || home == "" {
+		logger.Warn("abandon: could not resolve home to remove the per-epic worktree (leftover tree may block a same-slug retry)",
+			"epic", e.ID, "box", e.Host, "err", herr)
+		return
+	}
+	base := watchdog.EpicBasePath(home, repo.Repo)
+	worktree := watchdog.EpicWorktreePath(home, repo.Repo, e.ID)
+	if wrerr := watchdog.RemoveEpicWorktree(ctx, runner, e.Host, base, worktree); wrerr != nil {
+		logger.Warn("abandon: could not remove the per-epic worktree (it may not exist)",
+			"epic", e.ID, "box", e.Host, "worktree", worktree, "err", wrerr)
+	}
 }
 
 func runEpicStatus(ctx context.Context, st *store.Store, args []string) error {

@@ -18,7 +18,7 @@ func TestSetEpicRuntimeStateAndSeatBinding(t *testing.T) {
 	if err := st.AddEpicRun(ctx, store.EpicRun{
 		ID: "frob", Repo: "acme/russ", FilePath: "epics/2026-07-16-frob.md",
 		Host: "buncher", Branch: "epic/frob", TmuxName: "epic-frob", Agent: "codex",
-	}, now); err != nil {
+	}, 1, now); err != nil {
 		t.Fatalf("add epic: %v", err)
 	}
 
@@ -58,7 +58,7 @@ func TestEpicRuntimeDefaultsUnknownContext(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
 	now := time.Now()
-	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "z", Repo: "r", FilePath: "epics/z.md", TmuxName: "epic-z", Agent: "claude"}, now); err != nil {
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "z", Repo: "r", FilePath: "epics/z.md", TmuxName: "epic-z", Agent: "claude"}, 1, now); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	e, err := st.GetEpicRun(ctx, "z")

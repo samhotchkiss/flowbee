@@ -617,7 +617,7 @@ func mustRegisterEpic(t *testing.T, st *store.Store, repo, id, branch, filePath 
 	if err := st.AddEpicRun(context.Background(), store.EpicRun{
 		ID: id, Repo: repo, FilePath: filePath, Title: "Foo",
 		Scope: []string{"app/foo/**"}, Branch: branch, TmuxName: "epic-" + id,
-	}, time.Unix(500, 0)); err != nil {
+	}, 1, time.Unix(500, 0)); err != nil {
 		t.Fatalf("register epic: %v", err)
 	}
 }

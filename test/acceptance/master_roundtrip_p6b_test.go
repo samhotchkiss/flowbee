@@ -83,7 +83,7 @@ func TestP6bMasterRoundTrip(t *testing.T) {
 	if err := st.AddEpicRun(ctx, store.EpicRun{
 		ID: "x", Repo: "r", FilePath: "epics/x.md", Title: "X", Branch: "epic/x",
 		TmuxName: "epic-x", Agent: "claude",
-	}, now); err != nil {
+	}, 1, now); err != nil {
 		t.Fatalf("add epic: %v", err)
 	}
 	if err := st.UpsertEpicStatus(ctx, "x", epicspec.StatusBlock{
@@ -187,7 +187,7 @@ func TestP6bResolveFencesStaleEpoch(t *testing.T) {
 	ts := httptest.NewServer(srv.PrivateHandler())
 	defer ts.Close()
 
-	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "y", Repo: "r", TmuxName: "epic-y", Agent: "claude"}, now); err != nil {
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "y", Repo: "r", TmuxName: "epic-y", Agent: "claude"}, 1, now); err != nil {
 		t.Fatalf("add epic: %v", err)
 	}
 	pane.state["epic-y"] = "awaiting_input"

@@ -34,6 +34,10 @@ func TestSeatCRUD(t *testing.T) {
 	if got.ExtraEnv["FOO"] != "bar" || !got.Enabled {
 		t.Fatalf("env/enabled: %+v", got)
 	}
+	// max_concurrent defaults to 1 (one-box-one-epic preserved) when not specified.
+	if got.MaxConcurrent != 1 {
+		t.Fatalf("expected default max_concurrent=1, got %d", got.MaxConcurrent)
+	}
 
 	// a codex seat on the same box is a distinct row (different dir).
 	if err := st.AddSeat(ctx, store.Seat{Box: "buncher", AgentFamily: "codex", CodexHome: "/home/ops/.codex"}, now); err != nil {
@@ -61,6 +65,50 @@ func TestSeatCRUD(t *testing.T) {
 	}
 	if ready, err := st.ListReadySeats(ctx, "grok"); err != nil || len(ready) != 1 || ready[0].AgentFamily != "grok" {
 		t.Fatalf("expected 1 ready grok seat, got %+v err=%v", ready, err)
+	}
+}
+
+// TestSeatMaxConcurrent covers the 0031 per-seat concurrent-epic cap: an explicit cap
+// round-trips through AddSeat, an unset/zero cap normalizes to 1 (never an unbounded box),
+// SetSeatMaxConcurrent updates it (the operational "make this a 2-wide codex seat" write),
+// a cap below 1 is rejected, and an unknown seat is ErrSeatNotFound.
+func TestSeatMaxConcurrent(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+
+	// a codex box registered 2-wide round-trips the cap.
+	codex := store.Seat{Box: "codexbox", AgentFamily: "codex", CodexHome: "/home/ops/.codex", MaxConcurrent: 2}
+	if err := st.AddSeat(ctx, codex, now); err != nil {
+		t.Fatalf("add codex 2-wide: %v", err)
+	}
+	if cb, err := st.GetSeat(ctx, codex.ComposeID()); err != nil || cb.MaxConcurrent != 2 {
+		t.Fatalf("expected codex max_concurrent=2, got %+v (err %v)", cb, err)
+	}
+
+	// an unset/zero cap normalizes to 1 (never a cap-0 seat that refuses every launch).
+	zero := store.Seat{Box: "zerobox", AgentFamily: "claude", ConfigDir: "/home/ops/.claude", MaxConcurrent: 0}
+	if err := st.AddSeat(ctx, zero, now); err != nil {
+		t.Fatalf("add zerobox: %v", err)
+	}
+	if zb, _ := st.GetSeat(ctx, zero.ComposeID()); zb.MaxConcurrent != 1 {
+		t.Fatalf("expected zerobox cap normalized to 1, got %d", zb.MaxConcurrent)
+	}
+
+	// SetSeatMaxConcurrent bumps it later (turn the zerobox claude seat into a 3-wide seat).
+	if err := st.SetSeatMaxConcurrent(ctx, zero.ComposeID(), 3, now); err != nil {
+		t.Fatalf("set max concurrent: %v", err)
+	}
+	if zb, _ := st.GetSeat(ctx, zero.ComposeID()); zb.MaxConcurrent != 3 {
+		t.Fatalf("expected zerobox cap updated to 3, got %d", zb.MaxConcurrent)
+	}
+
+	// a cap below 1 is rejected (that's a seat rm, not a cap); an unknown seat is not found.
+	if err := st.SetSeatMaxConcurrent(ctx, zero.ComposeID(), 0, now); err == nil {
+		t.Fatal("expected max_concurrent < 1 to be rejected")
+	}
+	if err := st.SetSeatMaxConcurrent(ctx, "ghost|codex|/nope", 2, now); !errors.Is(err, store.ErrSeatNotFound) {
+		t.Fatalf("expected ErrSeatNotFound setting cap on unknown seat, got %v", err)
 	}
 }
 

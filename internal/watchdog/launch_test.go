@@ -3,6 +3,7 @@ package watchdog
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -31,6 +32,67 @@ func (r *queuedRunner) Run(_ context.Context, cmd string) (string, error) {
 func (r *queuedRunner) push(out string, err error) {
 	r.outs = append(r.outs, out)
 	r.errs = append(r.errs, err)
+}
+
+// TestEpicWorktreePathDerivation: the per-epic worktree path is DISTINCT per slug (two
+// epics on one box never collide), lives OUTSIDE the shared base checkout, and the base
+// path is the Phase-6 <home>/dev/<repo> convention.
+func TestEpicWorktreePathDerivation(t *testing.T) {
+	base := EpicBasePath("/home/ops", "russ")
+	if base != "/home/ops/dev/russ" {
+		t.Fatalf("EpicBasePath: got %q", base)
+	}
+	wtA := EpicWorktreePath("/home/ops", "russ", "2026-07-16-a")
+	wtB := EpicWorktreePath("/home/ops", "russ", "2026-07-16-b")
+	if wtA == wtB {
+		t.Fatalf("two slugs must derive distinct worktree paths, both were %q", wtA)
+	}
+	if wtA != "/home/ops/dev/.flowbee-wt/russ/2026-07-16-a" {
+		t.Fatalf("EpicWorktreePath: got %q", wtA)
+	}
+	// the worktree must be OUTSIDE the base tree (git worktree cannot nest a worktree
+	// inside its own base) — assert it is not a subpath of base.
+	if strings.HasPrefix(wtA, base+"/") {
+		t.Fatalf("worktree %q must not be nested inside base %q", wtA, base)
+	}
+}
+
+// TestProvisionEpicWorktree_IssuesAddAndFailsHard: ProvisionEpicWorktree issues exactly
+// WorktreeAddCmd, and a Runner error is launch-BLOCKING (returned, never swallowed into a
+// base-tree fallback).
+func TestProvisionEpicWorktree_IssuesAddAndFailsHard(t *testing.T) {
+	r := &queuedRunner{}
+	r.push("", nil) // worktree add: OK
+	base := "/home/ops/dev/russ"
+	wt := "/home/ops/dev/.flowbee-wt/russ/slug"
+	if err := ProvisionEpicWorktree(context.Background(), r, "buncher", base, wt, "main"); err != nil {
+		t.Fatalf("ProvisionEpicWorktree: %v", err)
+	}
+	if len(r.calls) != 1 || r.calls[0] != WorktreeAddCmd("buncher", base, wt, "main") {
+		t.Fatalf("expected exactly the worktree-add command, got %v", r.calls)
+	}
+
+	// a failed worktree add is a HARD error — no fallback.
+	rf := &queuedRunner{}
+	rf.push("", errors.New("fatal: 'origin/main' is not a commit"))
+	if err := ProvisionEpicWorktree(context.Background(), rf, "buncher", base, wt, "main"); err == nil {
+		t.Fatal("a failed worktree add must be launch-blocking (returned as an error)")
+	}
+}
+
+// TestRemoveEpicWorktree_IssuesRemove: RemoveEpicWorktree issues exactly WorktreeRemoveCmd —
+// the command the rollback + abandon cleanup paths depend on.
+func TestRemoveEpicWorktree_IssuesRemove(t *testing.T) {
+	r := &queuedRunner{}
+	r.push("", nil)
+	base := "/home/ops/dev/russ"
+	wt := "/home/ops/dev/.flowbee-wt/russ/slug"
+	if err := RemoveEpicWorktree(context.Background(), r, "buncher", base, wt); err != nil {
+		t.Fatalf("RemoveEpicWorktree: %v", err)
+	}
+	if len(r.calls) != 1 || r.calls[0] != WorktreeRemoveCmd("buncher", base, wt) {
+		t.Fatalf("expected exactly the worktree-remove command, got %v", r.calls)
+	}
 }
 
 func TestPreflight_HappyPath_ExistingCheckout(t *testing.T) {

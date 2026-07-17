@@ -103,7 +103,7 @@ func TestInjectEpicCriteriaPopulatesLeaseContext(t *testing.T) {
 		ID: "2026-07-03-foo", Repo: "", FilePath: "epics/2026-07-03-foo.md",
 		Title: "Foo", Scope: []string{"app/foo/**"}, Branch: "epic/2026-07-03-foo",
 		TmuxName: "epic-2026-07-03-foo",
-	}, time.Unix(500, 0)); err != nil {
+	}, 1, time.Unix(500, 0)); err != nil {
 		t.Fatalf("register epic: %v", err)
 	}
 
@@ -141,7 +141,7 @@ func TestInjectEpicCriteriaNonEpicPRNoOp(t *testing.T) {
 		ID: "2026-07-03-foo", Repo: "", FilePath: "epics/2026-07-03-foo.md",
 		Title: "Foo", Scope: []string{"app/foo/**"}, Branch: "epic/2026-07-03-foo",
 		TmuxName: "epic-2026-07-03-foo",
-	}, time.Unix(500, 0)); err != nil {
+	}, 1, time.Unix(500, 0)); err != nil {
 		t.Fatalf("register epic: %v", err)
 	}
 
@@ -169,7 +169,7 @@ func TestInjectEpicCriteriaBaseReadFailureOmitsSection(t *testing.T) {
 		ID: "2026-07-03-foo", Repo: "", FilePath: "epics/2026-07-03-foo.md",
 		Title: "Foo", Scope: []string{"app/foo/**"}, Branch: "epic/2026-07-03-foo",
 		TmuxName: "epic-2026-07-03-foo",
-	}, time.Unix(500, 0)); err != nil {
+	}, 1, time.Unix(500, 0)); err != nil {
 		t.Fatalf("register epic: %v", err)
 	}
 

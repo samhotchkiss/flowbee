@@ -188,6 +188,40 @@ func SendGoalCmd(box, tmuxName, text string) string {
 	return remoteWrap(box, "tmux send-keys -t "+shQuote(exactTarget(tmuxName))+" "+shQuote(text)+" Enter")
 }
 
+// WorktreeAddCmd creates a per-epic git worktree at `worktree`, checked out DETACHED at
+// origin/<branch>, sharing the base checkout's .git object store — the isolation that lets
+// two epics coexist on one box without a second full clone. It first `git -C <base>
+// fetch`es origin/<branch> so the worktree starts from a current base (a reused base may be
+// stale), mkdir -p's the worktree's PARENT (the <home>/dev/.flowbee-wt/<repo>/ tree may not
+// exist yet), then adds the worktree DETACHED so the epic runner can `git checkout -b
+// epic/<slug>` inside it — two worktrees never conflict on a branch name, and a detached
+// HEAD lets the new branch be cut cleanly. A failure is launch-BLOCKING by contract (the
+// caller refuses the launch and rolls back) — we NEVER fall back to the shared base tree,
+// which is exactly the cross-epic tree corruption the per-epic worktree exists to prevent.
+//
+// TRUST BOUNDARY: base/worktree are control-plane-derived literal paths and branch is the
+// repo registry's default_branch (operator-set, trusted) — but every one is shQuote'd like
+// every other argument here, and the origin/<branch> checkout target is built as
+// shQuote("origin/"+branch) so a branch with shell metacharacters can never break out of
+// its single argument (mirrors RepoRefreshCmd / SendGoalCmd).
+func WorktreeAddCmd(box, base, worktree, branch string) string {
+	return remoteWrap(box, "git -C "+shQuote(base)+" fetch --quiet origin "+shQuote(branch)+
+		" && mkdir -p -- "+shQuote(parentDirUnix(worktree))+
+		" && git -C "+shQuote(base)+" worktree add --detach "+shQuote(worktree)+" "+shQuote("origin/"+branch))
+}
+
+// WorktreeRemoveCmd tears a per-epic worktree back down — `git -C <base> worktree remove
+// --force <worktree>`, run against the base checkout that owns it. `--force` removes the
+// worktree even with a dirty/locked tree (a half-launched or abandoned epic's tree is
+// expendable — the epic's real work, if any, is already on its pushed branch). Used on the
+// launch-failure ROLLBACK path (alongside DeleteEpicRun) and on `flowbee epic abandon`, so
+// a retry of the same slug isn't blocked by a leftover worktree at the same path.
+// Best-effort by contract at the call site (a box that's unreachable, or a worktree git
+// never created, must not fail the rollback/abandon).
+func WorktreeRemoveCmd(box, base, worktree string) string {
+	return remoteWrap(box, "git -C "+shQuote(base)+" worktree remove --force "+shQuote(worktree))
+}
+
 // parentDirUnix returns the parent directory of a UNIX-style (forward-slash) path,
 // without relying on path/filepath (which is OS-path-separator-aware and would be
 // wrong when this control plane runs on a different OS than the remote box). A

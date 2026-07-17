@@ -273,7 +273,7 @@ func TestIngestEpicStatuses(t *testing.T) {
 	if err := st.AddEpicRun(ctx, store.EpicRun{
 		ID: "2026-07-03-frob", Repo: "default", FilePath: "epics/2026-07-03-frob.md",
 		Branch: "epic/2026-07-03-frob", TmuxName: "epic-2026-07-03-frob",
-	}, now); err != nil {
+	}, 1, now); err != nil {
 		t.Fatalf("add epic run: %v", err)
 	}
 	if err := st.MarkEpicLaunched(ctx, "2026-07-03-frob", now); err != nil {
@@ -285,7 +285,7 @@ func TestIngestEpicStatuses(t *testing.T) {
 	if err := st.AddEpicRun(ctx, store.EpicRun{
 		ID: "2026-07-03-ghost", Repo: "no-such-repo", FilePath: "epics/2026-07-03-ghost.md",
 		Branch: "epic/2026-07-03-ghost", TmuxName: "epic-2026-07-03-ghost",
-	}, now); err != nil {
+	}, 1, now); err != nil {
 		t.Fatalf("add ghost epic run: %v", err)
 	}
 	if err := st.MarkEpicLaunched(ctx, "2026-07-03-ghost", now); err != nil {
@@ -355,7 +355,7 @@ func TestIngestEpicStatuses_MissingBranchIsNotAnError(t *testing.T) {
 	}
 	if err := st.AddEpicRun(ctx, store.EpicRun{
 		ID: "e1", Repo: "default", FilePath: "epics/e1.md", Branch: "epic/e1", TmuxName: "epic-e1",
-	}, now); err != nil {
+	}, 1, now); err != nil {
 		t.Fatalf("add epic run: %v", err)
 	}
 	if err := st.MarkEpicLaunched(ctx, "e1", now); err != nil {

@@ -30,7 +30,7 @@ func TestDigestETag304(t *testing.T) {
 	defer done()
 	ctx := context.Background()
 	now := time.Now()
-	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "e1", Repo: "r", TmuxName: "epic-e1", Agent: "claude"}, now); err != nil {
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "e1", Repo: "r", TmuxName: "epic-e1", Agent: "claude"}, 1, now); err != nil {
 		t.Fatalf("add epic: %v", err)
 	}
 
@@ -73,7 +73,7 @@ func TestDigestWindowsVerbatim(t *testing.T) {
 	}, now); err != nil {
 		t.Fatalf("fold account: %v", err)
 	}
-	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "e1", Repo: "r", TmuxName: "epic-e1", Agent: "claude"}, now); err != nil {
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "e1", Repo: "r", TmuxName: "epic-e1", Agent: "claude"}, 1, now); err != nil {
 		t.Fatalf("add epic: %v", err)
 	}
 	if err := st.SetEpicSeatBinding(ctx, "e1", "acctW", "seat1", "claude", now); err != nil {
@@ -124,7 +124,7 @@ func TestSummaryETag304(t *testing.T) {
 	defer done()
 	ctx := context.Background()
 	now := time.Now()
-	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "e1", Repo: "r", TmuxName: "epic-e1", Agent: "claude"}, now); err != nil {
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "e1", Repo: "r", TmuxName: "epic-e1", Agent: "claude"}, 1, now); err != nil {
 		t.Fatalf("add epic: %v", err)
 	}
 	resp, err := http.Get(url + "/v1/summary")
@@ -157,7 +157,7 @@ func TestOneEpicDigestUntrustedTail(t *testing.T) {
 	st, url, done := newMasterTestServer(t)
 	defer done()
 	ctx := context.Background()
-	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "e1", Repo: "r", TmuxName: "epic-e1", Agent: "claude"}, time.Now()); err != nil {
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "e1", Repo: "r", TmuxName: "epic-e1", Agent: "claude"}, 1, time.Now()); err != nil {
 		t.Fatalf("add epic: %v", err)
 	}
 	// no tail requested: just the epic digest.
