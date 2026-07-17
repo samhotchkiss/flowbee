@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -1584,9 +1585,20 @@ func (s *Server) injectEpicCriteria(ctx context.Context, repo, baseSHA, headSHA 
 	}
 	specForCriteria := specHead
 	if baseSHA != "" {
-		if specPinned, _, perr := s.store.EpicContractAtRef(mirror, e, baseSHA); perr == nil {
-			specForCriteria = specPinned
+		specPinned, _, perr := s.store.EpicContractAtRef(mirror, e, baseSHA)
+		if perr != nil {
+			// A base read that FAILS must NOT fall back to the head-authored contract: a
+			// reviewer shown a spec a lying agent could have shrunk/renumbered at head is
+			// worse than one shown NO epic section at all (writeEpicCriteria is a complete
+			// no-op when EpicCriteria is empty). The merge gate re-verifies against the
+			// launch-pinned contract independently and fails CLOSED regardless, so omitting
+			// the brief's epic section can never wrongly ALLOW a self-merge — it only drops
+			// an advisory section back to an ordinary review. Log and skip.
+			slog.Warn("epic criteria: pinned-base contract read failed; omitting epic section from review brief",
+				"repo", repo, "epic", e.ID, "base", baseSHA, "err", perr)
+			return
 		}
+		specForCriteria = specPinned
 	}
 	lc.EpicCriteria = epicspec.RenderCriteria(specForCriteria)
 	lc.EpicChecklist = epicspec.RenderChecklist(sbHead)
