@@ -107,6 +107,22 @@ const (
 	// ci_green@sha fact it produced is honored by the merge gate exactly like
 	// reconciled GitHub-Actions CI. Audit-only on the build job (no projection move).
 	KindTestCIRecorded EventKind = "test_ci_recorded"
+
+	// Epic-lane Phase 5 (plan §1, §9-P5) attention-queue + master-registry audit
+	// kinds. These events are appended to job_events keyed on the EPIC id (epic-scoped
+	// items), the SUPERVISOR label (registration), or the ATTENTION item id (item-scoped
+	// events with no epic, e.g. master_absent) — never on a `jobs` row. Fold ignores
+	// them (no case below), by design: the attention_items / supervisors tables are the
+	// rich source of truth, and these rows are an ordered audit trail the operator drawer
+	// reads back per epic (plan §1.5 "the drawer's intervention history reads the ledger").
+	// The event's LeaseEpoch carries the item's item_epoch (or the supervisor epoch) — the
+	// fence in force when it was emitted — matching the ledger's fencing convention.
+	KindAttentionOpened      EventKind = "attention_opened"      // a typed condition became an active item (or was reopened)
+	KindAttentionLeased      EventKind = "attention_leased"      // a master leased an open item (item_epoch++)
+	KindAttentionResolved    EventKind = "attention_resolved"    // an item reached resolved (acked|dismissed|cleared)
+	KindAttentionEscalated   EventKind = "attention_escalated"   // an item routed to the operator (human takeover)
+	KindSupervisorRegistered EventKind = "supervisor_registered" // a master (re-)registered; epoch bumped, prior leases orphaned
+	KindEpicIntervention     EventKind = "epic_intervention"     // a master-authored steer's delivery verdict (strong|weak|failed)
 )
 
 // Event is one appended ledger row. Payload holds kind-specific RESOLVED facts as
