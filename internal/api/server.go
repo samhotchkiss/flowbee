@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1463,7 +1462,7 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 			headSHA = f.HeadSHA
 		}
 		if role == job.RoleCodeReviewer {
-			s.injectEpicCriteria(ctx, j.Repo, headSHA, grant.Context)
+			s.injectEpicCriteria(ctx, j.Repo, j.BaseSHA, headSHA, grant.Context)
 		}
 	}
 	// Repo provisioning hints (§7.4): only for build jobs that carry a
@@ -1487,32 +1486,22 @@ func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, 
 }
 
 // epicMirrorPathFor derives the per-repo control-plane mirror path from the server's
-// configured base mirror (s.mirrorPath), replicating cmd/flowbee/serve.go's UNEXPORTED
-// controlMirrorFor EXACTLY (sibling <dir>/<id>.git for a non-default repo id): api
-// sits BELOW cmd/flowbee in the import graph (cmd/flowbee imports internal/api, never
-// the reverse), so it cannot call that helper directly — this small, deliberately
-// duplicated derivation is the same trade every other per-repo mirror consumer in this
-// codebase already makes (each layer derives a repo's mirror path from the one shared
-// FLOWBEE_MIRROR_PATH-rooted convention independently) rather than threading a new
-// cross-package callback for a single read-only, best-effort lookup. Empty when no
+// configured base mirror (s.mirrorPath). It delegates to the shared
+// gitops.RepoMirrorPath so it CANNOT drift from cmd/flowbee/serve.go's controlMirrorFor
+// (which uses the same helper) — previously this was a hand-duplicated copy of that
+// derivation in two packages that could silently disagree (review m5). Empty when no
 // mirror is configured at all (base == "").
 func epicMirrorPathFor(base, repoID string) string {
-	if base == "" {
-		return ""
-	}
-	if repoID == "" || repoID == "default" {
-		return base
-	}
-	return filepath.Join(filepath.Dir(base), repoID+".git")
+	return gitops.RepoMirrorPath(base, repoID)
 }
 
 // injectEpicCriteria is the epic-lane Phase 3 criteria-driven reviewer brief (task
 // brief point 3): for a code_reviewer lease, best-effort detect whether the job is
 // bound to an epic PR (store.EpicForHeadSHA, SHA-tip match against repo's registered
 // epics — see that function's doc for why a SHA, not a branch name) and, if so, read
-// the epic's contract AS OF headSHA (store.EpicContractAtHead — the SAME mirror read
-// project.go's merge-time epicDenyReason performs, so the gate and what the reviewer
-// reads always agree) and render it onto ctx.EpicCriteria/EpicChecklist
+// the epic's contract (store.EpicContractAtRef — the criteria from the launch-pinned
+// base like project.go's merge-time epicDenyReason, the claimed status from head) and
+// render it onto ctx.EpicCriteria/EpicChecklist
 // (renderReviewBrief embeds these, respecting its own size cap).
 //
 // Entirely best-effort and silent on any failure (no mirror configured, repo has no
@@ -1523,7 +1512,7 @@ func epicMirrorPathFor(base, repoID string) string {
 // reviews the diff on its own merits; nothing here can wrongly ALLOW an unmerited
 // self-merge, since epicDenyReason re-verifies independently at merge time regardless
 // of what the reviewer saw.
-func (s *Server) injectEpicCriteria(ctx context.Context, repo, headSHA string, lc *LeaseContext) {
+func (s *Server) injectEpicCriteria(ctx context.Context, repo, baseSHA, headSHA string, lc *LeaseContext) {
 	if lc == nil || headSHA == "" {
 		return
 	}
@@ -1540,12 +1529,24 @@ func (s *Server) injectEpicCriteria(ctx context.Context, repo, headSHA string, l
 	if err != nil || !ok {
 		return
 	}
-	spec, sb, err := s.store.EpicContractAtHead(mirror, e, headSHA)
+	// the CLAIMED ## Status is read from head (that is what the author asserts); the
+	// CRITERIA (Goal/Constraints/Steps) come from the LAUNCH-PINNED contract at the PR
+	// base (review M1 — so the reviewer sees the real, frozen contract, not a head that
+	// a lying agent could have shrunk). Best-effort: fall back to the head spec for the
+	// criteria if the base read fails — the merge gate re-verifies against the pinned
+	// contract independently, so a degraded brief can never wrongly ALLOW a self-merge.
+	specHead, sbHead, err := s.store.EpicContractAtRef(mirror, e, headSHA)
 	if err != nil {
 		return
 	}
-	lc.EpicCriteria = epicspec.RenderCriteria(spec)
-	lc.EpicChecklist = epicspec.RenderChecklist(sb)
+	specForCriteria := specHead
+	if baseSHA != "" {
+		if specPinned, _, perr := s.store.EpicContractAtRef(mirror, e, baseSHA); perr == nil {
+			specForCriteria = specPinned
+		}
+	}
+	lc.EpicCriteria = epicspec.RenderCriteria(specForCriteria)
+	lc.EpicChecklist = epicspec.RenderChecklist(sbHead)
 }
 
 // workerRepoURL builds the per-job clone/push URL the lease ships to a worker. SSH

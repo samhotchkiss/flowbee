@@ -67,6 +67,29 @@ func TestCheckEvidenceEmptyEvidence(t *testing.T) {
 	}
 }
 
+// TestCheckEvidencePlaceholderEvidenceRejected (review m2): a checked box whose
+// evidence is a bare placeholder ('-', 'none', 'n/a', whitespace) is NOT real
+// evidence and must fail exactly like an empty string — otherwise an agent could
+// satisfy the gate with "(evidence: -)".
+func TestCheckEvidencePlaceholderEvidenceRejected(t *testing.T) {
+	for _, placeholder := range []string{"-", "none", "N/A", "  ", "nil"} {
+		sb := StatusBlock{
+			State: "done",
+			Checklist: []ChecklistItem{
+				{Step: 1, Checked: true, Evidence: "ran the test"},
+				{Step: 2, Checked: true, Evidence: placeholder},
+			},
+		}
+		got := CheckEvidence(evidenceSpec(), sb)
+		if got.Clear {
+			t.Fatalf("evidence %q must NOT count as real evidence", placeholder)
+		}
+		if !containsSubstring(got.Failures, "step 2") || !containsSubstring(got.Failures, "no evidence") {
+			t.Fatalf("failures should name step 2's placeholder evidence %q: %v", placeholder, got.Failures)
+		}
+	}
+}
+
 func TestCheckEvidenceMissingStepFromChecklist(t *testing.T) {
 	sb := StatusBlock{
 		State: "done",

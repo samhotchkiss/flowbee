@@ -15,8 +15,9 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
 
-// TestEpicMirrorPathFor mirrors cmd/flowbee/serve.go's controlMirrorFor derivation
-// (epicMirrorPathFor's doc explains why it's duplicated here rather than imported).
+// TestEpicMirrorPathFor pins epicMirrorPathFor, which now delegates to the shared
+// gitops.RepoMirrorPath (review m5) — the same helper cmd/flowbee/serve.go's
+// controlMirrorFor uses, so the two can no longer drift.
 func TestEpicMirrorPathFor(t *testing.T) {
 	if got := epicMirrorPathFor("", "russ"); got != "" {
 		t.Fatalf("no base mirror configured -> empty, got %q", got)
@@ -112,7 +113,7 @@ func TestInjectEpicCriteriaPopulatesLeaseContext(t *testing.T) {
 	// non-F9 (single managed repo) deployment.
 	srv := &Server{store: st, mirrorPath: mirrorPath, clock: clock.Real{}}
 	lc := &LeaseContext{}
-	srv.injectEpicCriteria(context.Background(), "", headSHA, lc)
+	srv.injectEpicCriteria(context.Background(), "", "", headSHA, lc)
 
 	if lc.EpicCriteria == "" {
 		t.Fatal("EpicCriteria should be populated for a job bound to a registered epic PR")
@@ -146,7 +147,7 @@ func TestInjectEpicCriteriaNonEpicPRNoOp(t *testing.T) {
 
 	srv := &Server{store: st, mirrorPath: mirrorPath, clock: clock.Real{}}
 	lc := &LeaseContext{}
-	srv.injectEpicCriteria(context.Background(), "", "some-ordinary-pr-head-sha", lc)
+	srv.injectEpicCriteria(context.Background(), "", "", "some-ordinary-pr-head-sha", lc)
 
 	if lc.EpicCriteria != "" || lc.EpicChecklist != "" {
 		t.Fatalf("an ordinary PR must leave both epic fields empty, got EpicCriteria=%q EpicChecklist=%q", lc.EpicCriteria, lc.EpicChecklist)
@@ -160,7 +161,7 @@ func TestInjectEpicCriteriaNoMirrorConfiguredNoOp(t *testing.T) {
 	st := testutil.NewStore(t)
 	srv := &Server{store: st, mirrorPath: "", clock: clock.Real{}}
 	lc := &LeaseContext{}
-	srv.injectEpicCriteria(context.Background(), "", "any-head-sha", lc)
+	srv.injectEpicCriteria(context.Background(), "", "", "any-head-sha", lc)
 	if lc.EpicCriteria != "" || lc.EpicChecklist != "" {
 		t.Fatal("no mirror configured must leave both epic fields empty")
 	}

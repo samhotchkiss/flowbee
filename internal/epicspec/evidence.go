@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // EvidenceResult is the epic-lane Phase 3 CONTRACT verdict: whether an epic PR's own
@@ -73,7 +74,11 @@ func CheckEvidence(spec Spec, sb StatusBlock) EvidenceResult {
 			failures = append(failures, fmt.Sprintf("step %d (%s): missing from the ## Status checklist", step.N, truncateForReason(step.Text)))
 		case !item.Checked:
 			failures = append(failures, fmt.Sprintf("step %d (%s): unchecked", step.N, truncateForReason(step.Text)))
-		case strings.TrimSpace(item.Evidence) == "":
+		case isEmptyEvidence(item.Evidence):
+			// a checked box whose evidence is empty OR a bare placeholder ('-', 'none',
+			// 'n/a', whitespace) is "claimed but unverifiable" — the same leniency tokens
+			// isEmptyPlaceholder rejects for Blockers must not COUNT AS evidence here, or an
+			// agent could satisfy the gate by writing "(evidence: -)" (review m2).
 			failures = append(failures, fmt.Sprintf("step %d (%s): checked but no evidence", step.N, truncateForReason(step.Text)))
 		}
 	}
@@ -96,6 +101,15 @@ func isEmptyPlaceholder(s string) bool {
 	return false
 }
 
+// isEmptyEvidence reports whether a checklist item's evidence string is effectively
+// absent: empty/whitespace, or a conventional "nothing here" placeholder. A bare '-'
+// or 'none' is NOT real evidence (review m2) — it must fail the evidence gate exactly
+// as an empty string does, so a checked box always has to carry a substantive claim.
+func isEmptyEvidence(ev string) bool {
+	ev = strings.TrimSpace(ev)
+	return ev == "" || isEmptyPlaceholder(ev)
+}
+
 // truncateForReason bounds a step's TEXT when it is embedded into a merge_handoff
 // reason string — the reason is user-facing (an operator's attention queue, §9.2a's
 // existing DenylistHits/StaticFailures precedent) and a step's free-text description
@@ -107,7 +121,14 @@ func truncateForReason(s string) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max-1] + "…"
+	// back the cut up to a rune boundary so a multi-byte character in the step text
+	// (an em dash, a non-ASCII identifier) is never split into invalid UTF-8 in the
+	// reason string (review n1 — same posture as internal/worker's truncateRuneSafe).
+	cut := max - 1
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // CheckScope is the SCOPE-HONESTY check (task brief point 2): every file the PR

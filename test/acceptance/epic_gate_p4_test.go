@@ -152,29 +152,39 @@ func merged(fake *gh.Fake) bool {
 	return false
 }
 
-// TestEpicGateP4_ClaimedButUndiffedStepRoutesToHandoff is the Phase-4 acceptance:
-// an epic PR whose ## Status checks Step 2 [x] but backs it with NOTHING (no
-// evidence, no matching change in the diff) is DENIED autonomous merge and routed
-// to merge_handoff — even though State is done, blockers are empty, and the diff is
-// in scope. The unbacked claim is the sole reason for the handoff.
-func TestEpicGateP4_ClaimedButUndiffedStepRoutesToHandoff(t *testing.T) {
+const epicP4SpecPath = "epics/2026-07-03-foo.md"
+
+// epicP4FilesBaseHead serves the spec at BOTH the launch-pinned base ("base-sha", what
+// seedMergingEpicJob authorizes) and the PR head. Review M1: the gate reads the Goal/Steps
+// contract from the PINNED base and only the claimed ## Status from head. The base carries
+// the standard (unedited) ## Steps; its own status is irrelevant.
+func epicP4FilesBaseHead(head string) map[string]map[string]string {
+	return map[string]map[string]string{
+		"base-sha":      {epicP4SpecPath: epicSpecFile("building", "none", "")},
+		"epic-head-sha": {epicP4SpecPath: head},
+	}
+}
+
+// TestEpicGateP4_ClaimedStepWithoutEvidenceRoutesToHandoff is the Phase-4 acceptance:
+// an epic PR whose ## Status checks Step 2 [x] but backs it with NO EVIDENCE is DENIED
+// autonomous merge and routed to merge_handoff — even though State is done, blockers are
+// empty, and the diff is in scope. The deterministic gate fires on the empty-evidence
+// prong (a checked box with no substantive evidence string); per-step diff-correspondence
+// ("this checked step has a matching change in the diff") is NOT enforced here — that is
+// the cross-family reviewer's job (brief §15.8) and Phase 8's claim_exceeds_commits.
+func TestEpicGateP4_ClaimedStepWithoutEvidenceRoutesToHandoff(t *testing.T) {
 	st, fake, sender, _ := newEpicGateEnv(t)
 	ctx := context.Background()
 
 	registerEpicRun(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
-	// Step 1 is genuinely evidenced; Step 2 is CHECKED but has no evidence and no
-	// corresponding change — the "claimed but undiffed" lie the gate exists to catch.
+	// Step 1 is genuinely evidenced; Step 2 is CHECKED but carries no evidence.
 	checklist := "- [x] Step 1 — first step (evidence: go test passed)\n" +
 		"- [x] Step 2 — second step"
 	hist := &epicGateHistory{
 		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
-		// the diff touches only Step 1's file (+ the epic's own status file, implicitly
-		// in scope per F1) — Step 2 has NO backing change anywhere in it.
 		diffOut: epicDiffAdding("app/foo/a.go", "// step 1 work") +
 			epicDiffAdding("epics/2026-07-03-foo.md", "- [x] Step 2 — second step"),
-		files: map[string]map[string]string{
-			"epic-head-sha": {"epics/2026-07-03-foo.md": epicSpecFile("done", "none", checklist)},
-		},
+		files: epicP4FilesBaseHead(epicSpecFile("done", "none", checklist)),
 	}
 	sender.WithHistory(hist, "main")
 	seedMergingEpicJob(t, st, "j", "russ", "epic-head-sha")
@@ -184,18 +194,60 @@ func TestEpicGateP4_ClaimedButUndiffedStepRoutesToHandoff(t *testing.T) {
 		t.Fatalf("drain: %v", err)
 	}
 	if merged(fake) {
-		t.Fatal("an epic PR claiming a step done with no evidence/change must NOT self-merge")
+		t.Fatal("an epic PR claiming a step done with no evidence must NOT self-merge")
 	}
 	j, _ := st.GetJob(ctx, "j")
 	if j.State != job.StateMergeHandoff {
-		t.Fatalf("state=%s, want merge_handoff (unbacked step claim)", j.State)
+		t.Fatalf("state=%s, want merge_handoff (unevidenced step claim)", j.State)
+	}
+}
+
+// TestEpicGateP4_HeadRewritesScopeAndStepsDenied is the review-M1 pin: an epic PR that
+// EDITS ITS OWN CONTRACT at head to self-certify — widening scope: to '**' so an
+// out-of-bounds file "passes", and dropping a ## Steps entry so a smaller checklist looks
+// complete — is DENIED. The gate judges scope against the launch-pinned e.Scope (not the
+// head frontmatter) and Steps against the pinned base (not head), so both edits are
+// caught: the out-of-scope file trips CheckScope and the shrunk head Steps trip the
+// spec-immutability breach. Without the M1 fix this PR would have self-merged.
+func TestEpicGateP4_HeadRewritesScopeAndStepsDenied(t *testing.T) {
+	st, fake, sender, _ := newEpicGateEnv(t)
+	ctx := context.Background()
+
+	registerEpicRun(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
+	// the lying HEAD contract: scope widened to '**', and only ONE step (renumbered) that
+	// the status marks done — so a naive head-trusting gate would pass both scope + evidence.
+	headLie := "---\ntitle: Foo\nscope:\n  - '**'\n---\n\n" +
+		"## Goal\n\nDo the thing.\n\n" +
+		"## Steps\n\n1. Only step\nValidate: go test ./...\n\n" +
+		"## Status\n\nUpdated: 2026-07-03T12:00:00Z\nCurrent: step 1/1\nState: done\n\n" +
+		"- [x] Step 1 — only step (evidence: go test passed)\n\nBlockers: none\n"
+	hist := &epicGateHistory{
+		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
+		// touches a file OUTSIDE the pinned app/foo/** scope — only the head's forged '**'
+		// would admit it.
+		diffOut: epicDiffAdding("internal/secret/backdoor.go", "// out of pinned scope") +
+			epicDiffAdding("epics/2026-07-03-foo.md", "forged status"),
+		files: epicP4FilesBaseHead(headLie),
+	}
+	sender.WithHistory(hist, "main")
+	seedMergingEpicJob(t, st, "j", "russ", "epic-head-sha")
+	setEpicLiveGreenPR(fake, 42, "base-sha", "epic-head-sha")
+
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if merged(fake) {
+		t.Fatal("an epic PR that rewrote its own scope:/Steps at head must NOT self-merge")
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateMergeHandoff {
+		t.Fatalf("state=%s, want merge_handoff (contract rewritten at head)", j.State)
 	}
 }
 
 // TestEpicGateP4_AllGreenMergesAutonomously is the negative control: the SAME
 // harness, with Step 2 properly evidenced, merges autonomously via the merge queue.
-// Together the two prove the handoff above is caused by the unbacked claim, not by
-// the epic path itself.
+// Together the tests prove the handoffs above are caused by the specific violation,
+// not by the epic path itself.
 func TestEpicGateP4_AllGreenMergesAutonomously(t *testing.T) {
 	st, fake, sender, _ := newEpicGateEnv(t)
 	ctx := context.Background()
@@ -207,9 +259,7 @@ func TestEpicGateP4_AllGreenMergesAutonomously(t *testing.T) {
 		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
 		diffOut: epicDiffAdding("app/foo/a.go", "// step 1 work") +
 			epicDiffAdding("epics/2026-07-03-foo.md", "- [x] Step 2 done"),
-		files: map[string]map[string]string{
-			"epic-head-sha": {"epics/2026-07-03-foo.md": epicSpecFile("done", "none", checklist)},
-		},
+		files: epicP4FilesBaseHead(epicSpecFile("done", "none", checklist)),
 	}
 	sender.WithHistory(hist, "main")
 	seedMergingEpicJob(t, st, "j", "russ", "epic-head-sha")

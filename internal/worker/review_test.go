@@ -164,6 +164,41 @@ func TestRenderReviewBriefInjectsEpicCriteria(t *testing.T) {
 	}
 }
 
+// TestRenderReviewBriefEpicDecisionOverridesDiffOnly (review M2): for an epic PR the
+// Decision block must be the epic-specific one — which renders LAST and explicitly
+// overrides the generic diff-only carve-outs — not the generic "do not bounce for
+// things you could not confirm without the source/tests" framing (which, landing last,
+// would silently un-supersede the RUN-THE-CODE instruction the Epic Contract carries).
+func TestRenderReviewBriefEpicDecisionOverridesDiffOnly(t *testing.T) {
+	epic := &client.LeaseContext{
+		Identity: "r", Task: "t", Diff: "d",
+		EpicCriteria:  "**Goal:**\n\nShip it.\n\n- RUN THE CODE and run targeted tests.\n",
+		EpicChecklist: "State: done\n- [x] Step 1 — x (evidence: y)\n",
+	}
+	brief := renderReviewBrief("job-1", "code_reviewer", epic)
+	if !strings.Contains(brief, "EPIC PR — this OVERRIDES") {
+		t.Fatalf("epic brief must carry the epic-specific Decision block\n%s", brief)
+	}
+	// the generic diff-only Decision carve-out must NOT be the one that lands for an epic.
+	if strings.Contains(brief, "those are not blocking") {
+		t.Fatalf("epic brief must NOT emit the generic diff-only Decision block\n%s", brief)
+	}
+	// ordering: the overriding Decision must come AFTER the Epic Contract section so a
+	// top-to-bottom read ends on "run the code", not on a diff-only framing.
+	if ci, di := strings.Index(brief, "Epic Contract"), strings.Index(brief, "EPIC PR — this OVERRIDES"); ci < 0 || di < ci {
+		t.Fatalf("the epic Decision (%d) must render after the Epic Contract section (%d)", di, ci)
+	}
+
+	// a NON-epic review keeps the generic Decision block unchanged.
+	generic := renderReviewBrief("job-1", "code_reviewer", &client.LeaseContext{Identity: "r", Task: "t", Diff: "d"})
+	if !strings.Contains(generic, "those are not blocking") {
+		t.Fatalf("a non-epic review must keep the generic Decision block\n%s", generic)
+	}
+	if strings.Contains(generic, "EPIC PR — this OVERRIDES") {
+		t.Fatalf("a non-epic review must NOT carry the epic Decision block\n%s", generic)
+	}
+}
+
 // TestRenderReviewBriefTruncatesEpicChecklistNotCriteria: when the FULL epic section
 // (fixed criteria + checklist) would blow the total brief cap, the FIXED
 // Goal/Constraints/Steps criteria stays intact and only the CHECKLIST is truncated,

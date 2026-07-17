@@ -552,11 +552,30 @@ func renderReviewBrief(jobID, role string, c *client.LeaseContext) string {
 		} else {
 			b.WriteString("The change to review is the unified diff at $FLOWBEE_DIFF_FILE (.flowbee/diff.patch).\n\n")
 		}
-		b.WriteString("**Decision:** `approved` if the diff is a correct, safe implementation of the task with no " +
-			"blocking defect you can identify FROM THE DIFF. Use `changes_requested` ONLY for a CONCRETE blocking " +
-			"problem visible in the diff — a real bug, a security issue, a missing acceptance criterion, or a clearly " +
-			"wrong approach — and name it specifically in notes. Do NOT bounce for style nits, speculative concerns, " +
-			"or things you simply could not confirm without the source/tests; those are not blocking.\n\n")
+		// Decision framing. For an EPIC PR the generic diff-only carve-outs below are the
+		// WRONG posture (review M2): the epic lane's trust model requires executing the
+		// code, and this Decision block renders LAST, so a diff-only framing here would
+		// silently un-supersede the RUN-THE-CODE instruction the Epic Contract section
+		// wrote earlier. Emit an epic-specific Decision that OVERRIDES the generic one when
+		// epic criteria are present (until Phase 8's verify_evidence re-execution lands,
+		// this running reviewer is the only layer catching fabricated-but-structurally-
+		// complete evidence).
+		if strings.TrimSpace(c.EpicCriteria) != "" {
+			b.WriteString("**Decision (EPIC PR — this OVERRIDES the diff-only guidance above):** You MUST build the code " +
+				"and run the epic's `Validate:` commands (listed in the Epic Contract) at the PR head BEFORE deciding. " +
+				"Return `approved` ONLY if you actually built and ran them, they pass, and the diff honors the epic's " +
+				"contract. Return `changes_requested` for any failure you OBSERVED by running — a failing `Validate:`, a " +
+				"rigged or removed test, a step claimed `[x]` but not backed by the diff, or a violated Constraint — and " +
+				"name it in notes. The diff-only carve-outs above (\"do not bounce for things you could not confirm " +
+				"without the source/tests\") DO NOT apply to an epic PR: confirming by RUNNING is the job. Only if you " +
+				"genuinely cannot obtain the source to run it here, say so explicitly in notes rather than approving.\n\n")
+		} else {
+			b.WriteString("**Decision:** `approved` if the diff is a correct, safe implementation of the task with no " +
+				"blocking defect you can identify FROM THE DIFF. Use `changes_requested` ONLY for a CONCRETE blocking " +
+				"problem visible in the diff — a real bug, a security issue, a missing acceptance criterion, or a clearly " +
+				"wrong approach — and name it specifically in notes. Do NOT bounce for style nits, speculative concerns, " +
+				"or things you simply could not confirm without the source/tests; those are not blocking.\n\n")
+		}
 		b.WriteString("**Output:** write JSON to $FLOWBEE_VERDICT_FILE:\n" +
 			"```json\n{\"decision\":\"approved|changes_requested\",\"disposition\":\"self_merge\",\"notes\":\"...\"}\n```\n")
 	}

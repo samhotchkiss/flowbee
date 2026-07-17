@@ -208,9 +208,10 @@ func Check(migrationsDir, ladderPath string) ([]string, error) {
 // Reserve atomically appends the next free number for slug to the ladder file and
 // returns the reserved filename stem (NNNN_slug). It holds an exclusive advisory
 // lock (flock) on the ladder file across read→compute→write so two concurrent
-// `flowbee migration reserve` invocations serialize — the whole point of the
-// ladder (parallel builders must not both grab the same number). The write is
-// performed in place while the lock is held.
+// `flowbee migration reserve` invocations ON THE SAME HOST serialize. flock is
+// same-host only; across machines/worktrees the backstops are the git merge conflict
+// this append produces and the laddercheck CI gate (Check) — the lock just keeps the
+// common same-host case clean. The write is performed in place while the lock is held.
 func Reserve(ladderPath, slug string) (string, error) {
 	slug = strings.TrimSpace(slug)
 	if !slugRe.MatchString(slug) {

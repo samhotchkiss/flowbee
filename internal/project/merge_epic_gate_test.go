@@ -46,6 +46,21 @@ func epicFile(state, blockers, checklist string) string {
 const epicAllGreenChecklist = "- [x] Step 1 — first step (evidence: go test passed)\n" +
 	"- [x] Step 2 — second step (evidence: go test bar passed)"
 
+const epicSpecPath = "epics/2026-07-03-foo.md"
+
+// epicFilesBaseHead serves the epic spec at BOTH the launch-pinned PR base ("base-sha",
+// what epicMergingJob authorizes) and the PR head ("epic-head-sha"). Review M1: the gate
+// reads the Goal/Steps contract from the PINNED base and only the claimed ## Status from
+// head, so a test must provide both. The base carries the SAME ## Steps as head (an
+// unedited, spec-immutable contract → no drift); its own ## Status is irrelevant (only
+// its Steps/Goal are read at the base).
+func epicFilesBaseHead(head string) map[string]map[string]string {
+	return map[string]map[string]string{
+		"base-sha":      {epicSpecPath: epicFile("building", "none", "")},
+		"epic-head-sha": {epicSpecPath: head},
+	}
+}
+
 // TestEpicGateAllGreenMergesAutonomously: an epic PR whose ## Status claims State:
 // done, every step checked with evidence, and no blockers, and whose diff stays
 // inside scope: — merges autonomously exactly like an ordinary clean PR. The diff
@@ -64,7 +79,7 @@ func TestEpicGateAllGreenMergesAutonomously(t *testing.T) {
 		diffOut: diffAdding("app/foo/a.go", "// x") +
 			diffAdding("epics/2026-07-03-foo.md", "- [x] Step 2 — second step (evidence: go test bar passed)"),
 		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
-		files:   map[string]map[string]string{"epic-head-sha": {"epics/2026-07-03-foo.md": epicFile("done", "none", epicAllGreenChecklist)}},
+		files:   epicFilesBaseHead(epicFile("done", "none", epicAllGreenChecklist)),
 	}
 	sender.WithHistory(fh, "main")
 	epicMergingJob(t, st, "j", "russ", "epic-head-sha")
@@ -88,6 +103,125 @@ func TestEpicGateAllGreenMergesAutonomously(t *testing.T) {
 	}
 }
 
+// TestEpicGateExplainerInScopeMergesAutonomously (plan §15.14 / review F1 parity): an
+// all-green epic PR whose diff touches ONLY in-scope source, the epic's own spec .md,
+// AND its epics/<slug>-explainer.html merges autonomously — the explainer is implicitly
+// in scope exactly like the spec file, so maintaining the mandated human-facing explainer
+// never trips the scope gate.
+func TestEpicGateExplainerInScopeMergesAutonomously(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+
+	mustRegisterEpic(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
+	fh := &fakeHistory{
+		tip: "t",
+		diffOut: diffAdding("app/foo/a.go", "// x") +
+			diffAdding("epics/2026-07-03-foo.md", "- [x] Step 2 — second step (evidence: go test bar passed)") +
+			diffAdding("epics/2026-07-03-foo-explainer.html", "<p>as-built</p>"),
+		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
+		files:   epicFilesBaseHead(epicFile("done", "none", epicAllGreenChecklist)),
+	}
+	sender.WithHistory(fh, "main")
+	epicMergingJob(t, st, "j", "russ", "epic-head-sha")
+	setLiveGreenPR(fake, 42, "base-sha", "epic-head-sha")
+
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	sent := false
+	for _, c := range fake.Calls() {
+		if c == "EnqueueMergeQueue(42)" {
+			sent = true
+		}
+	}
+	if !sent {
+		j, _ := st.GetJob(ctx, "j")
+		t.Fatalf("an epic PR touching only in-scope + its spec + its explainer must merge; calls=%v state=%s", fake.Calls(), j.State)
+	}
+}
+
+// TestEpicGateHeadScopeWideningIgnored (review M1a): the gate matches touched paths
+// against the LAUNCH-PINNED scope (e.Scope), never the head frontmatter. A lying head
+// that widens scope: to '**' cannot admit an out-of-pinned-scope file — it still routes
+// to handoff.
+func TestEpicGateHeadScopeWideningIgnored(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+
+	mustRegisterEpic(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
+	// head widens scope to '**' (the lie); base keeps the pinned app/foo/** + 2 steps.
+	headWideScope := "---\ntitle: Foo\nscope:\n  - '**'\n---\n\n" +
+		"## Goal\n\nDo the thing.\n\n" +
+		"## Steps\n\n1. First step\nValidate: go test ./app/foo/...\n\n2. Second step\nValidate: go test ./app/foo/bar/...\n\n" +
+		"## Status\n\nUpdated: 2026-07-03T12:00:00Z\nCurrent: step 2/2\nState: done\n\n" +
+		epicAllGreenChecklist + "\n\nBlockers: none\n"
+	fh := &fakeHistory{
+		tip:     "t",
+		diffOut: diffAdding("internal/secret/x.go", "// out of pinned scope"), // only head's '**' would admit it
+		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
+		files: map[string]map[string]string{
+			"base-sha":      {epicSpecPath: epicFile("building", "none", "")},
+			"epic-head-sha": {epicSpecPath: headWideScope},
+		},
+	}
+	sender.WithHistory(fh, "main")
+	epicMergingJob(t, st, "j", "russ", "epic-head-sha")
+	setLiveGreenPR(fake, 42, "base-sha", "epic-head-sha")
+
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	for _, c := range fake.Calls() {
+		if c == "EnqueueMergeQueue(42)" {
+			t.Fatal("widening scope: to '**' at head must NOT let an out-of-pinned-scope file self-merge")
+		}
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateMergeHandoff {
+		t.Fatalf("state=%s, want merge_handoff", j.State)
+	}
+}
+
+// TestEpicGateStepsDriftAtHeadRoutesToHandoff (review M1c): a head whose ## Steps differ
+// from the launch-pinned ones is a spec-immutability breach and is denied — an agent
+// cannot shrink/renumber its own contract at head to self-certify a smaller checklist.
+func TestEpicGateStepsDriftAtHeadRoutesToHandoff(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+
+	mustRegisterEpic(t, st, "russ", "2026-07-03-foo", "epic/2026-07-03-foo", "epics/2026-07-03-foo.md")
+	// head DROPS Step 2 and marks its single remaining step done (in scope, evidenced) —
+	// only the pinned-Steps comparison catches it.
+	headOneStep := "---\ntitle: Foo\nscope:\n  - app/foo/**\n---\n\n" +
+		"## Goal\n\nDo the thing.\n\n" +
+		"## Steps\n\n1. First step\nValidate: go test ./app/foo/...\n\n" +
+		"## Status\n\nUpdated: 2026-07-03T12:00:00Z\nCurrent: step 1/1\nState: done\n\n" +
+		"- [x] Step 1 — first step (evidence: go test passed)\n\nBlockers: none\n"
+	fh := &fakeHistory{
+		tip:     "t",
+		diffOut: diffAdding("app/foo/a.go", "// x") + diffAdding("epics/2026-07-03-foo.md", "status"),
+		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
+		files: map[string]map[string]string{
+			"base-sha":      {epicSpecPath: epicFile("building", "none", "")}, // pinned: 2 steps
+			"epic-head-sha": {epicSpecPath: headOneStep},                      // head: 1 step
+		},
+	}
+	sender.WithHistory(fh, "main")
+	epicMergingJob(t, st, "j", "russ", "epic-head-sha")
+	setLiveGreenPR(fake, 42, "base-sha", "epic-head-sha")
+
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	for _, c := range fake.Calls() {
+		if c == "EnqueueMergeQueue(42)" {
+			t.Fatal("a head that dropped a pinned step must NOT self-merge")
+		}
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateMergeHandoff {
+		t.Fatalf("state=%s, want merge_handoff (spec-immutability breach)", j.State)
+	}
+}
+
 // TestEpicGateOtherEpicsFileIsStillOutOfScope (review F1): only the epic's OWN
 // spec file is implicitly in scope; a diff touching a DIFFERENT epic's file must
 // still fail the scope-honesty check and route to handoff.
@@ -101,7 +235,7 @@ func TestEpicGateOtherEpicsFileIsStillOutOfScope(t *testing.T) {
 		diffOut: diffAdding("epics/2026-07-03-foo.md", "- [x] Step 2 (evidence: ...)") +
 			diffAdding("epics/2026-07-01-other-epic.md", "tampered status"),
 		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
-		files:   map[string]map[string]string{"epic-head-sha": {"epics/2026-07-03-foo.md": epicFile("done", "none", epicAllGreenChecklist)}},
+		files:   epicFilesBaseHead(epicFile("done", "none", epicAllGreenChecklist)),
 	}
 	sender.WithHistory(fh, "main")
 	epicMergingJob(t, st, "j", "russ", "epic-head-sha")
@@ -203,7 +337,7 @@ func TestEpicGateUncheckedStepRoutesToHandoff(t *testing.T) {
 		tip:     "t",
 		diffOut: diffAdding("app/foo/a.go", "// x"),
 		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
-		files:   map[string]map[string]string{"epic-head-sha": {"epics/2026-07-03-foo.md": epicFile("done", "none", checklist)}},
+		files:   epicFilesBaseHead(epicFile("done", "none", checklist)),
 	}
 	sender.WithHistory(fh, "main")
 	epicMergingJob(t, st, "j", "russ", "epic-head-sha")
@@ -236,7 +370,7 @@ func TestEpicGateEmptyEvidenceRoutesToHandoff(t *testing.T) {
 		tip:     "t",
 		diffOut: diffAdding("app/foo/a.go", "// x"),
 		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
-		files:   map[string]map[string]string{"epic-head-sha": {"epics/2026-07-03-foo.md": epicFile("done", "none", checklist)}},
+		files:   epicFilesBaseHead(epicFile("done", "none", checklist)),
 	}
 	sender.WithHistory(fh, "main")
 	epicMergingJob(t, st, "j", "russ", "epic-head-sha")
@@ -266,7 +400,7 @@ func TestEpicGateStateNotDoneRoutesToHandoff(t *testing.T) {
 		tip:     "t",
 		diffOut: diffAdding("app/foo/a.go", "// x"),
 		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
-		files:   map[string]map[string]string{"epic-head-sha": {"epics/2026-07-03-foo.md": epicFile("building", "none", epicAllGreenChecklist)}},
+		files:   epicFilesBaseHead(epicFile("building", "none", epicAllGreenChecklist)),
 	}
 	sender.WithHistory(fh, "main")
 	epicMergingJob(t, st, "j", "russ", "epic-head-sha")
@@ -296,7 +430,7 @@ func TestEpicGateBlockersPresentRoutesToHandoff(t *testing.T) {
 		tip:     "t",
 		diffOut: diffAdding("app/foo/a.go", "// x"),
 		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
-		files:   map[string]map[string]string{"epic-head-sha": {"epics/2026-07-03-foo.md": epicFile("done", "waiting on a design call", epicAllGreenChecklist)}},
+		files:   epicFilesBaseHead(epicFile("done", "waiting on a design call", epicAllGreenChecklist)),
 	}
 	sender.WithHistory(fh, "main")
 	epicMergingJob(t, st, "j", "russ", "epic-head-sha")
@@ -326,7 +460,7 @@ func TestEpicGateOutOfScopeFileRoutesToHandoff(t *testing.T) {
 		tip:     "t",
 		diffOut: diffAdding("app/other/evil.go", "// x"), // outside app/foo/**
 		refTips: map[string]string{"refs/heads/epic/2026-07-03-foo": "epic-head-sha"},
-		files:   map[string]map[string]string{"epic-head-sha": {"epics/2026-07-03-foo.md": epicFile("done", "none", epicAllGreenChecklist)}},
+		files:   epicFilesBaseHead(epicFile("done", "none", epicAllGreenChecklist)),
 	}
 	sender.WithHistory(fh, "main")
 	epicMergingJob(t, st, "j", "russ", "epic-head-sha")

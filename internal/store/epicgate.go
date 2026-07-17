@@ -170,28 +170,41 @@ func isMissingRemoteRef(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "couldn't find remote ref")
 }
 
-// EpicContractAtHead reads epic run e's spec file AS OF headSHA — the PR's
-// reconciled head, NOT main and NOT the epics table's own status_* snapshot (which
-// ingestEpicStatuses refreshes on its own ~2-minute cadence and can lag the exact
-// commit under review) — via mirror, then parses it with epicspec's STRICT spec
-// parser (Goal/Constraints/Steps — spec-frozen per author-epic/SKILL.md, so reading
-// it at the PR head rather than at launch time changes nothing for a well-behaved
-// epic, but catches a HAND-EDITED spec honestly) plus the lenient status parser (the
-// claimed ## Status this exact commit carries). Both the evidence/scope GATE
-// (project.go's epicDenyReason) and the REVIEWER BRIEF (api/server.go's
-// leaseGrantForJob) call this, so the gate and what the reviewer reads always agree
-// on the identical bytes.
-func (s *Store) EpicContractAtHead(mirror EpicMirrorReader, e EpicRun, headSHA string) (epicspec.Spec, epicspec.StatusBlock, error) {
-	raw, found, err := mirror.ReadFileAtRef(headSHA, e.FilePath)
+// ErrEpicFileAbsent / ErrEpicSpecUnparseable let a caller of EpicContractAtRef tell
+// the three failure modes apart, which matters to epicDenyReason's fail-closed posture
+// (review M1/F2): reading the LAUNCH-PINNED contract at the PR base, a missing or
+// unparseable file is a permanent contract problem (route to a human), while a bare
+// I/O error against a reachable commit is transient (retry). errors.Is against these
+// distinguishes them without string-matching.
+var (
+	ErrEpicFileAbsent      = errors.New("epic file absent at ref")
+	ErrEpicSpecUnparseable = errors.New("epic spec unparseable")
+)
+
+// EpicContractAtRef reads epic run e's spec file AS OF ref via mirror, then parses it
+// with epicspec's STRICT spec parser (Goal/Constraints/Steps) plus the lenient status
+// parser (the claimed ## Status that commit carries). It is called at TWO refs by the
+// merge gate (review M1): the LAUNCH-PINNED ref (the PR base — main, where the spec is
+// committed pre-launch and is spec-immutable by contract) supplies the authoritative
+// Goal/Steps the evidence check judges against, and the PR HEAD (author-controlled)
+// supplies only the CLAIMED ## Status. Reading the CONTRACT from head would let a lying
+// agent shrink its own ## Steps or widen scope: at head and self-certify — so the gate
+// pins the contract at base and trusts head only for the claim.
+//
+// Errors are typed so the caller can choose retry vs. handoff: a wrapped
+// ErrEpicFileAbsent (file not present at ref) or ErrEpicSpecUnparseable (present but
+// won't parse) is a permanent condition; any other error is I/O (transient).
+func (s *Store) EpicContractAtRef(mirror EpicMirrorReader, e EpicRun, ref string) (epicspec.Spec, epicspec.StatusBlock, error) {
+	raw, found, err := mirror.ReadFileAtRef(ref, e.FilePath)
 	if err != nil {
-		return epicspec.Spec{}, epicspec.StatusBlock{}, fmt.Errorf("read %s at %s: %w", e.FilePath, headSHA, err)
+		return epicspec.Spec{}, epicspec.StatusBlock{}, fmt.Errorf("read %s at %s: %w", e.FilePath, ref, err)
 	}
 	if !found {
-		return epicspec.Spec{}, epicspec.StatusBlock{}, fmt.Errorf("%s not found at PR head %s", e.FilePath, headSHA)
+		return epicspec.Spec{}, epicspec.StatusBlock{}, fmt.Errorf("%w: %s at %s", ErrEpicFileAbsent, e.FilePath, ref)
 	}
 	spec, err := epicspec.ParseSpec(raw)
 	if err != nil {
-		return epicspec.Spec{}, epicspec.StatusBlock{}, fmt.Errorf("parse epic spec: %w", err)
+		return epicspec.Spec{}, epicspec.StatusBlock{}, fmt.Errorf("%w: %s at %s: %v", ErrEpicSpecUnparseable, e.FilePath, ref, err)
 	}
 	sb := epicspec.ParseStatus(epicspec.ParseStatusSection(raw))
 	return spec, sb, nil

@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ import (
 
 // fakeEpicMirror is a minimal in-memory store.EpicMirrorReader: branches map to a tip
 // SHA, and (ref, path) pairs map to file content — enough to exercise EpicForHeadSHA
-// and EpicContractAtHead without any real git process.
+// and EpicContractAtRef without any real git process.
 type fakeEpicMirror struct {
 	branchTips map[string]string            // branch -> tip SHA
 	files      map[string]map[string]string // ref -> path -> content
@@ -243,7 +244,7 @@ func TestEpicForRepoBranchNearMissAndRepoMismatch(t *testing.T) {
 	}
 }
 
-func TestEpicContractAtHeadReadsAndParses(t *testing.T) {
+func TestEpicContractAtRefReadsAndParses(t *testing.T) {
 	st := testutil.NewStore(t)
 
 	e := store.EpicRun{
@@ -263,9 +264,9 @@ func TestEpicContractAtHeadReadsAndParses(t *testing.T) {
 		},
 	}
 
-	spec, sb, err := st.EpicContractAtHead(mirror, e, "sha-head")
+	spec, sb, err := st.EpicContractAtRef(mirror, e, "sha-head")
 	if err != nil {
-		t.Fatalf("EpicContractAtHead: %v", err)
+		t.Fatalf("EpicContractAtRef: %v", err)
 	}
 	if spec.Title != "Foo" || len(spec.Steps) != 1 {
 		t.Fatalf("spec not parsed as expected: %+v", spec)
@@ -275,12 +276,18 @@ func TestEpicContractAtHeadReadsAndParses(t *testing.T) {
 	}
 }
 
-func TestEpicContractAtHeadNotFound(t *testing.T) {
+func TestEpicContractAtRefNotFound(t *testing.T) {
 	e := store.EpicRun{ID: "x", FilePath: "epics/x.md"}
 	mirror := &fakeEpicMirror{files: map[string]map[string]string{}}
 	st := testutil.NewStore(t)
 
-	if _, _, err := st.EpicContractAtHead(mirror, e, "sha-head"); err == nil {
-		t.Fatal("want an error when the epic file is not found at the PR head")
+	_, _, err := st.EpicContractAtRef(mirror, e, "sha-head")
+	if err == nil {
+		t.Fatal("want an error when the epic file is not found at the ref")
+	}
+	// the error must be the typed ErrEpicFileAbsent so a caller (epicDenyReason) can
+	// tell an absent pinned contract (handoff) from a transient I/O error (retry).
+	if !errors.Is(err, store.ErrEpicFileAbsent) {
+		t.Fatalf("want ErrEpicFileAbsent, got %v", err)
 	}
 }

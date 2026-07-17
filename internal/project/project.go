@@ -73,34 +73,40 @@ func contentDenyReason(actualDiff string, allowOwnSource bool) string {
 	return "content gate (actual diff) " + strings.Join(reasons, "; ")
 }
 
-// epicDenyReason is the epic-lane Phase 3 extension of the content-integrity gate
-// (task brief point 2): for an epic PR — detected via store.EpicForHeadSHA, which
-// SHA-tip-matches j.HeadSHA against every epic registered for repo (GitHub gives
-// Flowbee no fact naming a PR's head branch NAME, only its SHA — see that function's
-// doc) — judge the diff AGAINST THE EPIC'S OWN CONTRACT rather than as a generic
-// diff: every ## Steps entry must be checked with non-empty evidence, State: must be
-// exactly "done", Blockers: must be empty, AND every touched path must fall inside
-// the epic's declared scope: globs (a REAL per-file glob match, epicspec.CheckScope —
-// not the conservative launch-time overlap heuristic). The epic file is read AS OF
-// THE PR HEAD (headSHA) via the SAME mirror the generic content gate above already
-// required for this merge (s.history) — never from the epics table's own status_*
-// snapshot, which can lag the exact commit under review (task brief: "NOT from the
-// possibly-stale epics table").
+// epicDenyReason is the epic-lane extension of the content-integrity gate (task brief
+// point 2): for an epic PR — detected via store.EpicForHeadSHA, which SHA-tip-matches
+// j.HeadSHA against every epic registered for repo (GitHub gives Flowbee no fact naming
+// a PR's head branch NAME, only its SHA — see that function's doc) — judge the diff
+// AGAINST THE EPIC'S OWN LAUNCH-PINNED CONTRACT rather than as a generic diff: every
+// pinned ## Steps entry must be checked with non-empty evidence, State: must be exactly
+// "done", Blockers: must be empty, AND every touched path must fall inside the epic's
+// launch-pinned scope (a REAL per-file glob match, epicspec.CheckScope — not the
+// conservative launch-time overlap heuristic).
+//
+// review M1 — WHOSE contract: the Goal/Steps and scope: are frozen at launch and MUST
+// come from the pinned source (scope from e.Scope, stored by AddEpicRun from the
+// main-committed spec; Steps from the epic file at the PR BASE), because the PR HEAD is
+// author-controlled — a lying agent could widen scope: to '**' or delete/renumber its
+// own ## Steps at head and self-certify. Only the CLAIMED ## Status is read from head.
+// A head whose ## Steps drift from the pinned ones is a spec-immutability breach and is
+// denied explicitly. NB — detection is a coincidental-SHA match (headSHA == an epic
+// branch tip). In the astronomically-unlikely event an ORDINARY PR's head SHA collides
+// with an epic branch tip, this gate would judge it against that epic's contract and,
+// at worst, route a legitimate merge to a human — the FAIL-CLOSED direction, never a
+// wrongful merge; the safe way to be wrong.
 //
 // Returns ("", nil) — no denial — for the overwhelmingly common non-epic PR, and
 // when repo has no epics in the detection window at all (zero extra mirror I/O
 // then — see store.EpicForHeadSHA). Detection trouble fails CLOSED-to-RETRY
-// (review F2): a mirror fetch/rev-parse error against a live epic's branch returns
-// a non-nil error so the caller RETRIES the merge row, exactly matching the
-// generic content gate's posture when ITS DiffBetween fails — a transient mirror
-// outage must never let an unevidenced epic PR merge disguised as an ordinary one
-// (store.EpicForHeadSHA's doc details the two clean-skip exceptions: a branch
-// genuinely absent at origin, and a terminal epic's branch hiccup). Once an epic
-// IS identified, failing to READ or PARSE its contract at the PR head fails CLOSED
-// to HANDOFF (a deny reason, not an error): a PR that provably belongs to epic
-// <slug> but whose contract can't be verified must reach a human, not retry
-// forever against a file that will never parse.
-func (s *Sender) epicDenyReason(ctx context.Context, repo, headSHA, actualDiff string) (string, error) {
+// (review F2): a mirror fetch/rev-parse error against a live epic's branch, or a
+// bare I/O error reading the pinned contract at the (reachable) base, returns a
+// non-nil error so the caller RETRIES the merge row — a transient mirror outage must
+// never let an unevidenced epic PR merge disguised as an ordinary one. Once an epic IS
+// identified: an empty base SHA, an absent/unparseable pinned contract, or an
+// unreadable contract at head all fail CLOSED to HANDOFF (a deny reason, not an
+// error) — a PR that provably belongs to epic <slug> but can't be contract-verified
+// must reach a human, not retry forever.
+func (s *Sender) epicDenyReason(ctx context.Context, repo, baseSHA, headSHA, actualDiff string) (string, error) {
 	if s.history == nil || headSHA == "" {
 		return "", nil
 	}
@@ -111,27 +117,91 @@ func (s *Sender) epicDenyReason(ctx context.Context, repo, headSHA, actualDiff s
 	if !ok {
 		return "", nil // clean non-match across every epic in the window: an ordinary PR
 	}
-	spec, sb, err := s.store.EpicContractAtHead(s.history, e, headSHA)
-	if err != nil {
-		return fmt.Sprintf("epic %q contract unreadable at PR head: %v", e.ID, err), nil
+	// review m4: an epic-detected PR with NO base SHA cannot be contract-verified (no
+	// diff to scope-check, no launch-pinned ref to read). Fail CLOSED to a human rather
+	// than the (base-guarded) content path silently skipping the epic gate entirely.
+	if baseSHA == "" {
+		return fmt.Sprintf("epic %q PR has no base SHA — cannot verify against the launch-pinned contract", e.ID), nil
 	}
+
+	// review M1 (the load-bearing fix): judge against the LAUNCH-PINNED contract, not
+	// the author-controlled PR head. The Goal/Steps and the scope: globs are frozen at
+	// launch (spec-immutable by contract, committed to main pre-launch); reading them
+	// from head would let a lying agent widen scope: to '**' or delete/renumber its own
+	// ## Steps at head and self-certify. So: pinned Steps come from the epic file at the
+	// PR BASE, scope comes from the launch-stored e.Scope, and ONLY the claimed ##
+	// Status is read from head.
+	specPinned, _, perr := s.store.EpicContractAtRef(s.history, e, baseSHA)
+	if perr != nil {
+		// permanent contract problems at the pinned ref → handoff; a bare I/O error
+		// against the (reachable) base is transient → retry (review M1/F2).
+		if errors.Is(perr, store.ErrEpicFileAbsent) {
+			return fmt.Sprintf("epic %q: launch-pinned contract %s absent at PR base — cannot verify spec immutability", e.ID, e.FilePath), nil
+		}
+		if errors.Is(perr, store.ErrEpicSpecUnparseable) {
+			return fmt.Sprintf("epic %q: launch-pinned contract unparseable at PR base: %v", e.ID, perr), nil
+		}
+		return "", fmt.Errorf("epic %q pinned-contract read at base: %w", e.ID, perr)
+	}
+	specHead, sbHead, herr := s.store.EpicContractAtRef(s.history, e, headSHA)
+	if herr != nil {
+		// head is author-controlled; an absent/unparseable/unreadable contract at head
+		// is a claim the author must fix — route to a human, do not retry forever.
+		return fmt.Sprintf("epic %q contract unreadable at PR head: %v", e.ID, herr), nil
+	}
+
 	var reasons []string
-	if ev := epicspec.CheckEvidence(spec, sb); !ev.Clear {
+	// spec-immutability breach (review M1c): the ## Steps the agent presents at head
+	// MUST match the launch-pinned ones. A head that adds/removes/renumbers/reworries a
+	// step has edited a frozen contract — deny explicitly (and the evidence check below
+	// still judges against the PINNED steps regardless, so shrinking head's list can
+	// never shrink what must be evidenced).
+	if !stepsMatch(specPinned.Steps, specHead.Steps) {
+		reasons = append(reasons, fmt.Sprintf("epic %q spec-immutability breach: ## Steps changed since launch (%d pinned vs %d at head)",
+			e.ID, len(specPinned.Steps), len(specHead.Steps)))
+	}
+	// evidence: PINNED steps vs the CLAIMED head ## Status.
+	if ev := epicspec.CheckEvidence(specPinned, sbHead); !ev.Clear {
 		reasons = append(reasons, fmt.Sprintf("epic %q evidence incomplete: %s", e.ID, strings.Join(ev.Failures, "; ")))
 	}
-	// scope honesty (review F1): the epic's OWN spec file is IMPLICITLY in scope on
-	// top of the author's scope: globs. Every real epic PR necessarily touches it —
-	// epics/INSTRUCTIONS.md MANDATES ## Status updates on the epic's own branch, and
-	// the evidence check above REQUIRES those updates to be present at the PR head —
-	// so matching against the author globs alone would fail every all-green epic on
-	// its own mandatory status commits (a catch-22: the gate's two halves would
-	// contradict each other and the lane could never self-merge anything). Only e's
-	// OWN file is implicit; a diff touching a DIFFERENT epic's file still violates.
-	scope := append(append([]string{}, spec.Scope...), e.FilePath)
+	// scope honesty (review M1a + F1): match against the LAUNCH-PINNED scope (e.Scope,
+	// stored by AddEpicRun from the main-committed spec — never the head frontmatter a
+	// lying agent could widen to '**'), PLUS the epic's OWN spec file AND its explainer
+	// (epics/<slug>-explainer.html) implicitly. Every real epic PR touches both: the
+	// contract MANDATES ## Status updates on the epic's own .md and a maintained
+	// -explainer.html on its branch, so author-globs-only would fail every all-green epic
+	// on its own mandatory status/explainer commits (the F1 catch-22). Only e's OWN spec
+	// and explainer are implicit; a diff touching a DIFFERENT epic's file still violates.
+	scope := append(append([]string{}, e.Scope...), e.FilePath, epicExplainerPath(e.FilePath))
 	if out := epicspec.CheckScope(scope, content.TouchedPaths(actualDiff)); len(out) > 0 {
 		reasons = append(reasons, fmt.Sprintf("epic %q scope violation: %s", e.ID, strings.Join(out, ", ")))
 	}
 	return strings.Join(reasons, "; "), nil
+}
+
+// epicExplainerPath derives an epic's human-facing explainer path from its spec path:
+// epics/<slug>.md -> epics/<slug>-explainer.html (contract §Explainer / plan §15.14). It
+// is implicitly in scope alongside the spec so maintaining it never trips the gate.
+func epicExplainerPath(specPath string) string {
+	return strings.TrimSuffix(specPath, ".md") + "-explainer.html"
+}
+
+// stepsMatch reports whether two ## Steps lists are the same frozen contract: same
+// count, and each step's number/text/validate equal after trimming (so a pure
+// reformatting is tolerated, but any added/removed/renumbered/reworded step — the
+// evidence-shrinking edit the immutability rule exists to catch — is not).
+func stepsMatch(pinned, head []epicspec.Step) bool {
+	if len(pinned) != len(head) {
+		return false
+	}
+	for i := range pinned {
+		if pinned[i].N != head[i].N ||
+			strings.TrimSpace(pinned[i].Text) != strings.TrimSpace(head[i].Text) ||
+			strings.TrimSpace(pinned[i].Validate) != strings.TrimSpace(head[i].Validate) {
+			return false
+		}
+	}
+	return true
 }
 
 type liveMergeCIResult struct {
@@ -799,12 +869,14 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			return "", errStaleMergeAuthorization
 		}
 		expectedHead = row.HeadSHA
+		var actualDiff string
 		if j.BaseSHA != "" {
 			br := store.IssueBranch(s.resolveIssueNum(ctx, j), row.JobID)
 			if ferr := s.history.FetchBranch(br); ferr != nil {
 				return "", fmt.Errorf("verify autonomous merge: fetch %s: %w", br, ferr)
 			}
-			actualDiff, derr := s.history.DiffBetween(j.BaseSHA, j.HeadSHA)
+			var derr error
+			actualDiff, derr = s.history.DiffBetween(j.BaseSHA, j.HeadSHA)
 			if derr != nil {
 				// An UNREACHABLE revision is permanent, not transient: Flowbee self-merged by
 				// promoting an epoch commit, but GitHub SQUASH-merged the PR and discarded that
@@ -833,26 +905,28 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 				}
 				return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
 			}
-			// epic-lane Phase 3 (task brief point 2): an epic PR (branch epic/<slug>,
-			// auto-adopted by Phase 0) is judged against the EPIC'S OWN CONTRACT, not as
-			// a generic diff — see epicDenyReason. ("", nil) for the overwhelmingly
-			// common non-epic PR; a detection ERROR (transient mirror trouble against a
-			// live epic's branch) RETRIES the merge row — never a blind merge of a
-			// possibly-unevidenced epic PR (review F2, same posture as the DiffBetween
-			// error path above).
-			reason, eerr := s.epicDenyReason(ctx, j.Repo, j.HeadSHA, actualDiff)
-			if eerr != nil {
-				return "", fmt.Errorf("verify autonomous merge: %w", eerr)
+		}
+		// epic-lane (task brief point 2, review M1/m4): an epic PR (branch epic/<slug>,
+		// auto-adopted by Phase 0) is judged against the EPIC'S OWN LAUNCH-PINNED CONTRACT,
+		// not as a generic diff — see epicDenyReason. This runs OUTSIDE the base-guarded
+		// content block on purpose (m4): an epic-detected PR must fail CLOSED even when the
+		// content re-verify was skipped for an empty base, never silently skip its own gate.
+		// ("", nil) for the overwhelmingly common non-epic PR; a detection ERROR (transient
+		// mirror trouble against a live epic's branch, or an I/O error reading the pinned
+		// contract) RETRIES the merge row — never a blind merge of a possibly-unevidenced
+		// epic PR (review F2/M1).
+		reason, eerr := s.epicDenyReason(ctx, j.Repo, j.BaseSHA, j.HeadSHA, actualDiff)
+		if eerr != nil {
+			return "", fmt.Errorf("verify autonomous merge: %w", eerr)
+		}
+		if reason != "" {
+			if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
+				return "", fmt.Errorf("route self-merge to handoff (epic evidence): %w", rerr)
 			}
-			if reason != "" {
-				if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
-					return "", fmt.Errorf("route self-merge to handoff (epic evidence): %w", rerr)
-				}
-				if s.pub != nil {
-					s.pub.PublishReconcile(row.JobID, "project_out:self_merge_denied")
-				}
-				return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
+			if s.pub != nil {
+				s.pub.PublishReconcile(row.JobID, "project_out:self_merge_denied")
 			}
+			return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
 		}
 		ci, err := s.liveMergeCI(ctx, number, expectedHead)
 		if err != nil {

@@ -1043,14 +1043,7 @@ func rebaseStaleReviews(ctx context.Context, logger *slog.Logger, st *store.Stor
 // so a non-default repo's build NEVER resolves base_sha from another repo's tree.
 // Empty when no mirror is configured.
 func controlMirrorFor(r store.Repo) string {
-	base := os.Getenv("FLOWBEE_MIRROR_PATH")
-	if base == "" {
-		return ""
-	}
-	if r.ID == "" || r.ID == "default" {
-		return base
-	}
-	return filepath.Join(filepath.Dir(base), r.ID+".git")
+	return gitops.RepoMirrorPath(os.Getenv("FLOWBEE_MIRROR_PATH"), r.ID)
 }
 
 // repoTokenURL builds the credential-bearing clone/push URL for a repo from the
