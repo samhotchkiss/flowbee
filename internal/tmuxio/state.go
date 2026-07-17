@@ -112,8 +112,8 @@ var classifyRules = []classifyRule{
 		`Codex goal-session status bar when done: "Goal achieved (1h 52m)"`},
 	{StateIdleAtPrompt, regexp.MustCompile(`Worked for \d+`), scopeBottom,
 		`Codex "Worked for Xm" / grok "Worked for 1.7s." completion banner above an idle prompt`},
-	{StateIdleAtPrompt, regexp.MustCompile(`Grok \d`), scopeBottom,
-		`Grok idle input box's bottom-right model label: "╰… Grok 4.5 (high) · always-approve ─╯". This is grok-specific (never on a Claude/Codex pane) so it distinguishes grok's ❯-in-rounded-box idle from Claude's "│ > │" box and Codex's bare "›". A Working rule (Ctrl+c:cancel / [stop] / spinner) fires FIRST when a turn is running, since the same label is also present mid-turn`},
+	{StateIdleAtPrompt, regexp.MustCompile(`Grok \d[\d.]* \(`), scopeBottom,
+		`Grok idle input box's bottom-right model label: "╰… Grok 4.5 (high) · always-approve ─╯". The "Grok <ver> (" shape (a version then a paren) is the rendered label, not transcript prose — grok-specific (never on a Claude/Codex pane), so it distinguishes grok's ❯-in-rounded-box idle from Claude's "│ > │" box and Codex's bare "›". A Working rule (Ctrl+c:cancel / [stop] / spinner) fires FIRST when a turn is running, since the same label is also present mid-turn`},
 }
 
 // classifyBottomLines bounds the scopeBottom window: the live UI (input box,
