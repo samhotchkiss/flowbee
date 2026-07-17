@@ -415,6 +415,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/needs-input", s.needsInputJSON)
 	mux.HandleFunc("GET /v1/backlog", s.backlogJSON)
 	mux.HandleFunc("GET /v1/fleet", s.fleetJSON)
+	mux.HandleFunc("GET /v1/sessions", s.sessionsJSON)
 	// F7 board-lifecycle WRITE / intake edges (operator / user-agent / planner loop):
 	// answer a needs_design item, promote a backlog item, opt a quiescent item in, retry
 	// a needs_human job, cancel, or inject work via the spec/epic front door. These MUTATE
@@ -986,6 +987,48 @@ func (s *Server) fleetJSON(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "fleet error", http.StatusInternalServerError)
 		return
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
+// goalSessionRow is the wire shape of one goal-session registry entry on
+// GET /v1/sessions. store.GoalSession carries watchdog-internal bookkeeping
+// (pane hashes, resume counters) that stays off the wire; this row is the
+// operator-facing subset the dashboard/status surfaces already print.
+type goalSessionRow struct {
+	ID            string `json:"id"`
+	Box           string `json:"box,omitempty"` // "" = local (the control-plane box)
+	TmuxName      string `json:"tmux_name"`
+	TZ            string `json:"tz,omitempty"`
+	Repo          string `json:"repo,omitempty"`
+	Note          string `json:"note,omitempty"`
+	State         string `json:"state"` // pursuing|working|blocked|achieved|unknown|unreachable
+	StateDetail   string `json:"state_detail,omitempty"`
+	GoalElapsed   string `json:"goal_elapsed,omitempty"`
+	BlockedUntil  string `json:"blocked_until,omitempty"` // RFC3339; set when auto-resume is armed
+	Enabled       bool   `json:"enabled"`
+	LastChangeAt  string `json:"last_change_at,omitempty"`
+	LastCheckedAt string `json:"last_checked_at,omitempty"`
+}
+
+// sessionsJSON serves the goal-session registry (the epic-lane watchdog's
+// watch list) as JSON — the machine-readable `flowbee session list`. Read-only
+// dashboard posture, same as /v1/board: state is watchdog-derived and carries
+// no Domain-A write surface. Always an array, never null.
+func (s *Server) sessionsJSON(w http.ResponseWriter, r *http.Request) {
+	sessions, err := s.store.ListGoalSessions(r.Context())
+	if err != nil {
+		http.Error(w, "sessions error", http.StatusInternalServerError)
+		return
+	}
+	rows := make([]goalSessionRow, 0, len(sessions))
+	for _, g := range sessions {
+		rows = append(rows, goalSessionRow{
+			ID: g.ID, Box: g.Box, TmuxName: g.TmuxName, TZ: g.TZ,
+			Repo: g.Repo, Note: g.Note, State: g.State, StateDetail: g.StateDetail,
+			GoalElapsed: g.GoalElapsed, BlockedUntil: g.BlockedUntil, Enabled: g.Enabled,
+			LastChangeAt: g.LastChangeAt, LastCheckedAt: g.LastCheckedAt,
+		})
 	}
 	writeJSON(w, http.StatusOK, rows)
 }
