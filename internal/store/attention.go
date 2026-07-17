@@ -437,6 +437,53 @@ func (s *Store) ResolveAttention(ctx context.Context, id, resolution string, now
 	})
 }
 
+// ResolveAttentionFenced is the FENCED no-send resolve (dismiss/ack/escalate — plan §1.5
+// "Other actions") the master API's resolve path uses. It closes the TOCTOU a Go-side
+// read-then-resolve leaves open (m1): the fence check AND the write happen in ONE serialized
+// tx, rejecting unless the item is leased-by-caller with a matching item_epoch AND the
+// caller's supervisor epoch matches the live one (attention.FenceOK) — else
+// lease.ErrStaleEpoch (409 fenced), identical to BeginDelivery. So a stale incarnation can
+// never dismiss/escalate an item another master re-leased across an epoch boundary between
+// the read and the write. An "escalated" resolution ledgers attention_escalated (routed to
+// the operator sink in Phase 7); anything else ledgers attention_resolved.
+func (s *Store) ResolveAttentionFenced(ctx context.Context, id, masterID string, epoch, itemEpoch int, resolution string, now time.Time) error {
+	if resolution == "" {
+		return errors.New("resolution is required")
+	}
+	ts := now.Format(rfc3339)
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		f, err := loadFenceTx(ctx, tx, id, masterID, epoch, itemEpoch, attention.StateLeased)
+		if err != nil {
+			return err
+		}
+		if !attention.FenceOK(f) {
+			return fmt.Errorf("resolve attention %q: %w", id, lease.ErrStaleEpoch)
+		}
+		var epicID string
+		if e := tx.QueryRowContext(ctx, `SELECT epic_id FROM attention_items WHERE id = ?`, id).Scan(&epicID); e != nil {
+			return e
+		}
+		// belt-and-suspenders: the WHERE re-asserts the fence atomically with the write.
+		res, err := tx.ExecContext(ctx, `
+			UPDATE attention_items
+			   SET state = 'resolved', resolution = ?, leased_by = '', delivery_key = '',
+			       resolved_at = ?, updated_at = ?
+			 WHERE id = ? AND state = 'leased' AND leased_by = ? AND item_epoch = ?`,
+			resolution, ts, ts, id, masterID, itemEpoch)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Errorf("resolve attention %q: %w", id, lease.ErrStaleEpoch)
+		}
+		kind := ledger.KindAttentionResolved
+		if resolution == "escalated" {
+			kind = ledger.KindAttentionEscalated
+		}
+		return appendEpicLedger(ctx, tx, ledgerKeyFor(epicID, id), kind, masterID, itemEpoch, id, resolution, now)
+	})
+}
+
 // ReapExpiredLeases returns every LEASED item whose lease has expired back to open
 // (plan §1.4/§1.6) — the master died or stalled and the lease TTL passed. Returns the
 // reaped rows. Deliberately does NOT touch state=delivering rows: a crash mid-send is

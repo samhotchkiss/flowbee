@@ -127,6 +127,15 @@ type Config struct {
 	// to disable — mirrors FLOWBEE_SELF_UNBLOCK's reversible-switch convention exactly.
 	SessionWatchDisabled bool `yaml:"session_watch_disabled"`
 
+	// EpicSupervisionDisabled is the kill-switch for the consolidated epic-supervision
+	// ticker (epic-lane Phase 6b, plan §12.2): the ONE 2-minute-tick batch that classifies
+	// each epic pane, produces/auto-resolves attention items, reaps stranded launches +
+	// expired leases, recovers crash-window deliveries, runs the send-and-ack loop, reaps
+	// dead masters, and pings an idle master (plan §1/§12.3/§15.10). Default false (enabled).
+	// Set FLOWBEE_EPIC_SUPERVISION to a falsey value (0/false/off/no) to disable — mirrors
+	// FLOWBEE_SESSION_WATCH's reversible-switch convention exactly.
+	EpicSupervisionDisabled bool `yaml:"epic_supervision_disabled"`
+
 	// AdvisorEnabled turns on Rung E: the read-only, single-shot LLM advisor consulted for a
 	// job the deterministic janitor could not rescue (a stall past its mechanical unblock
 	// cap). It NOMINATES an action {PLAN,CORRECTION,REPROMPT,STOP}; the store re-authorizes.
@@ -356,6 +365,15 @@ func applyEnv(c *Config) {
 			c.SessionWatchDisabled = true
 		default:
 			c.SessionWatchDisabled = false
+		}
+	}
+	// epic-supervision kill-switch: same falsey-string convention.
+	if v := os.Getenv("FLOWBEE_EPIC_SUPERVISION"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "0", "false", "off", "no", "disable", "disabled":
+			c.EpicSupervisionDisabled = true
+		default:
+			c.EpicSupervisionDisabled = false
 		}
 	}
 	// Rung-E advisor is opt-in: any truthy value enables it.

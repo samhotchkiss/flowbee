@@ -100,6 +100,14 @@ type Server struct {
 	workerGitSSH  bool
 	// staleHB is the roster's stale-heartbeat threshold (§12.6.2).
 	staleHB time.Duration
+
+	// deliverer is the epic-lane master-resolve pane-delivery seam (plan §1.5 step 3):
+	// nil in New (a real tmuxDeliverer is built per-call), injected in tests to exercise
+	// the fenced store transitions without a real tmux. See masters.go.
+	deliverer PaneDeliverer
+	// hbIntervalS is the master heartbeat interval the register response advertises
+	// (plan §1.2). Mirrors the worker HeartbeatIntervalS; 0 => the 30s default.
+	hbIntervalS int
 	// pauseMarkerPath is the filesystem path whose EXISTENCE signals a fleet
 	// pause. When present, the lease endpoint returns no-work (204) without
 	// attempting a claim — in-flight leases/heartbeats/results are unaffected.
@@ -299,6 +307,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		authn:              cfg.Authenticator,
 		ui:                 ui,
 		pauseMarkerPath:    cfg.PauseMarkerPath,
+		hbIntervalS:        cfg.HeartbeatIntervalS,
 		reviewAccounts:     parseReviewAccounts(os.Getenv("FLOWBEE_REVIEW_ACCOUNTS")),
 		buildAccounts:      parseReviewAccounts(os.Getenv("FLOWBEE_BUILD_ACCOUNTS")),
 		resolverAccounts:   parseReviewAccounts(os.Getenv("FLOWBEE_RESOLVER_ACCOUNTS")),
@@ -353,6 +362,11 @@ type PRAdopter interface {
 // SetAdopter wires the PR-adoption backend (the multi-repo Manager). Called after
 // wireMultiRepo builds the Manager, so adopt is only live once GitHub loops exist.
 func (s *Server) SetAdopter(a PRAdopter) { s.adopter = a }
+
+// SetPaneDeliverer injects the master-resolve pane-delivery seam (plan §1.5). Production
+// leaves it nil (a real tmuxDeliverer is built per resolve); tests inject a fake so the
+// fenced delivering→awaiting_ack transitions are exercised without a live tmux.
+func (s *Server) SetPaneDeliverer(d PaneDeliverer) { s.deliverer = d }
 
 // HealthHandler serves the health listener.
 func (s *Server) HealthHandler() http.Handler {
@@ -418,6 +432,14 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/backlog", s.backlogJSON)
 	mux.HandleFunc("GET /v1/fleet", s.fleetJSON)
 	mux.HandleFunc("GET /v1/sessions", s.sessionsJSON)
+	// epic-lane read-models (Phase 6b, plan §2.1 + §15.16). These join the OPEN loopback
+	// read tier /v1/sessions uses: they expose no Domain-A write, are a PUBLIC versioned
+	// contract external consumers (the elgato Stream Deck plugin) poll, and carry ETag/304.
+	mux.HandleFunc("GET /v1/epics/digest", s.epicsDigest)
+	mux.HandleFunc("GET /v1/epics/{id}/digest", s.epicDigestOne)
+	mux.HandleFunc("GET /v1/summary", s.summary)
+	// the master's read-only attention queue view (no lease) also joins the open read tier.
+	mux.HandleFunc("GET /v1/masters/attention", s.mastersAttention)
 	// F7 board-lifecycle WRITE / intake edges (operator / user-agent / planner loop):
 	// answer a needs_design item, promote a backlog item, opt a quiescent item in, retry
 	// a needs_human job, cancel, or inject work via the spec/epic front door. These MUTATE
@@ -436,6 +458,14 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.Handle("POST /v1/specs", op(s.specCreate))
 	mux.Handle("POST /v1/epics", op(s.epicCreate))
 	mux.Handle("POST /v1/adopt", op(s.adoptPR))
+	// epic-lane master WRITE surface (Phase 6b, plan §1): register / heartbeat / lease
+	// (the poll one-call) / resolve (the fenced exactly-once-in-practice state machine).
+	// These MUTATE supervision state + type into a live pane, so they carry the worker-
+	// token posture (loopback-bypass in dev, a valid token off-loopback).
+	mux.Handle("POST /v1/masters/register", op(s.mastersRegister))
+	mux.Handle("POST /v1/masters/{id}/heartbeat", op(s.mastersHeartbeat))
+	mux.Handle("POST /v1/masters/attention/lease", op(s.mastersLease))
+	mux.Handle("POST /v1/masters/attention/{id}/resolve", op(s.mastersResolve))
 	// the board's machine-readable snapshot (HTML clients hit the web UI's "/"; a
 	// JSON client uses this stable endpoint instead of content-negotiating "/").
 	mux.HandleFunc("GET /v1/board", s.boardJSON)
