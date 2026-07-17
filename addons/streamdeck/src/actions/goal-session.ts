@@ -30,8 +30,17 @@ type View = {
 
 const logger = streamDeck.logger.createScope("GoalSession");
 
+/**
+ * The auto-slot pool: sessions that are live RIGHT NOW (local = tmux session
+ * exists; remote = watchdog says so). Set keys up once and they populate and
+ * vacate on their own as sessions start and finish — no Stream Deck app trips.
+ */
+export function runningEntries(entries: SessionEntry[]): SessionEntry[] {
+	return entries.filter((e) => e.running !== false);
+}
+
 export function resolveEntry(entries: SessionEntry[], selector: string | undefined, column: number): SessionEntry | undefined {
-	if (!selector) return entries[column];
+	if (!selector) return runningEntries(entries)[column];
 	if (selector.startsWith("tmux:")) {
 		const name = selector.slice(5);
 		return entries.find((e) => e.tmux_name === name) ?? {
@@ -120,7 +129,7 @@ export class GoalSessionAction extends SingletonAction<Settings> {
 			.sendToPropertyInspector({
 				event: "getSessions",
 				items: [
-					{ value: "", label: "Auto (by key column)" },
+					{ value: "", label: "Auto — running sessions fill keys by column" },
 					...(watched.length
 						? [{ label: "Goal sessions (watched)", children: watched.map((e) => ({ value: e.id, label: `${e.id} — ${e.state}` })) }]
 						: []),
@@ -146,7 +155,7 @@ export class GoalSessionAction extends SingletonAction<Settings> {
 		}
 		const entry = resolveEntry(data, view.settings.session, view.column);
 		if (!entry) {
-			set(noteKey("—", view.settings.session ? "gone?" : `no session #${view.column + 1}`));
+			set(noteKey("—", view.settings.session ? "gone?" : `slot ${view.column + 1} idle`));
 			flasher.unregister(view.action.id);
 			return;
 		}

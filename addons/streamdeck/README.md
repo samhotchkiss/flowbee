@@ -47,9 +47,12 @@ row 3   [master]    [ask status] [pause/resume]  [attention] [fleet]    ← cont
   work is queued with zero live workers.
 
 Keys auto-assign by **column**: five Account Usage keys dropped across row 1
-show accounts 1–5 in the server's stable order; same for Goal Session keys in
-row 2. Pin a specific account/session in the key's property inspector instead
-whenever you want a fixed assignment.
+show accounts 1–5 in the server's stable order. Goal Session keys in auto mode
+populate from **running sessions only** — local sessions verified against live
+tmux every poll, remote ones by watchdog state — so a row of blank keys fills
+itself as sessions start and vacates as they finish ("slot N idle"); you never
+open the Stream Deck app to swap sessions. Pin a specific account/session in
+the key's property inspector only when you want a fixed assignment.
 
 ## Install
 
