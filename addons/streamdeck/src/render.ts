@@ -66,43 +66,85 @@ export function accountStatusColor(status: AccountStatus): string {
 	}
 }
 
-/** Ring gauge for one account's usage level. */
+/** Fixed hue per window kind (Apple-Health style: the ring's identity IS its color). */
+export const RING_HUES = {
+	session: "#f5b93c", // honey — the 5h ring (outer)
+	weekly_all: "#60a5fa", // blue — the weekly ring (middle)
+	weekly_scoped: "#8b8ff0", // violet — the per-model ("Fable") ring (inner)
+	used: "#34d399", // legacy single-value gauge
+} as const;
+
+/** Background alarm tiers: session-or-week ≥80% → yellow, ≥95% → orange. */
+export const BG_WARN_PCT = 80;
+export const BG_HOT_PCT = 95;
+const BG_WARN = "#eab308";
+const BG_HOT = "#f97316";
+
+export type RingSpec = {
+	pct: number;
+	hue: string;
+	/** short tag naming the window ("5h", "wk", model name, "used"). */
+	tag: string;
+	/** render the fill red regardless of hue (window itself at/over its limit). */
+	alarm?: boolean;
+};
+
+/**
+ * Concentric usage rings for one account, outer → inner (session / weekly /
+ * model-scoped; providers that report fewer windows simply draw fewer rings).
+ * bgTier tints the whole key — the glance-level alarm channel.
+ */
 export function accountKey(opts: {
 	label: string;
 	family: string;
-	pct: number;
-	ceiling: number;
-	status: AccountStatus;
+	rings: RingSpec[];
+	bindingPct: number;
+	bindingTag: string;
+	bgTier: "none" | "warn" | "hot";
+	stale?: boolean;
+	gated?: boolean;
+	never?: boolean;
 }): string {
-	const { label, family, pct, ceiling, status } = opts;
-	const color = accountStatusColor(status);
-	const shown = Math.max(0, Math.min(pct, 100));
-	const r = 44;
-	const c = 2 * Math.PI * r;
-	const frac = shown / 100;
-	// ceiling tick position on the ring (same -90° rotation as the arc).
-	const ceilAngle = ((Math.min(ceiling, 100) / 100) * 360 - 90) * (Math.PI / 180);
-	const tick =
-		ceiling > 0 && ceiling <= 100
-			? `<line x1="${72 + (r - 8) * Math.cos(ceilAngle)}" y1="${62 + (r - 8) * Math.sin(ceilAngle)}" x2="${72 + (r + 8) * Math.cos(ceilAngle)}" y2="${62 + (r + 8) * Math.sin(ceilAngle)}" stroke="${COLORS.dim}" stroke-width="3"/>`
-			: "";
-	const center =
-		status === "never"
-			? `<text x="72" y="70" font-size="26" font-weight="700" fill="${COLORS.faint}" text-anchor="middle">–</text>`
-			: `<text x="72" y="72" font-size="30" font-weight="800" fill="${status === "stale" ? COLORS.faint : COLORS.text}" text-anchor="middle">${Math.round(pct)}<tspan font-size="16" font-weight="600">%</tspan></text>`;
-	const sub =
-		status === "gated"
-			? `<text x="72" y="90" font-size="12" font-weight="700" fill="${COLORS.red}" text-anchor="middle">AT LIMIT</text>`
-			: status === "stale"
-				? `<text x="72" y="90" font-size="12" fill="${COLORS.faint}" text-anchor="middle">stale</text>`
-				: "";
+	const { rings, stale } = opts;
+	const tinted = opts.bgTier !== "none" && !stale;
+	const bg = !tinted ? COLORS.bg : opts.bgTier === "hot" ? BG_HOT : BG_WARN;
+	// rings always sit on a dark puck (Apple-watch style) so the hues keep
+	// contrast; the alarm tint blazes around it. Only the bottom label flips dark.
+	const fgMain = COLORS.text;
+	const fgDim = COLORS.dim;
+	const labelColor = tinted ? "rgba(23,22,17,0.82)" : COLORS.dim;
+	const track = COLORS.panel;
+
+	const GEOM: Record<number, { radii: number[]; stroke: number }> = {
+		1: { radii: [46], stroke: 11 },
+		2: { radii: [48, 35], stroke: 10 },
+		3: { radii: [50, 39, 28], stroke: 8 },
+	};
+	const geom = GEOM[Math.min(Math.max(rings.length, 1), 3)];
+	const cy = 62;
+
+	let arcs = tinted ? `<circle cx="72" cy="${cy}" r="${geom.radii[0] + geom.stroke / 2 + 5}" fill="${COLORS.bg}"/>` : "";
+	rings.slice(0, 3).forEach((ring, i) => {
+		const r = geom.radii[i];
+		const c = 2 * Math.PI * r;
+		const frac = Math.max(0, Math.min(ring.pct, 100)) / 100;
+		const fill = ring.alarm && !stale ? COLORS.red : ring.hue;
+		arcs += `<circle cx="72" cy="${cy}" r="${r}" fill="none" stroke="${track}" stroke-width="${geom.stroke}"/>
+			<circle cx="72" cy="${cy}" r="${r}" fill="none" stroke="${stale ? COLORS.faint : fill}" stroke-width="${geom.stroke}" stroke-linecap="round"
+			  stroke-dasharray="${(frac * c).toFixed(1)} ${c.toFixed(1)}" transform="rotate(-90 72 ${cy})" opacity="${stale ? 0.4 : 1}"/>`;
+	});
+
+	const pctSize = rings.length >= 3 ? 19 : 26;
+	const center = opts.never
+		? `<text x="72" y="${cy + 7}" font-size="24" font-weight="700" fill="${fgDim}" text-anchor="middle">–</text>`
+		: `<text x="72" y="${cy + (rings.length >= 3 ? 3 : 5)}" font-size="${pctSize}" font-weight="800" fill="${stale ? fgDim : fgMain}" text-anchor="middle">${Math.round(opts.bindingPct)}<tspan font-size="${pctSize * 0.55}" font-weight="600">%</tspan></text>
+			 <text x="72" y="${cy + (rings.length >= 3 ? 15 : 20)}" font-size="10" font-weight="700" letter-spacing="0.5" fill="${opts.gated && !stale ? COLORS.red : fgDim}" text-anchor="middle">${esc(truncate(stale ? "stale" : opts.gated ? "LIMIT" : opts.bindingTag, 7).toUpperCase())}</text>`;
+
 	return svg(
-		`<circle cx="72" cy="62" r="${r}" fill="none" stroke="${COLORS.panel}" stroke-width="10"/>
-		 <circle cx="72" cy="62" r="${r}" fill="none" stroke="${color}" stroke-width="10" stroke-linecap="round"
-		   stroke-dasharray="${(frac * c).toFixed(1)} ${c.toFixed(1)}" transform="rotate(-90 72 62)" opacity="${status === "stale" ? 0.35 : 1}"/>
-		 ${tick}${center}${sub}
-		 <circle cx="26" cy="126" r="5" fill="${familyColor(family)}"/>
-		 <text x="38" y="131" font-size="15" font-weight="600" fill="${COLORS.dim}">${esc(truncate(label, 11))}</text>`,
+		`${arcs}${center}
+		 <circle cx="26" cy="126" r="5" fill="${stale ? COLORS.faint : familyColor(opts.family)}"/>
+		 <text x="38" y="131" font-size="15" font-weight="600" fill="${labelColor}">${esc(truncate(opts.label, 11))}</text>`,
+		bg,
 	);
 }
 

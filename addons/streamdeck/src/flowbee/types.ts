@@ -1,5 +1,22 @@
 /** Wire types for the Flowbee read/control API (field names match the Go json tags). */
 
+/**
+ * One real usage window, mirroring internal/acctprobe's cross-provider
+ * vocabulary: `session` = the short rolling window (Claude 5h), `weekly_all`
+ * = account-wide weekly, `weekly_scoped` = the per-model weekly sub-limit
+ * (Scope carries the model name — the "Fable limit"). An absent window was
+ * not reported by the provider (Codex currently ships no session window) —
+ * it is never synthesized as 0%.
+ */
+export type LimitWindow = {
+	kind: "session" | "weekly_all" | "weekly_scoped";
+	percent: number;
+	severity?: "normal" | "critical";
+	resets_at?: string;
+	/** model display name for weekly_scoped windows. */
+	scope?: string;
+};
+
 /** GET /v1/fleet — one per-account usage gauge. */
 export type AccountUsage = {
 	account_id: string;
@@ -11,6 +28,11 @@ export type AccountUsage = {
 	at_ceiling: boolean;
 	/** RFC3339; absent when the account has never reported. Only staleness signal (>24h = stale). */
 	reported_at?: string;
+	/**
+	 * Real per-window percentages (epic-lane Phase 6 digest / capacity strip).
+	 * Absent on today's wire — the key falls back to a single usage_pct ring.
+	 */
+	windows?: LimitWindow[];
 };
 
 /** GET /v1/sessions — one goal-session registry entry (watchdog-watched tmux session). */

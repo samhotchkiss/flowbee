@@ -12,10 +12,19 @@ row 2   [epic-a]    [epic-b]     [epic-c]        [epic-d]    [ … ]      ← Go
 row 3   [master]    [ask status] [pause/resume]  [attention] [fleet]    ← controls
 ```
 
-- **Account Usage** — ring gauge per agent account (`GET /v1/fleet`): green,
-  amber ≥75%, red at ceiling / rate-limited, dimmed when the last report is
-  older than 24h. Ceiling tick on the ring. Press → opens the fleet dashboard.
-  On a Stream Deck + dial it renders as a `$B1` bar instead.
+- **Account Usage** — Apple-Health-style concentric rings per agent account,
+  one ring per limit window the provider actually reports, outer → inner:
+  **session (5h, honey) / weekly (blue) / per-model "Fable" limit (violet)**.
+  Claude accounts draw all three; Codex draws just the weekly ring while its
+  session limit stays retired (it reappears automatically if the provider
+  brings it back). The center shows the binding limit ("83% 5H"). The key
+  **background turns yellow when session-or-week hits 80% and orange at 95%**
+  (rings sit on a dark puck so they stay readable over the tint); a window at
+  100%/critical renders red; everything dims when the last report is >24h old.
+  Real per-window data arrives with the epic-lane digest API — until then the
+  key shows a single gauge off today's `usage_pct`. Press → opens the fleet
+  dashboard. On a Stream Deck + dial it renders as a `$B1` bar of the binding
+  limit instead.
 - **Goal Session** — one goal session / epic per key (`GET /v1/sessions`, the
   watchdog registry): PURSUING / WORKING / **BLOCKED (flashes red)** / PARKED /
   DONE / UNREACHABLE, with elapsed time or the auto-resume gate ("→ 10:47") as

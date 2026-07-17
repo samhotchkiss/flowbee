@@ -14,9 +14,18 @@ import {
 import streamDeck from "@elgato/streamdeck";
 
 import { flowbee } from "../flowbee/service";
-import type { AccountUsage } from "../flowbee/types";
+import type { AccountUsage, LimitWindow } from "../flowbee/types";
 import { openUrl } from "../macos";
-import { accountKey, accountStatusColor, noteKey, type AccountStatus } from "../render";
+import {
+	BG_HOT_PCT,
+	BG_WARN_PCT,
+	RING_HUES,
+	accountKey,
+	accountStatusColor,
+	noteKey,
+	type AccountStatus,
+	type RingSpec,
+} from "../render";
 
 type Settings = {
 	/** account_id to pin; "" = auto-pick by key column. */
@@ -45,6 +54,70 @@ export function usageStatus(a: AccountUsage): AccountStatus {
 	if (a.rate_limited || a.at_ceiling) return "gated";
 	if (a.usage_pct >= 75) return "warn";
 	return "ok";
+}
+
+const KIND_ORDER: LimitWindow["kind"][] = ["session", "weekly_all", "weekly_scoped"];
+
+function windowTag(w: LimitWindow): string {
+	if (w.kind === "session") return "5h";
+	if (w.kind === "weekly_all") return "wk";
+	return w.scope || "model";
+}
+
+export type AccountRings = {
+	rings: RingSpec[];
+	bindingPct: number;
+	bindingTag: string;
+	/** what drives the background tint: max of session/weekly (user spec), not the scoped ring. */
+	bgDriverPct: number;
+};
+
+/**
+ * Rings outer → inner: session (5h) / weekly / model-scoped ("Fable"), one per
+ * window the provider actually reports — Codex draws a single weekly ring
+ * until its session limit returns. Pre-digest wire (no windows[]) falls back
+ * to one generic ring off usage_pct.
+ */
+export function accountRings(a: AccountUsage): AccountRings {
+	const windows = a.windows ?? [];
+	if (windows.length === 0) {
+		const gatedNow = a.rate_limited || a.at_ceiling;
+		return {
+			rings: [{ pct: a.usage_pct, hue: RING_HUES.used, tag: "used", alarm: gatedNow }],
+			bindingPct: a.usage_pct,
+			bindingTag: "used",
+			bgDriverPct: a.usage_pct,
+		};
+	}
+	const rings: RingSpec[] = [];
+	let binding: { pct: number; tag: string } | undefined;
+	let bgDriverPct = 0;
+	for (const kind of KIND_ORDER) {
+		const ofKind = windows.filter((w) => w.kind === kind);
+		if (ofKind.length === 0) continue;
+		const worst = ofKind.reduce((a, b) => (b.percent > a.percent ? b : a));
+		const tag = windowTag(worst);
+		rings.push({
+			pct: worst.percent,
+			hue: RING_HUES[kind],
+			tag,
+			alarm: worst.percent >= 100 || worst.severity === "critical",
+		});
+		if (!binding || worst.percent > binding.pct) binding = { pct: worst.percent, tag };
+		if (kind !== "weekly_scoped") bgDriverPct = Math.max(bgDriverPct, worst.percent);
+	}
+	return {
+		rings,
+		bindingPct: binding?.pct ?? 0,
+		bindingTag: binding?.tag ?? "used",
+		bgDriverPct,
+	};
+}
+
+export function bgTier(bgDriverPct: number): "none" | "warn" | "hot" {
+	if (bgDriverPct >= BG_HOT_PCT) return "hot";
+	if (bgDriverPct >= BG_WARN_PCT) return "warn";
+	return "none";
 }
 
 @action({ UUID: "com.samhotchkiss.flowbee.account-usage" })
@@ -146,12 +219,13 @@ export class AccountUsageAction extends SingletonAction<Settings> {
 			return;
 		}
 		const status = usageStatus(account);
+		const { rings, bindingPct, bindingTag, bgDriverPct } = accountRings(account);
 		if (view.action.isDial()) {
 			void view.action
 				.setFeedback({
 					title: shortLabel(account.account_id),
-					value: status === "never" ? "–" : `${Math.round(account.usage_pct)}%`,
-					indicator: { value: Math.max(0, Math.min(account.usage_pct, 100)), bar_fill_c: accountStatusColor(status) },
+					value: status === "never" ? "–" : `${bindingTag} ${Math.round(bindingPct)}%`,
+					indicator: { value: Math.max(0, Math.min(bindingPct, 100)), bar_fill_c: accountStatusColor(status) },
 				})
 				.catch(() => {});
 			return;
@@ -160,9 +234,13 @@ export class AccountUsageAction extends SingletonAction<Settings> {
 			accountKey({
 				label: shortLabel(account.account_id),
 				family: account.model_family,
-				pct: account.usage_pct,
-				ceiling: account.ceiling_pct,
-				status,
+				rings,
+				bindingPct,
+				bindingTag,
+				bgTier: status === "stale" || status === "never" ? "none" : bgTier(bgDriverPct),
+				stale: status === "stale",
+				gated: status === "gated",
+				never: status === "never",
 			}),
 		);
 	}
