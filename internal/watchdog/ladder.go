@@ -123,7 +123,7 @@ func (p LadderParams) withDefaults() LadderParams {
 		p.LoginShell = "${SHELL:-/bin/sh}"
 	}
 	if p.LocalHostname == "" {
-		p.LocalHostname, _ = os.Hostname() // "" on failure ⇒ confirmation can't detect a local drop-back
+		p.LocalHostname, _ = os.Hostname() // "" on failure ⇒ confirmRemoteHost FAILS CLOSED (refuses to launch remotely)
 	}
 	if p.RemoteMarkerNonce == "" {
 		p.RemoteMarkerNonce = randNonce()
@@ -279,7 +279,23 @@ func runRemoteAttach(ctx context.Context, client *tmuxio.Client, clk tmuxio.Cloc
 // local one means ssh dropped to the local shell (confirmed=false); a DIFFERENT host is
 // the remote box (confirmed=true). The marker carries a per-launch nonce so a prior
 // launch's scrollback cannot match. Returns (confirmed, evidence, infra-error).
+//
+// FAIL-CLOSED on an unknown local hostname: if localHost is "" (os.Hostname() failed),
+// it CANNOT tell local from remote, so it refuses to confirm — a control plane that
+// cannot name itself must not launch remotely (a guard that silently disabled itself
+// would restore the M3 race exactly when we can't identify ourselves).
+//
+// ACCEPTED LIMITATION (fail-closed): if a remote box genuinely SHARES the local hostname
+// (two machines both named e.g. "mac-mini"), host==localHost reads as a local drop-back
+// and a LEGITIMATE remote seat can never launch. That is the safe direction, and the
+// evidence names it explicitly so an operator can rename the box or set a distinct
+// LadderParams.LocalHostname. (A future refinement could match an expected remote
+// hostname recorded at seat registration for an exact-match confirmation.)
 func confirmRemoteHost(ctx context.Context, client *tmuxio.Client, clk tmuxio.Clock, session, nonce, localHost string, timeout, interval time.Duration) (bool, string, error) {
+	if localHost == "" {
+		// fail closed: we cannot distinguish local from remote without our own name.
+		return false, "cannot verify remote host: local hostname unknown (os.Hostname failed)", nil
+	}
 	marker := remoteMarkerPrefix + nonce
 	if _, err := client.Send(ctx, session, "echo "+marker+"_$(hostname)", tmuxio.SendOptions{}); err != nil {
 		return false, "", err
@@ -291,13 +307,13 @@ func confirmRemoteHost(ctx context.Context, client *tmuxio.Client, clk tmuxio.Cl
 			return false, "", err
 		}
 		if host, ok := extractMarkerHost(capt.Raw, marker); ok {
-			if localHost != "" && host == localHost {
-				return false, "resolved to the LOCAL host " + host, nil
+			if host == localHost {
+				return false, "remote host name " + host + " matches the local host — an ssh drop-back to the local shell, OR the remote box shares this hostname (rename the box or set a distinct LocalHostname)", nil
 			}
 			return true, "remote host " + host + " confirmed", nil
 		}
 		if !clk.Now().Before(deadline) {
-			return false, "marker never appeared", nil
+			return false, "remote-host marker never appeared", nil
 		}
 		clk.Sleep(ctx, interval)
 	}

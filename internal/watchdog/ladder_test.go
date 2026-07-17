@@ -349,3 +349,54 @@ func TestExtractMarkerHost(t *testing.T) {
 		t.Fatal("the command-echo line alone must not resolve a host")
 	}
 }
+
+// TestExtractMarkerHost_ReEchoedInput guards against an ssh -t / PS2 setup that RE-ECHOES
+// the typed command (so the pane holds the marker in BOTH the echoed input line AND the
+// resolved-output line): the extractor must pick the OUTPUT host, never a token off the
+// still-`$(hostname)` input line.
+func TestExtractMarkerHost_ReEchoedInput(t *testing.T) {
+	// row 1: primary prompt echo of the typed command (has `echo ` and `$(`)
+	// row 2: a PS2/bracketed re-echo of the same command (still has `$(`)
+	// row 3: the resolved OUTPUT — the only line the extractor may read
+	capt := "remote:~$ echo FLOWBEE_REMOTE_z9_$(hostname)\n" +
+		"> FLOWBEE_REMOTE_z9_$(hostname)\n" +
+		"FLOWBEE_REMOTE_z9_far-box\n" +
+		"remote:~$ "
+	host, ok := extractMarkerHost(capt, "FLOWBEE_REMOTE_z9")
+	if !ok {
+		t.Fatal("expected the resolved output host to be found")
+	}
+	if host != "far-box" {
+		t.Fatalf("extractMarkerHost picked %q — it must read the OUTPUT host, not a $(hostname) input token", host)
+	}
+	if host == "$(hostname)" {
+		t.Fatal("extractMarkerHost was fooled by the echoed input line")
+	}
+}
+
+// TestConfirmRemoteHost_EmptyLocalHostnameFailsClosed is the §15.15 M3 fail-closed guard:
+// if the control plane cannot name itself (os.Hostname() == "" ⇒ LocalHostname==""), the
+// confirmation CANNOT tell the local shell from a remote one, so it must REFUSE to confirm
+// arrival — returning NOT-verified with a clear cause and WITHOUT even echoing a marker.
+// The full-ladder consequence (rollback + no CLI line typed on a !confirmed result) is the
+// same !confirmed → killAndFail path proven by TestRunLadder_SSHExitToLocalShell_NotVerified.
+// (This branch is unreachable through RunLadder — withDefaults fills LocalHostname from
+// os.Hostname() when empty — so it is exercised directly here.)
+func TestConfirmRemoteHost_EmptyLocalHostnameFailsClosed(t *testing.T) {
+	f := &ladderFake{hostname: "remote-box"} // a genuine remote — but we can't prove which
+	client, clk := newLadderClient(f)
+	ok, ev, err := confirmRemoteHost(context.Background(), client, clk, "epic-frob", "n1", "", 5*time.Second, time.Second)
+	if err != nil {
+		t.Fatalf("unexpected infra error: %v", err)
+	}
+	if ok {
+		t.Fatalf("empty local hostname must FAIL CLOSED, got confirmed=true (ev=%q)", ev)
+	}
+	if !strings.Contains(ev, "local hostname unknown") {
+		t.Fatalf("evidence should name the cause, got %q", ev)
+	}
+	// it must refuse BEFORE echoing any marker (no probe into a possibly-local shell).
+	if f.countMatching("FLOWBEE_REMOTE_") != 0 {
+		t.Fatalf("fail-closed must refuse before echoing a marker: %v", f.recorded())
+	}
+}
