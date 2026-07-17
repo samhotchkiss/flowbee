@@ -34,6 +34,16 @@ func (s *Store) AddEpicHost(ctx context.Context, h EpicHost, now time.Time) erro
 	if h.Name == "" {
 		return errors.New("host name is required")
 	}
+	// same argv-safety gate AddGoalSession applies to box/tmux_name (review F6): a
+	// registered host name flows into `flowbee epic start`'s ssh/tmux launch argv
+	// (internal/watchdog's remoteWrap), where a leading '-' reads as an ssh OPTION
+	// (`-oProxyCommand=...` is local RCE) and whitespace/control chars split argv.
+	// The `--` separator downstream is the primary fix; rejecting such a name at
+	// REGISTRATION makes it unregistrable in the first place (defense in depth,
+	// identical posture to the goal-session registry).
+	if err := validateArgvSafe("host name", h.Name); err != nil {
+		return err
+	}
 	ts := now.Format(rfc3339)
 	_, err := s.DB.ExecContext(ctx, `
 		INSERT INTO epic_hosts (name, note, enabled, created_at, updated_at)

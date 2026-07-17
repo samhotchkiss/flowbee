@@ -52,3 +52,30 @@ func TestEpicHostCRUD(t *testing.T) {
 		t.Fatalf("expected ErrEpicHostNotFound on double-remove, got %v", err)
 	}
 }
+
+// TestAddEpicHostRejectsArgvHostileNames: a registered host name flows into
+// `flowbee epic start`'s ssh/tmux launch argv, so the same argv-safety gate the
+// goal-session registry applies (leading '-' = ssh option injection; whitespace/
+// control chars = argv splitting) must make such a name unregistrable (review F6).
+func TestAddEpicHostRejectsArgvHostileNames(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+
+	for _, name := range []string{
+		"-oProxyCommand=evil", // ssh option injection
+		"-box",                // any leading dash
+		"box name",            // space splits argv
+		"box\tname",           // tab
+		"box\nname",           // newline
+		"box\x01name",         // control char
+	} {
+		if err := st.AddEpicHost(ctx, store.EpicHost{Name: name}, now); err == nil {
+			t.Errorf("AddEpicHost(%q) should be rejected as argv-hostile", name)
+		}
+	}
+	// a normal hostname still registers.
+	if err := st.AddEpicHost(ctx, store.EpicHost{Name: "feller.local"}, now); err != nil {
+		t.Fatalf("a benign hostname must register: %v", err)
+	}
+}

@@ -88,4 +88,4 @@ desired against actual and decides; decisions project *out* to workers; workers 
 and at every write, the gate enforces the lease/epoch fence so no stale actor can
 touch a resource it no longer owns.
 
-See also: [operating.md](operating.md)
+See also: [operating.md](operating.md) · [the epic lane design + phase plan](design/epic-lane.md)
