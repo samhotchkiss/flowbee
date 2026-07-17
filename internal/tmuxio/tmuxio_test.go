@@ -719,3 +719,35 @@ func TestRemoteWrapGuardsHost(t *testing.T) {
 		t.Errorf("remoteWrap must place `--` before the host: %s", got)
 	}
 }
+
+// TestExactTarget: the wrong-target fix. A bare session name gains a `=` (forcing
+// exact match so `-t flowbee` can never prefix-match `flowbee-claude`); a compound
+// session:win.pane target gains the `=` on its session component; and the target
+// forms that are already unambiguous — pane/window/session ids and an
+// already-`=`'d target — are left untouched (a `=` would corrupt them). The empty
+// input is the error path: it is returned unchanged, NEVER fabricated into a bare
+// "=" catch-anything target.
+func TestExactTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"bare session", "flowbee", "=flowbee:"},
+		{"session that is a prefix of another", "epic-fix", "=epic-fix:"},
+		{"session with interior space", "my session", "=my session:"},
+		{"session:window.pane", "flowbee:0.1", "=flowbee:0.1"},
+		{"session:window", "flowbee:2", "=flowbee:2"},
+		{"pane-id", "%5", "%5"},
+		{"window-id", "@3", "@3"},
+		{"session-id", "$2", "$2"},
+		{"already =-prefixed", "=flowbee:", "=flowbee:"},
+		{"already =-prefixed compound", "=flowbee:0.1", "=flowbee:0.1"},
+		{"empty (error path — never a bare =)", "", ""},
+	}
+	for _, c := range cases {
+		if got := exactTarget(c.in); got != c.want {
+			t.Errorf("%s: exactTarget(%q) = %q, want %q", c.name, c.in, got, c.want)
+		}
+	}
+}

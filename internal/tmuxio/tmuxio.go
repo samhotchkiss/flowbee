@@ -237,6 +237,48 @@ func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// exactTarget forces EXACT session-name matching on a tmux -t target.
+//
+// A bare `tmux -t <name>` PREFIX-matches session names: `send-keys -t flowbee`
+// will deliver keystrokes to session `flowbee-claude` when no session is named
+// exactly `flowbee`, and `kill-session -t epic-fix` will kill `epic-fix-v2`. For a
+// supervisor that TYPES KEYSTROKES INTO and KILLS agent sessions by name, that is a
+// wrong-target hazard of the highest order. tmux accepts a leading `=` on the
+// SESSION part of a target to force an exact match (`=flowbee`, `=flowbee:0.1`),
+// so this prepends that `=` for session-name targets.
+//
+// A bare session name additionally gains a trailing `:`. This is REQUIRED, not
+// cosmetic: tmux's target-PANE parser (capture-pane / send-keys / display-message /
+// paste-buffer) REJECTS a lone `=name` ("can't find pane: =name") — it needs a
+// pane-qualified target, and `=name:` names the session's active pane with exact
+// session matching. tmux's target-SESSION parser (has-session / kill-session)
+// accepts `=name:` too, so one form is correct across every command this package
+// builds (verified against tmux 3.6a). A compound target already carrying `:`
+// (e.g. `session:win.pane`) needs no extra colon.
+//
+// It deliberately leaves alone the target forms that are ALREADY unambiguous and
+// would be CORRUPTED by a `=`:
+//   - pane ids ("%5"), window ids ("@3"), and session ids ("$2") are unique object
+//     handles, exact by construction — a `=` prefix is meaningless and breaks them;
+//   - a target the caller already `=`-prefixed must not be double-prefixed;
+//   - the empty string returns unchanged — NEVER fabricated into a bare "=" (which
+//     tmux would read as a malformed catch-anything target). Emptiness is already
+//     rejected upstream by validateIdent before any command is built, so this is a
+//     pure fail-safe.
+func exactTarget(target string) string {
+	if target == "" {
+		return ""
+	}
+	switch target[0] {
+	case '=', '%', '@', '$':
+		return target
+	}
+	if !strings.Contains(target, ":") {
+		return "=" + target + ":"
+	}
+	return "=" + target
+}
+
 // assertValidIdent enforces the caller-supplied-identifier contract at the API
 // boundary (review m12), matching store.AddGoalSession's defense-in-depth posture:
 // session names, tmux targets, and ssh hosts must be non-empty, must not start with

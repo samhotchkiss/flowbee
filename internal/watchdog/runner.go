@@ -54,25 +54,25 @@ func (r ShellRunner) Run(ctx context.Context, shellCmd string) (string, error) {
 // capturePaneCmd builds the "read the current status line" command — just the
 // visible pane, matching the exact form given in the task brief.
 func capturePaneCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux capture-pane -t "+shQuote(tmuxName)+" -p")
+	return remoteWrap(box, "tmux capture-pane -t "+shQuote(exactTarget(tmuxName))+" -p")
 }
 
 // captureScrollbackCmd adds -S -60 for diagnosis (classifying WHY a session is
 // blocked needs the reason text that scrolled by, not just the current line).
 func captureScrollbackCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux capture-pane -t "+shQuote(tmuxName)+" -p -S -60")
+	return remoteWrap(box, "tmux capture-pane -t "+shQuote(exactTarget(tmuxName))+" -p -S -60")
 }
 
 // sendResumeCmd sends the literal "/goal resume" text followed by Enter.
 func sendResumeCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux send-keys -t "+shQuote(tmuxName)+" "+shQuote("/goal resume")+" Enter")
+	return remoteWrap(box, "tmux send-keys -t "+shQuote(exactTarget(tmuxName))+" "+shQuote("/goal resume")+" Enter")
 }
 
 // sendEnterCmd sends a bare Enter — the fix for the observed "TUI's slash-command
 // menu swallows the first Enter, leaving the text unsubmitted in the input line"
 // failure mode.
 func sendEnterCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux send-keys -t "+shQuote(tmuxName)+" Enter")
+	return remoteWrap(box, "tmux send-keys -t "+shQuote(exactTarget(tmuxName))+" Enter")
 }
 
 // ── epic-lane Phase 2 additions ──
@@ -175,7 +175,7 @@ func NewTmuxSessionCmd(box, tmuxName, dir, startCmd string) string {
 // the failure was at create time). NEVER used on a live epic: `flowbee epic
 // abandon` deliberately leaves the session running (operator decision).
 func KillTmuxSessionCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux kill-session -t "+shQuote(tmuxName))
+	return remoteWrap(box, "tmux kill-session -t "+shQuote(exactTarget(tmuxName)))
 }
 
 // SendGoalCmd sends literal text + Enter into an existing tmux pane — the ONE
@@ -185,7 +185,7 @@ func KillTmuxSessionCmd(box, tmuxName string) string {
 // the launcher builds from trusted inputs (repo id, slug), mirroring sendResumeCmd's
 // shape exactly but parameterized since the payload differs per epic.
 func SendGoalCmd(box, tmuxName, text string) string {
-	return remoteWrap(box, "tmux send-keys -t "+shQuote(tmuxName)+" "+shQuote(text)+" Enter")
+	return remoteWrap(box, "tmux send-keys -t "+shQuote(exactTarget(tmuxName))+" "+shQuote(text)+" Enter")
 }
 
 // parentDirUnix returns the parent directory of a UNIX-style (forward-slash) path,
@@ -223,4 +223,37 @@ func remoteWrap(box, inner string) string {
 // emit an escaped literal quote, reopen.
 func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// exactTarget forces EXACT session-name matching on a tmux -t target.
+//
+// A bare `tmux -t <name>` PREFIX-matches session names: `send-keys -t flowbee`
+// delivers keystrokes to session `flowbee-claude` when no session is named exactly
+// `flowbee`, and `kill-session -t epic-fix` kills `epic-fix-v2`. For a watcher that
+// TYPES "/goal resume" INTO and (on rollback) KILLS agent sessions by their
+// registered name, prefix-matching is a wrong-target hazard of the highest order.
+// tmux accepts a leading `=` on the SESSION part of a target to force an exact
+// match, so this prepends it. A bare session name also gains a trailing `:`
+// (`=flowbee:`): the target-PANE parser behind capture-pane/send-keys REJECTS a
+// lone `=name` ("can't find pane: =name") and needs a pane-qualified target, while
+// kill-session accepts `=name:` too, so one form is correct across capture, send,
+// and kill (verified against tmux 3.6a). Every tmuxName the watcher passes is a
+// registered goal-session name, so it always takes this branch; the
+// pane/window/session-id sigils and the already-`=`'d / empty cases are handled
+// defensively so this stays semantically identical to internal/tmuxio's helper of
+// the same name (a target already `=`-, `%`-, `@`-, or `$`-prefixed is left
+// untouched; a compound target already carrying `:` is not given a second one; ""
+// is never fabricated into a bare "=").
+func exactTarget(target string) string {
+	if target == "" {
+		return ""
+	}
+	switch target[0] {
+	case '=', '%', '@', '$':
+		return target
+	}
+	if !strings.Contains(target, ":") {
+		return "=" + target + ":"
+	}
+	return "=" + target
 }

@@ -291,6 +291,86 @@ func TestIntegrationBorderedBoxSend(t *testing.T) {
 	}
 }
 
+// markerSubstrate renders a persistent unique marker line above the prompt, so a
+// capture can prove WHICH session it actually read.
+func markerSubstrate(marker string) string {
+	return "printf '" + marker + "\\n❯ '; while IFS= read -r line; do printf '\\nGOT[%s]\\n❯ ' \"$line\"; done"
+}
+
+// TestIntegrationExactMatchRejectsPrefix is the real-tmux proof of the wrong-target
+// fix: with ONLY `foo-bar` alive, every by-name operation targeting `foo` must MISS
+// (error / false / no-op) rather than PREFIX-MATCH onto `foo-bar`. Bare `tmux -t
+// foo` would silently resolve to `foo-bar` and type keystrokes into — or KILL — the
+// wrong agent.
+func TestIntegrationExactMatchRejectsPrefix(t *testing.T) {
+	c := newTestServer(t)
+	ctx := context.Background()
+	if err := c.NewSession(ctx, SessionSpec{Name: "foo-bar", Command: markerSubstrate("BETAMARKER")}); err != nil {
+		t.Fatalf("NewSession foo-bar: %v", err)
+	}
+	waitForCapture(t, c, "foo-bar", "❯", 3*time.Second)
+
+	// HasSession("foo") must be false — NOT a prefix hit on foo-bar.
+	if ok, err := c.HasSession(ctx, "foo"); err != nil || ok {
+		t.Fatalf("HasSession(foo) with only foo-bar alive = (%v,%v), want (false,nil) — a true is a prefix-match bug", ok, err)
+	}
+	// Capture("foo") must error — there is no session named exactly foo.
+	if _, err := c.Capture(ctx, "foo", 0); err == nil {
+		t.Fatal("Capture(foo) succeeded with only foo-bar alive — it prefix-matched foo-bar")
+	}
+	// Send("foo", …) must error and must NOT deliver keystrokes into foo-bar.
+	if _, err := c.Send(ctx, "foo", "WRONGTARGET", SendOptions{}); err == nil {
+		t.Fatal("Send(foo) succeeded with only foo-bar alive — it prefix-matched foo-bar and typed into the wrong agent")
+	}
+	// Prove foo-bar never received the message.
+	if raw, _ := c.Capture(ctx, "foo-bar", 0); strings.Contains(raw.Raw, "WRONGTARGET") {
+		t.Fatalf("foo-bar received keystrokes meant for a nonexistent 'foo' session; capture=%q", raw.Raw)
+	}
+	// KillSession("foo") must error and must NOT kill foo-bar.
+	if err := c.KillSession(ctx, "foo"); err == nil {
+		t.Fatal("KillSession(foo) succeeded with only foo-bar alive — it prefix-matched and killed the wrong session")
+	}
+	if ok, err := c.HasSession(ctx, "foo-bar"); err != nil || !ok {
+		t.Fatalf("foo-bar must survive a KillSession(foo): HasSession(foo-bar)=(%v,%v), want (true,nil)", ok, err)
+	}
+}
+
+// TestIntegrationExactMatchHitsRightSession: with BOTH `foo` and `foo-bar` alive,
+// capture and kill by exact name land on exactly the named session and never the
+// other.
+func TestIntegrationExactMatchHitsRightSession(t *testing.T) {
+	c := newTestServer(t)
+	ctx := context.Background()
+	if err := c.NewSession(ctx, SessionSpec{Name: "foo", Command: markerSubstrate("ALPHAMARKER")}); err != nil {
+		t.Fatalf("NewSession foo: %v", err)
+	}
+	if err := c.NewSession(ctx, SessionSpec{Name: "foo-bar", Command: markerSubstrate("BETAMARKER")}); err != nil {
+		t.Fatalf("NewSession foo-bar: %v", err)
+	}
+	waitForCapture(t, c, "foo", "ALPHAMARKER", 3*time.Second)
+	waitForCapture(t, c, "foo-bar", "BETAMARKER", 3*time.Second)
+
+	// Capture(foo) reads foo's marker and NOT foo-bar's.
+	raw, err := c.Capture(ctx, "foo", 0)
+	if err != nil {
+		t.Fatalf("Capture(foo): %v", err)
+	}
+	if !strings.Contains(raw.Raw, "ALPHAMARKER") || strings.Contains(raw.Raw, "BETAMARKER") {
+		t.Fatalf("Capture(foo) hit the wrong session; capture=%q", raw.Raw)
+	}
+
+	// KillSession(foo) removes exactly foo; foo-bar survives.
+	if err := c.KillSession(ctx, "foo"); err != nil {
+		t.Fatalf("KillSession(foo): %v", err)
+	}
+	if ok, _ := c.HasSession(ctx, "foo"); ok {
+		t.Fatal("foo still exists after KillSession(foo)")
+	}
+	if ok, err := c.HasSession(ctx, "foo-bar"); err != nil || !ok {
+		t.Fatalf("foo-bar must survive KillSession(foo): (%v,%v), want (true,nil)", ok, err)
+	}
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {
