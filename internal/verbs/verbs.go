@@ -17,6 +17,15 @@
 // DATA vs VERBS: a master's free-text reply is DATA delivered as a bracketed paste and
 // never routed through this table (plan §1.5). Only the CLOSED control set — resume,
 // launch, bare-Enter nudge, escape-modal, clear-context — is a verb.
+//
+// INPUT CONTRACT (what a caller must guarantee): every Send this package returns is
+// delivered into a pane via the tmuxio verified-send primitive as a BRACKETED PASTE, so
+// its Text is inert data — no byte is interpreted as a terminal control sequence. The
+// interpolated parameters are the CALLER's responsibility to validate BEFORE they reach
+// here: Launch's `slug` is a cmd/flowbee safeSlugRe-gated epic id and `specPath` is a
+// registered epics/ path (never pane/scrollback/epic-body content); NotifyMaster's
+// `topKind` is validated here against the closed enum and its `count` is clamped to ≥0.
+// This package performs NO shell/argv quoting — it emits payloads, not commands.
 package verbs
 
 import (
@@ -146,6 +155,9 @@ func (v Verbs) EscapeModal() Send { return Send{Key: "Escape"} }
 func (v Verbs) NotifyMaster(count int, topKind string) (Send, error) {
 	if !attention.ValidKind(topKind) {
 		return Send{}, fmt.Errorf("%w: %q", ErrInvalidKind, topKind)
+	}
+	if count < 0 {
+		count = 0 // clamp: a negative count is never rendered into a master's pane
 	}
 	return Send{
 		Text:        fmt.Sprintf("flowbee: %d attention items pending (top: %s). Run: flowbee master poll", count, topKind),

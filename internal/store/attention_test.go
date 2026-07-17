@@ -149,7 +149,7 @@ func TestAttentionLeaseAndDelivery(t *testing.T) {
 	}
 
 	// ledger (keyed on the epic id) carries the intervention timeline.
-	evs, err := st.LoadEvents(ctx, "e1")
+	evs, err := st.LoadEvents(ctx, "att:e1")
 	if err != nil {
 		t.Fatalf("load events: %v", err)
 	}
@@ -370,11 +370,11 @@ func TestResolveDismissAndEscalate(t *testing.T) {
 	if err := st.ResolveAttention(ctx, "b", "escalated", attnT0.Add(time.Minute)); err != nil {
 		t.Fatalf("escalate: %v", err)
 	}
-	e1, _ := st.LoadEvents(ctx, "e1")
+	e1, _ := st.LoadEvents(ctx, "att:e1")
 	if e1[len(e1)-1].Kind != ledger.KindAttentionResolved {
 		t.Fatalf("dismiss ledger = %s, want attention_resolved", e1[len(e1)-1].Kind)
 	}
-	e2, _ := st.LoadEvents(ctx, "e2")
+	e2, _ := st.LoadEvents(ctx, "att:e2")
 	if e2[len(e2)-1].Kind != ledger.KindAttentionEscalated {
 		t.Fatalf("escalate ledger = %s, want attention_escalated", e2[len(e2)-1].Kind)
 	}
@@ -443,6 +443,174 @@ func TestListOpenAttentionFilters(t *testing.T) {
 	byKind, _ := st.ListOpenAttention(ctx, "", []string{"needs_input"}, "")
 	if len(byKind) != 1 || byKind[0].ID != "b" {
 		t.Fatalf("kind filter: %v", ids(byKind))
+	}
+}
+
+// deliverStranded sets up a master + one item leased and moved into `delivering` with the
+// given key, then lets its lease TTL pass — the crash-window shape.
+func deliverStranded(t *testing.T, st *store.Store, ctx context.Context, itemID, epic, dedup, key string) store.SupervisorRegistration {
+	t.Helper()
+	reg := registerMaster(t, st, ctx, "master-a", attnT0)
+	upsertItem(t, st, ctx, store.AttentionItem{ID: itemID, Kind: "needs_input", EpicID: epic, Priority: 20, DedupKey: dedup}, attnT0)
+	if _, err := st.LeaseAttention(ctx, reg.MasterID, reg.Epoch, 5, nil, 2*time.Minute, attnT0); err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if err := st.BeginDelivery(ctx, itemID, reg.MasterID, reg.Epoch, 1, key, attnT0.Add(30*time.Second)); err != nil {
+		t.Fatalf("begin delivery: %v", err)
+	}
+	return reg
+}
+
+// TestRecoverStrandedAwaitingAck (M1): a crashed delivery whose payload the pane re-check
+// finds ALREADY submitted is advanced to awaiting_ack — idempotently, with awaiting_since
+// set — and a late fenced verdict from the dead master still rejects.
+func TestRecoverStrandedAwaitingAck(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	reg := deliverStranded(t, st, ctx, "att1", "e1", "e1:ni", "idem-1")
+
+	// the plain lease reaper deliberately skips delivering rows.
+	if reaped, _ := st.ReapExpiredLeases(ctx, attnT0.Add(3*time.Minute)); len(reaped) != 0 {
+		t.Fatalf("reaper must skip delivering rows: %+v", reaped)
+	}
+	// a WRONG delivery_key must not recover (a relaunched/moved-on pane).
+	if err := st.RecoverStrandedAwaitingAck(ctx, "att1", "wrong-key", attnT0.Add(3*time.Minute)); !errors.Is(err, store.ErrAttentionState) {
+		t.Fatalf("wrong-key recover = %v, want ErrAttentionState", err)
+	}
+	// the right key recovers to awaiting_ack with the ack clock set.
+	if err := st.RecoverStrandedAwaitingAck(ctx, "att1", "idem-1", attnT0.Add(4*time.Minute)); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	got, _ := st.GetAttentionItem(ctx, "att1")
+	if got.State != "awaiting_ack" || got.AwaitingSince == "" {
+		t.Fatalf("after recover: %+v (want awaiting_ack + awaiting_since set)", got)
+	}
+	// idempotent: a second recover no-ops (does not move awaiting_since).
+	if err := st.RecoverStrandedAwaitingAck(ctx, "att1", "idem-1", attnT0.Add(5*time.Minute)); err != nil {
+		t.Fatalf("idempotent recover: %v", err)
+	}
+	if again, _ := st.GetAttentionItem(ctx, "att1"); again.AwaitingSince != got.AwaitingSince {
+		t.Fatalf("idempotent recover moved awaiting_since %q -> %q", got.AwaitingSince, again.AwaitingSince)
+	}
+	// a late fenced verdict from the dead master is rejected (state no longer delivering).
+	if err := st.RecordDeliveryVerdict(ctx, "att1", "master-a", reg.Epoch, 1, "strong", attnT0.Add(6*time.Minute)); !errors.Is(err, lease.ErrStaleEpoch) {
+		t.Fatalf("late verdict after recovery = %v, want ErrStaleEpoch", err)
+	}
+}
+
+// TestReopenStranded (M1): a crashed delivery whose pane moved on is reopened for a fresh
+// decision — freeing the dedup_key and the epic's in-flight slot, preserving item_epoch so
+// a late fenced verdict from the dead master still rejects.
+func TestReopenStranded(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	reg := deliverStranded(t, st, ctx, "att1", "e1", "e1:ni", "idem-1")
+
+	if err := st.ReopenStranded(ctx, "att1", attnT0.Add(4*time.Minute)); err != nil {
+		t.Fatalf("reopen stranded: %v", err)
+	}
+	got, _ := st.GetAttentionItem(ctx, "att1")
+	if got.State != "open" || got.LeasedBy != "" || got.DeliveryKey != "" {
+		t.Fatalf("after reopen stranded: %+v (want open, no lease, no key)", got)
+	}
+	if got.ItemEpoch != 1 {
+		t.Fatalf("item_epoch must be preserved across a stranded reopen, got %d", got.ItemEpoch)
+	}
+	if got.Detail != "delivery_stranded" {
+		t.Fatalf("detail = %q, want delivery_stranded", got.Detail)
+	}
+	// the epic's in-flight slot is freed: a fresh lease grabs it again, bumping item_epoch.
+	leased, err := st.LeaseAttention(ctx, reg.MasterID, reg.Epoch, 5, nil, 5*time.Minute, attnT0.Add(5*time.Minute))
+	if err != nil || len(leased) != 1 || leased[0].ItemEpoch != 2 {
+		t.Fatalf("re-lease after stranded reopen: leased=%+v err=%v (want item_epoch 2)", leased, err)
+	}
+	// the dead master's late verdict (old item_epoch, item no longer delivering) rejects.
+	if err := st.RecordDeliveryVerdict(ctx, "att1", "master-a", reg.Epoch, 1, "strong", attnT0.Add(6*time.Minute)); !errors.Is(err, lease.ErrStaleEpoch) {
+		t.Fatalf("late verdict after reopen = %v, want ErrStaleEpoch", err)
+	}
+	// reopening a now-open item is a state error.
+	if err := st.ReopenStranded(ctx, "att1", attnT0.Add(7*time.Minute)); !errors.Is(err, store.ErrAttentionState) {
+		t.Fatalf("reopen of a non-delivering item = %v, want ErrAttentionState", err)
+	}
+}
+
+// TestAwaitingSinceRefreshImmune (m1): awaiting_since is stamped on the strong/weak
+// transition and a producer re-observing the same condition (an UpsertAttentionItem
+// refresh of the awaiting_ack row) must NOT corrupt it.
+func TestAwaitingSinceRefreshImmune(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	reg := registerMaster(t, st, ctx, "master-a", attnT0)
+	upsertItem(t, st, ctx, store.AttentionItem{ID: "att1", Kind: "needs_input", EpicID: "e1", Priority: 20, DedupKey: "e1:ni"}, attnT0)
+	st.LeaseAttention(ctx, reg.MasterID, reg.Epoch, 5, nil, 5*time.Minute, attnT0.Add(time.Minute))
+	st.BeginDelivery(ctx, "att1", reg.MasterID, reg.Epoch, 1, "idem", attnT0.Add(2*time.Minute))
+	st.RecordDeliveryVerdict(ctx, "att1", reg.MasterID, reg.Epoch, 1, "strong", attnT0.Add(3*time.Minute))
+
+	got, _ := st.GetAttentionItem(ctx, "att1")
+	if got.AwaitingSince == "" {
+		t.Fatalf("awaiting_since not stamped on the strong verdict: %+v", got)
+	}
+	since := got.AwaitingSince
+
+	// a producer re-observes the same condition (dedup active set includes awaiting_ack).
+	created, _ := upsertItem(t, st, ctx, store.AttentionItem{ID: "att-x", Kind: "needs_input", EpicID: "e1", Priority: 20, DedupKey: "e1:ni"}, attnT0.Add(4*time.Minute))
+	if created {
+		t.Fatalf("re-observe of an awaiting_ack condition must refresh, not create a new row")
+	}
+	got2, _ := st.GetAttentionItem(ctx, "att1")
+	if got2.Occurrences != 2 {
+		t.Fatalf("refresh should bump occurrences, got %d", got2.Occurrences)
+	}
+	if got2.AwaitingSince != since {
+		t.Fatalf("refresh corrupted awaiting_since: %q -> %q", since, got2.AwaitingSince)
+	}
+}
+
+// TestAutoResolveClearedScope (m2): clear-wins for open + awaiting_ack, but a leased or
+// delivering row is the master's to finish and is left untouched.
+func TestAutoResolveClearedScope(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	reg := registerMaster(t, st, ctx, "master-a", attnT0)
+
+	// leased row: NOT cleared.
+	upsertItem(t, st, ctx, store.AttentionItem{ID: "a", Kind: "stalled", EpicID: "e1", Priority: 15, DedupKey: "e1:a"}, attnT0)
+	st.LeaseAttention(ctx, reg.MasterID, reg.Epoch, 5, nil, 5*time.Minute, attnT0.Add(time.Minute))
+	if resolved, err := st.AutoResolveCleared(ctx, "e1:a", attnT0.Add(2*time.Minute)); err != nil || resolved {
+		t.Fatalf("AutoResolveCleared on a leased row: resolved=%v err=%v (want false)", resolved, err)
+	}
+	if got, _ := st.GetAttentionItem(ctx, "a"); got.State != "leased" {
+		t.Fatalf("leased row was yanked: %s", got.State)
+	}
+
+	// open row: cleared.
+	upsertItem(t, st, ctx, store.AttentionItem{ID: "b", Kind: "needs_input", EpicID: "e2", Priority: 20, DedupKey: "e2:b"}, attnT0)
+	if resolved, _ := st.AutoResolveCleared(ctx, "e2:b", attnT0.Add(2*time.Minute)); !resolved {
+		t.Fatalf("open row should clear")
+	}
+
+	// delivering row: NOT cleared. (Inline setup — re-registering the master here would
+	// bump its epoch and invalidate reg for the awaiting_ack case below.)
+	upsertItem(t, st, ctx, store.AttentionItem{ID: "d", Kind: "needs_input", EpicID: "e4", Priority: 20, DedupKey: "e4:d"}, attnT0)
+	st.LeaseAttention(ctx, reg.MasterID, reg.Epoch, 5, []string{"needs_input"}, 5*time.Minute, attnT0.Add(2*time.Minute))
+	st.BeginDelivery(ctx, "d", reg.MasterID, reg.Epoch, 1, "idem-d", attnT0.Add(2*time.Minute+time.Second))
+	if resolved, _ := st.AutoResolveCleared(ctx, "e4:d", attnT0.Add(2*time.Minute+2*time.Second)); resolved {
+		t.Fatalf("AutoResolveCleared must not clear a delivering row")
+	}
+	if got, _ := st.GetAttentionItem(ctx, "d"); got.State != "delivering" {
+		t.Fatalf("delivering row was yanked: %s", got.State)
+	}
+
+	// awaiting_ack row: clear-wins.
+	upsertItem(t, st, ctx, store.AttentionItem{ID: "c", Kind: "needs_input", EpicID: "e3", Priority: 20, DedupKey: "e3:c"}, attnT0)
+	st.LeaseAttention(ctx, reg.MasterID, reg.Epoch, 5, []string{"needs_input"}, 5*time.Minute, attnT0.Add(3*time.Minute))
+	st.BeginDelivery(ctx, "c", reg.MasterID, reg.Epoch, 1, "idem-c", attnT0.Add(4*time.Minute))
+	st.RecordDeliveryVerdict(ctx, "c", reg.MasterID, reg.Epoch, 1, "weak", attnT0.Add(5*time.Minute))
+	if resolved, _ := st.AutoResolveCleared(ctx, "e3:c", attnT0.Add(6*time.Minute)); !resolved {
+		t.Fatalf("awaiting_ack row should clear (clear-wins)")
+	}
+	if got, _ := st.GetAttentionItem(ctx, "c"); got.State != "resolved" || got.Resolution != "cleared" {
+		t.Fatalf("awaiting_ack clear = %+v (want resolved/cleared)", got)
 	}
 }
 

@@ -44,6 +44,11 @@ type SupervisorRegistration struct {
 // ErrSupervisorNotFound is returned when a master id/label is unknown.
 var ErrSupervisorNotFound = errors.New("supervisor not found")
 
+// ErrSupervisorRevoked is returned when a re-registration targets a label whose master
+// was deliberately revoked (operator retirement): registration will NOT resurrect it
+// (n2). Re-enabling a revoked master is a separate, explicit action.
+var ErrSupervisorRevoked = errors.New("supervisor was revoked; re-enable explicitly")
+
 // RegisterSupervisor is the IDEMPOTENT upsert keyed on Label (plan §1.2) — the opposite
 // of AddGoalSession/AddEpicRun, which fail loud, because re-registration is EXPECTED on
 // every `/clear` or restart. A brand-new master and a post-`/clear` master are the same
@@ -66,10 +71,10 @@ func (s *Store) RegisterSupervisor(ctx context.Context, sup Supervisor, now time
 	ts := now.Format(rfc3339)
 	var reg SupervisorRegistration
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		var id string
+		var id, state string
 		var epoch int
-		e := tx.QueryRowContext(ctx, `SELECT id, epoch FROM supervisors WHERE label = ?`, sup.Label).
-			Scan(&id, &epoch)
+		e := tx.QueryRowContext(ctx, `SELECT id, epoch, state FROM supervisors WHERE label = ?`, sup.Label).
+			Scan(&id, &epoch, &state)
 		switch {
 		case errors.Is(e, sql.ErrNoRows):
 			id = sup.Label // id defaults to the label on first registration
@@ -88,6 +93,11 @@ func (s *Store) RegisterSupervisor(ctx context.Context, sup Supervisor, now time
 			}
 		case e != nil:
 			return e
+		case state == "revoked":
+			// a DELIBERATELY revoked master (operator retirement) is NOT resurrected by a
+			// re-registration — that would silently re-enable a master an operator killed.
+			// Explicit re-enable is a separate, intentional action (n2).
+			return ErrSupervisorRevoked
 		default:
 			epoch++
 			if _, err := tx.ExecContext(ctx, `
@@ -107,7 +117,7 @@ func (s *Store) RegisterSupervisor(ctx context.Context, sup Supervisor, now time
 		}
 		reg.MasterID = id
 		reg.Epoch = epoch
-		return appendEpicLedger(ctx, tx, id, ledger.KindSupervisorRegistered, id, epoch, "", "registered", now)
+		return appendEpicLedger(ctx, tx, supLedgerPrefix+id, ledger.KindSupervisorRegistered, id, epoch, "", "registered", now)
 	})
 	if err != nil {
 		return SupervisorRegistration{}, err

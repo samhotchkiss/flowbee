@@ -49,7 +49,7 @@ func TestRegisterSupervisorIdempotent(t *testing.T) {
 	}
 
 	// registration ledgered (keyed on the label) — twice.
-	evs, _ := st.LoadEvents(ctx, "master-pearl")
+	evs, _ := st.LoadEvents(ctx, "sup:master-pearl")
 	n := 0
 	for _, e := range evs {
 		if e.Kind == ledger.KindSupervisorRegistered {
@@ -63,6 +63,25 @@ func TestRegisterSupervisorIdempotent(t *testing.T) {
 	// argv-hostile box is rejected at registration.
 	if _, err := st.RegisterSupervisor(ctx, store.Supervisor{Label: "bad", Box: "-oProxyCommand=x"}, supT0); err == nil {
 		t.Fatalf("expected an argv-safety rejection for a leading-dash box")
+	}
+}
+
+// TestRegisterSupervisorRevokedNotResurrected (n2): a re-registration must NOT silently
+// resurrect a deliberately revoked master.
+func TestRegisterSupervisorRevokedNotResurrected(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	registerMaster(t, st, ctx, "master-a", supT0)
+	// operator revokes it (no CLI yet; simulate the retired state directly).
+	if _, err := st.DB.ExecContext(ctx, `UPDATE supervisors SET state='revoked' WHERE id='master-a'`); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := st.RegisterSupervisor(ctx, store.Supervisor{Label: "master-a", Kind: "claude"}, supT0.Add(time.Hour)); !errors.Is(err, store.ErrSupervisorRevoked) {
+		t.Fatalf("re-register of a revoked master = %v, want ErrSupervisorRevoked", err)
+	}
+	// it stays revoked.
+	if sup, _ := st.GetSupervisor(ctx, "master-a"); sup.State != "revoked" {
+		t.Fatalf("state = %q, want it to stay revoked", sup.State)
 	}
 }
 

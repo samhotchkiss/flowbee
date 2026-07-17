@@ -32,6 +32,7 @@ type AttentionItem struct {
 	LeasedBy       string // supervisors.id holding the lease
 	ItemEpoch      int    // the item's own monotonic fence (bumped on every lease)
 	LeaseExpiresAt string
+	AwaitingSince  string // when the row entered awaiting_ack (the send-and-ack clock, §12.3)
 	DeliveryKey    string
 	Evidence       map[string]string
 	Detail         string
@@ -60,8 +61,9 @@ var (
 
 const attentionSelect = `
 	SELECT id, kind, epic_id, repo, priority, state, dedup_key, blocking, leased_by,
-	       item_epoch, lease_expires_at, delivery_key, evidence_json, detail, resolution,
-	       verdict, occurrences, first_seen_at, last_seen_at, resolved_at, created_at, updated_at
+	       item_epoch, lease_expires_at, awaiting_since, delivery_key, evidence_json, detail,
+	       resolution, verdict, occurrences, first_seen_at, last_seen_at, resolved_at,
+	       created_at, updated_at
 	  FROM attention_items`
 
 func scanAttentionItem(row rowScanner) (AttentionItem, error) {
@@ -69,9 +71,9 @@ func scanAttentionItem(row rowScanner) (AttentionItem, error) {
 	var blocking int
 	var evidenceJSON string
 	err := row.Scan(&a.ID, &a.Kind, &a.EpicID, &a.Repo, &a.Priority, &a.State, &a.DedupKey,
-		&blocking, &a.LeasedBy, &a.ItemEpoch, &a.LeaseExpiresAt, &a.DeliveryKey, &evidenceJSON,
-		&a.Detail, &a.Resolution, &a.Verdict, &a.Occurrences, &a.FirstSeenAt, &a.LastSeenAt,
-		&a.ResolvedAt, &a.CreatedAt, &a.UpdatedAt)
+		&blocking, &a.LeasedBy, &a.ItemEpoch, &a.LeaseExpiresAt, &a.AwaitingSince, &a.DeliveryKey,
+		&evidenceJSON, &a.Detail, &a.Resolution, &a.Verdict, &a.Occurrences, &a.FirstSeenAt,
+		&a.LastSeenAt, &a.ResolvedAt, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AttentionItem{}, ErrAttentionNotFound
 	}
@@ -109,27 +111,21 @@ func (s *Store) UpsertAttentionItem(ctx context.Context, item AttentionItem, now
 	ts := now.Format(rfc3339)
 	evidenceJSON := marshalEvidence(item.Evidence)
 	err = s.tx(ctx, func(tx *sql.Tx) error {
-		var existingID string
-		e := tx.QueryRowContext(ctx,
-			`SELECT id FROM attention_items WHERE dedup_key = ? AND state IN `+attentionActiveStatesSQL+` LIMIT 1`,
-			item.DedupKey).Scan(&existingID)
-		if e == nil {
+		existingID, found, e := activeItemIDByDedupTx(ctx, tx, item.DedupKey)
+		if e != nil {
+			return e
+		}
+		if found {
 			// refresh the live item — a re-seen condition, never a duplicate row.
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE attention_items
-				   SET occurrences = occurrences + 1, last_seen_at = ?, evidence_json = ?,
-				       detail = ?, priority = ?, blocking = ?, repo = ?, epic_id = ?, updated_at = ?
-				 WHERE id = ?`,
-				ts, evidenceJSON, item.Detail, item.Priority, b2i(item.Blocking), item.Repo, item.EpicID, ts, existingID); err != nil {
+			if err := refreshActiveAttentionTx(ctx, tx, existingID, item, evidenceJSON, ts); err != nil {
 				return err
 			}
 			created = false
 			id = existingID
 			return nil
 		}
-		if !errors.Is(e, sql.ErrNoRows) {
-			return e
-		}
+		// NOTE (awaiting_since): deliberately omitted from the INSERT — a fresh row is
+		// 'open', so it defaults to '' and is set ONLY on entry to awaiting_ack (below).
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO attention_items
 			    (id, kind, epic_id, repo, priority, state, dedup_key, blocking, leased_by,
@@ -139,8 +135,21 @@ func (s *Store) UpsertAttentionItem(ctx context.Context, item AttentionItem, now
 			item.ID, item.Kind, item.EpicID, item.Repo, item.Priority, item.DedupKey, b2i(item.Blocking),
 			evidenceJSON, item.Detail, ts, ts, ts, ts); err != nil {
 			if isUniqueConstraintErr(err) {
-				// unreachable under MaxOpenConns=1 (the tx holds the sole connection), but
-				// keep the store honest: the active dedup_key already exists -> a refresh.
+				// The partial UNIQUE index fired: an active row for this dedup_key already
+				// exists (unreachable under MaxOpenConns=1, but honor the comment). Fall back
+				// to a refresh so a producer NEVER surfaces a raw constraint error.
+				existingID, found, e2 := activeItemIDByDedupTx(ctx, tx, item.DedupKey)
+				if e2 != nil {
+					return e2
+				}
+				if found {
+					if err := refreshActiveAttentionTx(ctx, tx, existingID, item, evidenceJSON, ts); err != nil {
+						return err
+					}
+					created = false
+					id = existingID
+					return nil
+				}
 				return fmt.Errorf("upsert attention %q: %w", item.ID, err)
 			}
 			return fmt.Errorf("insert attention %q: %w", item.ID, err)
@@ -153,18 +162,54 @@ func (s *Store) UpsertAttentionItem(ctx context.Context, item AttentionItem, now
 	return created, id, err
 }
 
-// AutoResolveCleared resolves the ACTIVE item for a dedup_key with resolution='cleared'
-// — the producer's call when the underlying condition clears (pane left AWAITING_INPUT,
-// CI green, account dropped below critical). A no-op (resolved=false) if nothing is
-// active for the key. This is the other half of dedup discipline: the open set tracks
+// activeItemIDByDedupTx returns the id of the (at most one) ACTIVE item for a dedup_key.
+func activeItemIDByDedupTx(ctx context.Context, tx *sql.Tx, dedupKey string) (string, bool, error) {
+	var id string
+	e := tx.QueryRowContext(ctx,
+		`SELECT id FROM attention_items WHERE dedup_key = ? AND state IN `+attentionActiveStatesSQL+` LIMIT 1`,
+		dedupKey).Scan(&id)
+	if errors.Is(e, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if e != nil {
+		return "", false, e
+	}
+	return id, true, nil
+}
+
+// refreshActiveAttentionTx bumps occurrences/last_seen_at and refreshes the mutable
+// producer fields on a re-seen active item. It deliberately does NOT touch awaiting_since
+// (the send-and-ack clock) or the lease/state columns — a refresh of a leased/delivering/
+// awaiting_ack row must not disturb the master's in-flight work.
+func refreshActiveAttentionTx(ctx context.Context, tx *sql.Tx, id string, item AttentionItem, evidenceJSON, ts string) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE attention_items
+		   SET occurrences = occurrences + 1, last_seen_at = ?, evidence_json = ?,
+		       detail = ?, priority = ?, blocking = ?, repo = ?, epic_id = ?, updated_at = ?
+		 WHERE id = ?`,
+		ts, evidenceJSON, item.Detail, item.Priority, b2i(item.Blocking), item.Repo, item.EpicID, ts, id)
+	return err
+}
+
+// AutoResolveCleared resolves a NOT-IN-FLIGHT item for a dedup_key with
+// resolution='cleared' — the producer's call when the underlying condition clears (pane
+// left AWAITING_INPUT, CI green, account dropped below critical). A no-op (resolved=false)
+// if nothing matches. This is the other half of dedup discipline: the open set tracks
 // current reality in BOTH directions.
+//
+// Scoped to state IN ('open','awaiting_ack') by design: a 'leased'/'delivering' row is the
+// MASTER's to finish — yanking it out from under an in-flight steer (or overwriting a
+// just-recorded verdict with 'cleared') would corrupt the exactly-once loop. If the
+// condition genuinely cleared while the master held the lease, its own resolve closes the
+// item, and the NEXT producer tick's re-upsert simply no-ops. For 'open' (never leased) and
+// 'awaiting_ack' (delivered, awaiting confirmation) clear-wins is correct: reality moved on.
 func (s *Store) AutoResolveCleared(ctx context.Context, dedupKey string, now time.Time) (resolved bool, err error) {
 	ts := now.Format(rfc3339)
 	err = s.tx(ctx, func(tx *sql.Tx) error {
 		var id, epicID string
 		var itemEpoch int
 		e := tx.QueryRowContext(ctx,
-			`SELECT id, epic_id, item_epoch FROM attention_items WHERE dedup_key = ? AND state IN `+attentionActiveStatesSQL+` LIMIT 1`,
+			`SELECT id, epic_id, item_epoch FROM attention_items WHERE dedup_key = ? AND state IN ('open','awaiting_ack') LIMIT 1`,
 			dedupKey).Scan(&id, &epicID, &itemEpoch)
 		if errors.Is(e, sql.ErrNoRows) {
 			return nil
@@ -309,9 +354,11 @@ func (s *Store) RecordDeliveryVerdict(ctx context.Context, id, masterID string, 
 				       leased_by = '', delivery_key = '', lease_expires_at = '', updated_at = ?
 				 WHERE id = ? AND state = 'delivering'`, ts, id)
 		} else {
+			// entry into awaiting_ack: stamp the send-and-ack clock (awaiting_since), the
+			// ONLY place it is written alongside RecoverStrandedAwaitingAck.
 			_, err = tx.ExecContext(ctx, `
-				UPDATE attention_items SET state = 'awaiting_ack', verdict = ?, updated_at = ?
-				 WHERE id = ? AND state = 'delivering'`, verdict, ts, id)
+				UPDATE attention_items SET state = 'awaiting_ack', verdict = ?, awaiting_since = ?, updated_at = ?
+				 WHERE id = ? AND state = 'delivering'`, verdict, ts, ts, id)
 		}
 		if err != nil {
 			return err
@@ -344,7 +391,7 @@ func (s *Store) ReopenUnacked(ctx context.Context, id string, now time.Time) err
 		res, err := tx.ExecContext(ctx, `
 			UPDATE attention_items
 			   SET state = 'open', detail = 'steer_not_processed', leased_by = '',
-			       delivery_key = '', lease_expires_at = '', updated_at = ?
+			       delivery_key = '', lease_expires_at = '', awaiting_since = '', updated_at = ?
 			 WHERE id = ? AND state = 'awaiting_ack'`, ts, id)
 		if err != nil {
 			return err
@@ -450,6 +497,74 @@ func (s *Store) ListStrandedDeliveries(ctx context.Context, now time.Time) ([]At
 		out = append(out, it)
 	}
 	return out, nil
+}
+
+// RecoverStrandedAwaitingAck is the crash-window recovery WRITE for the case where the
+// ticker's pane re-check found the payload ALREADY submitted (plan §1.5 "Crash-window
+// handling"): the verified send landed but the crashed master never recorded a verdict.
+// This is a SYSTEM-actor, UNFENCED (the leaseholder is dead — there is no live epoch to
+// present), STATE-GUARDED move delivering->awaiting_ack. It is guarded by delivery_key so
+// a relaunched/moved-on pane whose key differs is never silently acked (that case takes
+// ReopenStranded instead). Idempotent: a second call (already awaiting_ack) no-ops. Stamps
+// awaiting_since (the ack loop's clock) so a recovered delivery still ack-expires normally.
+// ErrAttentionState if the row is not delivering-with-this-key (and not already recovered).
+func (s *Store) RecoverStrandedAwaitingAck(ctx context.Context, id, deliveryKey string, now time.Time) error {
+	if deliveryKey == "" {
+		return errors.New("delivery_key is required")
+	}
+	ts := now.Format(rfc3339)
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		epicID, itemEpoch, state, err := loadItemMetaTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if state == attention.StateAwaitingAck {
+			return nil // idempotent: an earlier recovery (or verdict) already advanced it
+		}
+		res, err := tx.ExecContext(ctx, `
+			UPDATE attention_items
+			   SET state = 'awaiting_ack', detail = 'recovered_stranded', awaiting_since = ?, updated_at = ?
+			 WHERE id = ? AND state = 'delivering' AND delivery_key = ?`, ts, ts, id, deliveryKey)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrAttentionState
+		}
+		return appendEpicLedger(ctx, tx, ledgerKeyFor(epicID, id),
+			ledger.KindEpicIntervention, "system", itemEpoch, id, "recovered", now)
+	})
+}
+
+// ReopenStranded is the crash-window recovery WRITE for the case where the ticker's pane
+// re-check found the payload NOT submitted / the pane moved on (plan §1.5): a fresh
+// decision is needed. A SYSTEM-actor, UNFENCED, STATE-GUARDED move delivering->open that
+// clears leased_by/delivery_key/lease_expires_at (freeing the dedup_key's active slot AND
+// the epic's one-in-flight slot for a re-lease) while PRESERVING item_epoch — so a late
+// fenced RecordDeliveryVerdict from the dead master still rejects (its state/leaseholder
+// no longer match, and a subsequent re-lease bumps item_epoch out from under it). Ledgers
+// attention_opened. ErrAttentionState if the row is not delivering.
+func (s *Store) ReopenStranded(ctx context.Context, id string, now time.Time) error {
+	ts := now.Format(rfc3339)
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		epicID, itemEpoch, _, err := loadItemMetaTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `
+			UPDATE attention_items
+			   SET state = 'open', detail = 'delivery_stranded', leased_by = '', delivery_key = '',
+			       lease_expires_at = '', updated_at = ?
+			 WHERE id = ? AND state = 'delivering'`, ts, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrAttentionState
+		}
+		return appendEpicLedger(ctx, tx, ledgerKeyFor(epicID, id),
+			ledger.KindAttentionOpened, "system", itemEpoch, id, "delivery_stranded", now)
+	})
 }
 
 // ListOpenAttention is the read-only queue view (plan §1.4 "GET .../attention"). state
@@ -650,21 +765,39 @@ func collectExpired(rows *sql.Rows, now time.Time) ([]expiredRef, error) {
 
 // ledgerKeyFor is the job_events stream key for an attention event: the EPIC id for an
 // epic-scoped item (so the operator drawer reads the epic's intervention timeline via
-// LoadEvents(epic) — plan §1.5), or the item id when there is no epic (e.g. master_absent).
+// LoadEvents("att:"+epic) — plan §1.5), or the item id when there is no epic (e.g.
+// master_absent). The "att:" prefix makes the namespace disjointness (see appendEpicLedger)
+// STRUCTURAL rather than merely conventional.
 func ledgerKeyFor(epicID, itemID string) string {
 	if epicID != "" {
-		return epicID
+		return attnLedgerPrefix + epicID
 	}
-	return itemID
+	return attnLedgerPrefix + itemID
 }
 
+// Ledger stream-key prefixes (m5). job_events.job_id is a shared namespace: a real job
+// keys on its ULID; attention/supervisor audit rows key on these prefixed streams. The
+// prefixes guarantee the epic-lane keys can NEVER collide with a jobs.id ULID (or with
+// each other), keeping UNIQUE(job_id, job_seq) well-defined per stream.
+const (
+	attnLedgerPrefix = "att:"
+	supLedgerPrefix  = "sup:"
+)
+
 // appendEpicLedger appends one epic-lane audit event to job_events (the ledger spine).
-// `key` is the event stream (see ledgerKeyFor / the supervisor label); the per-key
-// job_seq is computed within the tx (safe under MaxOpenConns=1). `epoch` carries the
-// fence in force (item_epoch or supervisor epoch). itemID/reason ride the Payload's
-// existing LeaseID/RevokeReason fields — a DOCUMENTED reuse: Fold has no case for these
-// kinds (it ignores them), so no ledger.Payload schema change is needed and the shared
-// ledger.go diff stays additive (constants only), per the parallel-builder contract.
+// `key` is the event stream (an "att:"/"sup:"-prefixed key — see ledgerKeyFor /
+// supLedgerPrefix); the per-key job_seq is computed within the tx (safe under
+// MaxOpenConns=1). `epoch` carries the fence in force (item_epoch or supervisor epoch).
+// itemID/reason ride the Payload's existing LeaseID/RevokeReason fields — a DOCUMENTED
+// reuse: Fold has no case for these kinds (it ignores them), so no ledger.Payload schema
+// change is needed and the shared ledger.go diff stays additive (constants only), per the
+// parallel-builder contract.
+//
+// NAMESPACE INVARIANT (m5): job_events.job_id is a shared TEXT space with UNIQUE(job_id,
+// job_seq). Real jobs key on jobs.id ULIDs; epic-lane streams key on the "att:"/"sup:"
+// prefixes above. Those spaces are disjoint BY CONSTRUCTION (a ULID never starts "att:"/
+// "sup:"), so an epic slug or supervisor label can never masquerade as a jobs.id and
+// diverge the per-stream job_seq sequence. Keep every epic-lane append prefixed.
 func appendEpicLedger(ctx context.Context, tx *sql.Tx, key string, kind ledger.EventKind, actor string, epoch int, itemID, reason string, now time.Time) error {
 	if actor == "" {
 		actor = "system"

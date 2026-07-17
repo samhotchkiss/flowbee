@@ -94,6 +94,11 @@ CREATE TABLE IF NOT EXISTS attention_items (
     leased_by         TEXT NOT NULL DEFAULT '',
     item_epoch        INTEGER NOT NULL DEFAULT 0,
     lease_expires_at  TEXT NOT NULL DEFAULT '',
+    -- awaiting_since is the send-and-ack clock (plan §12.3): the instant the row ENTERED
+    -- awaiting_ack (a strong/weak verdict, or a crash-stranded delivery recovered as
+    -- already-submitted). AckExpired reads it; it is set ONLY on entry to awaiting_ack and
+    -- is NEVER touched by an UpsertAttentionItem refresh (which would corrupt the clock).
+    awaiting_since    TEXT NOT NULL DEFAULT '',
     -- delivery_key is the client-generated idempotency key bound at BeginDelivery — the
     -- crash-window recovery (plan §1.5) re-captures the pane and matches against it
     -- rather than blindly re-sending.
@@ -118,8 +123,12 @@ CREATE TABLE IF NOT EXISTS attention_items (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_attention_active_dedup
     ON attention_items(dedup_key)
  WHERE state IN ('open','leased','delivering','awaiting_ack');
--- ListOpenAttention / LeaseAttention scan by state+priority; the reaper scans leased/
--- delivering rows by lease_expires_at; the digest joins by epic.
+-- ListOpenAttention / LeaseAttention scan and order by state+priority; this index is the
+-- matching scan hint. The lease/stranded reapers narrow to state='leased'|'delivering'
+-- with a non-empty lease_expires_at (this index's state prefix helps that first cut) and
+-- then compare the expiry IN GO (RFC3339Nano does not sort lexically across the
+-- fractional-second boundary, so lease_expires_at is deliberately NOT an indexed range
+-- key — the candidate set is tiny). The digest joins by epic (idx_attention_epic).
 CREATE INDEX IF NOT EXISTS idx_attention_state_prio ON attention_items(state, priority);
 CREATE INDEX IF NOT EXISTS idx_attention_epic ON attention_items(epic_id);
 

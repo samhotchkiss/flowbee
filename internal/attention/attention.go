@@ -334,6 +334,12 @@ func MasterLive(lastHeartbeat, now time.Time, pol Policy) bool {
 // attention (a human-immediate kind, or a master-first kind aged past its window). A
 // live master will lease the items itself, so the alarm stays dark. The alarm item's
 // own kind (master_absent) is skipped so the check never feeds on itself.
+//
+// lastHeartbeat is a SINGLE liveness reading: with a FLEET of masters the caller passes
+// max(last_heartbeat) over the non-stale supervisors (the freshest live heartbeat) — if
+// any master is live, the fleet is live and the alarm stays dark. The tier model above
+// (plan §15.4) subsumes the older "priority ≤ 15 past T_absent" rule; the plan doc has
+// been reconciled to it, so no additional threshold input is needed here.
 func ShouldRaiseMasterAbsent(items []Item, lastHeartbeat, now time.Time, pol Policy) bool {
 	if MasterLive(lastHeartbeat, now, pol) {
 		return false
