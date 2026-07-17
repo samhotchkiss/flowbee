@@ -40,8 +40,8 @@ type ladderFake struct {
 	mu            sync.Mutex
 	calls         []string
 	phase         string // shell | marker | prompt | working | auth | limbo
-	hostname      string // what $(hostname) resolves to in the pane (default "remote-box")
-	markerOut     string // the resolved remote-host marker line, set on the marker echo
+	identity      string // what $(whoami)@$(hostname) resolves to in the pane (default "ops@remote-box")
+	markerOut     string // the resolved remote-identity marker line, set on the marker echo
 	newSessionErr error
 	goalStuck     bool
 }
@@ -63,13 +63,13 @@ func (f *ladderFake) Run(_ context.Context, cmd string) (string, error) {
 	case strings.Contains(cmd, "set-buffer"), strings.Contains(cmd, "paste-buffer"):
 		return "", nil
 	case strings.Contains(cmd, "send-keys"):
-		if strings.Contains(cmd, "FLOWBEE_REMOTE_") && strings.Contains(cmd, "$(hostname)") {
-			// model the shell evaluating `echo <marker>_$(hostname)`.
-			host := f.hostname
-			if host == "" {
-				host = "remote-box"
+		if strings.Contains(cmd, "FLOWBEE_REMOTE_") && strings.Contains(cmd, "$(whoami)@$(hostname)") {
+			// model the shell evaluating `echo <marker>_$(whoami)@$(hostname)`.
+			id := f.identity
+			if id == "" {
+				id = "ops@remote-box"
 			}
-			f.markerOut = extractFakeMarker(cmd) + "_" + host
+			f.markerOut = extractFakeMarker(cmd) + "_" + id
 			f.phase = "marker"
 		}
 		if strings.Contains(cmd, "CLAUDE_CONFIG_DIR") || strings.Contains(cmd, "CODEX_HOME") {
@@ -89,8 +89,9 @@ func (f *ladderFake) Run(_ context.Context, cmd string) (string, error) {
 	return "", nil
 }
 
-// extractFakeMarker pulls "FLOWBEE_REMOTE_<nonce>" out of an `echo <marker>_$(hostname)`
-// send-keys command, mirroring the ladder's own marker construction.
+// extractFakeMarker pulls "FLOWBEE_REMOTE_<nonce>" out of an `echo
+// <marker>_$(whoami)@$(hostname)` send-keys command, mirroring the ladder's own marker
+// construction (it splits at the first `_$(`, so the added `@$(hostname)` does not matter).
 func extractFakeMarker(cmd string) string {
 	i := strings.Index(cmd, "FLOWBEE_REMOTE_")
 	if i < 0 {
@@ -150,11 +151,11 @@ func remoteSeat() LaunchSeat {
 }
 
 func TestRunLadder_RemoteHappyPath(t *testing.T) {
-	f := &ladderFake{hostname: "remote-box"}
+	f := &ladderFake{identity: "ops@remote-box"}
 	client, clk := newLadderClient(f)
 	res, err := RunLadder(context.Background(), client, clk, LadderParams{
 		Slug: "frob", Seat: remoteSeat(), SpecPath: "epics/2026-07-16-frob.md", Dir: "/home/ops/epics/frob",
-		LocalHostname: "control-plane", RemoteMarkerNonce: "testnonce",
+		LocalIdentity: "sam@control-plane", RemoteMarkerNonce: "testnonce",
 	})
 	if err != nil {
 		t.Fatalf("RunLadder: %v", err)
@@ -169,9 +170,9 @@ func TestRunLadder_RemoteHappyPath(t *testing.T) {
 	if f.countMatching("ssh -t -- buncher tmux new -A -s epic-frob") == 0 {
 		t.Fatalf("ssh attach line missing: %v", f.recorded())
 	}
-	// the remote-host confirmation ran and matched a host != the local one.
-	if f.countMatching("echo FLOWBEE_REMOTE_testnonce_$(hostname)") == 0 {
-		t.Fatalf("remote-host confirmation echo missing: %v", f.recorded())
+	// the remote-identity confirmation ran and matched an identity != the local one.
+	if f.countMatching("echo FLOWBEE_REMOTE_testnonce_$(whoami)@$(hostname)") == 0 {
+		t.Fatalf("remote-identity confirmation echo missing: %v", f.recorded())
 	}
 	// M2: tmuxio.Client exactifies targets to the pane-valid `=epic-frob:` form; the
 	// ladder must never emit a bare `-t 'epic-frob'` NOR a lone (colon-less) `=epic-frob`.
@@ -194,15 +195,15 @@ func TestRunLadder_RemoteHappyPath(t *testing.T) {
 
 // TestRunLadder_SSHExitToLocalShell_NotVerified is the §15.15 M3 guard: if the ssh line
 // instant-exits, control drops to the LOCAL control-plane shell (which also looks like a
-// shell). The remote-host confirmation resolves $(hostname) to the LOCAL host, so the
-// ladder must REFUSE to type the launch line there — LaunchFailed, never LaunchVerified,
-// with rollback.
+// shell). The remote-identity confirmation resolves $(whoami)@$(hostname) to the control
+// plane's OWN user@host == LocalIdentity, so the ladder must REFUSE to type the launch line
+// there — LaunchFailed, never LaunchVerified, with rollback.
 func TestRunLadder_SSHExitToLocalShell_NotVerified(t *testing.T) {
-	f := &ladderFake{hostname: "control-plane"} // $(hostname) == the local host: an ssh drop-back
+	f := &ladderFake{identity: "sam@control-plane"} // resolves == LocalIdentity: an ssh drop-back to the local shell
 	client, clk := newLadderClient(f)
 	res, err := RunLadder(context.Background(), client, clk, LadderParams{
 		Slug: "frob", Seat: remoteSeat(), SpecPath: "epics/x.md",
-		LocalHostname: "control-plane", RemoteMarkerNonce: "testnonce",
+		LocalIdentity: "sam@control-plane", RemoteMarkerNonce: "testnonce",
 		ShellTimeout: 6 * time.Second, PollInterval: 2 * time.Second,
 	})
 	if err != nil {
@@ -220,6 +221,33 @@ func TestRunLadder_SSHExitToLocalShell_NotVerified(t *testing.T) {
 	}
 	if f.countMatching("kill-session") == 0 {
 		t.Fatalf("a confirmation failure must roll back the local session")
+	}
+}
+
+// TestRunLadder_SameHostDifferentUser_Verified is the REAL-FLEET topology the hostname-only
+// discriminator broke: seats are reached via `ssh <user>@localhost`, so a seat shares the
+// control plane's HOSTNAME (Mac-Studio.local) and differs only by USER. Under hostname-only
+// comparison the seat's host == the local host and EVERY real seat failed closed; the
+// user@host tuple (claude1@Mac-Studio.local != sam@Mac-Studio.local) correctly VERIFIES.
+func TestRunLadder_SameHostDifferentUser_Verified(t *testing.T) {
+	f := &ladderFake{identity: "claude1@Mac-Studio.local"} // SAME host as the control plane, DIFFERENT user
+	client, clk := newLadderClient(f)
+	res, err := RunLadder(context.Background(), client, clk, LadderParams{
+		Slug: "frob", Seat: remoteSeat(), SpecPath: "epics/x.md",
+		LocalIdentity: "sam@Mac-Studio.local", RemoteMarkerNonce: "testnonce",
+	})
+	if err != nil {
+		t.Fatalf("RunLadder: %v", err)
+	}
+	if res.Outcome != LaunchVerified || res.Stage != StageDone {
+		t.Fatalf("a same-host-different-user seat MUST verify (this was the field bug), got %+v", res)
+	}
+	// it proceeded past confirmation and typed the CLI launch line onto the seat.
+	if f.countMatching("CLAUDE_CONFIG_DIR=") == 0 {
+		t.Fatalf("a verified same-host seat must reach the CLI launch stage: %v", f.recorded())
+	}
+	if f.countMatching("kill-session") != 0 {
+		t.Fatalf("a verified launch must not roll back the session")
 	}
 }
 
@@ -338,61 +366,77 @@ func TestBuildCLILineAndSSHAttach(t *testing.T) {
 	}
 }
 
-func TestExtractMarkerHost(t *testing.T) {
-	cap := "ops@remote-box:~$ echo FLOWBEE_REMOTE_n1_$(hostname)\nFLOWBEE_REMOTE_n1_remote-box\nops@remote-box:~$"
-	host, ok := extractMarkerHost(cap, "FLOWBEE_REMOTE_n1")
-	if !ok || host != "remote-box" {
-		t.Fatalf("extractMarkerHost = %q,%v — the command-echo line must be skipped and only the OUTPUT read", host, ok)
+func TestExtractMarkerIdentity(t *testing.T) {
+	cap := "ops@remote-box:~$ echo FLOWBEE_REMOTE_n1_$(whoami)@$(hostname)\nFLOWBEE_REMOTE_n1_ops@remote-box\nops@remote-box:~$"
+	id, ok := extractMarkerIdentity(cap, "FLOWBEE_REMOTE_n1")
+	if !ok || id != "ops@remote-box" {
+		t.Fatalf("extractMarkerIdentity = %q,%v — the command-echo line must be skipped and only the OUTPUT read", id, ok)
 	}
 	// a capture with ONLY the command echo (no output yet) must not resolve.
-	if _, ok := extractMarkerHost("$ echo FLOWBEE_REMOTE_n1_$(hostname)", "FLOWBEE_REMOTE_n1"); ok {
-		t.Fatal("the command-echo line alone must not resolve a host")
+	if _, ok := extractMarkerIdentity("$ echo FLOWBEE_REMOTE_n1_$(whoami)@$(hostname)", "FLOWBEE_REMOTE_n1"); ok {
+		t.Fatal("the command-echo line alone must not resolve an identity")
 	}
 }
 
-// TestExtractMarkerHost_ReEchoedInput guards against an ssh -t / PS2 setup that RE-ECHOES
-// the typed command (so the pane holds the marker in BOTH the echoed input line AND the
-// resolved-output line): the extractor must pick the OUTPUT host, never a token off the
-// still-`$(hostname)` input line.
-func TestExtractMarkerHost_ReEchoedInput(t *testing.T) {
+// TestExtractMarkerIdentity_ReEchoedInput guards against an ssh -t / PS2 setup that
+// RE-ECHOES the typed command (so the pane holds the marker in BOTH the echoed input line
+// AND the resolved-output line): the extractor must pick the OUTPUT `user@host`, never a
+// token off the still-`$(whoami)@$(hostname)` input line.
+func TestExtractMarkerIdentity_ReEchoedInput(t *testing.T) {
 	// row 1: primary prompt echo of the typed command (has `echo ` and `$(`)
 	// row 2: a PS2/bracketed re-echo of the same command (still has `$(`)
 	// row 3: the resolved OUTPUT — the only line the extractor may read
-	capt := "remote:~$ echo FLOWBEE_REMOTE_z9_$(hostname)\n" +
-		"> FLOWBEE_REMOTE_z9_$(hostname)\n" +
-		"FLOWBEE_REMOTE_z9_far-box\n" +
+	capt := "remote:~$ echo FLOWBEE_REMOTE_z9_$(whoami)@$(hostname)\n" +
+		"> FLOWBEE_REMOTE_z9_$(whoami)@$(hostname)\n" +
+		"FLOWBEE_REMOTE_z9_claude1@far-box\n" +
 		"remote:~$ "
-	host, ok := extractMarkerHost(capt, "FLOWBEE_REMOTE_z9")
+	id, ok := extractMarkerIdentity(capt, "FLOWBEE_REMOTE_z9")
 	if !ok {
-		t.Fatal("expected the resolved output host to be found")
+		t.Fatal("expected the resolved output identity to be found")
 	}
-	if host != "far-box" {
-		t.Fatalf("extractMarkerHost picked %q — it must read the OUTPUT host, not a $(hostname) input token", host)
+	if id != "claude1@far-box" {
+		t.Fatalf("extractMarkerIdentity picked %q — it must read the OUTPUT user@host, not a $(whoami)@$(hostname) input token", id)
 	}
-	if host == "$(hostname)" {
-		t.Fatal("extractMarkerHost was fooled by the echoed input line")
+	if strings.Contains(id, "$(") {
+		t.Fatal("extractMarkerIdentity was fooled by the echoed input line")
 	}
 }
 
-// TestConfirmRemoteHost_EmptyLocalHostnameFailsClosed is the §15.15 M3 fail-closed guard:
-// if the control plane cannot name itself (os.Hostname() == "" ⇒ LocalHostname==""), the
-// confirmation CANNOT tell the local shell from a remote one, so it must REFUSE to confirm
-// arrival — returning NOT-verified with a clear cause and WITHOUT even echoing a marker.
-// The full-ladder consequence (rollback + no CLI line typed on a !confirmed result) is the
-// same !confirmed → killAndFail path proven by TestRunLadder_SSHExitToLocalShell_NotVerified.
-// (This branch is unreachable through RunLadder — withDefaults fills LocalHostname from
-// os.Hostname() when empty — so it is exercised directly here.)
-func TestConfirmRemoteHost_EmptyLocalHostnameFailsClosed(t *testing.T) {
-	f := &ladderFake{hostname: "remote-box"} // a genuine remote — but we can't prove which
+// TestBuildIdentity_EitherEmptyFailsClosed proves the identity builder yields the
+// fail-closed empty string when EITHER the user OR the host is unknown — the M3 signal that
+// confirmRemoteHost keys on. A control plane that cannot fully name itself must not launch.
+func TestBuildIdentity_EitherEmptyFailsClosed(t *testing.T) {
+	if id := buildIdentity("", "Mac-Studio.local"); id != "" {
+		t.Fatalf("empty USER must fail closed (empty identity), got %q", id)
+	}
+	if id := buildIdentity("sam", ""); id != "" {
+		t.Fatalf("empty HOST must fail closed (empty identity), got %q", id)
+	}
+	if id := buildIdentity("sam", "Mac-Studio.local"); id != "sam@Mac-Studio.local" {
+		t.Fatalf("a full user+host must join into user@host, got %q", id)
+	}
+}
+
+// TestConfirmRemoteHost_EmptyLocalIdentityFailsClosed is the §15.15 M3 fail-closed guard:
+// if the control plane cannot name itself (empty user OR empty host ⇒ LocalIdentity==""),
+// the confirmation CANNOT tell the local shell from a remote one, so it must REFUSE to
+// confirm arrival — returning NOT-verified with a clear cause and WITHOUT even echoing a
+// marker. The full-ladder consequence (rollback + no CLI line typed on a !confirmed result)
+// is the same !confirmed → killAndFail path proven by
+// TestRunLadder_SSHExitToLocalShell_NotVerified. (This branch is unreachable through
+// RunLadder — withDefaults fills LocalIdentity from resolveLocalIdentity() when empty — so
+// it is exercised directly here.)
+func TestConfirmRemoteHost_EmptyLocalIdentityFailsClosed(t *testing.T) {
+	f := &ladderFake{identity: "ops@remote-box"} // a genuine remote — but we can't prove which
 	client, clk := newLadderClient(f)
 	ok, ev, err := confirmRemoteHost(context.Background(), client, clk, "epic-frob", "n1", "", 5*time.Second, time.Second)
 	if err != nil {
 		t.Fatalf("unexpected infra error: %v", err)
 	}
 	if ok {
-		t.Fatalf("empty local hostname must FAIL CLOSED, got confirmed=true (ev=%q)", ev)
+		t.Fatalf("empty local identity must FAIL CLOSED, got confirmed=true (ev=%q)", ev)
 	}
-	if !strings.Contains(ev, "local hostname unknown") {
+	if !strings.Contains(ev, "local user@host unknown") {
 		t.Fatalf("evidence should name the cause, got %q", ev)
 	}
 	// it must refuse BEFORE echoing any marker (no probe into a possibly-local shell).
