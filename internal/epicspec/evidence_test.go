@@ -3,6 +3,7 @@ package epicspec
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func evidenceSpec() Spec {
@@ -202,6 +203,43 @@ func TestCheckScopeNoTouchedPaths(t *testing.T) {
 	out := CheckScope([]string{"internal/foo/**"}, nil)
 	if len(out) != 0 {
 		t.Fatalf("no touched paths -> no violations, got %v", out)
+	}
+}
+
+// TestTruncateForReasonRuneSafe (review n1): a step whose free-text description is long
+// AND multibyte (em dashes, CJK, accented text) is truncated for the merge_handoff reason
+// WITHOUT ever splitting a rune into invalid UTF-8. A naive byte slice (s[:59]) would land
+// mid-rune and leave a mojibake half-character in the operator's attention queue; the cut
+// backs up to a rune boundary instead, so the embedded reason is always valid UTF-8.
+func TestTruncateForReasonRuneSafe(t *testing.T) {
+	// 30 em dashes = 90 bytes; a naive s[:59] cut lands INSIDE the 20th dash (a 3-byte
+	// rune spanning bytes 57–59), producing invalid UTF-8. The rune-safe cut backs up.
+	longMultibyte := strings.Repeat("—", 30)
+	got := truncateForReason(longMultibyte)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated reason is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("a truncated reason must end with the ellipsis marker, got %q", got)
+	}
+	if len(got) >= len(longMultibyte) {
+		t.Fatalf("a >60-byte description must actually be truncated, got %d bytes from %d", len(got), len(longMultibyte))
+	}
+
+	// End-to-end through CheckEvidence: a multibyte step DESCRIPTION that fails the gate
+	// must surface a valid-UTF-8 failure string, since the reason embeds
+	// truncateForReason(step.Text) verbatim.
+	spec := Spec{
+		Steps: []Step{{N: 1, Text: "実装タスク " + strings.Repeat("é", 60), Validate: "go test ./..."}},
+	}
+	res := CheckEvidence(spec, StatusBlock{State: "done"}) // step 1 missing from the checklist
+	if res.Clear || len(res.Failures) == 0 {
+		t.Fatal("want a failure for the missing multibyte step")
+	}
+	for _, f := range res.Failures {
+		if !utf8.ValidString(f) {
+			t.Fatalf("failure reason is not valid UTF-8: %q", f)
+		}
 	}
 }
 

@@ -183,6 +183,12 @@ func TestRenderReviewBriefEpicDecisionOverridesDiffOnly(t *testing.T) {
 	if strings.Contains(brief, "those are not blocking") {
 		t.Fatalf("epic brief must NOT emit the generic diff-only Decision block\n%s", brief)
 	}
+	// the generic diff-only TOP block ("you are NOT expected to run tests … FROM THE DIFF")
+	// must be SUPPRESSED for an epic PR too — absence beats supersession, so a top-to-bottom
+	// read never encounters a "don't run anything" framing before the RUN-THE-CODE contract.
+	if strings.Contains(brief, "NOT expected to run tests") {
+		t.Fatalf("epic brief must SUPPRESS the generic diff-only top block\n%s", brief)
+	}
 	// ordering: the overriding Decision must come AFTER the Epic Contract section so a
 	// top-to-bottom read ends on "run the code", not on a diff-only framing.
 	if ci, di := strings.Index(brief, "Epic Contract"), strings.Index(brief, "EPIC PR — this OVERRIDES"); ci < 0 || di < ci {
@@ -193,6 +199,10 @@ func TestRenderReviewBriefEpicDecisionOverridesDiffOnly(t *testing.T) {
 	generic := renderReviewBrief("job-1", "code_reviewer", &client.LeaseContext{Identity: "r", Task: "t", Diff: "d"})
 	if !strings.Contains(generic, "those are not blocking") {
 		t.Fatalf("a non-epic review must keep the generic Decision block\n%s", generic)
+	}
+	// the top diff-only block still renders for an ordinary (non-epic) review.
+	if !strings.Contains(generic, "NOT expected to run tests") {
+		t.Fatalf("a non-epic review must keep the generic diff-only top block\n%s", generic)
 	}
 	if strings.Contains(generic, "EPIC PR — this OVERRIDES") {
 		t.Fatalf("a non-epic review must NOT carry the epic Decision block\n%s", generic)

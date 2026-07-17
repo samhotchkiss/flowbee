@@ -154,6 +154,37 @@ func TestInjectEpicCriteriaNonEpicPRNoOp(t *testing.T) {
 	}
 }
 
+// TestInjectEpicCriteriaBaseReadFailureOmitsSection (phase-4 residue): when the epic PR
+// carries a NON-EMPTY base SHA the mirror cannot resolve (a failed pinned-contract read),
+// injectEpicCriteria omits the epic section ENTIRELY rather than falling back to the
+// head-authored (forgeable) contract — a reviewer shown NO epic section is safer than one
+// shown a spec a lying agent could have shrunk/renumbered at head. The merge gate
+// re-verifies against the pinned contract independently, so the degraded brief can never
+// wrongly ALLOW a self-merge.
+func TestInjectEpicCriteriaBaseReadFailureOmitsSection(t *testing.T) {
+	st := testutil.NewStore(t)
+	mirrorPath, headSHA := epicMirrorFixture(t, "2026-07-03-foo", "epics/2026-07-03-foo.md", epicCriteriaFixtureBody)
+
+	if err := st.AddEpicRun(context.Background(), store.EpicRun{
+		ID: "2026-07-03-foo", Repo: "", FilePath: "epics/2026-07-03-foo.md",
+		Title: "Foo", Scope: []string{"app/foo/**"}, Branch: "epic/2026-07-03-foo",
+		TmuxName: "epic-2026-07-03-foo",
+	}, time.Unix(500, 0)); err != nil {
+		t.Fatalf("register epic: %v", err)
+	}
+
+	srv := &Server{store: st, mirrorPath: mirrorPath, clock: clock.Real{}}
+	lc := &LeaseContext{}
+	// A well-formed but NON-EXISTENT base SHA: the head read succeeds (the real epic tip)
+	// but the pinned-base contract read fails, exercising the fail-safe omit path. The
+	// PRIOR behavior fell back to the head spec here; it must now leave both fields empty.
+	srv.injectEpicCriteria(context.Background(), "", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", headSHA, lc)
+
+	if lc.EpicCriteria != "" || lc.EpicChecklist != "" {
+		t.Fatalf("a failed pinned-base read must omit the epic section entirely (both fields empty), got EpicCriteria=%q EpicChecklist=%q", lc.EpicCriteria, lc.EpicChecklist)
+	}
+}
+
 // TestInjectEpicCriteriaNoMirrorConfiguredNoOp: with no mirror configured at all
 // (the common non-epic-lane deployment), injectEpicCriteria is a complete no-op —
 // no panic, no mirror I/O attempted.
