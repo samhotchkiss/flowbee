@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/user"
 	"strings"
 	"time"
 
@@ -104,9 +105,14 @@ type LadderParams struct {
 	// sh, since the literal survives NewSession's shQuote — see the package trace).
 	LoginShell string
 
-	// LocalHostname is the control-plane box's hostname, used by the remote-host
-	// confirmation (M3) to detect an ssh drop-back to the LOCAL shell. Default os.Hostname().
-	LocalHostname string
+	// LocalIdentity is the control-plane shell's `user@host` identity (e.g.
+	// "sam@Mac-Studio.local"), used by the remote-identity confirmation (M3) to detect an
+	// ssh drop-back to the LOCAL shell. The TUPLE — not the hostname alone — is the
+	// discriminator, because the real fleet reaches seats via `ssh <user>@localhost`: a seat
+	// (claude1@Mac-Studio.local) shares the control plane's HOSTNAME and differs only by
+	// USER (sam@Mac-Studio.local). Default `<current user>@<os.Hostname()>`; "" if EITHER the
+	// user or the host is unknown ⇒ confirmRemoteHost FAILS CLOSED (refuses to launch remotely).
+	LocalIdentity string
 	// RemoteMarkerNonce makes the confirmation marker unique per launch so stale
 	// scrollback cannot match. Default a fresh random hex; tests inject a fixed value.
 	RemoteMarkerNonce string
@@ -122,8 +128,8 @@ func (p LadderParams) withDefaults() LadderParams {
 	if p.LoginShell == "" {
 		p.LoginShell = "${SHELL:-/bin/sh}"
 	}
-	if p.LocalHostname == "" {
-		p.LocalHostname, _ = os.Hostname() // "" on failure ⇒ confirmRemoteHost FAILS CLOSED (refuses to launch remotely)
+	if p.LocalIdentity == "" {
+		p.LocalIdentity = resolveLocalIdentity() // "" if user OR host unknown ⇒ confirmRemoteHost FAILS CLOSED
 	}
 	if p.RemoteMarkerNonce == "" {
 		p.RemoteMarkerNonce = randNonce()
@@ -141,6 +147,41 @@ func (p LadderParams) withDefaults() LadderParams {
 		p.PollInterval = 2 * time.Second
 	}
 	return p
+}
+
+// resolveLocalIdentity returns the control-plane shell's `user@host` identity — the M3
+// discriminator that distinguishes the local control-plane shell from an ssh'd-to seat
+// shell EVEN ON THE SAME MACHINE. The real fleet is multiple unix users on ONE box, reached
+// via `ssh <user>@localhost`, so the hostname alone cannot tell a seat from the control
+// plane; the user@host tuple can. It returns "" if EITHER the user or the hostname cannot be
+// determined, so confirmRemoteHost FAILS CLOSED: a control plane that cannot fully name
+// itself must not launch remotely.
+func resolveLocalIdentity() string {
+	host, err := os.Hostname()
+	if err != nil {
+		host = ""
+	}
+	return buildIdentity(currentUsername(), host)
+}
+
+// currentUsername resolves the current unix user name via os/user, falling back to $USER
+// (so a cgo-less or /etc/passwd-less environment can still name itself). Returns "" when
+// neither is available — the fail-closed signal buildIdentity propagates.
+func currentUsername() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return os.Getenv("USER")
+}
+
+// buildIdentity joins a user and host into the `user@host` identity, or "" if EITHER is
+// empty. The empty result is the M3 fail-closed signal: confirmRemoteHost refuses to launch
+// remotely when the control plane cannot fully name itself.
+func buildIdentity(username, host string) string {
+	if username == "" || host == "" {
+		return ""
+	}
+	return username + "@" + host
 }
 
 // LadderResult is the ladder's typed progress: the outcome, the stage reached (or where
@@ -252,52 +293,55 @@ func runRemoteAttach(ctx context.Context, client *tmuxio.Client, clk tmuxio.Cloc
 			"remote shell did not arrive (last: "+last+")"), true, nil
 	}
 
-	// A shell-looking prompt appeared — but looksLikeShell CANNOT tell the remote shell
-	// from the LOCAL control-plane shell (both end in `$`/`%`). If the ssh line
+	// A shell-looking prompt appeared — but looksLikeShell CANNOT tell the remote seat
+	// shell from the LOCAL control-plane shell (both end in `$`/`%`). If the ssh line
 	// instant-exited (conn refused / host-key mismatch / net drop / auth exhaustion),
 	// control fell back to the LOCAL prompt; proceeding would type the CLI launch line
-	// into the WRONG (local) shell — and if the control-plane box is ALSO a seat host,
-	// claude would launch locally and reach WORKING while bound to a REMOTE seat (a
-	// wrong-box scheduling hazard). Confirm we are on the far box by echoing a per-launch
-	// marker suffixed with $(hostname) and requiring a host that DIFFERS from the local
-	// one (plan §15.15 M3).
-	confirmed, cev, cerr := confirmRemoteHost(ctx, client, clk, session, p.RemoteMarkerNonce, p.LocalHostname, p.ShellTimeout, p.PollInterval)
+	// into the WRONG (local) shell — and because the real fleet's seats run on the SAME box
+	// as the control plane (reached via `ssh <user>@localhost`), claude would launch as the
+	// WRONG user while bound to a remote seat (a wrong-seat scheduling hazard). Confirm we
+	// are on the far side by echoing a per-launch marker suffixed with $(whoami)@$(hostname)
+	// and requiring an IDENTITY that DIFFERS from the control plane's own (plan §15.15 M3).
+	confirmed, cev, cerr := confirmRemoteHost(ctx, client, clk, session, p.RemoteMarkerNonce, p.LocalIdentity, p.ShellTimeout, p.PollInterval)
 	if cerr != nil {
-		return killAndFail(ctx, client, session, target, StageAwaitRemoteShell, "confirm remote host: "+cerr.Error()), true, nil
+		return killAndFail(ctx, client, session, target, StageAwaitRemoteShell, "confirm remote identity: "+cerr.Error()), true, nil
 	}
 	if !confirmed {
 		return killAndFail(ctx, client, session, target, StageAwaitRemoteShell,
-			"remote-host confirmation failed ("+cev+") — refusing to type the launch line into a possibly-local shell"), true, nil
+			"remote-identity confirmation failed ("+cev+") — refusing to type the launch line into a possibly-local shell"), true, nil
 	}
 	return LadderResult{}, false, nil
 }
 
-// confirmRemoteHost proves the arrived shell is on the FAR box, not the local
-// control-plane shell an instant-exited ssh would drop back to (plan §15.15 M3). It
-// echoes `<marker>_$(hostname)` into the pane — $(hostname) is evaluated by whatever
-// shell we actually landed in — and reads back the resolved host: a host EQUAL to the
-// local one means ssh dropped to the local shell (confirmed=false); a DIFFERENT host is
-// the remote box (confirmed=true). The marker carries a per-launch nonce so a prior
-// launch's scrollback cannot match. Returns (confirmed, evidence, infra-error).
+// confirmRemoteHost proves the arrived shell is on the FAR SIDE (a seat), not the local
+// control-plane shell an instant-exited ssh would drop back to (plan §15.15 M3). It echoes
+// `<marker>_$(whoami)@$(hostname)` into the pane — evaluated by whatever shell we actually
+// landed in — and reads back the resolved `user@host` identity: an identity EQUAL to the
+// control plane's means ssh dropped back to the local shell (confirmed=false); a DIFFERENT
+// identity is a real seat (confirmed=true). The `user@host` TUPLE, not the hostname alone,
+// is the discriminator: the fleet reaches seats via `ssh <user>@localhost`, so a seat
+// (claude1@Mac-Studio.local) shares the control plane's HOSTNAME and differs only by USER
+// (sam@Mac-Studio.local) — hostname-only comparison would fail closed on every real seat.
+// The marker carries a per-launch nonce so a prior launch's scrollback cannot match.
+// Returns (confirmed, evidence, infra-error).
 //
-// FAIL-CLOSED on an unknown local hostname: if localHost is "" (os.Hostname() failed),
-// it CANNOT tell local from remote, so it refuses to confirm — a control plane that
-// cannot name itself must not launch remotely (a guard that silently disabled itself
-// would restore the M3 race exactly when we can't identify ourselves).
+// FAIL-CLOSED on an unknown local identity: if localIdentity is "" (the current user OR the
+// hostname could not be determined), it CANNOT tell local from remote, so it refuses to
+// confirm — a control plane that cannot fully name itself must not launch remotely (a guard
+// that silently disabled itself would restore the M3 race exactly when we can't identify
+// ourselves). It refuses BEFORE echoing any marker, so no probe is typed into a possibly-
+// local shell.
 //
-// ACCEPTED LIMITATION (fail-closed): if a remote box genuinely SHARES the local hostname
-// (two machines both named e.g. "mac-mini"), host==localHost reads as a local drop-back
-// and a LEGITIMATE remote seat can never launch. That is the safe direction, and the
-// evidence names it explicitly so an operator can rename the box or set a distinct
-// LadderParams.LocalHostname. (A future refinement could match an expected remote
-// hostname recorded at seat registration for an exact-match confirmation.)
-func confirmRemoteHost(ctx context.Context, client *tmuxio.Client, clk tmuxio.Clock, session, nonce, localHost string, timeout, interval time.Duration) (bool, string, error) {
-	if localHost == "" {
-		// fail closed: we cannot distinguish local from remote without our own name.
-		return false, "cannot verify remote host: local hostname unknown (os.Hostname failed)", nil
+// ACCEPTED LIMITATION (fail-closed): if a seat is (mis)configured to run as the control
+// plane's OWN user@host, its identity reads as a local drop-back and it can never launch.
+// That is the safe direction, and the evidence names it explicitly.
+func confirmRemoteHost(ctx context.Context, client *tmuxio.Client, clk tmuxio.Clock, session, nonce, localIdentity string, timeout, interval time.Duration) (bool, string, error) {
+	if localIdentity == "" {
+		// fail closed: we cannot distinguish local from remote without our own user@host.
+		return false, "cannot verify remote identity: local user@host unknown", nil
 	}
 	marker := remoteMarkerPrefix + nonce
-	if _, err := client.Send(ctx, session, "echo "+marker+"_$(hostname)", tmuxio.SendOptions{}); err != nil {
+	if _, err := client.Send(ctx, session, "echo "+marker+"_$(whoami)@$(hostname)", tmuxio.SendOptions{}); err != nil {
 		return false, "", err
 	}
 	deadline := clk.Now().Add(timeout)
@@ -306,14 +350,14 @@ func confirmRemoteHost(ctx context.Context, client *tmuxio.Client, clk tmuxio.Cl
 		if err != nil {
 			return false, "", err
 		}
-		if host, ok := extractMarkerHost(capt.Raw, marker); ok {
-			if host == localHost {
-				return false, "remote host name " + host + " matches the local host — an ssh drop-back to the local shell, OR the remote box shares this hostname (rename the box or set a distinct LocalHostname)", nil
+		if identity, ok := extractMarkerIdentity(capt.Raw, marker); ok {
+			if identity == localIdentity {
+				return false, "arrived shell identity " + identity + " matches the control plane — ssh dropped back to the local shell (or a seat configured with the control-plane's own user@host)", nil
 			}
-			return true, "remote host " + host + " confirmed", nil
+			return true, "remote identity " + identity + " confirmed", nil
 		}
 		if !clk.Now().Before(deadline) {
-			return false, "remote-host marker never appeared", nil
+			return false, "remote-identity marker never appeared", nil
 		}
 		clk.Sleep(ctx, interval)
 	}
@@ -322,10 +366,12 @@ func confirmRemoteHost(ctx context.Context, client *tmuxio.Client, clk tmuxio.Cl
 // remoteMarkerPrefix anchors the remote-host confirmation marker line in a capture.
 const remoteMarkerPrefix = "FLOWBEE_REMOTE_"
 
-// extractMarkerHost finds the RESOLVED marker line (`<marker>_<host>`) in a capture and
-// returns the host token. It skips the command ECHO line itself — the line still holding
-// the literal `$(hostname)` / `echo ` — so it reads the shell's OUTPUT, not the input.
-func extractMarkerHost(capture, marker string) (string, bool) {
+// extractMarkerIdentity finds the RESOLVED marker line (`<marker>_<user@host>`) in a
+// capture and returns the `user@host` identity token. It skips the command ECHO line
+// itself — the line still holding the literal `$(whoami)@$(hostname)` / `echo ` — so it
+// reads the shell's OUTPUT, not the input. The resolved token now carries an `@` (the
+// user@host tuple), but it is still delimited by whitespace, so the token cut is unchanged.
+func extractMarkerIdentity(capture, marker string) (string, bool) {
 	needle := marker + "_"
 	for _, ln := range strings.Split(capture, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -336,12 +382,12 @@ func extractMarkerHost(capture, marker string) (string, bool) {
 		if i < 0 {
 			continue
 		}
-		host := ln[i+len(needle):]
-		if sp := strings.IndexAny(host, " \t"); sp >= 0 {
-			host = host[:sp]
+		identity := ln[i+len(needle):]
+		if sp := strings.IndexAny(identity, " \t"); sp >= 0 {
+			identity = identity[:sp]
 		}
-		if host != "" {
-			return host, true
+		if identity != "" {
+			return identity, true
 		}
 	}
 	return "", false
