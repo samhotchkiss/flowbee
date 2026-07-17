@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // Broker is a tiny in-process pub/sub for the read-only /v1/events SSE feed. The
@@ -101,18 +102,47 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	// SSE hygiene (plan §15.16b): a keepalive COMMENT every 20s so a half-open socket on a
+	// slept laptop is detected instead of going silently stale. Comment lines (":"-prefixed)
+	// are ignored by every SSE client, so this never disturbs a data consumer.
+	keepalive := time.NewTicker(20 * time.Second)
+	defer keepalive.Stop()
+
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-keepalive.C:
+			if _, err := w.Write([]byte(": keepalive\n\n")); err != nil {
+				return
+			}
+			flusher.Flush()
 		case msg, ok := <-ch:
 			if !ok {
 				return
 			}
+			// named event: per topic (plan §15.16b) so a client can subscribe by topic. The
+			// topic is the event's State bucket ("epics" for epic-lane nudges), defaulting to
+			// "lifecycle". A data-only consumer (which reads only "data:" lines) is unaffected.
+			topic := topicOf(msg)
+			_, _ = w.Write([]byte("event: " + topic + "\n"))
 			_, _ = w.Write([]byte("data: "))
 			_, _ = w.Write(msg)
 			_, _ = w.Write([]byte("\n\n"))
 			flusher.Flush()
 		}
 	}
+}
+
+// topicOf extracts the SSE event topic from a published LifeEvent blob: the "epics" bucket
+// for epic-lane supervision nudges, else "lifecycle". Best-effort — an unparseable blob
+// defaults to lifecycle (SSE is a lossy nudge; poll is truth).
+func topicOf(blob []byte) string {
+	var e struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal(blob, &e) == nil && e.State == "epics" {
+		return "epics"
+	}
+	return "lifecycle"
 }
