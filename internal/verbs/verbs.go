@@ -42,9 +42,15 @@ type Family string
 const (
 	FamilyCodex  Family = "codex"
 	FamilyClaude Family = "claude"
+	// FamilyGrok is xAI's Grok Build CLI (grok-4.5). Live-confirmed against the seat box
+	// (grok1@localhost, /opt/homebrew/bin/grok, config dir ~/.grok / $GROK_HOME): it has a
+	// `/goal` autonomous-goal builtin (so Launch/Resume are SUPPORTED like codex) and a
+	// `/clear` context reset (an alias of /new). Its ONE keystroke divergence — Esc is a
+	// no-op, cancel is Ctrl+C — is handled in EscapeModal below.
+	FamilyGrok Family = "grok"
 )
 
-// ErrUnknownFamily is returned by For when the family is neither codex nor claude.
+// ErrUnknownFamily is returned by For when the family is not one of the known families.
 var ErrUnknownFamily = errors.New("verbs: unknown agent family")
 
 // ErrInvalidKind is returned by NotifyMaster when topKind is not a member of the closed
@@ -87,6 +93,8 @@ func For(family string) (Verbs, error) {
 		return Verbs{family: FamilyCodex}, nil
 	case FamilyClaude:
 		return Verbs{family: FamilyClaude}, nil
+	case FamilyGrok:
+		return Verbs{family: FamilyGrok}, nil
 	default:
 		return Verbs{}, fmt.Errorf("%w: %q", ErrUnknownFamily, family)
 	}
@@ -98,13 +106,17 @@ func (v Verbs) Family() Family { return v.family }
 // Resume resolves the "continue a stopped/paused goal" verb.
 //   - codex:  `/goal resume` (the Codex builtin; copied verbatim from the watchdog's
 //     closed verb set — internal/watchdog/runner.go sendResumeCmd).
+//   - grok:   `/goal resume` — grok's `/goal` autonomous-goal builtin has a `resume`
+//     subcommand (live-confirmed: `/goal` autocompletes to "Set, manage, or check an
+//     autonomous goal"), so resume is SUPPORTED, exactly like codex — NOT unsupported
+//     like Claude. Same spelling as codex, resolved through the table for a future split.
 //   - claude: ErrUnsupported — Claude Code has NO in-pane resume verb (confirmed against
 //     the Claude Code docs: `/resume` returns to a PRIOR conversation, `/goal` with no
 //     arg only shows status, and `claude --resume`/`-c` are launch-time flags). The
 //     caller MUST handle this rather than guess a keystroke.
 func (v Verbs) Resume() (Send, error) {
 	switch v.family {
-	case FamilyCodex:
+	case FamilyCodex, FamilyGrok:
 		return Send{Text: "/goal resume", SubmitEnter: true}, nil
 	default: // FamilyClaude
 		return Send{}, ErrUnsupported
@@ -116,13 +128,18 @@ func (v Verbs) Resume() (Send, error) {
 //   - codex:  `/goal execute the epic at <specPath> per epics/INSTRUCTIONS.md. Work on
 //     branch epic/<slug>.` — the EXACT string shape hardcoded today in cmd/flowbee's
 //     runEpicStart (and threaded through internal/watchdog/launch.go's SendGoalCmd).
-//   - claude: the SAME instruction WITHOUT the Codex `/goal execute ` builtin prefix —
+//   - grok:   the SAME `/goal execute …` builtin shape as codex — grok has a `/goal`
+//     autonomous-goal builtin (live-confirmed), so the objective typed after `/goal ` is
+//     the epic instruction, identical to codex. (The interactive `grok "<prompt>" --yolo`
+//     comes up bare at its `❯` box in Stage 4; the goal is typed in Stage 6 exactly like
+//     codex/claude, so the positional-prompt form is not used on the ladder path.)
+//   - claude: the SAME instruction WITHOUT the Codex/Grok `/goal execute ` builtin prefix —
 //     Claude Code takes a plain natural-language first prompt (confirmed against the
 //     docs). This is a plain-English instruction (DATA the agent acts on), not a guessed
 //     slash-command, so it is a real equivalent rather than a typed-unsupported.
 func (v Verbs) Launch(specPath, slug string) (Send, error) {
 	switch v.family {
-	case FamilyCodex:
+	case FamilyCodex, FamilyGrok:
 		return Send{
 			Text:        fmt.Sprintf("/goal execute the epic at %s per epics/INSTRUCTIONS.md. Work on branch epic/%s.", specPath, slug),
 			SubmitEnter: true,
@@ -137,13 +154,30 @@ func (v Verbs) Launch(specPath, slug string) (Send, error) {
 
 // NudgeEnter resolves the bare-Enter nudge (the "TUI swallowed the first Enter, text is
 // sitting unsubmitted" recovery — internal/watchdog's proven fix). Family-agnostic:
-// both Codex and Claude Code submit with a bare Enter.
+// Codex, Claude Code, and grok all submit with a bare Enter (grok's input bar shows
+// "Enter:send", live-confirmed).
 func (v Verbs) NudgeEnter() Send { return Send{Key: "Enter"} }
 
-// EscapeModal resolves the "dismiss a modal / menu / copy-mode" verb. Family-agnostic:
-// both Codex and Claude Code use the Escape key (confirmed against the Claude Code
-// keybindings docs — Esc closes dialogs/menus).
-func (v Verbs) EscapeModal() Send { return Send{Key: "Escape"} }
+// EscapeModal resolves the "dismiss a modal / menu / copy-mode" verb.
+//   - codex / claude: the Escape key (confirmed against the Claude Code keybindings docs —
+//     Esc closes dialogs/menus).
+//   - grok: Ctrl+U (kill-line), NOT Escape. This is the ONE grok keystroke divergence and
+//     it is CRITICAL: in grok, Esc is a documented NO-OP (live-verified — a typed `/` and
+//     its command menu both SURVIVED an Escape), so mapping EscapeModal to Esc would
+//     silently fail to dismiss anything. grok's cancel is Ctrl+C, but Ctrl+C is
+//     DESTRUCTIVE (it cancels the running turn, and a double Ctrl+C exits grok entirely),
+//     so it must NEVER back a generic "dismiss a modal" verb. Ctrl+U clears the input
+//     line, which dismisses grok's input-driven `/` command menu (the menu opens/closes
+//     with the `/`-prefixed input), and is a harmless no-op on an already-clean prompt —
+//     it can neither cancel a turn nor exit the app, so it "won't mis-fire". (A full
+//     arrow-key picker like `/model` is a human-initiated modal outside the --yolo
+//     autonomous launch path — EscapeModal is not wired onto that path today.)
+func (v Verbs) EscapeModal() Send {
+	if v.family == FamilyGrok {
+		return Send{Key: "C-u"}
+	}
+	return Send{Key: "Escape"}
+}
 
 // NotifyMaster resolves the push-to-wake ping flowbee types into an IDLE registered
 // master's pane so it re-polls (plan §15.10). count is the pending-item count; topKind
@@ -169,9 +203,11 @@ func (v Verbs) NotifyMaster(count int, topKind string) (Send, error) {
 //   - claude: `/clear` (the documented Claude Code slash-command — starts a fresh
 //     conversation, preserving project memory; the master's every-K-iterations reset).
 //   - codex:  `/clear` (the Codex CLI builtin that starts a fresh task in the same
-//     session — confirmed against the Codex CLI slash-command reference). Both families
-//     share the spelling, but it is resolved through the table (not hardcoded) so a
-//     future divergence is a one-line table change.
+//     session — confirmed against the Codex CLI slash-command reference).
+//   - grok:   `/clear` (live-confirmed: `/clear` autocompletes to "Start a new session" —
+//     it is grok's alias of `/new`). All three families share the spelling, but it is
+//     resolved through the table (not hardcoded) so a future divergence is a one-line
+//     table change.
 func (v Verbs) ClearContext() (Send, error) {
 	return Send{Text: "/clear", SubmitEnter: true}, nil
 }

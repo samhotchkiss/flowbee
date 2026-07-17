@@ -98,6 +98,53 @@ func boxCapture(interior string) string {
 		"  ? for shortcuts"
 }
 
+// ── grok pane fixtures (live-captured against grok1@localhost, grok 4.5) ──
+//
+// grok keeps its rounded `│ ❯ │` input box on screen EVEN WHILE a turn runs, and its
+// bottom-right label "Grok 4.5 (high) · always-approve" is present in BOTH idle and
+// working states — so the Working rules (spinner / [stop] / Ctrl+c:cancel) MUST out-rank
+// the idle box, or a working grok pane would misread as idle and the launch ladder's
+// confirm-working wait would time out. These fixtures pin that distinction.
+
+// grokIdleCapture is grok sitting idle at its prompt: the ❯ box + the "Grok 4.5 (…)"
+// label + a bar WITHOUT Ctrl+c:cancel (idle bars omit the cancel affordance).
+func grokIdleCapture() string {
+	return "  ~\n" +
+		"  ╭────────────────────────────────────────────╮\n" +
+		"  │ ❯                                          │\n" +
+		"  ╰──────────────── Grok 4.5 (high) · always-approve ─╯\n" +
+		"  Shift+Tab:mode  │  Ctrl+x:shortcuts\n"
+}
+
+// grokWorkingCapture is grok mid-turn: the braille spinner + …-label + [stop] affordance
+// and a bar WITH Ctrl+c:cancel — all while the SAME ❯ box + "Grok 4.5 (…)" label the idle
+// state shows are ALSO present. Must classify Working, never idle.
+func grokWorkingCapture() string {
+	return "     19\n" +
+		"     20\n" +
+		"    ⠼ Responding… 0.2s                              2.0s ⇣12.3k [stop]\n" +
+		"  ╭────────────────────────────────────────────╮\n" +
+		"  │ ❯                                          │\n" +
+		"  ╰──────────────── Grok 4.5 (high) · always-approve ─╯\n" +
+		"  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+x:shortcuts\n"
+}
+
+// grokWelcomeCapture is grok's startup splash (menu + braille ART) with the input box
+// ready — an IDLE state. The braille ART lines must NOT trip the braille-spinner Working
+// rule (they start with the box border │, not a bare braille glyph, and carry no …).
+func grokWelcomeCapture() string {
+	return "  ~\n" +
+		"  ╭──────────────────────────────────────────────────╮\n" +
+		"  │  ⠀⠀⠀⠀⠀⠀⣀⣀⡀⠀⠀⠀⢀⠄   Grok Build Beta  0.2.102          │\n" +
+		"  │  ⠀⠀⣼⡟⠁⠀⠀⠀⢀⡴⠻⣿⡀⠀   Grok 4.5 is here!                 │\n" +
+		"  │  ⠐⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   New worktree              ctrl+w  │\n" +
+		"  ╰──────────────────────────────────────────────────╯\n" +
+		"  ╭────────────────────────────────────────────╮\n" +
+		"  │ ❯                                          │\n" +
+		"  ╰──────────────── Grok 4.5 (high) · always-approve ─╯\n" +
+		"  Shift+Tab:mode  │  Ctrl+x:shortcuts\n"
+}
+
 // ── discovery ──
 
 func TestListPanes(t *testing.T) {
@@ -242,6 +289,12 @@ func TestClassify(t *testing.T) {
 		// m8: goal blocked/paused is its OWN state, NOT a keystroke-capturing menu.
 		{"codex goal blocked", "  gpt-5.6 · ~/dev/russ            Goal blocked (/goal resume)", StateGoalBlocked},
 		{"codex goal paused", "  gpt-5.6 · ~/dev/russ            Goal paused (/goal resume)", StateGoalBlocked},
+		// grok: idle ❯-box (Grok 4.5 label, no cancel), working spinner (box present but
+		// Working out-ranks it), and the welcome splash (braille ART must not read Working).
+		{"grok idle box", grokIdleCapture(), StateIdleAtPrompt},
+		{"grok working spinner+box", grokWorkingCapture(), StateWorking},
+		{"grok welcome splash idle", grokWelcomeCapture(), StateIdleAtPrompt},
+		{"grok completion banner", "     20\n     Worked for 1.7s.\n  │ ❯                 │\n  ╰── Grok 4.5 (high) · always-approve ─╯", StateIdleAtPrompt},
 		{"unknown garbage", "asdf qwer zxcv", StateUnknown},
 		{"empty", "", StateUnknown},
 	}
@@ -253,6 +306,45 @@ func TestClassify(t *testing.T) {
 		if got != StateUnknown && ev == "" {
 			t.Errorf("%s: non-Unknown state %q returned empty evidence", c.name, got)
 		}
+	}
+}
+
+// TestClassifyGrokWorkingOutranksBox pins the load-bearing grok distinction: a working
+// grok pane still shows its `│ ❯ │` idle box, so EACH working signal — the Ctrl+c:cancel
+// bar, the [stop] affordance, and the braille spinner + …-label — must independently
+// force Working, never letting the box-aware idle fallback win. Without this the launch
+// ladder's confirm-working wait would time out on every grok launch (task point 4).
+func TestClassifyGrokWorkingOutranksBox(t *testing.T) {
+	box := "  ╭────────────────╮\n  │ ❯              │\n  ╰── Grok 4.5 (high) · always-approve ─╯\n"
+	cases := []struct {
+		name    string
+		capture string
+	}{
+		{"cancel affordance in bar", box + "  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+x:shortcuts"},
+		{"stop affordance", "    ⠴ Thinking… 3.1s   [stop]\n" + box + "  Shift+Tab:mode  │  Ctrl+x:shortcuts"},
+		{"braille spinner + ellipsis", "    ⠙ Responding… 0.4s\n" + box + "  Shift+Tab:mode  │  Ctrl+x:shortcuts"},
+	}
+	for _, c := range cases {
+		if st, ev := Classify(c.capture); st != StateWorking {
+			t.Errorf("%s: Classify = %q (%q), want working (idle box must not win)", c.name, st, ev)
+		}
+	}
+}
+
+// TestClassifyGrokIdleDistinct proves grok's idle ❯-in-rounded-box classifies idle and is
+// attributed to grok (the "Grok 4.5" model label), distinct from Claude's "│ > │" box and
+// Codex's bare "›" — and that a genuinely-idle grok pane never reads as Working.
+func TestClassifyGrokIdleDistinct(t *testing.T) {
+	st, ev := Classify(grokIdleCapture())
+	if st != StateIdleAtPrompt {
+		t.Fatalf("grok idle = %q, want idle_at_prompt", st)
+	}
+	if !strings.Contains(ev, "Grok") {
+		t.Fatalf("grok idle evidence %q should attribute the state to grok's model label", ev)
+	}
+	// the idle bar has NO Ctrl+c:cancel, so no Working rule may fire.
+	if strings.Contains(grokIdleCapture(), "Ctrl+c:cancel") {
+		t.Fatal("fixture bug: an idle grok bar must not contain Ctrl+c:cancel")
 	}
 }
 

@@ -15,8 +15,8 @@ type State string
 
 const (
 	// StateIdleAtPrompt: the agent is sitting at its input prompt (a bare `❯`/`›`
-	// line, or Claude Code's bordered `│ > │` box) with no turn running — safe to
-	// send it a message.
+	// line, Claude Code's bordered `│ > │` box, or grok's rounded `│ ❯ │` box with a
+	// "Grok 4.5 (…)" bottom-right label) with no turn running — safe to send it a message.
 	StateIdleAtPrompt State = "idle_at_prompt"
 	// StateWorking: a turn is running (spinner / elapsed timer / "esc to interrupt").
 	// A message sent now queues behind the running turn.
@@ -91,6 +91,18 @@ var classifyRules = []classifyRule{
 	{StateWorking, regexp.MustCompile(`\(\d+s\s*·`), scopeBottom,
 		`Claude Code spinner counter: "✻ Cogitating… (12s · ↑ 2.1k tokens)"`},
 
+	// ── Working (grok: a turn is running — spinner / cancel affordance / [stop]) ──
+	// grok keeps its `│ ❯ │` input box on screen WHILE a turn runs, so these must fire
+	// BEFORE the idle box-aware fallback or a working grok pane would read as idle and the
+	// launch ladder's confirm-working wait would time out (task point 4). Live-captured
+	// against grok1@localhost (grok 4.5).
+	{StateWorking, regexp.MustCompile(`Ctrl\+c:cancel`), scopeBottom,
+		`Grok shortcuts bar WHILE a turn runs: "Shift+Tab:mode │ Ctrl+c:cancel │ Ctrl+x:shortcuts" — the cancel affordance is ABSENT when grok is idle (idle bar is "Shift+Tab:mode │ Ctrl+x:shortcuts")`},
+	{StateWorking, regexp.MustCompile(`\[stop\]`), scopeBottom,
+		`Grok spinner line stop affordance: "⠼ Responding… 0.2s      2.0s ⇣12.3k [stop]"`},
+	{StateWorking, regexp.MustCompile(`(?m)^[ \t]*[\x{2800}-\x{28FF}].*\x{2026}`), scopeBottom,
+		`Grok braille spinner + …-label at a line START: "⠼ Responding… 0.2s" (U+283C braille + U+2026 …). The welcome-splash braille ART is excluded because those lines start with the box border │, never a bare braille glyph`},
+
 	// ── IdleAtPrompt (a bare prompt / completion banner) ──
 	{StateIdleAtPrompt, regexp.MustCompile(`^❯(\s|$)`), scopeLastLine,
 		`Claude Code idle input prompt on the last line: "❯"`},
@@ -99,7 +111,9 @@ var classifyRules = []classifyRule{
 	{StateIdleAtPrompt, regexp.MustCompile(`Goal achieved`), scopeBottom,
 		`Codex goal-session status bar when done: "Goal achieved (1h 52m)"`},
 	{StateIdleAtPrompt, regexp.MustCompile(`Worked for \d+`), scopeBottom,
-		`Codex "Worked for Xm" completion banner above an idle prompt`},
+		`Codex "Worked for Xm" / grok "Worked for 1.7s." completion banner above an idle prompt`},
+	{StateIdleAtPrompt, regexp.MustCompile(`Grok \d`), scopeBottom,
+		`Grok idle input box's bottom-right model label: "╰… Grok 4.5 (high) · always-approve ─╯". This is grok-specific (never on a Claude/Codex pane) so it distinguishes grok's ❯-in-rounded-box idle from Claude's "│ > │" box and Codex's bare "›". A Working rule (Ctrl+c:cancel / [stop] / spinner) fires FIRST when a turn is running, since the same label is also present mid-turn`},
 }
 
 // classifyBottomLines bounds the scopeBottom window: the live UI (input box,
