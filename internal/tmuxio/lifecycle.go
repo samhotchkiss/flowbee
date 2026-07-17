@@ -75,7 +75,7 @@ func (c *Client) HasSession(ctx context.Context, name string) (bool, error) {
 	if err := c.validateIdent("session name", name); err != nil {
 		return false, err
 	}
-	sub := "has-session -t " + shQuote(name) + " >/dev/null 2>&1 && echo " +
+	sub := "has-session -t " + shQuote(exactTarget(name)) + " >/dev/null 2>&1 && echo " +
 		shQuote(sessionExistsToken) + " || echo " + shQuote(sessionMissingToken)
 	out, err := c.run(ctx, sub)
 	if err != nil {
@@ -96,7 +96,7 @@ func (c *Client) KillSession(ctx context.Context, name string) error {
 	if err := c.validateIdent("session name", name); err != nil {
 		return err
 	}
-	_, err := c.run(ctx, "kill-session -t "+shQuote(name))
+	_, err := c.run(ctx, "kill-session -t "+shQuote(exactTarget(name)))
 	return err
 }
 
