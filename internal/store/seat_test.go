@@ -1,0 +1,134 @@
+package store_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/samhotchkiss/flowbee/internal/store"
+	"github.com/samhotchkiss/flowbee/internal/testutil"
+)
+
+func TestSeatCRUD(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+
+	claude := store.Seat{Box: "buncher", AgentFamily: "claude", AccountKey: "acc-1", ConfigDir: "/home/ops/.claude-pearl", ExtraEnv: map[string]string{"FOO": "bar"}}
+	if err := st.AddSeat(ctx, claude, now); err != nil {
+		t.Fatalf("add claude seat: %v", err)
+	}
+	// re-adding the same box+dir is a dup (not an upsert).
+	if err := st.AddSeat(ctx, claude, now); !errors.Is(err, store.ErrSeatExists) {
+		t.Fatalf("expected ErrSeatExists, got %v", err)
+	}
+
+	got, err := st.GetSeat(ctx, "buncher|/home/ops/.claude-pearl")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.AgentFamily != "claude" || got.AccountKey != "acc-1" || got.Health != store.SeatUnreachable {
+		t.Fatalf("unexpected seat: %+v", got)
+	}
+	if got.ExtraEnv["FOO"] != "bar" || !got.Enabled {
+		t.Fatalf("env/enabled: %+v", got)
+	}
+
+	// a codex seat on the same box is a distinct row (different dir).
+	if err := st.AddSeat(ctx, store.Seat{Box: "buncher", AgentFamily: "codex", CodexHome: "/home/ops/.codex"}, now); err != nil {
+		t.Fatalf("add codex seat: %v", err)
+	}
+	all, err := st.ListSeats(ctx)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("list: n=%d err=%v", len(all), err)
+	}
+}
+
+func TestSeatValidation(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	cases := []struct {
+		name string
+		seat store.Seat
+	}{
+		{"unknown family", store.Seat{Box: "b", AgentFamily: "gpt", CodexHome: "/x"}},
+		{"claude without config_dir", store.Seat{Box: "b", AgentFamily: "claude"}},
+		{"claude with codex_home", store.Seat{Box: "b", AgentFamily: "claude", ConfigDir: "/a", CodexHome: "/b"}},
+		{"codex without codex_home", store.Seat{Box: "b", AgentFamily: "codex"}},
+		{"argv-unsafe box", store.Seat{Box: "-oProxyCommand=x", AgentFamily: "codex", CodexHome: "/x"}},
+		{"argv-unsafe config_dir", store.Seat{Box: "b", AgentFamily: "claude", ConfigDir: "/a b"}},
+		{"bad env key", store.Seat{Box: "b", AgentFamily: "codex", CodexHome: "/x", ExtraEnv: map[string]string{"9BAD": "v"}}},
+		{"argv-unsafe env value", store.Seat{Box: "b", AgentFamily: "codex", CodexHome: "/x", ExtraEnv: map[string]string{"OK": "a b"}}},
+	}
+	for _, c := range cases {
+		if err := st.AddSeat(ctx, c.seat, now); err == nil {
+			t.Errorf("%s: expected rejection, got nil", c.name)
+		}
+	}
+}
+
+func TestListReadySeatsAndHealth(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+
+	if err := st.AddSeat(ctx, store.Seat{Box: "b1", AgentFamily: "claude", ConfigDir: "/c1"}, now); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := st.AddSeat(ctx, store.Seat{Box: "b2", AgentFamily: "claude", ConfigDir: "/c2"}, now); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := st.AddSeat(ctx, store.Seat{Box: "b3", AgentFamily: "codex", CodexHome: "/c3"}, now); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	// nothing ready yet (all unreachable).
+	ready, err := st.ListReadySeats(ctx, "claude")
+	if err != nil || len(ready) != 0 {
+		t.Fatalf("expected 0 ready, n=%d err=%v", len(ready), err)
+	}
+
+	if err := st.UpdateSeatHealth(ctx, "b1|/c1", store.SeatReady, "weekly 30%", now); err != nil {
+		t.Fatalf("health b1: %v", err)
+	}
+	if err := st.UpdateSeatHealth(ctx, "b2|/c2", store.SeatLimitCritical, "weekly 96%", now); err != nil {
+		t.Fatalf("health b2: %v", err)
+	}
+	if err := st.UpdateSeatHealth(ctx, "b3|/c3", store.SeatReady, "ok", now); err != nil {
+		t.Fatalf("health b3: %v", err)
+	}
+
+	ready, err = st.ListReadySeats(ctx, "claude")
+	if err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+	if len(ready) != 1 || ready[0].ID != "b1|/c1" {
+		t.Fatalf("expected only b1 ready for claude, got %+v", ready)
+	}
+
+	if err := st.UpdateSeatHealth(ctx, "nope", store.SeatReady, "", now); !errors.Is(err, store.ErrSeatNotFound) {
+		t.Fatalf("expected ErrSeatNotFound, got %v", err)
+	}
+	if err := st.UpdateSeatHealth(ctx, "b1|/c1", "bogus", "", now); err == nil {
+		t.Fatal("expected invalid health rejection")
+	}
+}
+
+func TestSetSeatAccountKey(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := st.AddSeat(ctx, store.Seat{Box: "b1", AgentFamily: "codex", CodexHome: "/c1"}, now); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := st.SetSeatAccountKey(ctx, "b1|/c1", "acct-xyz", now); err != nil {
+		t.Fatalf("set key: %v", err)
+	}
+	got, _ := st.GetSeat(ctx, "b1|/c1")
+	if got.AccountKey != "acct-xyz" {
+		t.Fatalf("account key not set: %+v", got)
+	}
+}

@@ -34,6 +34,18 @@ type EpicRun struct {
 	StatusChecklist   []epicspec.ChecklistItem
 	StatusBlockers    string
 
+	// ── epic-lane Phase 6 (0028_epic_capacity.sql): account/seat binding + disk-derived
+	// runtime facts. AccountKey/SeatID/BuilderModelFamily are BOUND at launch by the
+	// gate; ContextPct/PaneState/AuthState/LastCommitAt are written each supervision pass.
+	AccountKey         string
+	SeatID             string
+	BuilderModelFamily string
+	ContextPct         float64 // remaining-context %; -1 = unknown (ctxprobe, §12.4)
+	PaneState          string  // last tmuxio.Classify (§12.1)
+	AuthState          string  // '' | ok | auth_dead (§12.4/§12.13)
+	LastCommitAt       string  // RFC3339 of the newest epic-branch commit
+	ExplainerPath      string  // per-epic visual explainer file on the branch (§15.14)
+
 	CreatedAt  string
 	LaunchedAt string
 	FinishedAt string
@@ -166,6 +178,8 @@ const epicRunSelect = `
 	SELECT id, repo, file_path, title, scope_json, host, branch, tmux_name, agent, state,
 	       status_updated_at, status_current_step, status_steps_total, status_state_detail,
 	       status_checklist_json, status_blockers,
+	       account_key, seat_id, builder_model_family, context_pct, pane_state, auth_state,
+	       last_commit_at, explainer_path,
 	       created_at, launched_at, finished_at, updated_at
 	  FROM epics`
 
@@ -176,6 +190,8 @@ func scanEpicRun(row rowScanner) (EpicRun, error) {
 		&e.TmuxName, &e.Agent, &e.State,
 		&e.StatusUpdatedAt, &e.StatusCurrentStep, &e.StatusStepsTotal, &e.StatusStateDetail,
 		&checklistJSON, &e.StatusBlockers,
+		&e.AccountKey, &e.SeatID, &e.BuilderModelFamily, &e.ContextPct, &e.PaneState, &e.AuthState,
+		&e.LastCommitAt, &e.ExplainerPath,
 		&e.CreatedAt, &e.LaunchedAt, &e.FinishedAt, &e.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return EpicRun{}, ErrEpicRunNotFound
