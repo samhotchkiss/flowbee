@@ -25,6 +25,11 @@ var corePackages = []string{
 	// fence, and per-kind escalation are PURE functions of injected values (plan §14),
 	// wired into the store's serialized txs exactly like scheduler.Pick.
 	"github.com/samhotchkiss/flowbee/internal/attention",
+	// epicdigest (epic-lane Phase 6) assembles the per-epic session digest, the on_task
+	// rollup, the compaction-jump helper, and the fleet counts-only summary — all PURE
+	// functions of injected state (plan §2.1, §15.16), served by the API and consumed by
+	// the master with no LLM/clock/tmux read.
+	"github.com/samhotchkiss/flowbee/internal/epicdigest",
 }
 
 // Forbidden import path prefixes. (time is intentionally allowed: the core uses

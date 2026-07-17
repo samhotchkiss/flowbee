@@ -1,0 +1,3 @@
+{"type":"assistant","timestamp":"2026-07-16T19:00:00.000Z","message":{"model":"claude-opus-4","usage":{"input_tokens":100000,"cache_read_input_tokens":78000,"cache_creation_input_tokens":2000,"output_tokens":900}}}
+{"type":"summary","timestamp":"2026-07-16T19:20:00.000Z","summary":"Conversation compacted to free context"}
+{"type":"assistant","timestamp":"2026-07-16T19:21:00.000Z","message":{"model":"claude-opus-4","usage":{"input_tokens":10000,"cache_read_input_tokens":19000,"cache_creation_input_tokens":1000,"output_tokens":300}}}
