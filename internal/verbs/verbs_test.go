@@ -26,12 +26,18 @@ func TestResume(t *testing.T) {
 	if got.Text != "/goal resume" || !got.SubmitEnter {
 		t.Fatalf("codex Resume = %+v", got)
 	}
+	// claude: the max-out recovery is the literal CONTINUE + Enter (operator-confirmed —
+	// a usage-capped claude session STOPS the goal and resumes on typed CONTINUE). NOT an
+	// error: this is load-bearing for the watchdog's per-family auto-resume.
 	cl, _ := For("claude")
-	if _, err := cl.Resume(); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("claude Resume = %v, want ErrUnsupported (no in-pane resume verb)", err)
+	got, err = cl.Resume()
+	if err != nil {
+		t.Fatalf("claude Resume err: %v (must send CONTINUE, not error)", err)
 	}
-	// grok: /goal resume is SUPPORTED (grok has the /goal builtin), like codex — NOT
-	// ErrUnsupported like claude.
+	if got.Text != "CONTINUE" || !got.SubmitEnter || got.Key != "" {
+		t.Fatalf("claude Resume = %+v, want CONTINUE+Enter (literal max-out recovery)", got)
+	}
+	// grok: /goal resume is SUPPORTED (grok has the /goal builtin), like codex.
 	gk, _ := For("grok")
 	got, err = gk.Resume()
 	if err != nil {

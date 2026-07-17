@@ -59,11 +59,10 @@ var ErrInvalidKind = errors.New("verbs: top kind is not a known attention kind")
 
 // ErrUnsupported is returned by a verb that has NO real equivalent for a family. It is
 // deliberate: a wrong guessed keystroke is worse than a typed "unsupported" the caller
-// must handle (plan §1.7). Currently only Claude Code's Resume() is unsupported — there
-// is no in-pane slash-command or keystroke that resumes a stopped autonomous task
-// (`claude --resume`/`-c` are LAUNCH-time flags, not something typeable into a running
-// pane). The caller (watchdog auto-resume / master) must handle this — e.g. skip the
-// resume and surface an attention item instead of sending a bogus key.
+// must handle (plan §1.7). It is currently RESERVED — no verb returns it today (every
+// family has a real Resume: codex/grok `/goal resume`, claude the literal `CONTINUE`), but
+// it remains part of the closed verb API so a future family with a genuinely-absent verb
+// can signal it rather than emit a bogus key, and callers may branch on it defensively.
 var ErrUnsupported = errors.New("verbs: no in-pane verb for this agent family")
 
 // Send is a RESOLVED control-plane keystroke payload — exactly what the caller hands to
@@ -108,18 +107,21 @@ func (v Verbs) Family() Family { return v.family }
 //     closed verb set — internal/watchdog/runner.go sendResumeCmd).
 //   - grok:   `/goal resume` — grok's `/goal` autonomous-goal builtin has a `resume`
 //     subcommand (live-confirmed: `/goal` autocompletes to "Set, manage, or check an
-//     autonomous goal"), so resume is SUPPORTED, exactly like codex — NOT unsupported
-//     like Claude. Same spelling as codex, resolved through the table for a future split.
-//   - claude: ErrUnsupported — Claude Code has NO in-pane resume verb (confirmed against
-//     the Claude Code docs: `/resume` returns to a PRIOR conversation, `/goal` with no
-//     arg only shows status, and `claude --resume`/`-c` are launch-time flags). The
-//     caller MUST handle this rather than guess a keystroke.
+//     autonomous goal"), so resume is SUPPORTED, exactly like codex. Same spelling as
+//     codex, resolved through the table for a future split.
+//   - claude: the literal word `CONTINUE` + Enter. This is the OPERATOR-CONFIRMED max-out
+//     recovery: when a Claude Code session hits its USAGE CAP it STOPS the goal, and the
+//     resume is to type `CONTINUE` into the pane (Claude Code has no `/goal resume`
+//     slash-command, but this literal DOES resume a usage-blocked stopped task — the
+//     load-bearing input the supervision watchdog types, timed off acctprobe resets_at,
+//     to auto-recover a maxed-out claude session or master pane, plan §15.17). A fixed
+//     literal keystroke sequence in the closed verb set — never derived from pane content.
 func (v Verbs) Resume() (Send, error) {
 	switch v.family {
 	case FamilyCodex, FamilyGrok:
 		return Send{Text: "/goal resume", SubmitEnter: true}, nil
 	default: // FamilyClaude
-		return Send{}, ErrUnsupported
+		return Send{Text: "CONTINUE", SubmitEnter: true}, nil
 	}
 }
 
