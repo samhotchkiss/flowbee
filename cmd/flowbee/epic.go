@@ -112,14 +112,14 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	fs := flag.NewFlagSet("epic start", flag.ContinueOnError)
 	hostFlag := fs.String("host", "", "restrict seat selection to this box (an override that must name a registered seat's box; §15.13)")
 	tzFlag := fs.String("tz", "", "the host's IANA timezone (default: probe the box via `date`/`timedatectl`, else assume serve-local — mirrors `flowbee session add --tz`)")
-	agentFlag := fs.String("agent", "", "coding agent family to launch (overrides the epic file's frontmatter agent:; claude|codex, default codex)")
+	agentFlag := fs.String("agent", "", "coding agent family to launch (overrides the epic file's frontmatter agent:; claude|codex|grok, default codex)")
 	planFlag := fs.Bool("plan", false, "dry-run: validate step count + scope-overlap + selected-seat headroom, do NOT launch (§5f/§10c)")
 	forceQuota := fs.Bool("force-quota", false, "launch even if no seat has weekly headroom (bypasses the severity/seat-health gate — use sparingly)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: flowbee epic start <repo> <epics/....md> [--host <box>] [--tz <iana>] [--agent claude|codex] [--plan] [--force-quota]")
+		return fmt.Errorf("usage: flowbee epic start <repo> <epics/....md> [--host <box>] [--tz <iana>] [--agent claude|codex|grok] [--plan] [--force-quota]")
 	}
 	repoID, filePath := fs.Arg(0), fs.Arg(1)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -263,14 +263,28 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 		logger.Warn("epic registered but failed to bind its seat/account (review handoff may pick the wrong family)", "epic", slug, "err", err)
 	}
 
+	// ── PREFLIGHT the seat's box BEFORE the ladder: resolve its home, ensure the repo is
+	// cloned at <home>/dev/<repo>, and verify gh auth + free disk. The fresh seat accounts
+	// have only the `gh` CLI (no repo cloned), and the 6b launch gate previously ran the
+	// ladder with NO checkout — so the agent came up in the seat's empty home. This clones
+	// the checkout and hands its path to the ladder as the working dir. A failure rolls
+	// back the 'launching' row (never run the ladder into a missing checkout). ──
+	checkout, perr := epicPreflight(ctx, watchdog.NewShellRunner(), seat.Box, repo)
+	if perr != nil {
+		raiseLaunchFailed(ctx, st, slug, repoID, "preflight failed: "+perr.Error(), now)
+		_ = st.DeleteEpicRun(ctx, slug)
+		return fmt.Errorf("launch refused: %w (epic registration rolled back — nothing reserved)", perr)
+	}
+
 	// ── THE LAUNCH LADDER (plan §15.15): drive a LOCAL tmux session through the staged,
 	// pane-classified launch machine, composed from tmuxio primitives + the family verb
 	// table. The local pane is the attach; a remote seat lives in a remote tmux the ssh
-	// line creates. ──
+	// line creates. The agent comes up cwd'd into the preflighted checkout. ──
 	client := tmuxio.New()
 	res, lerr := watchdog.RunLadder(ctx, client, realTmuxClock{}, watchdog.LadderParams{
 		Slug:     slug,
 		SpecPath: filePath,
+		Checkout: checkout,
 		Seat: watchdog.LaunchSeat{
 			Box: seat.Box, AgentFamily: seat.AgentFamily, ConfigDir: seat.ConfigDir,
 			CodexHome: seat.CodexHome, Account: seat.AccountKey, ExtraEnv: seat.ExtraEnv,
@@ -309,6 +323,42 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	fmt.Printf("✓ launched epic %q (seat %q, family %s, tmux %q, branch epic/%s) — run `flowbee epic status` to confirm\n",
 		slug, seat.ID, builderFamily, res.Session, slug)
 	return nil
+}
+
+// epicPreflight ensures the seat's box is launch-ready BEFORE the ladder runs. It resolves
+// the box's home over the SAME Runner the goal-session watchdog uses (local for box="",
+// ssh otherwise), computes the per-repo checkout path (<home>/dev/<repo> — the one-active-
+// epic-per-seat base checkout; the epic runner cuts epic/<slug> from main INSIDE it per
+// epics/INSTRUCTIONS.md), and runs watchdog.Preflight (gh auth + free disk + clone the repo
+// if absent). It returns the resolved checkout so the ladder can bring the agent up cwd'd
+// into it. A non-nil error is launch-blocking (unreachable box / failed clone / gh not
+// authenticated) — the caller rolls back the 'launching' registration.
+func epicPreflight(ctx context.Context, r watchdog.Runner, box string, repo store.Repo) (string, error) {
+	if repo.Owner == "" || repo.Repo == "" {
+		return "", fmt.Errorf("repo %q is missing its github owner/repo — cannot resolve the checkout to clone", repo.ID)
+	}
+	homeOut, err := r.Run(ctx, watchdog.HomeDirCmd(box))
+	if err != nil {
+		return "", fmt.Errorf("resolve home on box %q: %w", boxLabel(box), err)
+	}
+	home := strings.TrimSpace(homeOut)
+	if home == "" {
+		return "", fmt.Errorf("box %q reported an empty $HOME", boxLabel(box))
+	}
+	checkout := home + "/dev/" + repo.Repo
+	pf, err := watchdog.Preflight(ctx, r, watchdog.PreflightParams{
+		Box:           box,
+		CheckoutPath:  checkout,
+		DiskProbePath: home,
+		OwnerRepo:     repo.Owner + "/" + repo.Repo,
+	})
+	if err != nil {
+		return "", fmt.Errorf("preflight on box %q: %w", boxLabel(box), err)
+	}
+	if !pf.GhAuthOK {
+		return "", fmt.Errorf("box %q: gh is not authenticated (the epic's Finish step opens a PR via gh) — run `gh auth login` on the box", boxLabel(box))
+	}
+	return checkout, nil
 }
 
 // raiseLaunchFailed upserts a launch_failed attention item (plan §1.3) so a master/operator
@@ -551,7 +601,7 @@ func runEpicPlan(ctx context.Context, st *store.Store, args []string) error {
 	if len(byFamily) == 0 {
 		fmt.Println("  (no ready seats — `flowbee seat discover <box>` to register one)")
 	}
-	for _, fam := range []string{"claude", "codex"} {
+	for _, fam := range []string{"claude", "codex", "grok"} {
 		fmt.Printf("  %s: %d ready seat(s)\n", fam, byFamily[fam])
 	}
 	return nil

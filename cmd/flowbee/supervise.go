@@ -25,7 +25,7 @@ func foldSeatCapacity(ctx context.Context, logger *slog.Logger, st *store.Store,
 		if !s.Enabled {
 			continue
 		}
-		res, perr := probeSeatDir(s)
+		res, perr := probeSeatDir(ctx, s)
 		health, detail := classifySeatHealth(res, perr)
 		if res != nil && res.Identity.AccountKey != "" {
 			if uerr := st.UpsertAccountLimits(ctx, *res, now); uerr != nil {

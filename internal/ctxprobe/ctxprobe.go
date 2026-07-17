@@ -24,6 +24,11 @@
 //     is the current context occupancy. The context WINDOW size is usually NOT on disk
 //     in the transcript — when it is absent ctxprobe returns it UNKNOWN and NEVER
 //     guesses (plan §12.4), so RemainingPct reports ok=false rather than a fabricated %.
+//   - Grok: the newest session's signals.json under grok_home/sessions/<enc-cwd>/<uuid>/,
+//     whose contextTokensUsed / contextWindowTokens fields give BOTH the occupancy and the
+//     real window size directly (so grok — unlike Claude — needs no window guess; the
+//     window is READ, never the 500000 constant hardcoded). <enc-cwd> is the cwd
+//     encodeURIComponent-encoded (see EncodeCwd), grok's own session-dir naming.
 //
 // Injected FS/clock (mirroring acctprobe) so the same probes run locally or over a
 // remote FS, and tests drive fixtures deterministically.
@@ -42,6 +47,7 @@ type Provider string
 const (
 	ProviderClaude Provider = "claude"
 	ProviderCodex  Provider = "codex"
+	ProviderGrok   Provider = "grok"
 )
 
 // Reading is one session's context-window occupancy. UsedTokens is the tokens currently

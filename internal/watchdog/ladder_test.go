@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/tmuxio"
+	"github.com/samhotchkiss/flowbee/internal/verbs"
 )
 
 // ladderClock is an instant clock: Sleep advances Now (so a classify-wait's timeout loop
@@ -119,7 +120,7 @@ func (f *ladderFake) captureFor() string {
 	case "limbo":
 		return "Connecting to buncher…" // neither a shell nor an auth prompt
 	default: // shell
-		return "ops@buncher:~/epics/frob$"
+		return "ops@buncher:~/dev/russ$"
 	}
 }
 
@@ -154,7 +155,7 @@ func TestRunLadder_RemoteHappyPath(t *testing.T) {
 	f := &ladderFake{identity: "ops@remote-box"}
 	client, clk := newLadderClient(f)
 	res, err := RunLadder(context.Background(), client, clk, LadderParams{
-		Slug: "frob", Seat: remoteSeat(), SpecPath: "epics/2026-07-16-frob.md", Dir: "/home/ops/epics/frob",
+		Slug: "frob", Seat: remoteSeat(), SpecPath: "epics/2026-07-16-frob.md", Checkout: "/home/ops/dev/russ",
 		LocalIdentity: "sam@control-plane", RemoteMarkerNonce: "testnonce",
 	})
 	if err != nil {
@@ -166,9 +167,10 @@ func TestRunLadder_RemoteHappyPath(t *testing.T) {
 	if res.Session != "epic-frob" {
 		t.Fatalf("session name: %q", res.Session)
 	}
-	// the ssh attach line was sent to the far box by EXACT name.
-	if f.countMatching("ssh -t -- buncher tmux new -A -s epic-frob") == 0 {
-		t.Fatalf("ssh attach line missing: %v", f.recorded())
+	// the ssh attach line was sent to the far box by EXACT name, starting the remote
+	// session IN the epic's checkout (-c) so the agent comes up cwd'd into the repo (#9).
+	if f.countMatching("ssh -t -- buncher tmux new -A -s epic-frob -c /home/ops/dev/russ") == 0 {
+		t.Fatalf("ssh attach line (with -c checkout) missing: %v", f.recorded())
 	}
 	// the remote-identity confirmation ran and matched an identity != the local one.
 	if f.countMatching("echo FLOWBEE_REMOTE_testnonce_$(whoami)@$(hostname)") == 0 {
@@ -353,16 +355,38 @@ func TestRunLadder_UnknownFamilyRejected(t *testing.T) {
 }
 
 func TestBuildCLILineAndSSHAttach(t *testing.T) {
-	claude := buildCLILine(LaunchSeat{AgentFamily: "claude", ConfigDir: "/c", Account: "claude:pearl@swh.me", ExtraEnv: map[string]string{"B": "2", "A": "1"}}, "claude")
+	claude := buildCLILine(LaunchSeat{AgentFamily: "claude", ConfigDir: "/c", Account: "claude:pearl@swh.me", ExtraEnv: map[string]string{"B": "2", "A": "1"}}, "claude", "/home/ops/dev/russ")
+	// claude/codex append no CLI flags (cwd comes from the tmux session's start dir).
 	if claude != "CLAUDE_CONFIG_DIR=/c FLOWBEE_ACCOUNT=claude:pearl@swh.me A=1 B=2 claude" {
 		t.Fatalf("claude CLI line: %q", claude)
 	}
-	codex := buildCLILine(LaunchSeat{AgentFamily: "codex", CodexHome: "/h"}, "codex")
+	codex := buildCLILine(LaunchSeat{AgentFamily: "codex", CodexHome: "/h"}, "codex", "/home/ops/dev/russ")
 	if codex != "CODEX_HOME=/h codex" {
 		t.Fatalf("codex CLI line: %q", codex)
 	}
-	if got := buildSSHAttachLine("buncher", "epic-frob"); got != "ssh -t -- buncher tmux new -A -s epic-frob" {
+	// grok: GROK_HOME from the (reused) ConfigDir field, plus --yolo --cwd <checkout>.
+	grok := buildCLILine(LaunchSeat{AgentFamily: "grok", ConfigDir: "/home/gk/.grok", Account: "grok:me@x.ai"}, "grok", "/home/gk/dev/russ")
+	if grok != "GROK_HOME=/home/gk/.grok FLOWBEE_ACCOUNT=grok:me@x.ai grok --yolo --cwd /home/gk/dev/russ" {
+		t.Fatalf("grok CLI line: %q", grok)
+	}
+	// grok with no checkout: still --yolo, but no --cwd.
+	if g := buildCLILine(LaunchSeat{AgentFamily: "grok", ConfigDir: "/g"}, "grok", ""); g != "GROK_HOME=/g grok --yolo" {
+		t.Fatalf("grok CLI line (no checkout): %q", g)
+	}
+	if got := buildSSHAttachLine("buncher", "epic-frob", ""); got != "ssh -t -- buncher tmux new -A -s epic-frob" {
 		t.Fatalf("ssh attach: %q", got)
+	}
+	if got := buildSSHAttachLine("buncher", "epic-frob", "/home/ops/dev/russ"); got != "ssh -t -- buncher tmux new -A -s epic-frob -c /home/ops/dev/russ" {
+		t.Fatalf("ssh attach with checkout: %q", got)
+	}
+}
+
+// TestBinaryFor pins the per-family launch binary literals.
+func TestBinaryFor(t *testing.T) {
+	for fam, want := range map[verbs.Family]string{"claude": "claude", "codex": "codex", "grok": "grok"} {
+		if got := binaryFor(fam); got != want {
+			t.Errorf("binaryFor(%q)=%q want %q", fam, got, want)
+		}
 	}
 }
 

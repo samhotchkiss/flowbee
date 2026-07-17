@@ -39,9 +39,28 @@ func TestSeatCRUD(t *testing.T) {
 	if err := st.AddSeat(ctx, store.Seat{Box: "buncher", AgentFamily: "codex", CodexHome: "/home/ops/.codex"}, now); err != nil {
 		t.Fatalf("add codex seat: %v", err)
 	}
+	// a grok seat reuses config_dir for its GROK_HOME; the seatID folds the family in.
+	grok := store.Seat{Box: "buncher", AgentFamily: "grok", AccountKey: "acc-g", ConfigDir: "/home/ops/.grok"}
+	if err := st.AddSeat(ctx, grok, now); err != nil {
+		t.Fatalf("add grok seat: %v", err)
+	}
+	gotGrok, err := st.GetSeat(ctx, "buncher|grok|/home/ops/.grok")
+	if err != nil {
+		t.Fatalf("get grok: %v", err)
+	}
+	if gotGrok.AgentFamily != "grok" || gotGrok.Ident() != "/home/ops/.grok" {
+		t.Fatalf("unexpected grok seat: %+v (ident=%q)", gotGrok, gotGrok.Ident())
+	}
 	all, err := st.ListSeats(ctx)
-	if err != nil || len(all) != 2 {
+	if err != nil || len(all) != 3 {
 		t.Fatalf("list: n=%d err=%v", len(all), err)
+	}
+	// grok is selectable by family in ListReadySeats.
+	if err := st.UpdateSeatHealth(ctx, gotGrok.ID, store.SeatReady, "weekly 5%", now); err != nil {
+		t.Fatalf("grok health: %v", err)
+	}
+	if ready, err := st.ListReadySeats(ctx, "grok"); err != nil || len(ready) != 1 || ready[0].AgentFamily != "grok" {
+		t.Fatalf("expected 1 ready grok seat, got %+v err=%v", ready, err)
 	}
 }
 
@@ -58,6 +77,9 @@ func TestSeatValidation(t *testing.T) {
 		{"claude without config_dir", store.Seat{Box: "b", AgentFamily: "claude"}},
 		{"claude with codex_home", store.Seat{Box: "b", AgentFamily: "claude", ConfigDir: "/a", CodexHome: "/b"}},
 		{"codex without codex_home", store.Seat{Box: "b", AgentFamily: "codex"}},
+		{"grok without config_dir", store.Seat{Box: "b", AgentFamily: "grok"}},
+		{"grok with codex_home", store.Seat{Box: "b", AgentFamily: "grok", ConfigDir: "/g", CodexHome: "/x"}},
+		{"grok argv-unsafe config_dir", store.Seat{Box: "b", AgentFamily: "grok", ConfigDir: "/a b"}},
 		{"argv-unsafe box", store.Seat{Box: "-oProxyCommand=x", AgentFamily: "codex", CodexHome: "/x"}},
 		{"argv-unsafe config_dir", store.Seat{Box: "b", AgentFamily: "claude", ConfigDir: "/a b"}},
 		{"bad env key", store.Seat{Box: "b", AgentFamily: "codex", CodexHome: "/x", ExtraEnv: map[string]string{"9BAD": "v"}}},

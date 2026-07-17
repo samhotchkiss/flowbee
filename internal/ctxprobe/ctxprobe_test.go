@@ -114,6 +114,56 @@ func TestProbeClaude_MissingProjectDirUnknown(t *testing.T) {
 	}
 }
 
+func TestProbeGrok_ReadsWindowFromDisk(t *testing.T) {
+	p := ctxprobe.NewWith(ctxprobe.OSFS{})
+	r, ok, err := p.ProbeGrok(filepath.Join("testdata", "grok", "home"), cwd)
+	if err != nil || !ok {
+		t.Fatalf("probe: ok=%v err=%v", ok, err)
+	}
+	// the NEWEST session (higher-named uuid) wins: 120000/400000, not the older 999999.
+	if r.UsedTokens != 120000 {
+		t.Fatalf("expected the newest session's 120000, got %d", r.UsedTokens)
+	}
+	// grok records the window on disk — it must be READ (400000 here), never the
+	// hardcoded 500000 constant.
+	if r.ContextWindow != 400000 {
+		t.Fatalf("expected the on-disk window 400000 (never a 500000 guess), got %d", r.ContextWindow)
+	}
+	used, uok := r.UsedPct()
+	rem, rok := r.RemainingPct()
+	if !uok || !rok || used != 30 || rem != 70 {
+		t.Fatalf("pct: used=%v(%v) rem=%v(%v) want 30/70", used, uok, rem, rok)
+	}
+	if r.Provider != ctxprobe.ProviderGrok {
+		t.Fatalf("provider=%q want grok", r.Provider)
+	}
+}
+
+func TestProbeGrok_MissingCwdDirUnknown(t *testing.T) {
+	p := ctxprobe.NewWith(ctxprobe.OSFS{})
+	_, ok, err := p.ProbeGrok(filepath.Join("testdata", "grok", "home"), "/some/other/cwd")
+	if err != nil {
+		t.Fatalf("a missing session dir is unknown, not an error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false for a cwd with no grok session dir")
+	}
+}
+
+func TestEncodeCwd(t *testing.T) {
+	// live-verified: grok encodes cwd with encodeURIComponent (/ -> %2F).
+	if got := ctxprobe.EncodeCwd("/Users/grok1"); got != "%2FUsers%2Fgrok1" {
+		t.Fatalf("EncodeCwd(/Users/grok1) = %q, want %%2FUsers%%2Fgrok1", got)
+	}
+	if got := ctxprobe.EncodeCwd("/work/epic/frob"); got != "%2Fwork%2Fepic%2Ffrob" {
+		t.Fatalf("EncodeCwd = %q", got)
+	}
+	// unreserved runes (-_.~) survive un-encoded; a space and '#' are encoded.
+	if got := ctxprobe.EncodeCwd("/a-b_c.d~e f#g"); got != "%2Fa-b_c.d~e%20f%23g" {
+		t.Fatalf("EncodeCwd unreserved/encoded mix = %q", got)
+	}
+}
+
 func TestSlugForCwd(t *testing.T) {
 	if got := ctxprobe.SlugForCwd("/Users/sam/dev/flowbee"); got != "-Users-sam-dev-flowbee" {
 		t.Fatalf("slug = %q", got)

@@ -67,6 +67,7 @@ type Provider string
 const (
 	ProviderClaude Provider = "claude"
 	ProviderCodex  Provider = "codex"
+	ProviderGrok   Provider = "grok"
 )
 
 // TrustState says how far a Result's reading can be trusted. Routable() is the
@@ -150,8 +151,9 @@ type Identity struct {
 	ConfigDir        string // resolved config dir (claude) or CODEX_HOME (codex)
 	Tier             string // claude organizationRateLimitTier / codex planType
 	SeatTier         string // claude oauthAccount.seatTier (may be empty/null on disk)
-	AuthMode         string // codex auth.json auth_mode ("chatgpt"/"apikey"); empty for claude
+	AuthMode         string // codex auth.json auth_mode ("chatgpt"/"apikey") / grok auth.json auth_mode ("oidc"); empty for claude
 	Model            string // codex config.toml model (e.g. "gpt-5.6-sol"); empty for claude
+	PrincipalType    string // grok auth.json principal_type ("User"/"Team"); empty for claude/codex
 	Verified         bool   // true only when identity was network-verified (live)
 	CredentialDigest string // sha256(accessToken)[:16] — swap detection; never the token
 	LineageDigest    string // codex sha256(refreshToken)[:16] — fresh-login detection; never the token

@@ -311,6 +311,14 @@ func (p *Prober) CredentialDigest(ctx context.Context, provider Provider, dir st
 				return d
 			}
 		}
+	case ProviderGrok:
+		// grok's bearer (`key`) lives in ~/.grok/auth.json; read it transiently and return
+		// ONLY its one-way digest (never the token) — the codex/claude posture.
+		if entry, err := p.readGrokAuth(dir); err == nil {
+			if d, ok := digest16(entry.Key); ok {
+				return d
+			}
+		}
 	}
 	return ""
 }

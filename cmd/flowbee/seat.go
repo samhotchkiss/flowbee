@@ -74,8 +74,8 @@ func (e envFlag) Set(v string) error {
 func runSeatAdd(ctx context.Context, st *store.Store, args []string) error {
 	fs := flag.NewFlagSet("seat add", flag.ContinueOnError)
 	box := fs.String("box", "", "registered host / ssh destination ('' = control-plane box)")
-	family := fs.String("family", "", "agent family: claude|codex (required)")
-	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR (claude seats)")
+	family := fs.String("family", "", "agent family: claude|codex|grok (required)")
+	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR (claude seats) / GROK_HOME (grok seats)")
 	codexHome := fs.String("codex-home", "", "CODEX_HOME (codex seats)")
 	account := fs.String("account-key", "", "account_windows.account_key (optional; a probe resolves it)")
 	env := envFlag{}
@@ -112,7 +112,7 @@ func runSeatList(ctx context.Context, st *store.Store, args []string) error {
 
 func printSeatList(w io.Writer, seats []store.Seat) {
 	if len(seats) == 0 {
-		fmt.Fprintln(w, "no seats registered (flowbee seat add --box <b> --family <claude|codex> --config-dir/--codex-home <dir>)")
+		fmt.Fprintln(w, "no seats registered (flowbee seat add --box <b> --family <claude|codex|grok> --config-dir/--codex-home <dir>)")
 		return
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
@@ -146,7 +146,7 @@ func runSeatProbe(ctx context.Context, st *store.Store, args []string) error {
 		if *only != "" && s.Box != *only {
 			continue
 		}
-		res, perr := probeSeatDir(s)
+		res, perr := probeSeatDir(ctx, s)
 		health, detail := classifySeatHealth(res, perr)
 		if res != nil && res.Identity.AccountKey != "" {
 			// fold identity + whatever usage the reading carried (respecting trust).
@@ -266,22 +266,51 @@ func discoverSeats(p *acctprobe.Prober, box, home string) []seatProposal {
 			result: res, email: res.Identity.Email, health: health,
 		})
 	}
+	// the default grok home (GROK_HOME is env-scoped; discovery checks the ~/.grok
+	// convention). grok reuses the config_dir field for its home.
+	grokHome := filepath.Join(home, ".grok")
+	if res, perr := p.ProbeGrokHome(grokHome); res != nil && res.Identity.AccountKey != "" {
+		health, _ := classifySeatHealth(res, perr)
+		out = append(out, seatProposal{
+			seat:   store.Seat{Box: box, AgentFamily: "grok", AccountKey: res.Identity.AccountKey, ConfigDir: grokHome},
+			result: res, email: res.Identity.Email, health: health,
+		})
+	}
 	return out
 }
 
-// probeSeatDir probes a registered seat's config dir/codex home for identity + cached
-// usage, using the local FS for a local seat and read-only ssh for a remote one.
-func probeSeatDir(s store.Seat) (*acctprobe.Result, error) {
+// probeSeatDir probes a registered seat's identity + usage. A LOCAL seat (box="") uses
+// the LIVE-capable tier — the authoritative reading the capacity fold + `flowbee seat
+// probe` want, not a stale on-disk cache: Claude Keychain + /api/oauth/usage, Codex
+// app-server, grok's cli-chat-proxy billing endpoint (New() wires the real HTTP + exec).
+// A REMOTE seat uses the read-only-ssh CACHE tier, because the far box's credential store
+// (Keychain / token file behind a locked session) is not reachable to make the live call,
+// so the cache (the CLI's own last write) is the best signal ssh can serve.
+func probeSeatDir(ctx context.Context, s store.Seat) (*acctprobe.Result, error) {
+	local := s.Box == ""
 	var p *acctprobe.Prober
-	if s.Box == "" {
+	if local {
 		p = acctprobe.New()
 	} else {
 		p = acctprobe.NewWith(sshFS{rr: &remoteRunner{box: s.Box, timeout: 15 * time.Second}}, nil, nil, nil, clock.Real{})
 	}
-	if s.AgentFamily == "codex" {
-		return p.ProbeCodexHome(s.CodexHome)
+	switch s.AgentFamily {
+	case "codex":
+		if local {
+			return p.ProbeCodex(ctx, s.CodexHome) // live app-server
+		}
+		return p.ProbeCodexHome(s.CodexHome) // cache
+	case "grok":
+		if local {
+			return p.ProbeGrok(ctx, s.ConfigDir) // live billing endpoint (cache fallback)
+		}
+		return p.ProbeGrokHome(s.ConfigDir) // cache (unified.jsonl /usage log line)
+	default: // claude
+		if local {
+			return p.ProbeClaude(ctx, s.ConfigDir, "") // live /api/oauth/usage (cache fallback)
+		}
+		return p.ProbeClaudeDir(s.ConfigDir) // cache
 	}
-	return p.ProbeClaudeDir(s.ConfigDir)
 }
 
 // classifySeatHealth maps an acctprobe reading to a seat health (plan §15.13a). A probe
