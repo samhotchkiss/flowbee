@@ -22,21 +22,47 @@ export class HttpError extends Error {
 
 const TIMEOUT_MS = 4_000;
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+
+/** Bearer tokens only travel to loopback or over https — never cleartext off-box. */
+export function tokenTransportSafe(base: string): boolean {
+	try {
+		const u = new URL(base);
+		return u.protocol === "https:" || LOOPBACK_HOSTS.has(u.hostname);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Thin fetch client for the Flowbee control plane. Read endpoints are open on
- * loopback; the token (when set) rides along for the authed control/ops surface.
+ * loopback; the token (when set) rides along for the authed control/ops surface
+ * — but only when the transport can't leak it (loopback or https), so a typo'd
+ * off-box http URL never sprays the bearer token in cleartext.
  * Flowbee returns JSON `null` for several empty lists — normalized to [] here.
  */
 export class FlowbeeClient {
+	/** true when a token was configured but withheld because the URL is off-loopback http. */
+	readonly tokenWithheld: boolean;
+	private readonly token?: string;
+
 	constructor(
 		private readonly base: string,
-		private readonly token?: string,
-	) {}
+		token?: string,
+	) {
+		const safe = tokenTransportSafe(base);
+		this.token = token && safe ? token : undefined;
+		this.tokenWithheld = !!token && !safe;
+	}
+
+	/** Auth headers under the transport policy — shared with the SSE fetch. */
+	authHeaders(): Record<string, string> {
+		return this.token ? { Authorization: `Bearer ${this.token}` } : {};
+	}
 
 	private headers(json = false): Record<string, string> {
-		const h: Record<string, string> = {};
+		const h: Record<string, string> = this.authHeaders();
 		if (json) h["Content-Type"] = "application/json";
-		if (this.token) h["Authorization"] = `Bearer ${this.token}`;
 		return h;
 	}
 

@@ -80,4 +80,12 @@ npm run watch     # rebuild + restart the plugin on change
 ```
 
 Logs: `com.samhotchkiss.flowbee.sdPlugin/logs/`. Property-inspector debugging:
-`npx @elgato/cli dev`, then open http://localhost:23654/.
+`npx @elgato/cli dev`, then open http://localhost:23654/. To attach a Node
+debugger to the plugin itself, temporarily add `"Debug": "enabled"` under
+`Nodejs` in manifest.json — it is deliberately off in the shipped manifest
+(an open inspector port on a process that can exec tmux/ssh/osascript is a
+local-RCE foothold).
+
+Security posture: the API token is only ever attached when the base URL is
+loopback or https — a typo'd off-box `http://` host gets no credentials (a
+warning is logged instead).

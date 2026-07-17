@@ -9,7 +9,7 @@ import { PauseToggleAction } from "./actions/pause-toggle";
 import { flowbee } from "./flowbee/service";
 import type { GlobalSettings } from "./settings";
 
-streamDeck.logger.setLevel("debug");
+streamDeck.logger.setLevel("info");
 
 streamDeck.actions.registerAction(new AccountUsageAction());
 streamDeck.actions.registerAction(new GoalSessionAction());

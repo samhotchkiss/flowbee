@@ -59,6 +59,9 @@ class FlowbeeService {
 		this.client = new FlowbeeClient(baseUrl(gs), gs.token?.trim() || undefined);
 		this.serverHasSessions = true;
 		logger.info(`configured for ${this.client.baseUrl}`);
+		if (this.client.tokenWithheld) {
+			logger.warn("API token configured but WITHHELD: base URL is non-loopback http — use https (or loopback) to send credentials");
+		}
 		for (const [key, r] of this.resources) {
 			if (r.listeners.size > 0) {
 				this.restartTimer(key, r);
@@ -192,7 +195,13 @@ class FlowbeeService {
 		while (!abort.signal.aborted && this.anySubscribers) {
 			const connectedAt = Date.now();
 			try {
-				const res = await fetch(`${this.client.baseUrl}/v1/events`, { signal: abort.signal });
+				// /v1/events is on Flowbee's open read tier today; the auth header
+				// (same transport policy as the client) is for the authed SSE topics
+				// coming in the epic-lane API.
+				const res = await fetch(`${this.client.baseUrl}/v1/events`, {
+					headers: this.client.authHeaders(),
+					signal: abort.signal,
+				});
 				if (!res.ok || !res.body) throw new Error(`SSE HTTP ${res.status}`);
 				logger.info("SSE connected");
 				// connected after an outage — re-sync everything we watch.
