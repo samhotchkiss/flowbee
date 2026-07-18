@@ -27,10 +27,11 @@ import (
 
 // runEpic is the `flowbee epic <start|status|abandon>` CLI (epic-lane Phase 2).
 // Talks directly to the local control-plane DB and control-plane mirror on disk —
-// same posture as `flowbee session`/`flowbee host`: pure local reads/writes for
-// status+abandon, and for `start` a series of git-mirror reads + ssh/tmux calls
-// that need no serve process running (the mirror is just files on disk; `start`
-// provisions/reads it exactly like serve's own mirror-refresh loop does).
+// same posture as `flowbee session`/`flowbee host`: local reads/writes for status,
+// an exact registered tmux stop followed by a local write for abandon, and for
+// `start` a series of git-mirror reads + ssh/tmux calls that need no serve process
+// running (the mirror is just files on disk; `start` provisions/reads it exactly
+// like serve's own mirror-refresh loop does).
 func runEpic(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: flowbee epic <start|status|abandon> ...")
@@ -761,32 +762,50 @@ func subsystemsOf(scope []string) []string {
 }
 
 func runEpicAbandon(ctx context.Context, st *store.Store, args []string) error {
+	return runEpicAbandonWithRunner(ctx, st, args, watchdog.NewShellRunner(), os.Stdout)
+}
+
+// runEpicAbandonWithRunner is the testable abandon boundary. The durable transition
+// releases both the seat and scope, so it MUST happen only after the runner confirms
+// that this row's exact registered tmux session is absent. The private worktree is
+// deliberately left in place after the process stops so unpushed work remains recoverable.
+func runEpicAbandonWithRunner(ctx context.Context, st *store.Store, args []string, runner watchdog.Runner, w io.Writer) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: flowbee epic abandon <id>")
 	}
 	id := args[0]
-	// Resolve first so the CLI keeps its friendlier missing-id error. Abandon changes only
-	// durable orchestration state: it deliberately preserves the tmux process AND its
-	// worktree as one recovery unit. Removing a live agent's cwd here can destroy unpushed
-	// changes and strand the process in a deleted directory.
-	_, gerr := st.GetEpicRun(ctx, id)
+	// Resolve first both for the friendlier missing-id error and to bind cleanup to the
+	// immutable host/tmux pair stored for this exact epic (never to an id-derived guess).
+	epic, gerr := st.GetEpicRun(ctx, id)
 	if errors.Is(gerr, store.ErrEpicRunNotFound) {
 		return fmt.Errorf("no such epic %q", id)
 	}
 	if gerr != nil {
 		return gerr
 	}
+	if strings.TrimSpace(epic.TmuxName) == "" {
+		return fmt.Errorf("cannot abandon epic %q: it has no registered tmux session name, so a stop cannot be confirmed; the epic remains active with its scope, seat, and private worktree preserved", id)
+	}
+	where := "the local host"
+	if epic.Host != "" {
+		where = epic.Host + " and its local attach"
+		if _, err := runner.Run(ctx, watchdog.KillTmuxSessionCmd(epic.Host, epic.TmuxName)); err != nil {
+			return fmt.Errorf("cannot abandon epic %q: could not confirm remote tmux session %q stopped on %s; the epic remains active with its scope, seat, and private worktree preserved: %w",
+				id, epic.TmuxName, epic.Host, err)
+		}
+	}
+	if _, err := runner.Run(ctx, watchdog.KillTmuxSessionCmd("", epic.TmuxName)); err != nil {
+		return fmt.Errorf("cannot abandon epic %q: could not confirm local tmux session %q stopped; the epic remains active with its scope, seat, and private worktree preserved: %w",
+			id, epic.TmuxName, err)
+	}
 	if err := st.AbandonEpicRun(ctx, id, time.Now()); err != nil {
 		if errors.Is(err, store.ErrEpicRunNotFound) {
 			return fmt.Errorf("no such epic %q", id)
 		}
-		return err
+		return fmt.Errorf("tmux session %q was stopped, but epic %q could not be marked abandoned (its reservations remain held): %w", epic.TmuxName, id, err)
 	}
-	// operator decision, called out explicitly (§ task brief): abandon releases the
-	// scope/seat reservation and stops the watchdog watching it, but the tmux session and
-	// its worktree are kept together for inspection/recovery.
-	fmt.Printf("epic %q abandoned — scope + seat reservation released, goal-session watch disabled.\n"+
-		"the tmux session and private worktree were preserved; inspect or stop the session by hand (`tmux kill-session -t epic-%s` on its host).\n", id, id)
+	fmt.Fprintf(w, "epic %q abandoned — tmux session %q stopped on %s; scope + seat reservation released; goal-session watch disabled.\n"+
+		"the private worktree was preserved for inspection and recovery.\n", id, epic.TmuxName, where)
 	return nil
 }
 

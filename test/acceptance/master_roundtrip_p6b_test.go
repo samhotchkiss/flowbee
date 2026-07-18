@@ -60,6 +60,8 @@ func (p *fakePane) Deliver(_ context.Context, _, session, message string) (strin
 	return "strong", nil
 }
 
+func (p *fakePane) Stop(_ context.Context, _, _ string) error { return nil }
+
 // apiPaneDeliverer adapts fakePane to the api.PaneDeliverer 3-return shape.
 type apiPaneDeliverer struct{ p *fakePane }
 

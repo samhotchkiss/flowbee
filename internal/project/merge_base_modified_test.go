@@ -36,11 +36,8 @@ func TestMergeBaseModifiedRetriesNotDeadLetters(t *testing.T) {
 	_, _ = sender.DrainOnce(ctx)
 
 	j, _ := st.GetJob(ctx, "j")
-	if j.State == job.StateNeedsHuman {
-		t.Fatal("a base-modified merge dead-lettered the job to needs_human — it must retry")
-	}
-	if j.State == job.StateResolvingConflict {
-		t.Fatal("a base-modified merge spuriously routed to a conflict_resolver — it must retry")
+	if j.State != job.StateMerging || j.Verdict == nil {
+		t.Fatalf("base-modified state/verdict=%s/%+v, want merging with authorization intact for retry", j.State, j.Verdict)
 	}
 	// the merge row is left pending for the next drain (after the base settles).
 	row, ok, err := st.NextPendingOutbox(ctx)

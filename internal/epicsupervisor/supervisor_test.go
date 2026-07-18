@@ -2,6 +2,7 @@ package epicsupervisor
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -12,12 +13,23 @@ import (
 )
 
 // fakePane is a scripted pane for the supervision pass tests.
-type fakePane struct{ state map[string]string }
+type fakePane struct {
+	state   map[string]string
+	stopErr map[string]error
+	stops   map[string]int
+}
 
 func (p fakePane) Classify(_ context.Context, _, session string) (string, string, error) {
 	return p.state[session], "", nil
 }
 func (p fakePane) Deliver(_ context.Context, _, _, _ string) (string, error) { return "strong", nil }
+func (p fakePane) Stop(_ context.Context, host, session string) error {
+	key := host + "|" + session
+	if p.stops != nil {
+		p.stops[key]++
+	}
+	return p.stopErr[key]
+}
 
 // panickyPane panics when classifying one specific session (a malformed/wedged pane), used
 // to prove the M1 per-epic recover isolates one bad epic from the rest of the batch.
@@ -33,6 +45,7 @@ func (p panickyPane) Classify(_ context.Context, _, session string) (string, str
 	return p.state[session], "", nil
 }
 func (p panickyPane) Deliver(_ context.Context, _, _, _ string) (string, error) { return "strong", nil }
+func (p panickyPane) Stop(_ context.Context, _, _ string) error                 { return nil }
 
 // TestPassPerEpicPanicIsolation proves M1: a panic while observing ONE epic (a nil/wedged
 // pane) is recovered per-epic — the pass does NOT crash and every OTHER epic still
@@ -111,7 +124,7 @@ func TestProducerNeedsInputAndClear(t *testing.T) {
 func TestLaunchingReaper(t *testing.T) {
 	ctx := context.Background()
 	past := time.Now().Add(-30 * time.Minute)
-	pane := fakePane{state: map[string]string{}}
+	pane := fakePane{state: map[string]string{}, stops: map[string]int{}}
 	st, supv := newSupv(t, pane)
 	// created_at = past → older than the 10m strand window.
 	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "b", Repo: "r", Host: "box1", TmuxName: "epic-b", Agent: "claude"}, 1, past); err != nil {
@@ -127,6 +140,9 @@ func TestLaunchingReaper(t *testing.T) {
 	if e.State != "abandoned" {
 		t.Fatalf("stranded launch not reaped: state=%q", e.State)
 	}
+	if pane.stops["box1|epic-b"] != 1 || pane.stops["|epic-b"] != 1 {
+		t.Fatalf("stranded launch stop calls=%v, want remote agent then local attach", pane.stops)
+	}
 	open, _ := st.ListOpenAttention(ctx, "open", nil, "")
 	found := false
 	for _, it := range open {
@@ -136,6 +152,37 @@ func TestLaunchingReaper(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a launch_failed item, got %+v", open)
+	}
+}
+
+func TestLaunchingReaperRetainsCapacityWhenStopIsUnconfirmed(t *testing.T) {
+	ctx := context.Background()
+	past := time.Now().Add(-30 * time.Minute)
+	pane := fakePane{
+		state:   map[string]string{},
+		stops:   map[string]int{},
+		stopErr: map[string]error{"box1|epic-b": errors.New("ssh unreachable")},
+	}
+	st, supv := newSupv(t, pane)
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "b", Repo: "r", Host: "box1", TmuxName: "epic-b", Agent: "claude"}, 1, past); err != nil {
+		t.Fatalf("add epic: %v", err)
+	}
+
+	supv.Pass(ctx, time.Now())
+
+	e, err := st.GetEpicRun(ctx, "b")
+	if err != nil {
+		t.Fatalf("get epic: %v", err)
+	}
+	if e.State != "launching" {
+		t.Fatalf("unconfirmed cleanup released stranded epic: state=%q", e.State)
+	}
+	active, err := st.ListActiveEpicRuns(ctx)
+	if err != nil || len(active) != 1 || active[0].ID != "b" {
+		t.Fatalf("unconfirmed cleanup released capacity: active=%+v err=%v", active, err)
+	}
+	if pane.stops["box1|epic-b"] != 1 || pane.stops["|epic-b"] != 0 {
+		t.Fatalf("stop calls=%v, want fail closed after remote cleanup failure", pane.stops)
 	}
 }
 

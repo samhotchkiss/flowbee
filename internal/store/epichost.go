@@ -101,9 +101,8 @@ func (s *Store) ListEpicHosts(ctx context.Context) ([]EpicHost, error) {
 // RemoveEpicHost deletes a host from the registry (`flowbee host rm`).
 // ErrEpicHostNotFound if it never existed. Deliberately does NOT check for an
 // active epic on this host — an operator removing a host mid-epic is trusted to
-// know what they're doing (matches `flowbee epic abandon`'s "operator decision,
-// we don't second-guess it" posture); the epics row itself is untouched, so
-// `flowbee epic status` still shows the epic with its (now-unregistered) host name.
+// know what they're doing; the epics row itself is untouched, so `flowbee epic
+// status` still shows the epic with its (now-unregistered) host name.
 func (s *Store) RemoveEpicHost(ctx context.Context, name string) error {
 	res, err := s.DB.ExecContext(ctx, `DELETE FROM epic_hosts WHERE name = ?`, name)
 	if err != nil {

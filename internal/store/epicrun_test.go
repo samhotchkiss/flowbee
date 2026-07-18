@@ -312,8 +312,9 @@ func TestEpicRunAbandonReleasesHostAndDisablesSession(t *testing.T) {
 	if gs.Enabled {
 		t.Fatalf("expected the linked goal session to be disabled (watch paused) after abandon")
 	}
-	// abandon does NOT delete the tmux session's registration, only pauses watching
-	// it — the row must still exist (an operator decision to kill it, not ours).
+	// The store transition does NOT delete the tmux session's registration, only pauses
+	// watching it. The CLI has already stopped the process before invoking this method;
+	// the registry row remains as durable history.
 	if _, err := st.GetGoalSession(ctx, "epic-e3"); err != nil {
 		t.Fatalf("expected goal session row to still exist: %v", err)
 	}

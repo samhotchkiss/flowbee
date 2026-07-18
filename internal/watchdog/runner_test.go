@@ -321,3 +321,17 @@ func TestCommandBuildersUseExactMatchTargets(t *testing.T) {
 		t.Errorf("new-session -s must remain the literal create name, got: %q", create)
 	}
 }
+
+// TestKillTmuxSessionCmdConfirmsAbsence pins the abandon safety contract: success
+// means tmux was available and the exact session was observed absent after any kill.
+// The second has-session probe is what lets a caller retain reservations when a kill
+// fails or leaves the target alive; the command remains successful when it was absent.
+func TestKillTmuxSessionCmdConfirmsAbsence(t *testing.T) {
+	cmd := KillTmuxSessionCmd("", "epic-e1")
+	if !strings.Contains(cmd, "command -v tmux") {
+		t.Fatalf("missing tmux-availability check: %q", cmd)
+	}
+	if got := strings.Count(cmd, "tmux has-session -t '=epic-e1:'"); got != 2 {
+		t.Fatalf("has-session probes = %d, want initial idempotence check + post-kill confirmation: %q", got, cmd)
+	}
+}

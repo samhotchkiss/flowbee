@@ -412,8 +412,9 @@ func nextEpicState(cur, raw string) string {
 // holding: the scope/host occupancy (immediate — ListActiveEpicRuns excludes
 // 'abandoned') and the linked goal_sessions watch (disabled in the SAME tx, direct
 // SQL rather than SetGoalSessionEnabled, so the two writes commit atomically). Per
-// the task brief this deliberately does NOT kill the tmux session — that's an
-// operator decision the CLI output calls out explicitly (cmd/flowbee/epic.go).
+// this store method does not perform process I/O itself: its transition caller MUST first
+// confirm the row's exact registered tmux session is stopped. Keeping that ordering at
+// the command boundary prevents releasing these reservations around a live agent.
 func (s *Store) AbandonEpicRun(ctx context.Context, id string, now time.Time) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		var tmuxName string

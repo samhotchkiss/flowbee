@@ -215,16 +215,16 @@ func NewTmuxSessionCmd(box, tmuxName, dir, startCmd string) string {
 		" -c "+shQuote(dir)+" "+shQuote(startCmd))
 }
 
-// KillTmuxSessionCmd ensures a tmux session is stopped — used ONLY on the failed-launch
-// ROLLBACK path (review m7): a launch that created the session but then failed to
-// send its goal would otherwise leak the session, and a same-slug retry would then
-// permanently fail on tmux's duplicate-session error. It succeeds when the exact
-// session is already absent, so a rollback can distinguish that safe state from an
-// unreachable host or a real kill failure. NEVER used on a live epic: `flowbee epic
-// abandon` deliberately leaves the session running (operator decision).
+// KillTmuxSessionCmd ensures an exact tmux session is stopped. It is used by both
+// failed-launch rollback and explicit epic abandon: neither path may release a durable
+// seat/scope reservation while its agent could still be running. It succeeds when the
+// exact session is already absent (idempotence), and verifies absence after a kill so a
+// runner error means cleanup was not confirmed and the caller must retain reservations.
 func KillTmuxSessionCmd(box, tmuxName string) string {
 	target := shQuote(exactTarget(tmuxName))
-	return remoteWrap(box, "if tmux has-session -t "+target+" 2>/dev/null; then tmux kill-session -t "+target+"; fi")
+	return remoteWrap(box, "command -v tmux >/dev/null 2>&1 && { "+
+		"if tmux has-session -t "+target+" 2>/dev/null; then tmux kill-session -t "+target+"; fi; "+
+		"! tmux has-session -t "+target+" 2>/dev/null; }")
 }
 
 // SendGoalCmd sends literal text + Enter into an existing tmux pane — the ONE

@@ -211,7 +211,17 @@ type liveMergeCIResult struct {
 	checkURLs     map[string]string
 }
 
-func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedHead string) (liveMergeCIResult, error) {
+// staleMergeAuthorizationError carries the live base Flowbee observed while
+// re-checking the PR. The outbox drain uses it to re-arm the build on the new
+// integration head instead of preserving the now-stale reviewed base.
+type staleMergeAuthorizationError struct {
+	observedBase string
+}
+
+func (e *staleMergeAuthorizationError) Error() string { return errStaleMergeAuthorization.Error() }
+func (e *staleMergeAuthorizationError) Unwrap() error { return errStaleMergeAuthorization }
+
+func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedBase, expectedHead string) (liveMergeCIResult, error) {
 	reader, ok := s.gh.(gh.Client)
 	if !ok || prNumber == 0 {
 		return liveMergeCIResult{}, errMergeCINotReady
@@ -223,8 +233,8 @@ func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedHead str
 	if !ok {
 		return liveMergeCIResult{}, errMergeCINotReady
 	}
-	if expectedHead != "" && pr.HeadRefOid != expectedHead {
-		return liveMergeCIResult{}, errStaleMergeAuthorization
+	if pr.BaseRefOid != expectedBase || pr.HeadRefOid != expectedHead {
+		return liveMergeCIResult{}, &staleMergeAuthorizationError{observedBase: pr.BaseRefOid}
 	}
 	if ms, ok := s.gh.(gh.MergeUnsticker); ok {
 		state, found, err := ms.PullMergeableState(ctx, prNumber)
@@ -422,7 +432,7 @@ const maxOutboxAttempts = 100
 // conflict stays not-mergeable past the retries and then routes correctly.
 const mergeMergeabilityRetries = 3
 
-var errStaleMergeAuthorization = errors.New("merge authorization does not match the reviewed head")
+var errStaleMergeAuthorization = errors.New("merge authorization does not match the reviewed base/head")
 var errMergeCINotReady = errors.New("merge blocked: live required checks are not terminal green")
 var errMergeCIFailedRouted = errors.New("merge blocked: live required checks failed and repair was routed")
 
@@ -600,7 +610,12 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 		detail, err := s.send(ctx, row)
 		if err != nil {
 			if errors.Is(err, errStaleMergeAuthorization) || errors.Is(err, gh.ErrMergeHeadModified) {
-				if ierr := s.store.InvalidateStaleMergeAuthorization(ctx, row.JobID, s.clock.Now()); ierr != nil {
+				var stale *staleMergeAuthorizationError
+				var observedBase string
+				if errors.As(err, &stale) {
+					observedBase = stale.observedBase
+				}
+				if ierr := s.store.InvalidateStaleMergeAuthorization(ctx, row.JobID, observedBase, s.clock.Now()); ierr != nil {
 					return sent, ierr
 				}
 				if s.pub != nil {
@@ -928,7 +943,7 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			}
 			return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
 		}
-		ci, err := s.liveMergeCI(ctx, number, expectedHead)
+		ci, err := s.liveMergeCI(ctx, number, j.BaseSHA, expectedHead)
 		if err != nil {
 			return "", err
 		}

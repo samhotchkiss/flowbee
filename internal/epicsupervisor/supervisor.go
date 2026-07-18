@@ -12,6 +12,7 @@ package epicsupervisor
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -36,6 +37,9 @@ type Pane interface {
 	// Deliver types a push-to-wake ping (a closed-template DATA line, never pane content)
 	// into a master's IDLE pane and returns the tmuxio verdict.
 	Deliver(ctx context.Context, host, session, message string) (verdict string, err error)
+	// Stop idempotently stops one exact tmux session and confirms it is absent. A caller
+	// must retain the epic's seat/scope reservation when Stop cannot prove that state.
+	Stop(ctx context.Context, host, session string) error
 }
 
 // ContextProber resolves an epic session's remaining-context % from disk (internal/
@@ -237,8 +241,10 @@ func (s *Supervisor) produceForEpic(ctx context.Context, e store.EpicRun, paneSt
 
 // reapStrandedLaunches abandons any epic stuck in 'launching' past LaunchStrandAfter (plan
 // §13 — AddEpicRun writes 'launching' BEFORE the tmux session is confirmed up, so a crash
-// mid-launch strands the row and permanently holds the host/scope reservation). The abandon
-// releases the reservation + disables the watch; a launch_failed item routes the retry.
+// mid-launch strands the row and permanently holds the host/scope reservation). It first
+// stops the remote agent session (when any) and the local attach, and releases capacity
+// only after both exact sessions are confirmed absent. A launch_failed item routes cleanup
+// failures and retries without ever overbooking around a possibly-live agent.
 func (s *Supervisor) reapStrandedLaunches(ctx context.Context, epics []store.EpicRun, now time.Time) {
 	for _, e := range epics {
 		if e.State != "launching" {
@@ -246,6 +252,25 @@ func (s *Supervisor) reapStrandedLaunches(ctx context.Context, epics []store.Epi
 		}
 		started := store.ParseTimeOrZero(e.CreatedAt)
 		if started.IsZero() || now.Sub(started) < s.cfg.LaunchStrandAfter {
+			continue
+		}
+		if e.TmuxName == "" {
+			s.upsert(ctx, e, attention.KindLaunchFailed, 10, e.ID+":launch_failed", true,
+				map[string]string{"detail": "launch stranded but has no registered tmux session; capacity retained because cleanup cannot be confirmed"}, now)
+			continue
+		}
+		if e.Host != "" {
+			if err := s.pane.Stop(ctx, e.Host, e.TmuxName); err != nil {
+				s.upsert(ctx, e, attention.KindLaunchFailed, 10, e.ID+":launch_failed", true,
+					map[string]string{"detail": "launch stranded; remote tmux cleanup unconfirmed, so host/scope capacity remains reserved: " + err.Error()}, now)
+				s.logger.Warn("epic supervision: stranded launch remote cleanup unconfirmed; capacity retained", "epic", e.ID, "host", e.Host, "err", err)
+				continue
+			}
+		}
+		if err := s.pane.Stop(ctx, "", e.TmuxName); err != nil {
+			s.upsert(ctx, e, attention.KindLaunchFailed, 10, e.ID+":launch_failed", true,
+				map[string]string{"detail": "launch stranded; local attach cleanup unconfirmed, so host/scope capacity remains reserved: " + err.Error()}, now)
+			s.logger.Warn("epic supervision: stranded launch local cleanup unconfirmed; capacity retained", "epic", e.ID, "err", err)
 			continue
 		}
 		if err := s.store.AbandonEpicRun(ctx, e.ID, now); err != nil {
@@ -510,6 +535,27 @@ func (p TmuxPane) Deliver(ctx context.Context, host, session, message string) (s
 		return "", err
 	}
 	return string(res.Verification), nil
+}
+
+func (p TmuxPane) Stop(ctx context.Context, host, session string) error {
+	client := p.client(host)
+	exists, err := client.HasSession(ctx, session)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if err := client.KillSession(ctx, session); err != nil {
+			return err
+		}
+	}
+	exists, err = client.HasSession(ctx, session)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("tmux session %q still exists after kill", session)
+	}
+	return nil
 }
 
 // ── tiny string helpers ──

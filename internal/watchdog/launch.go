@@ -120,7 +120,7 @@ func ProvisionEpicWorktree(ctx context.Context, r Runner, box, base, worktree, b
 
 // RemoveEpicWorktree tears down an epic's private worktree (WorktreeRemoveCmd). It is used
 // only for launch-failure rollback, before the launch is declared verified. Explicit
-// abandon preserves the worktree with its still-live tmux session for recovery.
+// abandon stops the tmux session but preserves the worktree for recovery.
 func RemoveEpicWorktree(ctx context.Context, r Runner, box, base, worktree string) error {
 	if _, err := r.Run(ctx, WorktreeRemoveCmd(box, base, worktree)); err != nil {
 		return fmt.Errorf("remove per-epic worktree at %s: %w", worktree, err)
