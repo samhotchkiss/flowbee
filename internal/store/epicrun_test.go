@@ -3,7 +3,9 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,126 @@ func mustAddEpicRun(t *testing.T, st *store.Store, ctx context.Context, e store.
 	t.Helper()
 	if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
 		t.Fatalf("add epic run %q: %v", e.ID, err)
+	}
+}
+
+// TestAddEpicRunSeatCapacityIsAtomic proves the throughput model's real invariant:
+// capacity belongs to an authenticated seat, not to the host string. Two distinct
+// cap-1 seats on the same (including local/empty) host can run together; one cap-2
+// seat admits exactly two racing starts and refuses the third. The binding is part
+// of the initial insert, so a launching row is visible to the next atomic count.
+func TestAddEpicRunSeatCapacityIsAtomic(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	addSeat := func(seat store.Seat) store.Seat {
+		t.Helper()
+		if err := st.AddSeat(ctx, seat, now); err != nil {
+			t.Fatalf("add seat %+v: %v", seat, err)
+		}
+		seat.ID = seat.ComposeID()
+		return seat
+	}
+	localA := addSeat(store.Seat{
+		Box: "", AgentFamily: "codex", CodexHome: "/flowbee/codex-a",
+		AccountKey: "acct-a", Health: store.SeatReady, MaxConcurrent: 1,
+	})
+	localB := addSeat(store.Seat{
+		Box: "", AgentFamily: "codex", CodexHome: "/flowbee/codex-b",
+		AccountKey: "acct-b", Health: store.SeatReady, MaxConcurrent: 1,
+	})
+	fast := addSeat(store.Seat{
+		Box: "fastbox", AgentFamily: "codex", CodexHome: "/flowbee/codex-fast",
+		AccountKey: "acct-fast", Health: store.SeatReady, MaxConcurrent: 2,
+	})
+	sharedA := addSeat(store.Seat{
+		Box: "shared-host", AgentFamily: "codex", CodexHome: "/flowbee/shared-a",
+		AccountKey: "acct-shared-a", Health: store.SeatReady, MaxConcurrent: 1,
+	})
+	sharedB := addSeat(store.Seat{
+		Box: "shared-host", AgentFamily: "codex", CodexHome: "/flowbee/shared-b",
+		AccountKey: "acct-shared-b", Health: store.SeatReady, MaxConcurrent: 1,
+	})
+
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "local-a", Repo: "r", Host: "wrong-host", SeatID: localA.ID,
+		AccountKey: "wrong-account", BuilderModelFamily: "wrong-family", Scope: []string{"a/**"},
+	}, 99, now); err != nil {
+		t.Fatalf("first local seat: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "local-b", Repo: "r", SeatID: localB.ID, Scope: []string{"b/**"},
+	}, 1, now); err != nil {
+		t.Fatalf("a distinct cap-1 seat on the same local host must run concurrently: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "local-a-2", Repo: "r", SeatID: localA.ID, Scope: []string{"c/**"},
+	}, 99, now); !errors.Is(err, store.ErrEpicHostBusy) {
+		t.Fatalf("a second epic on the same cap-1 local seat must be refused, got %v", err)
+	}
+	got, err := st.GetEpicRun(ctx, "local-a")
+	if err != nil || got.SeatID != localA.ID || got.Host != "" || got.AccountKey != "acct-a" || got.BuilderModelFamily != "codex" {
+		t.Fatalf("initial insert must atomically persist the selected binding: err=%v epic=%+v", err, got)
+	}
+	for i, seat := range []store.Seat{sharedA, sharedB} {
+		if err := st.AddEpicRun(ctx, store.EpicRun{
+			ID: fmt.Sprintf("shared-%d", i), Repo: "r", SeatID: seat.ID,
+			Scope: []string{fmt.Sprintf("shared/%d/**", i)},
+		}, 1, now); err != nil {
+			t.Fatalf("distinct cap-1 seat %d on one nonempty host must admit concurrently: %v", i, err)
+		}
+	}
+
+	const racers = 3
+	start := make(chan struct{})
+	type result struct {
+		id  string
+		err error
+	}
+	results := make(chan result, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			id := fmt.Sprintf("race-%d", i)
+			results <- result{id: id, err: st.AddEpicRun(ctx, store.EpicRun{
+				ID: id, Repo: "r", SeatID: fast.ID,
+				Scope: []string{fmt.Sprintf("race/%d/**", i)},
+			}, 999, now)}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	succeeded, capped := 0, 0
+	var admitted []string
+	for result := range results {
+		err := result.err
+		switch {
+		case err == nil:
+			succeeded++
+			admitted = append(admitted, result.id)
+		case errors.Is(err, store.ErrEpicHostBusy):
+			capped++
+		default:
+			t.Fatalf("unexpected racing registration error: %v", err)
+		}
+	}
+	if succeeded != 2 || capped != 1 {
+		t.Fatalf("cap-2 racing starts: succeeded=%d capped=%d, want 2/1", succeeded, capped)
+	}
+	if err := st.AbandonEpicRun(ctx, admitted[0], now.Add(time.Minute)); err != nil {
+		t.Fatalf("release one slot: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "after-release", Repo: "r", SeatID: fast.ID, Scope: []string{"after/**"},
+	}, 1, now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("a terminal epic must release one exact-seat slot: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "ghost", Repo: "r", SeatID: "missing", Scope: []string{"ghost/**"}}, 99, now); !errors.Is(err, store.ErrSeatNotFound) {
+		t.Fatalf("unknown bound seat must fail closed, got %v", err)
 	}
 }
 

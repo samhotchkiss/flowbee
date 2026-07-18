@@ -45,6 +45,9 @@ func TestSetEpicRuntimeStateAndSeatBinding(t *testing.T) {
 	if e.AccountKey != "acc-1" || e.SeatID != "buncher|/home/ops/.codex" || e.BuilderModelFamily != "codex" {
 		t.Fatalf("binding not persisted: %+v", e)
 	}
+	if err := st.SetEpicSeatBinding(ctx, "frob", "acc-2", "other-seat", "claude", now); !errors.Is(err, store.ErrEpicSeatRebind) {
+		t.Fatalf("an admitted epic must not move to another seat, got %v", err)
+	}
 	if e.ExplainerPath != "epics/frob-explainer.html" {
 		t.Fatalf("explainer not persisted: %+v", e)
 	}

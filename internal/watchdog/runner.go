@@ -31,6 +31,14 @@ func NewShellRunner() ShellRunner {
 	return ShellRunner{Timeout: 15 * time.Second}
 }
 
+// NewLaunchRunner allows a first clone of a large repository to finish. Ordinary
+// supervision probes keep the tight 15s bound; only the explicit launch preflight
+// gets this longer ceiling. SSH itself still carries ConnectTimeout=5, so an
+// unreachable host fails quickly rather than consuming the full clone window.
+func NewLaunchRunner() ShellRunner {
+	return ShellRunner{Timeout: 10 * time.Minute}
+}
+
 func (r ShellRunner) Run(ctx context.Context, shellCmd string) (string, error) {
 	timeout := r.Timeout
 	if timeout <= 0 {
@@ -135,11 +143,51 @@ func RepoCheckoutExistsCmd(box, path string) string {
 // deliberately `gh`, not a raw `git clone` with a token-bearing URL: the preflight
 // already required `gh auth status` to pass, so the same credential (never placed
 // in argv, unlike a token-bearing https URL would be — `ps` on the remote box is
-// world-readable) clones the epic's checkout. mkdir -p's the parent first since
-// the ~/dev/ convention directory may not exist yet on a freshly provisioned box.
+// world-readable) clones the epic's checkout. Concurrent first launches coordinate
+// through an atomic, host-local mkdir lock. The lock owner clones to a mktemp sibling
+// and only then renames the COMPLETE tree into place; waiters return only after that
+// completed checkout is visible. This avoids both a half-populated canonical .git
+// directory and the subtle `mv -n <dir> <existing-dir>` behavior that can nest a
+// losing clone inside the winner. A dead lock owner and its recorded partial tree
+// are reclaimed from its PID (with an age fallback for the tiny
+// mkdir-before-PID-write crash window).
 func CloneRepoCmd(box, ownerRepo, path string) string {
-	return remoteWrap(box, "mkdir -p -- "+shQuote(parentDirUnix(path))+
-		" && gh repo clone "+shQuote(ownerRepo)+" "+shQuote(path)+" -- --quiet")
+	return remoteWrap(box,
+		"target="+shQuote(path)+"; "+
+			"lock=\"${target}.flowbee-clone.lock\"; partial=; held=; "+
+			"cleanup() { "+
+			"if test -n \"$partial\"; then rm -rf -- \"$partial\"; fi; "+
+			"if test -n \"$held\"; then "+
+			"owner=$(cat \"$lock/pid\" 2>/dev/null || true); "+
+			"if test \"$owner\" = \"$$\"; then rm -rf -- \"$lock\"; fi; "+
+			"fi; }; "+
+			"trap cleanup EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; "+
+			"mkdir -p -- "+shQuote(parentDirUnix(path))+" || exit 1; "+
+			"if test -d \"$target/.git\"; then exit 0; fi; "+
+			"while ! mkdir -- \"$lock\" 2>/dev/null; do "+
+			"if test -d \"$target/.git\"; then exit 0; fi; "+
+			"owner=$(cat \"$lock/pid\" 2>/dev/null || true); stale=; "+
+			"case \"$owner\" in ''|*[!0-9]*) ;; *) "+
+			"if ! kill -0 \"$owner\" 2>/dev/null; then stale=yes; fi ;; esac; "+
+			"if test -z \"$stale\" && test -n \"$(find \"$lock\" -prune -mmin +15 -print 2>/dev/null)\"; then stale=yes; fi; "+
+			"if test -n \"$stale\"; then "+
+			"stale_lock=\"${lock}.stale.$$\"; "+
+			"if test ! -e \"$stale_lock\" && mv -- \"$lock\" \"$stale_lock\" 2>/dev/null; then "+
+			"orphan=$(cat \"$stale_lock/partial\" 2>/dev/null || true); "+
+			"case \"$orphan\" in \"$target\".flowbee-clone.*) rm -rf -- \"$orphan\" ;; esac; "+
+			"rm -rf -- \"$stale_lock\"; fi; "+
+			"fi; sleep 1; "+
+			"done; "+
+			"held=yes; printf '%s\\n' \"$$\" >\"$lock/pid\" || exit 1; "+
+			"if test -d \"$target/.git\"; then exit 0; fi; "+
+			"if test -e \"$target\" || test -L \"$target\"; then "+
+			"printf '%s\\n' \"flowbee: checkout target exists but is not a git checkout: $target\" >&2; exit 1; "+
+			"fi; "+
+			"partial=$(mktemp -d \"${target}.flowbee-clone.XXXXXX\") || exit 1; "+
+			"printf '%s\\n' \"$partial\" >\"$lock/partial\" || exit 1; "+
+			"gh repo clone "+shQuote(ownerRepo)+" \"$partial\" -- --quiet || exit 1; "+
+			"mv -- \"$partial\" \"$target\" || exit 1; partial=; "+
+			"test -d \"$target/.git\"")
 }
 
 // TimezoneCmd probes a box's IANA timezone name (the `flowbee epic start --tz`
@@ -167,15 +215,16 @@ func NewTmuxSessionCmd(box, tmuxName, dir, startCmd string) string {
 		" -c "+shQuote(dir)+" "+shQuote(startCmd))
 }
 
-// KillTmuxSessionCmd kills a tmux session by name — used ONLY on the failed-launch
+// KillTmuxSessionCmd ensures a tmux session is stopped — used ONLY on the failed-launch
 // ROLLBACK path (review m7): a launch that created the session but then failed to
 // send its goal would otherwise leak the session, and a same-slug retry would then
-// permanently fail on tmux's duplicate-session error. Best-effort by contract (the
-// caller logs but ignores a failure — the session may legitimately not exist when
-// the failure was at create time). NEVER used on a live epic: `flowbee epic
+// permanently fail on tmux's duplicate-session error. It succeeds when the exact
+// session is already absent, so a rollback can distinguish that safe state from an
+// unreachable host or a real kill failure. NEVER used on a live epic: `flowbee epic
 // abandon` deliberately leaves the session running (operator decision).
 func KillTmuxSessionCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux kill-session -t "+shQuote(exactTarget(tmuxName)))
+	target := shQuote(exactTarget(tmuxName))
+	return remoteWrap(box, "if tmux has-session -t "+target+" 2>/dev/null; then tmux kill-session -t "+target+"; fi")
 }
 
 // SendGoalCmd sends literal text + Enter into an existing tmux pane — the ONE
@@ -211,13 +260,11 @@ func WorktreeAddCmd(box, base, worktree, branch string) string {
 }
 
 // WorktreeRemoveCmd tears a per-epic worktree back down — `git -C <base> worktree remove
-// --force <worktree>`, run against the base checkout that owns it. `--force` removes the
-// worktree even with a dirty/locked tree (a half-launched or abandoned epic's tree is
-// expendable — the epic's real work, if any, is already on its pushed branch). Used on the
-// launch-failure ROLLBACK path (alongside DeleteEpicRun) and on `flowbee epic abandon`, so
-// a retry of the same slug isn't blocked by a leftover worktree at the same path.
+// --force <worktree>`, run against the base checkout that owns it. It is restricted to the
+// launch-failure ROLLBACK path, before a launch is declared verified; explicit abandon
+// preserves its session and worktree together so unpushed operator data is never erased.
 // Best-effort by contract at the call site (a box that's unreachable, or a worktree git
-// never created, must not fail the rollback/abandon).
+// never created, must not hide the original launch failure).
 func WorktreeRemoveCmd(box, base, worktree string) string {
 	return remoteWrap(box, "git -C "+shQuote(base)+" worktree remove --force "+shQuote(worktree))
 }

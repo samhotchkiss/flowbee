@@ -46,9 +46,9 @@ type Seat struct {
 	ConfigDir   string // CLAUDE_CONFIG_DIR (claude) / GROK_HOME (grok); '' for codex
 	CodexHome   string // CODEX_HOME (codex seats; '' for claude/grok)
 	ExtraEnv    map[string]string
-	// MaxConcurrent is how many ACTIVE epics this seat's BOX may hold at once
-	// (0031 migration). DEFAULT 1 preserves the original one-box-one-epic rule
-	// (claude/grok seats stay 1-wide); an operator raises it (a codex box gets 2).
+	// MaxConcurrent is how many ACTIVE epics this exact authenticated seat may hold
+	// at once (0031 migration). DEFAULT 1 preserves the original conservative rule
+	// (claude/grok seats stay 1-wide); an operator raises it when a seat can run more.
 	// AddEpicRun's launch gate reads it as the cap for its count-then-insert. A zero
 	// value read off a row that predates the column, or a caller that leaves it unset,
 	// is normalized to 1 at the enforcement seam — never a cap of 0 (which would refuse
@@ -311,7 +311,7 @@ func (s *Store) SetSeatAccountKey(ctx context.Context, id, accountKey string, no
 }
 
 // SetSeatMaxConcurrent updates a seat's concurrent-epic cap (`flowbee seat
-// set-max-concurrent`) — the operational write that turns a codex box into a 2-wide seat
+// set-max-concurrent`) — the operational write that turns a codex seat into a 2-wide seat
 // after `flowbee seat discover` registered it at the default 1, without re-adding it. A
 // cap below 1 is rejected (a seat that can hold zero epics is a `flowbee seat rm`, not a
 // cap). ErrSeatNotFound if the seat is gone. It never touches an ACTIVE epic, so lowering

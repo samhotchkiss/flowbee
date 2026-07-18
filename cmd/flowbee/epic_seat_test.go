@@ -47,7 +47,7 @@ func TestEpicSelectSeat(t *testing.T) {
 		}
 	}
 
-	// addCapSeat registers a ready seat of the given family with an explicit per-box
+	// addCapSeat registers a ready seat of the given family with an explicit per-seat
 	// concurrency cap — the input to the 2-concurrent-epics-per-seat placement tests.
 	addCapSeat := func(st *store.Store, box, acct, family string, cap int) {
 		t.Helper()
@@ -119,6 +119,37 @@ func TestEpicSelectSeat(t *testing.T) {
 		}
 	})
 
+	t.Run("force quota still returns a real capacity-bound seat", func(t *testing.T) {
+		st := testutil.NewStore(t)
+		addCapSeat(st, "claude1@localhost", "acct-critical", "claude", 1)
+		foldCritical(st, "acct-critical", acctprobe.KindWeeklyAll)
+		registered, err := st.ListSeats(ctx)
+		if err != nil || len(registered) != 1 {
+			t.Fatalf("list registered critical seat: seats=%+v err=%v", registered, err)
+		}
+		if err := st.UpdateSeatHealth(ctx, registered[0].ID, store.SeatLimitCritical, "weekly cap", now); err != nil {
+			t.Fatalf("mark seat quota-limited: %v", err)
+		}
+		seat, gate, err := epicSelectSeatWithQuotaOverride(ctx, st, "claude", "", nil, true)
+		if err != nil {
+			t.Fatalf("select with override: %v", err)
+		}
+		if gate.refuse || gate.hardNoSeat || seat.ID == "" || seat.AccountKey != "acct-critical" {
+			t.Fatalf("override must choose the registered critical seat, got seat=%+v gate=%+v", seat, gate)
+		}
+		if gate.warning == "" {
+			t.Fatalf("override must surface its quota risk")
+		}
+		active := []store.EpicRun{{ID: "e1", Host: seat.Box, SeatID: seat.ID, AccountKey: seat.AccountKey, State: "running"}}
+		_, full, err := epicSelectSeatWithQuotaOverride(ctx, st, "claude", "", active, true)
+		if err != nil {
+			t.Fatalf("select full override: %v", err)
+		}
+		if !full.refuse || !full.hardNoSeat {
+			t.Fatalf("--force-quota must never bypass exact-seat capacity, got %+v", full)
+		}
+	})
+
 	t.Run("anti-collocation prefers a non-busy account", func(t *testing.T) {
 		st := testutil.NewStore(t)
 		addSeat(st, "claude1@localhost", "pearl@swh.me")
@@ -151,7 +182,7 @@ func TestEpicSelectSeat(t *testing.T) {
 
 	// ── 2-concurrent-epics-per-seat: capacity-aware placement (0029) ──
 
-	t.Run("a cap-2 seat keeps capacity with one active epic on its box", func(t *testing.T) {
+	t.Run("a cap-2 seat keeps capacity with one active epic", func(t *testing.T) {
 		st := testutil.NewStore(t)
 		addCapSeat(st, "codex1@localhost", "acc-c1", "codex", 2)
 		// one active epic already on this box+account (boxLoad=1, below the cap of 2).
@@ -164,11 +195,11 @@ func TestEpicSelectSeat(t *testing.T) {
 		// here — see the next subtest). The seat's account already powers e1, so it comes
 		// back as a collocated pick with a warning, not a hard refusal.
 		if gate.refuse || seat.Box != "codex1@localhost" {
-			t.Fatalf("a cap-2 box with one epic must still place (got refuse=%v seat=%+v)", gate.refuse, seat)
+			t.Fatalf("a cap-2 seat with one epic must still place (got refuse=%v seat=%+v)", gate.refuse, seat)
 		}
 	})
 
-	t.Run("a cap-1 seat with an active epic on its box is refused (one-box-one-epic)", func(t *testing.T) {
+	t.Run("a cap-1 seat with an active epic is refused", func(t *testing.T) {
 		st := testutil.NewStore(t)
 		addCapSeat(st, "codex1@localhost", "acc-c1", "codex", 1)
 		active := []store.EpicRun{{ID: "e1", Host: "codex1@localhost", AccountKey: "acc-c1", State: "running"}}
@@ -178,6 +209,27 @@ func TestEpicSelectSeat(t *testing.T) {
 		}
 		if !gate.refuse || !gate.hardNoSeat {
 			t.Fatalf("a cap-1 box already holding an epic must hard-refuse (got %+v)", gate)
+		}
+	})
+
+	t.Run("a second cap-1 seat on the same host remains eligible", func(t *testing.T) {
+		st := testutil.NewStore(t)
+		first := store.Seat{Box: "shared-host", AgentFamily: "codex", CodexHome: "/cfg/codex1", AccountKey: "acc-1", Health: store.SeatReady, MaxConcurrent: 1}
+		second := store.Seat{Box: "shared-host", AgentFamily: "codex", CodexHome: "/cfg/codex2", AccountKey: "acc-2", Health: store.SeatReady, MaxConcurrent: 1}
+		for _, seat := range []store.Seat{first, second} {
+			if err := st.AddSeat(ctx, seat, now); err != nil {
+				t.Fatalf("add seat: %v", err)
+			}
+		}
+		active := []store.EpicRun{{
+			ID: "e1", Host: "shared-host", SeatID: first.ComposeID(), AccountKey: "acc-1", State: "running",
+		}}
+		seat, gate, err := epicSelectSeat(ctx, st, "codex", "shared-host", active)
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		if gate.refuse || seat.ID != second.ComposeID() {
+			t.Fatalf("distinct seat on same host should provide throughput; got refuse=%v seat=%+v", gate.refuse, seat)
 		}
 	})
 
@@ -198,7 +250,7 @@ func TestEpicSelectSeat(t *testing.T) {
 		}
 	})
 
-	t.Run("every box at cap is a hard refusal", func(t *testing.T) {
+	t.Run("every seat at cap is a hard refusal", func(t *testing.T) {
 		st := testutil.NewStore(t)
 		addCapSeat(st, "codexA@localhost", "acc-A", "codex", 1)
 		addCapSeat(st, "codexB@localhost", "acc-B", "codex", 1)

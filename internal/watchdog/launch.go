@@ -24,8 +24,8 @@ type PreflightParams struct {
 	// HomeDirCmd first (see its doc for why: a "$HOME" left in the string would get
 	// shQuote'd into inertness here, since every command below embeds CheckoutPath
 	// as a quoted argument). The convention is <home>/dev/<repo> (the per-repo base
-	// checkout for the one active epic on that seat; the epic runner cuts epic/<slug>
-	// from main inside it per epics/INSTRUCTIONS.md).
+	// checkout shared by every isolated epic worktree on that host; each epic runner cuts
+	// epic/<slug> from main in its own worktree per epics/INSTRUCTIONS.md).
 	CheckoutPath string
 	// DiskProbePath is the path `df` measures free space AT — it must be a path
 	// that ALREADY EXISTS on the box (the caller passes the resolved home
@@ -118,11 +118,9 @@ func ProvisionEpicWorktree(ctx context.Context, r Runner, box, base, worktree, b
 	return nil
 }
 
-// RemoveEpicWorktree tears down an epic's private worktree (WorktreeRemoveCmd). It is called
-// BEST-EFFORT on the launch-failure rollback path and on `flowbee epic abandon` — a leftover
-// worktree would otherwise block a same-slug retry — so the caller logs but does not fail on
-// its error (an unreachable box, or a worktree git never actually created, must not fail the
-// rollback/abandon it is cleaning up after).
+// RemoveEpicWorktree tears down an epic's private worktree (WorktreeRemoveCmd). It is used
+// only for launch-failure rollback, before the launch is declared verified. Explicit
+// abandon preserves the worktree with its still-live tmux session for recovery.
 func RemoveEpicWorktree(ctx context.Context, r Runner, box, base, worktree string) error {
 	if _, err := r.Run(ctx, WorktreeRemoveCmd(box, base, worktree)); err != nil {
 		return fmt.Errorf("remove per-epic worktree at %s: %w", worktree, err)

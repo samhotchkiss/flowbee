@@ -61,52 +61,86 @@ var (
 	// concurrent `epic start`s that both passed those reads could otherwise both
 	// insert (TOCTOU double-book) — the tx here is the authority, the CLI checks
 	// are a courtesy. Both are wrapped with detail via fmt.Errorf("%w: ...").
-	ErrEpicHostBusy     = errors.New("host is at its concurrent-epic cap")
+	// ErrEpicHostBusy keeps its historical name for callers, but capacity is now
+	// keyed by the selected seat. Distinct seats on one host can run concurrently;
+	// the host is only the physical placement/spread dimension.
+	ErrEpicHostBusy     = errors.New("seat is at its concurrent-epic cap")
 	ErrEpicScopeOverlap = errors.New("scope overlaps an active epic")
 )
 
 // AddEpicRun registers a new epic at state='launching' — `flowbee epic start`'s
-// one durable write before the tmux launch. The per-box CONCURRENCY-CAP gate and the
+// one durable write before the tmux launch. The per-seat CONCURRENCY-CAP gate and the
 // same-repo scope-overlap gate run INSIDE the same transaction as the insert (review
 // m6): the store pins MaxOpenConns(1), so the count-then-insert is serialized against
-// any concurrent start and can never over-book a box or double-book a scope. An epic
-// with no host (” — not currently produced by the CLI, which requires one) skips the
-// occupancy gate only.
+// any concurrent start and can never over-book a seat or double-book a scope.
 //
-// hostCap is the selected seat's max_concurrent (seats.max_concurrent, resolved by the
-// caller from the box's seat). The gate COUNTS the active epics on the box and refuses
-// when that count is already >= hostCap — DEFAULT 1 reproduces the original
-// one-box-one-epic rule exactly, a codex box set to 2 admits a second epic and refuses
-// the third. A hostCap < 1 is normalized to 1 here so a caller that forgot to resolve it
-// (or a seat row predating the column, read back as 0) can never accidentally open the
-// box to unbounded epics. Because the whole count-then-insert is one tx on a
-// single-connection store, a cap-2 box with two concurrent starts admits exactly one of
-// them past the second slot — it can never end with 3 active epics.
+// When SeatID is present (the production launch path), the authoritative seat row is
+// loaded inside this transaction. Its max_concurrent is the cap, and its box/account/
+// family become the epic's binding. The caller-supplied seatCap and placement fields
+// cannot weaken or stale that decision. Occupancy includes the exact seat plus legacy
+// active rows on its box that predate seat binding. This lets two distinct cap-1 seats on
+// one host run simultaneously without allowing either seat to be double-booked.
+//
+// Legacy/unbound callers retain the historical host-based gate so old imports and tests
+// remain readable. An empty host has no identity and therefore cannot be capacity-gated;
+// real local launches are safe because the production path always supplies a registered
+// SeatID. A legacy cap < 1 normalizes to 1.
 //
 // Starting at 'launching' rather than 'running' means a crash between this insert
 // and the tmux session actually coming up leaves a VISIBLE half-launched row
 // instead of nothing; runEpicStart's own error path calls DeleteEpicRun to roll
 // this back cleanly on any preflight/launch failure, so in steady state a row only
 // ever reaches 'launching' for the few seconds a launch is actually in flight.
-func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, hostCap int, now time.Time) error {
+func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, seatCap int, now time.Time) error {
 	if e.ID == "" {
 		return errors.New("epic id is required")
 	}
-	if hostCap < 1 {
-		hostCap = 1
+	if seatCap < 1 {
+		seatCap = 1
 	}
 	ts := now.Format(rfc3339)
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		if e.Host != "" {
-			var active int
+		var active int
+		capacityKey, capacityValue := "host", e.Host
+		if e.SeatID != "" {
+			var canonical Seat
+			err := tx.QueryRowContext(ctx, `
+				SELECT box, account_key, agent_family, max_concurrent
+				  FROM seats
+				 WHERE id = ?`, e.SeatID).Scan(
+				&canonical.Box, &canonical.AccountKey, &canonical.AgentFamily, &canonical.MaxConcurrent)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: %q", ErrSeatNotFound, e.SeatID)
+			}
+			if err != nil {
+				return err
+			}
+			e.Host = canonical.Box
+			e.AccountKey = canonical.AccountKey
+			e.BuilderModelFamily = canonical.AgentFamily
+			seatCap = canonical.MaxConcurrent
+			if seatCap < 1 {
+				seatCap = 1
+			}
+			capacityKey, capacityValue = "seat", e.SeatID
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*)
+				  FROM epics
+				 WHERE (seat_id = ? OR (seat_id = '' AND host = ?))
+				   AND state IN `+epicActiveStatesSQL, e.SeatID, e.Host).Scan(&active); err != nil {
+				return err
+			}
+		} else if e.Host != "" {
 			if err := tx.QueryRowContext(ctx,
 				`SELECT COUNT(*) FROM epics WHERE host = ? AND state IN `+epicActiveStatesSQL,
 				e.Host).Scan(&active); err != nil {
 				return err
 			}
-			if active >= hostCap {
-				return fmt.Errorf("%w: host %q already runs %d active epic(s) (cap %d)",
-					ErrEpicHostBusy, e.Host, active, hostCap)
+		}
+		if e.SeatID != "" || e.Host != "" {
+			if active >= seatCap {
+				return fmt.Errorf("%w: %s %q already runs %d active epic(s) (cap %d)",
+					ErrEpicHostBusy, capacityKey, capacityValue, active, seatCap)
 			}
 		}
 		rows, err := tx.QueryContext(ctx,
@@ -141,10 +175,10 @@ func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, hostCap int, now time
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO epics
 			    (id, repo, file_path, title, scope_json, host, branch, tmux_name, agent,
-			     state, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?)`,
+			     state, account_key, seat_id, builder_model_family, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?, ?, ?, ?)`,
 			e.ID, e.Repo, e.FilePath, e.Title, marshalStrings(e.Scope), e.Host, e.Branch,
-			e.TmuxName, e.Agent, ts, ts)
+			e.TmuxName, e.Agent, e.AccountKey, e.SeatID, e.BuilderModelFamily, ts, ts)
 		if err != nil {
 			if isUniqueConstraintErr(err) {
 				return ErrEpicRunExists

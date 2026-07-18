@@ -81,7 +81,7 @@ func runSeatAdd(ctx context.Context, st *store.Store, args []string) error {
 	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR (claude seats) / GROK_HOME (grok seats)")
 	codexHome := fs.String("codex-home", "", "CODEX_HOME (codex seats)")
 	account := fs.String("account-key", "", "account_windows.account_key (optional; a probe resolves it)")
-	maxConc := fs.Int("max-concurrent", 1, "how many epics may run on this seat's box at once (default 1 = one-box-one-epic; a fast codex box can take 2)")
+	maxConc := fs.Int("max-concurrent", 1, "how many epics may run on this exact seat at once (default 1; a fast seat can take 2)")
 	env := envFlag{}
 	fs.Var(env, "env", "extra launch env KEY=VALUE (repeatable)")
 	if err := fs.Parse(args); err != nil {

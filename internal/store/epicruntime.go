@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -48,22 +49,29 @@ func (s *Store) SetEpicRuntimeState(ctx context.Context, id string, rs EpicRunti
 	return nil
 }
 
-// SetEpicSeatBinding records the account/seat the launch gate provisioned the epic on,
-// plus the builder_model_family resolved from that binding (which drives the
-// completion-triggered cross-family review handoff, plan §11 — bound from the real
-// account/pane resolution, NOT config intent). ErrEpicRunNotFound if the epic is gone.
+// ErrEpicSeatRebind protects the admission invariant: once a launching/running row has
+// a seat, moving it after AddEpicRun's capacity check could overbook the destination.
+var ErrEpicSeatRebind = errors.New("epic seat binding is immutable")
+
+// SetEpicSeatBinding is the legacy one-time backfill seam for rows created before the
+// binding became part of AddEpicRun's atomic insert. A blank binding may be filled and
+// an identical binding refreshed, but an existing seat can never be changed. New launch
+// code must pass SeatID to AddEpicRun instead. ErrEpicRunNotFound if the epic is gone.
 func (s *Store) SetEpicSeatBinding(ctx context.Context, id, accountKey, seatID, builderModelFamily string, now time.Time) error {
 	ts := now.Format(rfc3339)
 	res, err := s.DB.ExecContext(ctx, `
 		UPDATE epics
 		   SET account_key = ?, seat_id = ?, builder_model_family = ?, updated_at = ?
-		 WHERE id = ?`,
-		accountKey, seatID, builderModelFamily, ts, id)
+		 WHERE id = ? AND (seat_id = '' OR seat_id = ?)`,
+		accountKey, seatID, builderModelFamily, ts, id, seatID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrEpicRunNotFound
+		if _, getErr := s.GetEpicRun(ctx, id); getErr != nil {
+			return getErr
+		}
+		return ErrEpicSeatRebind
 	}
 	return nil
 }
