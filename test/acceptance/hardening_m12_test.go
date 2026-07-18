@@ -280,11 +280,11 @@ func TestM12_RestartRecoveryZeroJobLoss(t *testing.T) {
 	}
 }
 
-// TestM12_DashboardRendersLive proves the finished UI (§12.6): /dashboard renders
+// TestM12_AuditRendersLive proves the finished legacy audit UI (§12.6): /audit renders
 // board + roster + budget + audit + cost in one page, and each JSON view serves
 // live data. It exercises a populated store (a worker on a lease, a budget gauge,
 // an audit row, a cost row) so the panes are non-empty.
-func TestM12_DashboardRendersLive(t *testing.T) {
+func TestM12_AuditRendersLive(t *testing.T) {
 	st := testutil.NewStore(t)
 	clk := clock.NewFake(time.Unix(1_700_000_000, 0))
 	mirrorPath, baseSHA := newBareFixture(t)
@@ -345,12 +345,12 @@ func TestM12_DashboardRendersLive(t *testing.T) {
 	assertJSONContains(t, ts, "/v1/cost", "4500")
 	assertJSONContains(t, ts, "/v1/audit", "pulls.create")
 
-	// the F12 productionized dashboard pane renders the operator panes live off the
-	// real store (the board is now its own rich pane at /board; the dashboard carries
-	// budget/roster/cost/audit/needs-human).
-	html := httpGetBody(t, ts, "/dashboard")
+	// The F12 audit pane renders budget/roster/cost/audit/needs-human tables live
+	// off the real store. The board remains at /board; the Fleet dashboard now owns
+	// the canonical /dashboard operator URL.
+	html := httpGetBody(t, ts, "/audit")
 	for _, want := range []string{
-		"Dashboard",        // header
+		"Audit",            // header
 		"dash.codex",       // roster pane
 		"4321",             // budget gauge
 		"4500",             // cost pane (micro-USD)
@@ -358,7 +358,7 @@ func TestM12_DashboardRendersLive(t *testing.T) {
 		"/assets/board.js", // SSE live-refresh hook (EventSource lives in the asset)
 	} {
 		if !strings.Contains(html, want) {
-			t.Fatalf("dashboard missing %q:\n%s", want, html)
+			t.Fatalf("audit missing %q:\n%s", want, html)
 		}
 	}
 	// the F12 board pane renders the live job card off the same store.

@@ -84,7 +84,7 @@ func TestEpicFleetDashboardRendersLiveCapacityAndConcurrentSeats(t *testing.T) {
 		t.Fatalf("fold healthy account: %v", err)
 	}
 	if err := st.UpsertAccountLimits(ctx, acctprobe.Result{
-		Identity: acctprobe.Identity{Provider: "codex", AccountKey: codexSeat.AccountKey, Email: "codex@x"},
+		Identity: acctprobe.Identity{Provider: "codex", AccountKey: codexSeat.AccountKey},
 		Usage: acctprobe.Usage{Windows: acctprobe.Windows{
 			{Kind: acctprobe.KindWeeklyAll, Percent: 59, Severity: acctprobe.SeverityNormal},
 		}}, TrustState: acctprobe.TrustDisplayOnly, CapturedAt: now,
@@ -151,9 +151,10 @@ func TestEpicFleetDashboardRendersLiveCapacityAndConcurrentSeats(t *testing.T) {
 		}
 		for _, want := range []string{
 			"Flowbee Fleet", "session-per-epic control plane", "Session cap hit", "s@swh.me", "pearl@swh.me",
+			">codex1</strong>",
 			"data-throughput", "data-usage", "data-account=\"acct-capped-6356db02\"", "data-seats",
 			"data-epic=\"instant-cache\"", "data-epic=\"register-lifecycle\"", "data-epic=\"reply-latency\"",
-			"2/2", "ci red on epic pr", "version-locked prompt tests", "Completed today", "id=\"theme-toggle\"",
+			"2/2", "CI red", "version-locked prompt tests", "Completed today", "id=\"theme-toggle\"",
 		} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("%s missing %q\n---\n%s", path, want, body)
@@ -188,8 +189,261 @@ func getBody(t *testing.T, h http.Handler, path string) (int, string) {
 	return rec.Code, rec.Body.String()
 }
 
+// TestProductionDashboardRoutes pins the operator-facing URL contract: the URL
+// printed by `flowbee up` is the epic fleet dashboard, while the pre-existing
+// project-OUT audit remains available at its explicit /audit URL.
+func TestProductionDashboardRoutes(t *testing.T) {
+	st := testutil.NewStore(t)
+	h := mountUI(t, st, fixedClock{t: time.Date(2026, 7, 18, 18, 36, 0, 0, time.UTC)})
+
+	code, body := getBody(t, h, "/dashboard")
+	if code != http.StatusOK {
+		t.Fatalf("/dashboard status = %d", code)
+	}
+	if !strings.Contains(body, "Flowbee Fleet") || !strings.Contains(body, "session-per-epic control plane") {
+		t.Fatalf("/dashboard must render the production epic fleet:\n%s", body)
+	}
+	if strings.Contains(body, "Audit (project-OUT)") {
+		t.Fatalf("/dashboard must not render the legacy audit view:\n%s", body)
+	}
+
+	code, body = getBody(t, h, "/audit")
+	if code != http.StatusOK {
+		t.Fatalf("/audit status = %d", code)
+	}
+	if !strings.Contains(body, "Audit (project-OUT)") || !strings.Contains(body, "Needs human") {
+		t.Fatalf("/audit must preserve the legacy project-OUT audit view:\n%s", body)
+	}
+	if strings.Contains(body, "session-per-epic control plane") {
+		t.Fatalf("/audit must not render the epic fleet:\n%s", body)
+	}
+}
+
+// TestDashboardJSHasPeriodicRefreshFallback ensures a dashboard still converges
+// when an SSE nudge is dropped or a producer mutates a live read-model without
+// publishing. SSE remains the fast path; this interval is the correctness floor.
+func TestDashboardJSHasPeriodicRefreshFallback(t *testing.T) {
+	st := testutil.NewStore(t)
+	h := mountUI(t, st, fixedClock{t: time.Now()})
+	code, js := getBody(t, h, "/assets/board.js")
+	if code != http.StatusOK {
+		t.Fatalf("board.js status = %d", code)
+	}
+	if !strings.Contains(js, "setInterval") || !strings.Contains(js, "refresh") {
+		t.Fatalf("board.js needs a periodic refresh fallback in addition to EventSource:\n%s", js)
+	}
+}
+
+// TestEpicDashboardDerivesStaleMasterFromHeartbeat proves stored state='active'
+// cannot paint a dead master green. The web layer receives the same stale-heartbeat
+// threshold as the liveness reaper and must derive the operator-visible state by age.
+func TestEpicDashboardDerivesStaleMasterFromHeartbeat(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 18, 36, 0, 0, time.UTC)
+	if _, err := st.RegisterSupervisor(ctx, store.Supervisor{
+		Label: "flowbee-master", Kind: "claude", ModelFamily: "claude", Box: "box-master", TmuxName: "master",
+	}, now.Add(-10*time.Minute)); err != nil {
+		t.Fatalf("register stale master: %v", err)
+	}
+
+	_, body := getBody(t, mountUI(t, st, fixedClock{t: now}), "/dashboard")
+	if !strings.Contains(body, "ops-master-kpi critical") || !strings.Contains(body, ">stale</") {
+		t.Fatalf("master older than StaleHB must render stale/critical, not active:\n%s", body)
+	}
+}
+
+// TestTerminalEpicPresentationOverridesStaleRuntime pins two pieces of terminal
+// truth: a done lifecycle beats a stale pre-completion pane classification, and a
+// done epic with no trustworthy step denominator is complete rather than 0%/unknown.
+func TestTerminalEpicPresentationOverridesStaleRuntime(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 18, 36, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		id, pane       string
+		current, total int
+	}{
+		{id: "done-stale-working", pane: "working", current: 2, total: 7},
+		{id: "done-stale-idle", pane: "idle_at_prompt"},
+	} {
+		addRunningEpic(t, st, tc.id, now)
+		if err := st.UpsertEpicStatus(ctx, tc.id, epicspec.StatusBlock{
+			UpdatedRaw: now.Format(time.RFC3339), CurrentStep: tc.current, StepsTotal: tc.total, State: "done",
+		}, now); err != nil {
+			t.Fatalf("finish %s: %v", tc.id, err)
+		}
+		// Reproduce a persisted last observation from immediately before completion.
+		if err := st.SetEpicRuntimeState(ctx, tc.id, store.EpicRuntimeState{
+			ContextPct: store.ContextPctUnknown, PaneState: tc.pane,
+		}, now); err != nil {
+			t.Fatalf("set stale pane for %s: %v", tc.id, err)
+		}
+	}
+
+	_, body := getBody(t, mountUI(t, st, fixedClock{t: now}), "/dashboard")
+	for _, id := range []string{"done-stale-working", "done-stale-idle"} {
+		card := articleFor(t, body, `data-epic="`+id+`"`)
+		for _, want := range []string{
+			"ops-pane complete", ">complete</span>", `aria-valuenow="100"`, `style="width:100%"`,
+			`<strong class="ops-step">done</strong>`,
+		} {
+			if !strings.Contains(card, want) {
+				t.Fatalf("terminal card %s missing %q:\n%s", id, want, card)
+			}
+		}
+		if strings.Contains(card, "ops-pane working") || strings.Contains(card, "ops-pane idle") {
+			t.Fatalf("terminal card %s exposed stale pane state:\n%s", id, card)
+		}
+	}
+}
+
+// TestAbandonedEpicDoesNotInflateCompletedKPI separates a released/abandoned
+// reservation from successfully completed throughput.
+func TestAbandonedEpicDoesNotInflateCompletedKPI(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 18, 36, 0, 0, time.UTC)
+
+	addRunningEpic(t, st, "completed-one", now)
+	if err := st.UpsertEpicStatus(ctx, "completed-one", epicspec.StatusBlock{
+		UpdatedRaw: now.Format(time.RFC3339), CurrentStep: 3, StepsTotal: 3, State: "done",
+	}, now); err != nil {
+		t.Fatalf("finish completed epic: %v", err)
+	}
+	addRunningEpic(t, st, "abandoned-one", now)
+	if err := st.AbandonEpicRun(ctx, "abandoned-one", now); err != nil {
+		t.Fatalf("abandon epic: %v", err)
+	}
+
+	_, body := getBody(t, mountUI(t, st, fixedClock{t: now}), "/dashboard")
+	if got := kpiValue(t, body, "Epics completed"); got != "1" {
+		t.Fatalf("completed KPI = %q, want 1 (abandoned is not throughput):\n%s", got, body)
+	}
+}
+
+// TestDisabledSeatDoesNotRenderReady prevents a retired seat whose last probe was
+// healthy from advertising launch capacity after enabled has been cleared.
+func TestDisabledSeatDoesNotRenderReady(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 18, 36, 0, 0, time.UTC)
+	seat := store.Seat{
+		Box: "retired-box", AgentFamily: "codex", CodexHome: "/cfg/retired-codex",
+		AccountKey: "retired-account", Health: store.SeatReady, MaxConcurrent: 2,
+	}
+	if err := st.AddSeat(ctx, seat, now); err != nil {
+		t.Fatalf("add seat: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE seats SET enabled = 0 WHERE id = ?`, seat.ComposeID()); err != nil {
+		t.Fatalf("disable seat: %v", err)
+	}
+
+	_, body := getBody(t, mountUI(t, st, fixedClock{t: now}), "/dashboard")
+	row := articleFor(t, body, `data-seat="`+seat.ComposeID()+`"`)
+	if !strings.Contains(row, ">disabled</span>") {
+		t.Fatalf("disabled seat must render disabled:\n%s", row)
+	}
+	if strings.Contains(row, ">ready</span>") {
+		t.Fatalf("disabled seat must not advertise ready capacity:\n%s", row)
+	}
+	if got := kpiValue(t, body, "Seats · 0 families"); got != "0" {
+		t.Fatalf("enabled-seat KPI = %q, want 0 for a disabled-only registry:\n%s", got, body)
+	}
+}
+
+// TestLegacySQLiteEpicTimesSortAndCount proves the dashboard remains compatible
+// with rows written by SQLite datetime('now') before epic timestamps were uniformly
+// RFC3339. The newest legacy row sorts first and contributes to today's throughput.
+func TestLegacySQLiteEpicTimesSortAndCount(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 18, 36, 0, 0, time.UTC)
+	for _, id := range []string{"z-legacy-newest", "a-rfc-middle", "m-legacy-previous"} {
+		addRunningEpic(t, st, id, now.Add(-time.Hour))
+	}
+	for _, row := range []struct {
+		id, stamp string
+	}{
+		{id: "z-legacy-newest", stamp: "2026-07-18 18:00:00"},
+		{id: "a-rfc-middle", stamp: "2026-07-18T17:00:00Z"},
+		{id: "m-legacy-previous", stamp: "2026-07-17 23:00:00"},
+	} {
+		if _, err := st.DB.ExecContext(ctx, `
+			UPDATE epics
+			   SET state = 'done', status_state_detail = 'done', finished_at = ?, updated_at = ?
+			 WHERE id = ?`, row.stamp, row.stamp, row.id); err != nil {
+			t.Fatalf("set legacy time for %s: %v", row.id, err)
+		}
+	}
+
+	_, body := getBody(t, mountUI(t, st, fixedClock{t: now}), "/dashboard")
+	if got := kpiValue(t, body, "Completed today"); got != "2" {
+		t.Fatalf("completed-today KPI = %q, want 2 across RFC3339 + legacy SQLite timestamps:\n%s", got, body)
+	}
+	newest := strings.Index(body, `data-epic="z-legacy-newest"`)
+	middle := strings.Index(body, `data-epic="a-rfc-middle"`)
+	previous := strings.Index(body, `data-epic="m-legacy-previous"`)
+	if newest < 0 || middle < 0 || previous < 0 {
+		t.Fatalf("all legacy timestamp cards must render:\n%s", body)
+	}
+	if !(newest < middle && middle < previous) {
+		t.Fatalf("completed cards not newest-first: legacy-newest=%d rfc-middle=%d legacy-previous=%d\n%s",
+			newest, middle, previous, body)
+	}
+}
+
+func addRunningEpic(t *testing.T, st *store.Store, id string, now time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: id, Repo: "test", Title: id, Agent: "claude", Branch: "epic/" + id, TmuxName: "epic-" + id,
+	}, 1, now); err != nil {
+		t.Fatalf("add epic %s: %v", id, err)
+	}
+	if err := st.MarkEpicLaunched(ctx, id, now); err != nil {
+		t.Fatalf("launch epic %s: %v", id, err)
+	}
+}
+
+func articleFor(t *testing.T, body, marker string) string {
+	t.Helper()
+	i := strings.Index(body, marker)
+	if i < 0 {
+		t.Fatalf("response missing %q:\n%s", marker, body)
+	}
+	start := strings.LastIndex(body[:i], "<article")
+	if start < 0 {
+		t.Fatalf("response has %q outside an article", marker)
+	}
+	end := strings.Index(body[i:], "</article>")
+	if end < 0 {
+		t.Fatalf("article for %q is unterminated", marker)
+	}
+	return body[start : i+end+len("</article>")]
+}
+
+func kpiValue(t *testing.T, body, label string) string {
+	t.Helper()
+	labelAt := strings.Index(body, `<div class="ops-kpi-label">`+label)
+	if labelAt < 0 {
+		t.Fatalf("response missing KPI label %q:\n%s", label, body)
+	}
+	const open = `<div class="ops-kpi-value">`
+	valueAt := strings.LastIndex(body[:labelAt], open)
+	if valueAt < 0 {
+		t.Fatalf("KPI %q has no value", label)
+	}
+	valueAt += len(open)
+	end := strings.Index(body[valueAt:labelAt], "</div>")
+	if end < 0 {
+		t.Fatalf("KPI %q has an unterminated value", label)
+	}
+	return strings.TrimSpace(body[valueAt : valueAt+end])
+}
+
 // TestF12DashboardsRenderOffRealStore is the F12 acceptance test (build-list §G):
-// /board, /fleet, /dashboard render off REAL store data (a temp-file SQLite DB),
+// /board, /fleet, /audit render off REAL store data (a temp-file SQLite DB),
 // the board surfaces the Backlog + ⚠ Needs-you lanes + the yellow flowbee marker +
 // the per-card stage timer, the fleet shows per-model slot pips + an account usage
 // gauge with a ceiling line + rollover + live concurrent jobs, the detail drawer
@@ -323,14 +577,14 @@ func TestF12DashboardsRenderOffRealStore(t *testing.T) {
 		}
 	}
 
-	// ── /dashboard renders off real data ──
-	code, body = getBody(t, h, "/dashboard")
+	// ── /audit renders the legacy audit data ──
+	code, body = getBody(t, h, "/audit")
 	if code != http.StatusOK {
-		t.Fatalf("/dashboard status = %d", code)
+		t.Fatalf("/audit status = %d", code)
 	}
 	for _, want := range []string{"Dashboard", "Needs human", "Roster", "Cost", "Audit", "box-a"} {
 		if !strings.Contains(body, want) {
-			t.Fatalf("/dashboard missing %q\n---\n%s", want, body)
+			t.Fatalf("/audit missing %q\n---\n%s", want, body)
 		}
 	}
 

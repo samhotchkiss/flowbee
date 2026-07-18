@@ -4,6 +4,9 @@
 (function () {
   "use strict";
 
+  var pollTimer = null;
+  var refreshInFlight = false;
+
   // ── SSE live hook ── any lifecycle event reloads the live data (debounced).
   function wireSSE() {
     var live = document.querySelector("nav.fb-nav .live");
@@ -31,16 +34,38 @@
     } catch (e) { /* SSE unsupported: the page is still a valid static render */ }
   }
 
+  // SSE is a low-latency nudge, not the source of truth. Some store folds can be
+  // quiet and SSE itself is lossy, so poll the same read-only fragment every 30s.
+  // The singleton guard prevents duplicate timers if this wiring is reused later;
+  // hidden tabs wait until visible instead of doing background database reads.
+  function wirePollingFallback() {
+    if (pollTimer !== null) { return; }
+    pollTimer = window.setInterval(function () {
+      if (!document.hidden) { refresh(); }
+    }, 30000);
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) { refresh(); }
+    });
+    window.addEventListener("beforeunload", function () {
+      window.clearInterval(pollTimer);
+      pollTimer = null;
+    });
+  }
+
   // refresh re-fetches the current view's pane fragment and swaps the board/fleet
   // body in place (so the open drawer is preserved — the board is never dimmed).
   function refresh() {
     var root = document.getElementById("fb-live");
-    if (!root) { return; }
+    if (!root || refreshInFlight) { return; }
+    refreshInFlight = true;
     // preserve the current query (e.g. the board's ?repo=<id> filter) so the live
     // refresh keeps the same view; just append partial=1 to get the body fragment.
     var params = new URLSearchParams(window.location.search);
     params.set("partial", "1");
-    fetch(window.location.pathname + "?" + params.toString(), { headers: { "Accept": "text/html" } })
+    fetch(window.location.pathname + "?" + params.toString(), {
+      headers: { "Accept": "text/html" },
+      cache: "no-store"
+    })
       .then(function (r) { return r.ok ? r.text() : null; })
       .then(function (html) {
         if (html === null) { return; }
@@ -48,7 +73,8 @@
         wireCards();
         wireTheme();
       })
-      .catch(function () { /* transient: the next event retries */ });
+      .catch(function () { /* transient: the next event or poll retries */ })
+      .finally(function () { refreshInFlight = false; });
   }
 
   // ── detail drawer ── click a card to open the drawer; click another card to
@@ -121,6 +147,7 @@
     try { stored = window.localStorage.getItem("flowbee-theme") || "dark"; } catch (e) { /* private mode */ }
     setTheme(stored);
     wireSSE();
+    wirePollingFallback();
     wireCards();
     wireTheme();
     var c = document.getElementById("fb-drawer-close");

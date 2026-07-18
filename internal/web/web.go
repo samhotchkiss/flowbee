@@ -92,16 +92,18 @@ func New(data Data, clk clock.Clock, cfg Config) *UI {
 }
 
 // Mount registers the UI routes + the embedded asset handler on a mux. The epic
-// fleet is the home page; the legacy job board remains at /board. /board/detail
-// serves its drawer fragment.
+// fleet is the home page and the canonical /dashboard; /epics remains a direct
+// alias. The former dashboard audit surface lives at /audit, and the legacy job
+// board remains at /board. /board/detail serves its drawer fragment.
 func (u *UI) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /assets/", http.FileServer(http.FS(assetsFS)))
 	mux.HandleFunc("GET /", u.epics)
 	mux.HandleFunc("GET /epics", u.epics)
+	mux.HandleFunc("GET /dashboard", u.epics)
 	mux.HandleFunc("GET /board", u.board)
 	mux.HandleFunc("GET /board/detail", u.detail)
 	mux.HandleFunc("GET /fleet", u.fleet)
-	mux.HandleFunc("GET /dashboard", u.dashboard)
+	mux.HandleFunc("GET /audit", u.audit)
 	mux.HandleFunc("GET /roster", u.roster)
 }
 

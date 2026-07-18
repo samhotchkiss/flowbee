@@ -106,7 +106,7 @@
 
       <div class="ops-panel ops-seat-list" data-seats>
         {{range .Seats}}
-        <article class="ops-seat" data-seat="{{.ID}}">
+        <article class="ops-seat {{if not .Enabled}}disabled{{end}}" data-seat="{{.ID}}" data-enabled="{{.Enabled}}">
           <div class="ops-seat-name">
             <span class="ops-family {{.FamilyClass}}">{{.Family}}</span>
             <strong>{{.Name}}</strong>
@@ -136,7 +136,7 @@
     {{end}}
 
     <div class="ops-epic-group" data-epics="completed">
-      <h3>Completed <span>{{len .Completed}}</span></h3>
+      <h3>Completed <span>{{len .Completed}}{{if .CompletedHidden}} shown · {{.CompletedHidden}} older{{end}}</span></h3>
       {{if .Completed}}<div class="ops-epic-grid">{{range .Completed}}{{template "ops-epic-card" .}}{{end}}</div>
       {{else}}<div class="ops-empty ops-empty-lane">No completed epics in this registry yet.</div>{{end}}
     </div>
@@ -147,13 +147,20 @@
       <div class="ops-epic-grid">{{range .Review}}{{template "ops-epic-card" .}}{{end}}</div>
     </div>
     {{end}}
+
+    {{if .Archived}}
+    <div class="ops-epic-group" data-epics="archived">
+      <h3>Archived <span>{{len .Archived}}</span></h3>
+      <div class="ops-epic-grid">{{range .Archived}}{{template "ops-epic-card" .}}{{end}}</div>
+    </div>
+    {{end}}
   </section>
 
   <footer class="ops-footer" data-masters>
     <div>
       {{if .Master.Registered}}<strong>{{.Master.Label}}</strong> {{.Master.Box}} · {{.Master.Kind}} · epoch {{.Master.Epoch}} · <span class="{{.Master.StateClass}}">{{.Master.State}}</span> · last hb {{.Master.Heartbeat}}
       {{else}}<strong>master</strong> not registered{{end}}
-      <nav aria-label="Other Flowbee views"><a href="/board">board</a><a href="/fleet">legacy fleet</a><a href="/dashboard">audit</a></nav>
+      <nav aria-label="Other Flowbee views"><a href="/board">board</a><a href="/fleet">legacy fleet</a><a href="/audit">audit</a></nav>
     </div>
     <button type="button" id="theme-toggle" class="ops-theme" aria-pressed="false">◐ theme</button>
   </footer>

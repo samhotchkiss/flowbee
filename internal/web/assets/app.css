@@ -331,6 +331,7 @@ html.sse-live .ops-live-dot{background:var(--ops-green);box-shadow:0 0 0 4px col
 
 .ops-seat{min-height:52px;display:grid;grid-template-columns:minmax(190px,1.4fr) minmax(120px,1fr) auto 42px;align-items:center;gap:12px;padding:0 18px;border-bottom:1px solid var(--ops-line)}
 .ops-seat:last-child{border-bottom:0}
+.ops-seat.disabled{opacity:.58;background:color-mix(in srgb,var(--ops-faint) 4%,transparent)}
 .ops-seat-name{display:flex;align-items:center;gap:10px;min-width:0}
 .ops-seat-name strong{font-family:var(--mono);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ops-capacity-pips{display:flex;gap:3px;margin-left:2px}
@@ -386,6 +387,8 @@ html.sse-live .ops-live-dot{background:var(--ops-green);box-shadow:0 0 0 4px col
 .ops-footer nav a:hover{color:var(--ops-text)}
 .ops-theme{border:1px solid var(--ops-line);border-radius:8px;background:var(--ops-panel);color:var(--ops-muted);font:11px var(--mono);padding:7px 11px;cursor:pointer}
 .ops-theme:hover{color:var(--ops-text);border-color:var(--ops-muted)}
+.ops-theme:active{transform:translateY(1px)}
+.ops-shell a:focus-visible,.ops-theme:focus-visible{outline:2px solid var(--ops-cyan);outline-offset:3px}
 
 @media (max-width:1050px){
   .ops-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}

@@ -484,6 +484,13 @@ func runServe(args []string) error {
 		logger.Info("👁️  goal-session watchdog enabled (2m tick)")
 	}
 
+	// Keep every epics-topic nudge on the same digest-sequence contract as the master
+	// API: constrained consumers can dedupe, while the dashboard simply re-reads truth.
+	publishEpicNudge := func(event string) {
+		seq, _ := st.EpicDigestSeq(ctx)
+		srv.Broker().Publish(api.LifeEvent{State: "epics", Event: event, DigestSeq: seq})
+	}
+
 	// THE ONE CONSOLIDATED EPIC-SUPERVISION TICKER (epic-lane Phase 6b, plan §12.2). A
 	// SINGLE 2-minute goroutine does the WHOLE epic pass in a serialized batch — NOT six
 	// tickers, so the single-writer SQLite budget stays bounded: (a) status ingestion off
@@ -526,6 +533,9 @@ func runServe(args []string) error {
 						if supv != nil {
 							supv.Pass(ctx, now)
 						}
+						// The dashboard polls as a backstop, but the completed serialized pass is
+						// also the authoritative low-latency nudge for epic/runtime/attention data.
+						publishEpicNudge("epic_supervision_pass")
 					}()
 				}
 			}
@@ -540,6 +550,12 @@ func runServe(args []string) error {
 	// kill-switch (the capacity data feeds the supervision decisions).
 	if !cfg.EpicSupervisionDisabled {
 		go func() {
+			foldAndPublish := func() {
+				foldSeatCapacity(ctx, logger, st, time.Now())
+				// Account windows and seat health are dashboard truth too; publish even
+				// when no threshold crossing produced the legacy capacity event.
+				publishEpicNudge("capacity_fold")
+			}
 			// stagger: wait ~1 minute before the first probe so it never collides with the
 			// supervision tick's first fire on startup.
 			select {
@@ -547,7 +563,7 @@ func runServe(args []string) error {
 				return
 			case <-time.After(time.Minute):
 			}
-			foldSeatCapacity(ctx, logger, st, time.Now())
+			foldAndPublish()
 			t := time.NewTicker(5 * time.Minute)
 			defer t.Stop()
 			for {
@@ -555,7 +571,7 @@ func runServe(args []string) error {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					foldSeatCapacity(ctx, logger, st, time.Now())
+					foldAndPublish()
 				}
 			}
 		}()

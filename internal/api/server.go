@@ -471,7 +471,8 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/board", s.boardJSON)
 	// F12 web UI (internal/web): the rich Fleet + Board + Dashboard + Roster panes,
 	// wired to the same live read-models the SSE feed refreshes. Embedded via
-	// go:embed. It owns "/", "/epics", "/board", "/board/detail", "/fleet", "/dashboard",
+	// go:embed. It owns the Fleet dashboard at "/", "/dashboard", and "/epics";
+	// the legacy audit at "/audit"; plus "/board", "/board/detail", "/fleet",
 	// "/roster", and "/assets/". The read-only views bind to loopback/Tailscale.
 	s.ui.Mount(mux)
 	return mux

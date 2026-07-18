@@ -10,13 +10,14 @@ import (
 	"strings"
 	"time"
 
+	attentioncore "github.com/samhotchkiss/flowbee/internal/attention"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
 // page is the shared template payload: the active nav tab + the view-specific
 // body data. The base template renders the nav + the live SSE hook around it.
 type page struct {
-	Active  string // "epics" | "board" | "fleet" | "dashboard" | "roster"
+	Active  string // "epics" | "board" | "fleet" | "audit" | "roster"
 	Title   string
 	Partial bool // true => render only the live body fragment (SSE refresh)
 	Epics   *epicsView
@@ -306,6 +307,7 @@ type epicSeatRow struct {
 	Box                 string
 	Family, FamilyClass string
 	AccountKey          string
+	Enabled             bool
 	HealthLabel         string
 	HealthClass         string
 	UsageLabel          string
@@ -383,12 +385,16 @@ type epicsView struct {
 	Active                  []epicCard
 	Review                  []epicCard
 	Completed               []epicCard
+	Archived                []epicCard
+	CompletedHidden         int
 }
+
+const dashboardCompletedLimit = 24
 
 func (u *UI) epics(w http.ResponseWriter, r *http.Request) {
 	// "GET /" is a ServeMux subtree pattern. Refuse unknown paths instead of
 	// accidentally turning /v1/typo into a 200 HTML dashboard.
-	if r.URL.Path != "/" && r.URL.Path != "/epics" {
+	if r.URL.Path != "/" && r.URL.Path != "/epics" && r.URL.Path != "/dashboard" {
 		http.NotFound(w, r)
 		return
 	}
@@ -428,7 +434,7 @@ func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors [
 
 	latest := time.Time{}
 	considerLatest := func(raw string) {
-		if t := store.ParseTimeOrZero(raw); t.After(latest) {
+		if t := parseDashboardTime(raw, now.Location()); t.After(latest) {
 			latest = t
 		}
 	}
@@ -461,8 +467,12 @@ func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors [
 
 	attentionByEpic := map[string][]store.AttentionItem{}
 	for _, item := range attention {
-		attentionByEpic[item.EpicID] = append(attentionByEpic[item.EpicID], item)
-		v.Attention = append(v.Attention, buildAttentionRow(item, epics))
+		if isEpicDashboardAttention(item) {
+			attentionByEpic[item.EpicID] = append(attentionByEpic[item.EpicID], item)
+		}
+		if isHumanAttention(item) {
+			v.Attention = append(v.Attention, buildAttentionRow(item, epics))
+		}
 		considerLatest(item.UpdatedAt)
 	}
 
@@ -474,9 +484,13 @@ func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors [
 
 	seatNamesByAccount := map[string][]string{}
 	families := map[string]bool{}
+	enabledSeats := 0
 	for _, s := range seats {
 		fam := normalizeFamily(s.AgentFamily)
-		families[fam] = true
+		if s.Enabled {
+			families[fam] = true
+			enabledSeats++
+		}
 		name := seatAliases[s.ID]
 		if s.AccountKey != "" {
 			seatNamesByAccount[s.AccountKey] = append(seatNamesByAccount[s.AccountKey], name)
@@ -488,7 +502,7 @@ func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors [
 		row := epicSeatRow{
 			ID: s.ID, Name: name, Box: boxLabel(s.Box),
 			Family: familyLabel(fam), FamilyClass: familyClass(fam),
-			AccountKey: s.AccountKey, SeatLoad: activeBySeat[s.ID], HostLoad: activeByBox[s.Box], MaxConcurrent: cap,
+			AccountKey: s.AccountKey, Enabled: s.Enabled, SeatLoad: activeBySeat[s.ID], HostLoad: activeByBox[s.Box], MaxConcurrent: cap,
 		}
 		row.HealthLabel, row.HealthClass = seatHealth(s, windowByKey[s.AccountKey])
 		if aw, ok := windowByKey[s.AccountKey]; ok {
@@ -503,8 +517,12 @@ func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors [
 	for _, aw := range windows {
 		fam := normalizeFamily(firstNonEmpty(aw.ModelFamily, aw.Provider))
 		critical := accountCritical(aw)
+		displayName := strings.TrimSpace(aw.Email)
+		if displayName == "" {
+			displayName = firstNonEmpty(strings.Join(seatNamesByAccount[aw.AccountKey], ", "), shortID(aw.AccountKey))
+		}
 		row := epicAccountRow{
-			Key: aw.AccountKey, ShortKey: shortID(aw.AccountKey), Email: firstNonEmpty(aw.Email, aw.AccountKey),
+			Key: aw.AccountKey, ShortKey: shortID(aw.AccountKey), Email: displayName,
 			Family: familyLabel(fam), FamilyClass: familyClass(fam),
 			Session: buildUsageBar(aw.SessionPct, aw, false), Weekly: buildUsageBar(aw.WeeklyPct, aw, true),
 			ActiveEpics: activeByAccount[aw.AccountKey], SeatNames: strings.Join(seatNamesByAccount[aw.AccountKey], ", "),
@@ -534,15 +552,15 @@ func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors [
 		return v.Seats[i].Name < v.Seats[j].Name
 	})
 
-	terminalCount, doneToday, ciRed := 0, 0, 0
+	completedCount, doneToday, ciRed := 0, 0, 0
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	for _, e := range epics {
 		items := attentionByEpic[e.ID]
 		card := u.buildEpicCard(e, items, seatAliases, now)
-		terminal := isTerminalEpic(e.State)
-		if terminal {
-			terminalCount++
-			if finished := store.ParseTimeOrZero(e.FinishedAt); !finished.IsZero() && !finished.Before(dayStart) {
+		successful := isSuccessfulEpic(e.State)
+		if successful {
+			completedCount++
+			if finished := parseDashboardTime(e.FinishedAt, now.Location()); !finished.IsZero() && !finished.Before(dayStart) {
 				doneToday++
 			}
 		}
@@ -553,10 +571,12 @@ func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors [
 			}
 		}
 		switch {
+		case successful:
+			v.Completed = append(v.Completed, card)
+		case e.State == "abandoned":
+			v.Archived = append(v.Archived, card)
 		case len(items) > 0 || e.State == "blocked" || strings.Contains(strings.ToLower(e.StatusStateDetail), "review"):
 			v.Review = append(v.Review, card)
-		case terminal:
-			v.Completed = append(v.Completed, card)
 		default:
 			v.Active = append(v.Active, card)
 		}
@@ -569,13 +589,18 @@ func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors [
 		return v.Review[i].SortAt.After(v.Review[j].SortAt)
 	})
 	sort.SliceStable(v.Completed, func(i, j int) bool { return v.Completed[i].SortAt.After(v.Completed[j].SortAt) })
+	sort.SliceStable(v.Archived, func(i, j int) bool { return v.Archived[i].SortAt.After(v.Archived[j].SortAt) })
+	if len(v.Completed) > dashboardCompletedLimit {
+		v.CompletedHidden = len(v.Completed) - dashboardCompletedLimit
+		v.Completed = v.Completed[:dashboardCompletedLimit]
+	}
 
 	v.Stats = epicStatsView{
-		Completed: terminalCount, CompletedToday: doneToday,
+		Completed: completedCount, CompletedToday: doneToday,
 		Active: len(v.Active), Review: len(v.Review), CIRed: ciRed,
-		Seats: len(seats), Families: len(families), NeedsYou: len(attention),
+		Seats: enabledSeats, Families: len(families), NeedsYou: len(v.Attention),
 	}
-	v.Master = buildMaster(supervisors, now)
+	v.Master = buildMaster(supervisors, now, u.staleHB)
 	for _, sup := range supervisors {
 		considerLatest(sup.UpdatedAt)
 	}
@@ -590,16 +615,21 @@ func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors [
 
 func (u *UI) buildEpicCard(e store.EpicRun, items []store.AttentionItem, seatAliases map[string]string, now time.Time) epicCard {
 	fam := normalizeFamily(firstNonEmpty(e.BuilderModelFamily, e.Agent))
-	sortAt := store.ParseTimeOrZero(firstNonEmpty(e.FinishedAt, e.UpdatedAt, e.CreatedAt))
-	progress := 0
-	stepLabel := "—"
-	if e.StatusStepsTotal > 0 {
+	sortAt := firstDashboardTime(now.Location(), e.FinishedAt, e.UpdatedAt, e.CreatedAt)
+	progress, stepLabel := 0, "—"
+	if isSuccessfulEpic(e.State) {
+		progress = 100
+		stepLabel = "done"
+		if e.StatusStepsTotal > 0 && e.StatusCurrentStep >= e.StatusStepsTotal {
+			stepLabel = fmt.Sprintf("%d/%d", e.StatusCurrentStep, e.StatusStepsTotal)
+		}
+	} else if e.StatusStepsTotal > 0 {
 		progress = clampPct(e.StatusCurrentStep * 100 / e.StatusStepsTotal)
 		stepLabel = fmt.Sprintf("%d/%d", e.StatusCurrentStep, e.StatusStepsTotal)
 	}
 	status, statusClass := epicStatus(e, items)
 	pane, paneClass := paneStatus(e.PaneState, e.State)
-	updated := store.ParseTimeOrZero(firstNonEmpty(e.StatusUpdatedAt, e.UpdatedAt))
+	updated := firstDashboardTime(now.Location(), e.StatusUpdatedAt, e.UpdatedAt)
 	ageS := 0
 	if !updated.IsZero() && now.After(updated) {
 		ageS = int(now.Sub(updated) / time.Second)
@@ -611,11 +641,12 @@ func (u *UI) buildEpicCard(e store.EpicRun, items []store.AttentionItem, seatAli
 	detail := ""
 	if len(items) > 0 {
 		detail = firstNonEmpty(items[0].Detail, humanizeToken(items[0].Kind))
-	} else if e.StatusBlockers != "" {
+	} else if !isTerminalEpic(e.State) && e.StatusBlockers != "" {
 		detail = e.StatusBlockers
 	}
+	title, subtitle := epicDisplayText(e)
 	return epicCard{
-		ID: e.ID, Title: firstNonEmpty(e.Title, e.ID), Subtitle: epicSubtitle(e),
+		ID: e.ID, Title: title, Subtitle: subtitle,
 		State: e.State, StatusLabel: status, StatusClass: statusClass,
 		Family: familyLabel(fam), FamilyClass: familyClass(fam),
 		SeatName: firstNonEmpty(seatAliases[e.SeatID], shortID(e.SeatID)), Host: boxLabel(e.Host),
@@ -645,28 +676,81 @@ func buildAttentionRow(item store.AttentionItem, epics []store.EpicRun) epicAtte
 	}
 }
 
-func buildMaster(supervisors []store.Supervisor, now time.Time) epicMasterView {
+// isHumanAttention keeps the top-level "Needs you" signal distinct from the
+// master's own durable queue. Leased/delivering items are already being handled;
+// master-first conditions such as CI red stay visible on their epic card without
+// falsely paging the operator.
+func isHumanAttention(item store.AttentionItem) bool {
+	if item.State != attentioncore.StateOpen {
+		return false
+	}
+	kind := attentioncore.Kind(item.Kind)
+	return attentioncore.TierFor(kind) == attentioncore.TierHumanImmediate ||
+		kind == attentioncore.KindBlockedNonResumable
+}
+
+// isEpicDashboardAttention drops informational queue entries that should not move
+// a terminal epic back into the review lane. They remain available through the
+// versioned attention API and audit view.
+func isEpicDashboardAttention(item store.AttentionItem) bool {
+	switch attentioncore.Kind(item.Kind) {
+	case attentioncore.KindEpicFinished, attentioncore.KindMergeMainSuggested,
+		attentioncore.KindCIInfraIncident, attentioncore.KindMasterAbsent:
+		return false
+	default:
+		return item.EpicID != ""
+	}
+}
+
+func buildMaster(supervisors []store.Supervisor, now time.Time, staleAfter time.Duration) epicMasterView {
 	var picked *store.Supervisor
 	for i := range supervisors {
 		s := &supervisors[i]
-		if picked == nil || (s.State == "active" && picked.State != "active") ||
-			(s.State == picked.State && store.ParseTimeOrZero(s.LastHeartbeatAt).After(store.ParseTimeOrZero(picked.LastHeartbeatAt))) {
+		if picked == nil || supervisorRank(*s, now, staleAfter) > supervisorRank(*picked, now, staleAfter) ||
+			(supervisorRank(*s, now, staleAfter) == supervisorRank(*picked, now, staleAfter) &&
+				parseDashboardTime(s.LastHeartbeatAt, now.Location()).After(parseDashboardTime(picked.LastHeartbeatAt, now.Location()))) {
 			picked = s
 		}
 	}
 	if picked == nil {
 		return epicMasterView{State: "offline", StateClass: "muted", Heartbeat: "no master registered", Box: "—"}
 	}
+	state := effectiveSupervisorState(*picked, now, staleAfter)
 	stateClass := "muted"
-	if picked.State == "active" {
+	if state == "active" {
 		stateClass = "active"
-	} else if picked.State == "stale" || picked.State == "revoked" {
+	} else if state == "stale" || state == "revoked" {
 		stateClass = "critical"
 	}
 	return epicMasterView{
-		Registered: true, Label: picked.Label, State: picked.State, StateClass: stateClass,
+		Registered: true, Label: picked.Label, State: state, StateClass: stateClass,
 		Epoch: picked.Epoch, Kind: picked.Kind, Box: boxLabel(picked.Box),
-		Heartbeat: humanAgo(store.ParseTimeOrZero(picked.LastHeartbeatAt), now),
+		Heartbeat: humanAgo(parseDashboardTime(picked.LastHeartbeatAt, now.Location()), now),
+	}
+}
+
+func effectiveSupervisorState(s store.Supervisor, now time.Time, staleAfter time.Duration) string {
+	if s.State != "active" {
+		return s.State
+	}
+	if staleAfter <= 0 {
+		staleAfter = 90 * time.Second
+	}
+	hb := parseDashboardTime(s.LastHeartbeatAt, now.Location())
+	if hb.IsZero() || now.Sub(hb) > staleAfter {
+		return "stale"
+	}
+	return "active"
+}
+
+func supervisorRank(s store.Supervisor, now time.Time, staleAfter time.Duration) int {
+	switch effectiveSupervisorState(s, now, staleAfter) {
+	case "active":
+		return 2
+	case "stale":
+		return 1
+	default:
+		return 0
 	}
 }
 
@@ -732,7 +816,7 @@ func accountTrust(aw store.AccountWindow) (string, string) {
 		return "stale", "stale"
 	}
 	switch aw.TrustState {
-	case "verified", "verified_local":
+	case "verified", "verified_local", "live": // "live" is the pre-0031 persisted spelling.
 		return "live", "live"
 	case "display_only":
 		return "display only", "muted"
@@ -750,6 +834,9 @@ func accountCritical(aw store.AccountWindow) bool {
 }
 
 func seatHealth(s store.Seat, aw store.AccountWindow) (string, string) {
+	if !s.Enabled {
+		return "disabled", "muted"
+	}
 	if aw.AccountKey != "" && accountCritical(aw) {
 		return "acct capped", "critical"
 	}
@@ -770,6 +857,16 @@ func seatHealth(s store.Seat, aw store.AccountWindow) (string, string) {
 }
 
 func epicStatus(e store.EpicRun, items []store.AttentionItem) (string, string) {
+	// Durable terminal state wins over stale status markdown or an attention row that
+	// was still in flight when the epic closed.
+	switch e.State {
+	case "done":
+		return "complete", "success"
+	case "achieved":
+		return "achieved", "success"
+	case "abandoned":
+		return "abandoned", "muted"
+	}
 	for _, item := range items {
 		if strings.Contains(strings.ToLower(item.Kind), "ci_red") {
 			return "CI red", "critical"
@@ -779,12 +876,6 @@ func epicStatus(e store.EpicRun, items []store.AttentionItem) (string, string) {
 		return humanizeToken(items[0].Kind), "review"
 	}
 	switch e.State {
-	case "done":
-		return "complete", "success"
-	case "achieved":
-		return "achieved", "success"
-	case "abandoned":
-		return "abandoned", "muted"
 	case "blocked":
 		return "blocked", "critical"
 	case "launching", "pending":
@@ -795,6 +886,9 @@ func epicStatus(e store.EpicRun, items []store.AttentionItem) (string, string) {
 }
 
 func paneStatus(pane, state string) (string, string) {
+	if isTerminalEpic(state) {
+		return "complete", "complete"
+	}
 	t := strings.ToLower(pane)
 	switch {
 	case strings.Contains(t, "work"):
@@ -805,8 +899,6 @@ func paneStatus(pane, state string) (string, string) {
 		return "idle", "idle"
 	case strings.Contains(t, "stall") || strings.Contains(t, "wedg"):
 		return "stalled", "critical"
-	case isTerminalEpic(state):
-		return "complete", "complete"
 	case pane == "":
 		return "unknown", "unknown"
 	default:
@@ -830,6 +922,10 @@ func isTerminalEpic(state string) bool {
 	default:
 		return false
 	}
+}
+
+func isSuccessfulEpic(state string) bool {
+	return state == "done" || state == "achieved"
 }
 
 func normalizeFamily(raw string) string {
@@ -872,8 +968,29 @@ func friendlySeatName(s store.Seat, fam string, ordinal int) string {
 	return base
 }
 
+// epicDisplayText understands the title shape emitted by the epic authoring flow:
+// "epic/<slug> — description". Keeping the slug and description separate matches
+// the operator mockup and avoids truncating the useful part of real, long titles.
+func epicDisplayText(e store.EpicRun) (string, string) {
+	raw := strings.TrimSpace(e.Title)
+	if heading, description, ok := strings.Cut(raw, " — "); ok {
+		heading = strings.TrimPrefix(strings.TrimSpace(heading), "epic/")
+		heading = strings.TrimPrefix(heading, "mail-")
+		return firstNonEmpty(heading, shortEpicSlug(e.ID)), strings.TrimSpace(description)
+	}
+	return firstNonEmpty(raw, shortEpicSlug(e.ID), e.ID), epicSubtitle(e)
+}
+
+func shortEpicSlug(id string) string {
+	id = strings.TrimSpace(id)
+	if len(id) > len("2006-01-02-") && id[4] == '-' && id[7] == '-' && id[10] == '-' {
+		id = id[11:]
+	}
+	return strings.TrimPrefix(id, "mail-")
+}
+
 func epicSubtitle(e store.EpicRun) string {
-	if e.StatusBlockers != "" {
+	if !isTerminalEpic(e.State) && e.StatusBlockers != "" {
 		return e.StatusBlockers
 	}
 	if len(e.Scope) > 0 {
@@ -888,6 +1005,35 @@ func epicSubtitle(e store.EpicRun) string {
 		return strings.Join(parts, " · ")
 	}
 	return firstNonEmpty(e.Repo, e.Branch, "Epic session")
+}
+
+// parseDashboardTime accepts the current RFC3339 store contract plus the legacy
+// SQLite timestamp shape present in pre-0031 epic rows. The latter has no zone and
+// is interpreted in the operator clock's location; it is display compatibility only,
+// never used by deterministic store decisions.
+func parseDashboardTime(raw string, loc *time.Location) time.Time {
+	if t := store.ParseTimeOrZero(raw); !t.IsZero() {
+		return t
+	}
+	if loc == nil {
+		loc = time.Local
+	}
+	raw = strings.TrimSpace(raw)
+	for _, layout := range []string{"2006-01-02 15:04:05.999999999", "2006-01-02 15:04:05"} {
+		if t, err := time.ParseInLocation(layout, raw, loc); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func firstDashboardTime(loc *time.Location, values ...string) time.Time {
+	for _, value := range values {
+		if t := parseDashboardTime(value, loc); !t.IsZero() {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 func preferredUsageLabel(aw store.AccountWindow) string {
@@ -1146,7 +1292,7 @@ type dashView struct {
 	Roster     []store.RosterWorker
 }
 
-func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
+func (u *UI) audit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	now := u.clock.Now()
 	budget, err := u.data.RateLimit(ctx)
@@ -1174,7 +1320,7 @@ func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "dashboard error", http.StatusInternalServerError)
 		return
 	}
-	u.renderPage(w, r, page{Active: "dashboard", Title: "Dashboard", Dash: &dashView{
+	u.renderPage(w, r, page{Active: "audit", Title: "Audit", Dash: &dashView{
 		Budget: budget, Cost: cost, Audit: audit, NeedsHuman: nh, Roster: roster,
 	}})
 }

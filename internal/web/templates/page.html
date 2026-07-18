@@ -21,10 +21,10 @@
 {{define "nav.html"}}
 <nav class="fb-nav">
   <span class="brand">🐝 Flowbee</span>
-  <a href="/epics" {{if eq .Active "epics"}}class="active"{{end}}>Epics</a>
+  <a href="/dashboard" {{if eq .Active "epics"}}class="active"{{end}}>Dashboard</a>
   <a href="/board" {{if eq .Active "board"}}class="active"{{end}}>Board</a>
   <a href="/fleet" {{if eq .Active "fleet"}}class="active"{{end}}>Fleet</a>
-  <a href="/dashboard" {{if eq .Active "dashboard"}}class="active"{{end}}>Dashboard</a>
+  <a href="/audit" {{if eq .Active "audit"}}class="active"{{end}}>Audit</a>
   <a href="/roster" {{if eq .Active "roster"}}class="active"{{end}}>Roster</a>
   <span class="spacer"></span>
   <span class="live"><span class="dot"></span>live</span>
