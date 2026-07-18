@@ -44,6 +44,13 @@ type Data interface {
 	RateLimit(ctx context.Context) (store.RateLimitGauge, error)
 	AllJobCost(ctx context.Context) ([]store.FlowCostRow, error)
 	AllAudit(ctx context.Context) ([]store.AuditRow, error)
+	// Epic-lane read models. The legacy jobs/workers board is intentionally still
+	// available at /board; these rows drive the session-per-epic operator surface.
+	ListEpicRuns(ctx context.Context) ([]store.EpicRun, error)
+	ListSeats(ctx context.Context) ([]store.Seat, error)
+	ListSupervisors(ctx context.Context) ([]store.Supervisor, error)
+	ListAccountWindows(ctx context.Context) ([]store.AccountWindow, error)
+	ListOpenAttention(ctx context.Context, state string, kinds []string, repo string) ([]store.AttentionItem, error)
 }
 
 // UI serves the F12 dashboards. It holds the parsed templates + the data source +
@@ -61,9 +68,9 @@ type UI struct {
 
 // Config carries the UI knobs.
 type Config struct {
-	StaleHB      time.Duration // the roster stale-heartbeat threshold (mirrors api).
-	StageAmber   time.Duration // a card turns amber after this long in a stage.
-	StageRed     time.Duration // a card turns red after this long in a stage.
+	StaleHB    time.Duration // the roster stale-heartbeat threshold (mirrors api).
+	StageAmber time.Duration // a card turns amber after this long in a stage.
+	StageRed   time.Duration // a card turns red after this long in a stage.
 }
 
 // New builds the UI, parsing the embedded templates with the helper funcs.
@@ -84,12 +91,13 @@ func New(data Data, clk clock.Clock, cfg Config) *UI {
 	return u
 }
 
-// Mount registers the UI routes + the embedded asset handler on a mux. The board
-// is the home page; /fleet and /dashboard are the other panes; /roster keeps the
-// legacy roster page. /board/detail serves the drawer fragment.
+// Mount registers the UI routes + the embedded asset handler on a mux. The epic
+// fleet is the home page; the legacy job board remains at /board. /board/detail
+// serves its drawer fragment.
 func (u *UI) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /assets/", http.FileServer(http.FS(assetsFS)))
-	mux.HandleFunc("GET /", u.board)
+	mux.HandleFunc("GET /", u.epics)
+	mux.HandleFunc("GET /epics", u.epics)
 	mux.HandleFunc("GET /board", u.board)
 	mux.HandleFunc("GET /board/detail", u.detail)
 	mux.HandleFunc("GET /fleet", u.fleet)

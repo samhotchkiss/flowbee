@@ -10,12 +10,23 @@
     try {
       var es = new EventSource("/v1/events");
       var t = null;
-      es.onopen = function () { if (live) live.classList.add("on"); };
-      es.onerror = function () { if (live) live.classList.remove("on"); };
-      es.onmessage = function () {
+      var scheduleRefresh = function () {
         clearTimeout(t);
         t = setTimeout(refresh, 350);
       };
+      es.onopen = function () {
+        document.documentElement.classList.add("sse-live");
+        if (live) live.classList.add("on");
+      };
+      es.onerror = function () {
+        document.documentElement.classList.remove("sse-live");
+        if (live) live.classList.remove("on");
+      };
+      // The server emits named `lifecycle` and `epics` events. `onmessage` only
+      // receives unnamed/default events, so listen to all three forms.
+      es.onmessage = scheduleRefresh;
+      es.addEventListener("lifecycle", scheduleRefresh);
+      es.addEventListener("epics", scheduleRefresh);
       window.addEventListener("beforeunload", function () { es.close(); });
     } catch (e) { /* SSE unsupported: the page is still a valid static render */ }
   }
@@ -35,6 +46,7 @@
         if (html === null) { return; }
         root.innerHTML = html;
         wireCards();
+        wireTheme();
       })
       .catch(function () { /* transient: the next event retries */ });
   }
@@ -77,9 +89,40 @@
     }
   }
 
+  // ── theme ── the epic fleet's target is dark, but the footer control is
+  // a real persisted toggle rather than decorative chrome.
+  function setTheme(theme) {
+    if (theme === "light") {
+      document.documentElement.setAttribute("data-theme", "light");
+    } else {
+      document.documentElement.removeAttribute("data-theme");
+      theme = "dark";
+    }
+    var button = document.getElementById("theme-toggle");
+    if (button) {
+      button.setAttribute("aria-pressed", theme === "light" ? "true" : "false");
+      button.setAttribute("title", "Switch to " + (theme === "light" ? "dark" : "light") + " theme");
+    }
+  }
+
+  function wireTheme() {
+    var button = document.getElementById("theme-toggle");
+    if (!button || button.getAttribute("data-wired") === "1") { return; }
+    button.setAttribute("data-wired", "1");
+    button.addEventListener("click", function () {
+      var next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+      setTheme(next);
+      try { window.localStorage.setItem("flowbee-theme", next); } catch (e) { /* private mode */ }
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
+    var stored = "dark";
+    try { stored = window.localStorage.getItem("flowbee-theme") || "dark"; } catch (e) { /* private mode */ }
+    setTheme(stored);
     wireSSE();
     wireCards();
+    wireTheme();
     var c = document.getElementById("fb-drawer-close");
     if (c) { c.addEventListener("click", closeDrawer); }
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") { closeDrawer(); } });

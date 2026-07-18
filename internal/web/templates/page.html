@@ -6,8 +6,8 @@
 <title>Flowbee · {{.Title}}</title>
 <link rel="stylesheet" href="/assets/app.css">
 </head>
-<body>
-{{template "nav.html" .}}
+<body class="page-{{.Active}}">
+{{if not .Epics}}{{template "nav.html" .}}{{end}}
 <main class="pane-{{.Active}}">
 <div id="fb-live">
 {{template "body.html" .}}
@@ -21,6 +21,7 @@
 {{define "nav.html"}}
 <nav class="fb-nav">
   <span class="brand">🐝 Flowbee</span>
+  <a href="/epics" {{if eq .Active "epics"}}class="active"{{end}}>Epics</a>
   <a href="/board" {{if eq .Active "board"}}class="active"{{end}}>Board</a>
   <a href="/fleet" {{if eq .Active "fleet"}}class="active"{{end}}>Fleet</a>
   <a href="/dashboard" {{if eq .Active "dashboard"}}class="active"{{end}}>Dashboard</a>
@@ -30,6 +31,7 @@
 </nav>{{end}}
 
 {{define "body.html"}}
+{{if .Epics}}{{template "epics.html" .Epics}}{{end}}
 {{if .Board}}{{template "board.html" .Board}}{{end}}
 {{if .Fleet}}{{template "fleet.html" .Fleet}}{{end}}
 {{if .Dash}}{{template "dashboard.html" .Dash}}{{end}}

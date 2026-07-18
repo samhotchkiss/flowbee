@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/acctprobe"
 	"github.com/samhotchkiss/flowbee/internal/capacity"
+	"github.com/samhotchkiss/flowbee/internal/epicspec"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
@@ -34,6 +36,148 @@ func mountUI(t *testing.T, st *store.Store, clk fixedClock) http.Handler {
 	mux := http.NewServeMux()
 	ui.Mount(mux)
 	return mux
+}
+
+// TestEpicFleetDashboardRendersLiveCapacityAndConcurrentSeats pins the target
+// session-per-epic operator surface against real migrated store data. It also
+// proves that the root route is exact, the SSE partial is chrome-free, and the
+// dashboard exposes the concurrent-seat load that controls launch throughput.
+func TestEpicFleetDashboardRendersLiveCapacityAndConcurrentSeats(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 18, 36, 0, 0, time.UTC)
+
+	cappedSeat := store.Seat{
+		Box: "box-a", AgentFamily: "claude", ConfigDir: "/cfg/claude1",
+		AccountKey: "acct-capped-6356db02", Health: store.SeatReady, MaxConcurrent: 2,
+	}
+	healthySeat := store.Seat{
+		Box: "box-b", AgentFamily: "claude", ConfigDir: "/cfg/claude2",
+		AccountKey: "acct-healthy-5ef2973c", Health: store.SeatReady, MaxConcurrent: 2,
+	}
+	codexSeat := store.Seat{
+		Box: "box-a", AgentFamily: "codex", CodexHome: "/cfg/codex1",
+		AccountKey: "acct-codex-42df4963", Health: store.SeatReady, MaxConcurrent: 2,
+	}
+	for _, seat := range []store.Seat{cappedSeat, healthySeat, codexSeat} {
+		if err := st.AddSeat(ctx, seat, now); err != nil {
+			t.Fatalf("add seat: %v", err)
+		}
+	}
+
+	if err := st.UpsertAccountLimits(ctx, acctprobe.Result{
+		Identity: acctprobe.Identity{Provider: "claude", AccountKey: cappedSeat.AccountKey, Email: "s@swh.me"},
+		Usage: acctprobe.Usage{Windows: acctprobe.Windows{
+			{Kind: acctprobe.KindSession, Percent: 100, Severity: acctprobe.SeverityCritical, ResetsAt: now.Add(14 * time.Minute)},
+			{Kind: acctprobe.KindWeeklyAll, Percent: 53, Severity: acctprobe.SeverityNormal},
+		}}, TrustState: acctprobe.TrustVerified, CapturedAt: now,
+	}, now); err != nil {
+		t.Fatalf("fold capped account: %v", err)
+	}
+	if err := st.UpsertAccountLimits(ctx, acctprobe.Result{
+		Identity: acctprobe.Identity{Provider: "claude", AccountKey: healthySeat.AccountKey, Email: "pearl@swh.me"},
+		Usage: acctprobe.Usage{Windows: acctprobe.Windows{
+			{Kind: acctprobe.KindSession, Percent: 63, Severity: acctprobe.SeverityNormal},
+			{Kind: acctprobe.KindWeeklyAll, Percent: 47, Severity: acctprobe.SeverityNormal},
+		}}, TrustState: acctprobe.TrustVerified, CapturedAt: now,
+	}, now); err != nil {
+		t.Fatalf("fold healthy account: %v", err)
+	}
+	if err := st.UpsertAccountLimits(ctx, acctprobe.Result{
+		Identity: acctprobe.Identity{Provider: "codex", AccountKey: codexSeat.AccountKey, Email: "codex@x"},
+		Usage: acctprobe.Usage{Windows: acctprobe.Windows{
+			{Kind: acctprobe.KindWeeklyAll, Percent: 59, Severity: acctprobe.SeverityNormal},
+		}}, TrustState: acctprobe.TrustDisplayOnly, CapturedAt: now,
+	}, now); err != nil {
+		t.Fatalf("fold codex account: %v", err)
+	}
+
+	active := []store.EpicRun{
+		{ID: "instant-cache", Repo: "russ", Title: "Instant cache", Scope: []string{"internal/cache/**"}, SeatID: cappedSeat.ComposeID(), Agent: "claude", Branch: "epic/instant-cache", TmuxName: "epic-instant-cache"},
+		{ID: "register-lifecycle", Repo: "russ", Title: "Register lifecycle", Scope: []string{"internal/register/**"}, SeatID: cappedSeat.ComposeID(), Agent: "claude", Branch: "epic/register-lifecycle", TmuxName: "epic-register-lifecycle"},
+	}
+	for _, epic := range active {
+		if err := st.AddEpicRun(ctx, epic, 99, now); err != nil {
+			t.Fatalf("add concurrent epic %s: %v", epic.ID, err)
+		}
+		if err := st.MarkEpicLaunched(ctx, epic.ID, now); err != nil {
+			t.Fatalf("launch epic %s: %v", epic.ID, err)
+		}
+	}
+	if err := st.UpsertEpicStatus(ctx, "instant-cache", epicspec.StatusBlock{
+		UpdatedRaw: now.Format(time.RFC3339), CurrentStep: 4, StepsTotal: 7, State: "building",
+	}, now); err != nil {
+		t.Fatalf("update active status: %v", err)
+	}
+	if err := st.UpsertEpicStatus(ctx, "register-lifecycle", epicspec.StatusBlock{
+		UpdatedRaw: now.Format(time.RFC3339), CurrentStep: 7, StepsTotal: 7, State: "blocked", Blockers: "version-locked prompt tests need an update",
+	}, now); err != nil {
+		t.Fatalf("update blocked status: %v", err)
+	}
+
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "reply-latency", Repo: "russ", Title: "Reply latency", Scope: []string{"internal/latency/**"},
+		Host: "box-b", Agent: "claude", Branch: "epic/reply-latency", TmuxName: "epic-reply-latency",
+	}, 2, now); err != nil {
+		t.Fatalf("add completed epic: %v", err)
+	}
+	if err := st.MarkEpicLaunched(ctx, "reply-latency", now); err != nil {
+		t.Fatalf("launch completed epic: %v", err)
+	}
+	if err := st.UpsertEpicStatus(ctx, "reply-latency", epicspec.StatusBlock{
+		UpdatedRaw: now.Format(time.RFC3339), CurrentStep: 6, StepsTotal: 6, State: "done",
+	}, now); err != nil {
+		t.Fatalf("finish completed epic: %v", err)
+	}
+
+	if _, _, err := st.UpsertAttentionItem(ctx, store.AttentionItem{
+		ID: "att-ci-red", Kind: "ci_red_on_epic_pr", EpicID: "register-lifecycle", Repo: "russ",
+		Priority: 20, DedupKey: "register-lifecycle:ci-red:head", Blocking: true,
+		Detail: "version-locked prompt tests need an update",
+	}, now); err != nil {
+		t.Fatalf("open attention: %v", err)
+	}
+	if _, err := st.RegisterSupervisor(ctx, store.Supervisor{
+		Label: "flowbee-master", Kind: "claude", ModelFamily: "claude", Box: "box-master", TmuxName: "master", Repos: []string{"russ"},
+	}, now); err != nil {
+		t.Fatalf("register master: %v", err)
+	}
+
+	h := mountUI(t, st, fixedClock{t: now})
+	for _, path := range []string{"/", "/epics"} {
+		code, body := getBody(t, h, path)
+		if code != http.StatusOK {
+			t.Fatalf("%s status = %d", path, code)
+		}
+		for _, want := range []string{
+			"Flowbee Fleet", "session-per-epic control plane", "Session cap hit", "s@swh.me", "pearl@swh.me",
+			"data-throughput", "data-usage", "data-account=\"acct-capped-6356db02\"", "data-seats",
+			"data-epic=\"instant-cache\"", "data-epic=\"register-lifecycle\"", "data-epic=\"reply-latency\"",
+			"2/2", "ci red on epic pr", "version-locked prompt tests", "Completed today", "id=\"theme-toggle\"",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("%s missing %q\n---\n%s", path, want, body)
+			}
+		}
+		if strings.Contains(body, "class=\"fb-nav\"") {
+			t.Fatalf("epic target must not render the legacy gradient nav:\n%s", body)
+		}
+	}
+
+	code, partial := getBody(t, h, "/epics?partial=1")
+	if code != http.StatusOK || strings.Contains(partial, "<!doctype html>") || !strings.Contains(partial, "data-throughput") {
+		t.Fatalf("epics partial contract failed (code=%d):\n%s", code, partial)
+	}
+	code, _ = getBody(t, h, "/v1/not-real")
+	if code != http.StatusNotFound {
+		t.Fatalf("unknown API path = %d, want 404", code)
+	}
+	_, js := getBody(t, h, "/assets/board.js")
+	for _, want := range []string{"addEventListener(\"lifecycle\"", "addEventListener(\"epics\"", "flowbee-theme"} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("board.js missing %q", want)
+		}
+	}
 }
 
 func getBody(t *testing.T, h http.Handler, path string) (int, string) {

@@ -1,0 +1,180 @@
+{{define "epics.html"}}
+<div class="ops-shell">
+  <header class="ops-header">
+    <div class="ops-heading">
+      <span class="ops-live-dot" aria-hidden="true"></span>
+      <strong>Flowbee Fleet</strong>
+      <span class="ops-context">· session-per-epic control plane</span>
+    </div>
+    <div class="ops-snapshot">
+      snapshot <strong>{{.SnapshotAt}}</strong> · {{.SnapshotAge}}
+      {{if .Master.Registered}}· master hb {{.Master.Heartbeat}}{{end}}
+    </div>
+  </header>
+
+  {{with .Alert}}
+  <section class="ops-alert" role="alert" data-capacity-alert>
+    <span class="ops-alert-icon" aria-hidden="true">▲</span>
+    <div>
+      <p><strong>Session cap hit</strong> — {{.Email}} ({{.Family}}) is at <b>{{.PctLabel}}</b> of its {{.WindowLabel}} window{{if ne .WeeklyLabel "—"}} (weekly {{.WeeklyLabel}}){{end}}.</p>
+      <p>This account{{if .Seats}} backs <b>{{.Seats}}</b>{{end}}, so those lanes share its capacity. {{.ResetLabel}}.</p>
+      {{if .HealthyEmail}}<p class="ops-alert-fix">Fleet routing can place new work on {{.HealthyEmail}} ({{.HealthyPct}}) while it recovers.</p>{{end}}
+    </div>
+  </section>
+  {{end}}
+
+  {{if .Attention}}
+  <section class="ops-attention" aria-labelledby="ops-attention-title" data-attention>
+    <div class="ops-attention-heading">
+      <h2 id="ops-attention-title">Needs you</h2>
+      <span>{{len .Attention}} open</span>
+    </div>
+    <div class="ops-attention-list">
+      {{range .Attention}}
+      <article class="ops-attention-item {{.Class}}" data-attention-id="{{.ID}}">
+        <div><strong>{{if .EpicTitle}}{{.EpicTitle}}{{else}}Fleet{{end}}</strong><span>{{.Kind}}</span></div>
+        <p>{{.Detail}}</p>
+        <small>priority {{.Priority}} · {{.State}}{{if gt .Occurrences 1}} · {{.Occurrences}} occurrences{{end}}</small>
+      </article>
+      {{end}}
+    </div>
+  </section>
+  {{end}}
+
+  <section class="ops-kpis" data-throughput aria-label="Fleet summary">
+    <article class="ops-kpi accent-cyan">
+      <div class="ops-kpi-value">{{.Stats.Completed}}</div>
+      <div class="ops-kpi-label">Epics completed</div>
+    </article>
+    <article class="ops-kpi">
+      <div class="ops-kpi-value">{{.Stats.CompletedToday}}</div>
+      <div class="ops-kpi-label">Completed today</div>
+    </article>
+    <article class="ops-kpi">
+      <div class="ops-kpi-value">{{.Stats.Review}}</div>
+      <div class="ops-kpi-label">In review{{if .Stats.CIRed}} · <span class="critical">{{.Stats.CIRed}} CI-red</span>{{end}}</div>
+    </article>
+    <article class="ops-kpi">
+      <div class="ops-kpi-value">{{.Stats.Seats}}</div>
+      <div class="ops-kpi-label">Seats · {{.Stats.Families}} families</div>
+    </article>
+    <article class="ops-kpi">
+      <div class="ops-kpi-value">{{.Stats.NeedsYou}}</div>
+      <div class="ops-kpi-label">Needs you · {{if .Stats.NeedsYou}}open{{else}}<span class="success">all clear</span>{{end}}</div>
+    </article>
+    <article class="ops-kpi ops-master-kpi {{.Master.StateClass}}">
+      <div class="ops-kpi-value"><span class="ops-state-dot"></span>{{.Master.State}}</div>
+      <div class="ops-kpi-label">Master{{if .Master.Registered}} · epoch {{.Master.Epoch}}{{end}}</div>
+    </article>
+  </section>
+
+  <section class="ops-section" aria-labelledby="ops-fleet-title">
+    <h2 id="ops-fleet-title">Account usage &amp; fleet</h2>
+    <div class="ops-fleet-intro">
+      <p>Per-account limits. Placement reads the same server windows before it admits a new epic.</p>
+      <p>Each authenticated seat contributes its own slots; host load is shown separately to make physical spread visible.</p>
+    </div>
+    <div class="ops-fleet-layout">
+      <div class="ops-panel ops-account-list" data-usage>
+        {{range .Accounts}}
+        <article class="ops-account {{if .Critical}}critical{{end}}" data-account="{{.Key}}">
+          <header>
+            <div class="ops-account-id">
+              <span class="ops-family {{.FamilyClass}}">{{.Family}}</span>
+              <strong>{{.Email}}</strong>
+              {{if .ShortKey}}<code>{{.ShortKey}}</code>{{end}}
+            </div>
+            <span class="ops-health {{.TrustClass}}">{{.TrustLabel}}</span>
+          </header>
+          <div class="ops-meter-row">
+            <div class="ops-meter-label"><span>session (5h)</span><strong>{{.Session.Label}}</strong></div>
+            <div class="ops-meter" aria-label="session usage {{.Session.Label}}"><span class="{{.Session.Class}}" style="width:{{.Session.Pct}}%"></span></div>
+          </div>
+          <div class="ops-meter-row">
+            <div class="ops-meter-label"><span>weekly</span><strong>{{.Weekly.Label}}</strong></div>
+            <div class="ops-meter" aria-label="weekly usage {{.Weekly.Label}}"><span class="{{.Weekly.Class}}" style="width:{{.Weekly.Pct}}%"></span></div>
+          </div>
+          <footer>
+            <span>{{.ResetLabel}}</span>
+            <span>{{if .SeatNames}}{{.SeatNames}}{{else}}no seat bound{{end}}{{if .ActiveEpics}} · {{.ActiveEpics}} active{{end}}</span>
+          </footer>
+        </article>
+        {{else}}
+        <div class="ops-empty">No account readings yet. Run a seat probe to populate live capacity.</div>
+        {{end}}
+      </div>
+
+      <div class="ops-panel ops-seat-list" data-seats>
+        {{range .Seats}}
+        <article class="ops-seat" data-seat="{{.ID}}">
+          <div class="ops-seat-name">
+            <span class="ops-family {{.FamilyClass}}">{{.Family}}</span>
+            <strong>{{.Name}}</strong>
+            <span class="ops-capacity-pips" title="{{.SeatLoad}} of {{.MaxConcurrent}} seat slots occupied">
+              {{range pips .SeatLoad .MaxConcurrent}}<i class="{{if .}}busy{{end}}"></i>{{end}}
+            </span>
+          </div>
+          <div class="ops-seat-host">{{.Box}} · host {{.HostLoad}} active</div>
+          <span class="ops-health {{.HealthClass}}">{{.HealthLabel}}</span>
+          <strong class="ops-seat-usage">{{.SeatLoad}}/{{.MaxConcurrent}} · {{.UsageLabel}}</strong>
+        </article>
+        {{else}}
+        <div class="ops-empty">No seats registered. Discover or add a seat before launching an epic.</div>
+        {{end}}
+      </div>
+    </div>
+  </section>
+
+  <section class="ops-section ops-pipeline" aria-labelledby="ops-pipeline-title">
+    <h2 id="ops-pipeline-title">Epics — current pipeline</h2>
+
+    {{if .Active}}
+    <div class="ops-epic-group" data-epics="active">
+      <h3>In flight <span>{{len .Active}}</span></h3>
+      <div class="ops-epic-grid">{{range .Active}}{{template "ops-epic-card" .}}{{end}}</div>
+    </div>
+    {{end}}
+
+    <div class="ops-epic-group" data-epics="completed">
+      <h3>Completed <span>{{len .Completed}}</span></h3>
+      {{if .Completed}}<div class="ops-epic-grid">{{range .Completed}}{{template "ops-epic-card" .}}{{end}}</div>
+      {{else}}<div class="ops-empty ops-empty-lane">No completed epics in this registry yet.</div>{{end}}
+    </div>
+
+    {{if .Review}}
+    <div class="ops-epic-group" data-epics="review">
+      <h3>In review / attention <span>{{len .Review}}</span></h3>
+      <div class="ops-epic-grid">{{range .Review}}{{template "ops-epic-card" .}}{{end}}</div>
+    </div>
+    {{end}}
+  </section>
+
+  <footer class="ops-footer" data-masters>
+    <div>
+      {{if .Master.Registered}}<strong>{{.Master.Label}}</strong> {{.Master.Box}} · {{.Master.Kind}} · epoch {{.Master.Epoch}} · <span class="{{.Master.StateClass}}">{{.Master.State}}</span> · last hb {{.Master.Heartbeat}}
+      {{else}}<strong>master</strong> not registered{{end}}
+      <nav aria-label="Other Flowbee views"><a href="/board">board</a><a href="/fleet">legacy fleet</a><a href="/dashboard">audit</a></nav>
+    </div>
+    <button type="button" id="theme-toggle" class="ops-theme" aria-pressed="false">◐ theme</button>
+  </footer>
+</div>
+{{end}}
+
+{{define "ops-epic-card"}}
+<article class="ops-epic-card {{.StatusClass}}" data-epic="{{.ID}}">
+  <header>
+    <strong>{{.Title}}</strong>
+    <span class="ops-pane {{.PaneClass}}"><i></i>{{.PaneLabel}}</span>
+  </header>
+  <p>{{.Subtitle}}</p>
+  <div class="ops-epic-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{.Progress}}"><span style="width:{{.Progress}}%"></span></div>
+  <footer>
+    <span class="ops-family {{.FamilyClass}}">{{.Family}}</span>
+    {{if .SeatName}}<code>{{.SeatName}}</code>{{end}}
+    <span class="ops-card-state {{.StatusClass}}">{{.StatusLabel}}</span>
+    {{if .ContextLabel}}<span class="ops-context-pct">{{.ContextLabel}}</span>{{end}}
+    <strong class="ops-step">{{.StepLabel}}</strong>
+  </footer>
+  {{if .AttentionDetail}}<div class="ops-card-alert">⚠ {{.AttentionDetail}}</div>{{end}}
+</article>
+{{end}}
