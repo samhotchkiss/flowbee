@@ -33,7 +33,7 @@ func bindWorkIntentDriverRoute(t *testing.T, st *store.Store, orchestrator strin
 	}
 	bindings := []store.DriverSessionBinding{
 		{WorkerIdentity: orchestrator, Role: store.DriverOrchestratorRole,
-			HostID: "intent-host", StoreID: storeID, TmuxServerInstanceID: "intent-server",
+			HostID: "intent-host", StoreID: storeID, TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "intent-server", LifecycleOwnership: "driver_managed",
 			LifecycleKey: "orchestrator-" + orchestrator, TargetEpoch: 1, ProfileID: "orchestrator",
 			WorkspaceRootID: "workspace-root", WorkspaceRelativePath: "repo",
 			SessionID:      "orchestrator-session-" + orchestrator,

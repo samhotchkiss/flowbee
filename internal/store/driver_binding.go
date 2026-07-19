@@ -7,9 +7,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
+
+var driverTmuxServerDomainPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`)
 
 const (
 	// DriverControlIdentity is the stable Flowbee-owned sender principal used for
@@ -37,10 +40,14 @@ type DriverSessionBinding struct {
 	ProjectID             string
 	WorkerIdentity        string
 	Role                  string
+	SeatID                string
 	BindingEpoch          int64
 	HostID                string
 	StoreID               string
+	TmuxServerDomainID    string
 	TmuxServerInstanceID  string
+	LifecycleOwnership    string
+	ExternalWatchID       string
 	LifecycleKey          string
 	TargetEpoch           int64
 	ProfileID             string
@@ -61,25 +68,42 @@ func (b DriverSessionBinding) validate() error {
 	for name, value := range map[string]string{
 		"project_id": b.ProjectID, "worker_identity": b.WorkerIdentity, "role": b.Role,
 		"host_id": b.HostID, "store_id": b.StoreID,
-		"tmux_server_instance_id": b.TmuxServerInstanceID, "lifecycle_key": b.LifecycleKey,
-		"profile_id": b.ProfileID, "workspace_root_id": b.WorkspaceRootID,
-		"workspace_relative_path": b.WorkspaceRelativePath, "session_id": b.SessionID,
+		"tmux_server_instance_id": b.TmuxServerInstanceID, "session_id": b.SessionID,
 		"pane_instance_id": b.PaneInstanceID, "agent_run_id": b.AgentRunID,
 	} {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("Driver session binding requires %s", name)
 		}
 	}
-	if b.TargetEpoch < 1 {
-		return errors.New("Driver session binding requires positive target_epoch")
+	if !driverTmuxServerDomainPattern.MatchString(b.TmuxServerDomainID) {
+		return errors.New("Driver session binding has invalid tmux server domain")
+	}
+	switch b.LifecycleOwnership {
+	case "driver_managed":
+		if b.ExternalWatchID != "" || b.LifecycleKey == "" || b.TargetEpoch < 1 || b.ProfileID == "" ||
+			b.WorkspaceRootID == "" || b.WorkspaceRelativePath == "" {
+			return errors.New("driver-managed binding requires a complete managed lifecycle target and no external watch")
+		}
+	case "external_observed":
+		if b.TmuxServerDomainID == "" || b.ExternalWatchID == "" || b.LifecycleKey == "" ||
+			b.TargetEpoch < 1 || b.ProfileID == "" || b.WorkspaceRootID != "" || b.WorkspaceRelativePath != "" {
+			return errors.New("externally observed binding requires an adopted lifecycle receipt tuple")
+		}
+	default:
+		return errors.New("Driver session binding requires explicit lifecycle ownership")
+	}
+	if b.Role != DriverReviewerRole && b.SeatID != "" {
+		return errors.New("only a code_reviewer Driver binding may carry a capacity seat")
 	}
 	return nil
 }
 
 func sameDriverBinding(a, b DriverSessionBinding) bool {
 	return a.ProjectID == b.ProjectID && a.WorkerIdentity == b.WorkerIdentity && a.Role == b.Role &&
+		a.SeatID == b.SeatID &&
 		a.HostID == b.HostID && a.StoreID == b.StoreID &&
-		a.TmuxServerInstanceID == b.TmuxServerInstanceID && a.LifecycleKey == b.LifecycleKey &&
+		a.TmuxServerDomainID == b.TmuxServerDomainID && a.TmuxServerInstanceID == b.TmuxServerInstanceID &&
+		a.LifecycleOwnership == b.LifecycleOwnership && a.ExternalWatchID == b.ExternalWatchID && a.LifecycleKey == b.LifecycleKey &&
 		a.TargetEpoch == b.TargetEpoch && a.ProfileID == b.ProfileID &&
 		a.WorkspaceRootID == b.WorkspaceRootID && a.WorkspaceRelativePath == b.WorkspaceRelativePath &&
 		a.SessionID == b.SessionID && a.PaneInstanceID == b.PaneInstanceID &&
@@ -87,9 +111,9 @@ func sameDriverBinding(a, b DriverSessionBinding) bool {
 }
 
 func driverBindingID(b DriverSessionBinding, epoch int64) string {
-	material := fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
-		b.ProjectID, b.WorkerIdentity, b.Role, epoch, b.StoreID, b.SessionID,
-		b.PaneInstanceID, b.AgentRunID, b.LifecycleKey)
+	material := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
+		b.ProjectID, b.WorkerIdentity, b.Role, b.SeatID, epoch, b.StoreID, b.SessionID,
+		b.PaneInstanceID, b.AgentRunID, b.LifecycleKey+"\x00"+b.ExternalWatchID)
 	h := sha256.Sum256([]byte(material))
 	return "driver-binding-" + hex.EncodeToString(h[:12])
 }
@@ -111,6 +135,22 @@ func (s *Store) UpsertDriverSessionBinding(ctx context.Context, in DriverSession
 	}
 	var out DriverSessionBinding
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if in.SeatID != "" {
+			var enabled int
+			var hostID, family, accountKey, lineage string
+			if err := tx.QueryRowContext(ctx, `SELECT enabled,expected_host_id,agent_family,
+				expected_account_key,expected_credential_lineage FROM seats WHERE id=?`, in.SeatID).
+				Scan(&enabled, &hostID, &family, &accountKey, &lineage); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("reviewer Driver binding seat %q does not exist", in.SeatID)
+				}
+				return err
+			}
+			if in.Role != DriverReviewerRole || enabled != 1 || hostID == "" || hostID != in.HostID ||
+				family == "" || family != in.Provider || accountKey == "" || lineage == "" {
+				return fmt.Errorf("reviewer Driver binding seat %q is not an enabled exact host/provider/capacity match", in.SeatID)
+			}
+		}
 		current, err := activeDriverSessionBindingTx(ctx, tx, in.ProjectID, in.WorkerIdentity, in.Role)
 		hadCurrent := err == nil
 		switch {
@@ -138,13 +178,14 @@ func (s *Store) UpsertDriverSessionBinding(ctx context.Context, in DriverSession
 		in.BindingEpoch = epoch
 		in.BindingID = driverBindingID(in, epoch)
 		_, err = tx.ExecContext(ctx, `INSERT INTO driver_session_bindings
-			(binding_id,project_id,worker_identity,role,binding_epoch,state,host_id,store_id,
-			 tmux_server_instance_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
+			(binding_id,project_id,worker_identity,role,seat_id,binding_epoch,state,host_id,store_id,
+			 tmux_server_domain_id,tmux_server_instance_id,lifecycle_ownership,external_watch_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
 			 workspace_relative_path,session_id,pane_instance_id,agent_run_id,provider,
 			 conversation_id,observed_at,created_at,updated_at)
-			VALUES (?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, in.BindingID,
-			in.ProjectID, in.WorkerIdentity, in.Role, epoch, in.HostID, in.StoreID,
-			in.TmuxServerInstanceID, in.LifecycleKey, in.TargetEpoch, in.ProfileID,
+			VALUES (?,?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, in.BindingID,
+			in.ProjectID, in.WorkerIdentity, in.Role, in.SeatID, epoch, in.HostID, in.StoreID,
+			in.TmuxServerDomainID, in.TmuxServerInstanceID, in.LifecycleOwnership, in.ExternalWatchID,
+			in.LifecycleKey, in.TargetEpoch, in.ProfileID,
 			in.WorkspaceRootID, in.WorkspaceRelativePath, in.SessionID, in.PaneInstanceID,
 			in.AgentRunID, in.Provider, in.ConversationID, in.ObservedAt.UTC().Format(rfc3339), stamp, stamp)
 		if err != nil {
@@ -154,9 +195,14 @@ func (s *Store) UpsertDriverSessionBinding(ctx context.Context, in DriverSession
 		// fresh claim attempt, but does not itself claim work or create an action.
 		// Release each projection hold with its own state-version fence + ledger
 		// event; a still-incomplete directional route is held again by the claim.
+		bindingRouteReady := in.Role == DriverReviewerRole && s.HasDriverControlOriginForBinding(in)
 		rows, err := tx.QueryContext(ctx, `SELECT epic_id,state_version FROM epic_deliveries
 			WHERE project_id=? AND state='review_queued' AND hold_kind='review_session_unbound'
-			  AND ?=1`, in.ProjectID, b2i(s.HasDriverControlOrigin()))
+			  AND ?=1 AND EXISTS (SELECT 1 FROM attention_items a
+			    WHERE a.epic_id=epic_deliveries.epic_id AND a.kind='review_claim_stalled'
+			      AND a.state<>'resolved'
+			      AND json_extract(a.evidence_json,'$.reviewer_identity')=?)`,
+			in.ProjectID, b2i(bindingRouteReady), in.WorkerIdentity)
 		if err != nil {
 			return err
 		}
@@ -217,8 +263,8 @@ func (s *Store) ActiveDriverSessionBinding(ctx context.Context, projectID, worke
 		projectID = "default"
 	}
 	return activeDriverSessionBindingRow(s.DB.QueryRowContext(ctx, `SELECT
-		binding_id,project_id,worker_identity,role,binding_epoch,host_id,store_id,
-		tmux_server_instance_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
+		binding_id,project_id,worker_identity,role,seat_id,binding_epoch,host_id,store_id,
+		tmux_server_domain_id,tmux_server_instance_id,lifecycle_ownership,external_watch_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
 		workspace_relative_path,session_id,pane_instance_id,agent_run_id,provider,
 		conversation_id,observed_at
 		FROM driver_session_bindings WHERE project_id=? AND worker_identity=? AND role=? AND state='active'`,
@@ -229,8 +275,8 @@ type bindingScanner interface{ Scan(...any) error }
 
 func activeDriverSessionBindingTx(ctx context.Context, tx *sql.Tx, projectID, workerIdentity, role string) (DriverSessionBinding, error) {
 	return activeDriverSessionBindingRow(tx.QueryRowContext(ctx, `SELECT
-		binding_id,project_id,worker_identity,role,binding_epoch,host_id,store_id,
-		tmux_server_instance_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
+		binding_id,project_id,worker_identity,role,seat_id,binding_epoch,host_id,store_id,
+		tmux_server_domain_id,tmux_server_instance_id,lifecycle_ownership,external_watch_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
 		workspace_relative_path,session_id,pane_instance_id,agent_run_id,provider,
 		conversation_id,observed_at
 		FROM driver_session_bindings WHERE project_id=? AND worker_identity=? AND role=? AND state='active'`,
@@ -240,8 +286,9 @@ func activeDriverSessionBindingTx(ctx context.Context, tx *sql.Tx, projectID, wo
 func activeDriverSessionBindingRow(row bindingScanner) (DriverSessionBinding, error) {
 	var b DriverSessionBinding
 	var observed string
-	err := row.Scan(&b.BindingID, &b.ProjectID, &b.WorkerIdentity, &b.Role, &b.BindingEpoch,
-		&b.HostID, &b.StoreID, &b.TmuxServerInstanceID, &b.LifecycleKey, &b.TargetEpoch,
+	err := row.Scan(&b.BindingID, &b.ProjectID, &b.WorkerIdentity, &b.Role, &b.SeatID, &b.BindingEpoch,
+		&b.HostID, &b.StoreID, &b.TmuxServerDomainID, &b.TmuxServerInstanceID,
+		&b.LifecycleOwnership, &b.ExternalWatchID, &b.LifecycleKey, &b.TargetEpoch,
 		&b.ProfileID, &b.WorkspaceRootID, &b.WorkspaceRelativePath, &b.SessionID,
 		&b.PaneInstanceID, &b.AgentRunID, &b.Provider, &b.ConversationID, &observed)
 	if err != nil {

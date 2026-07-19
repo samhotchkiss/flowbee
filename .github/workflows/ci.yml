@@ -13,6 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # laddercheck compares the candidate to `git merge-base origin/main
+          # HEAD`; shallow history would make that forward-only gate ambiguous.
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'

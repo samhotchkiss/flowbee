@@ -32,8 +32,9 @@ func seedWorkIntentRuntime(t *testing.T) (*store.Store, Action, *FakePort, time.
 	}
 	orchestrator, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		WorkerIdentity: "project-orchestrator", Role: store.DriverOrchestratorRole,
-		HostID: "host-1", StoreID: "store-1", TmuxServerInstanceID: "server-1",
-		LifecycleKey: "orchestrator", TargetEpoch: 1, ProfileID: "orchestrator",
+		HostID: "host-1", StoreID: "store-1", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1",
+		LifecycleOwnership: "driver_managed",
+		LifecycleKey:       "orchestrator", TargetEpoch: 1, ProfileID: "orchestrator",
 		WorkspaceRootID: "workspace-root", WorkspaceRelativePath: "repo",
 		SessionID: "orchestrator-session", PaneInstanceID: "orchestrator-pane",
 		AgentRunID: "orchestrator-run",
@@ -239,8 +240,9 @@ func TestWorkIntentRuntimeFencesReplacementBindingBeforeDriverMutation(t *testin
 	st, action, fake, now := seedWorkIntentRuntime(t)
 	if _, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		WorkerIdentity: "project-orchestrator", Role: store.DriverOrchestratorRole,
-		HostID: "host-1", StoreID: "store-1", TmuxServerInstanceID: "server-1",
-		LifecycleKey: "orchestrator", TargetEpoch: 2, ProfileID: "orchestrator",
+		HostID: "host-1", StoreID: "store-1", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1",
+		LifecycleOwnership: "driver_managed",
+		LifecycleKey:       "orchestrator", TargetEpoch: 2, ProfileID: "orchestrator",
 		WorkspaceRootID: "workspace-root", WorkspaceRelativePath: "repo",
 		SessionID: "orchestrator-session-v2", PaneInstanceID: "orchestrator-pane-v2",
 		AgentRunID: "orchestrator-run-v2",

@@ -104,7 +104,15 @@ type RegisterResponse struct {
 
 func (c *Client) Register(ctx context.Context, reg Registration) (RegisterResponse, error) {
 	var out RegisterResponse
-	if err := c.postJSON(ctx, "/v1/workers/register", nil, reg, &out); err != nil {
+	path := "/v1/workers/register"
+	if reg.Identity != "" {
+		// Bearer-authenticated servers ignore this as an authority source and bind
+		// registration to the token. It exists for the explicit loopback-bypass
+		// posture, whose authenticator binds identity from the query string because
+		// middleware cannot safely consume and replay the JSON body.
+		path += "?identity=" + url.QueryEscape(reg.Identity)
+	}
+	if err := c.postJSON(ctx, path, nil, reg, &out); err != nil {
 		return out, err
 	}
 	return out, nil

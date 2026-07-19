@@ -54,16 +54,18 @@ func newContractAPIFixture(t *testing.T, orchestrator, sourceMessage, slug strin
 	bindings := []store.DriverSessionBinding{
 		{
 			WorkerIdentity: store.DriverControlIdentity, Role: store.DriverControlRole,
-			HostID: "contract-api-host", StoreID: storeID, TmuxServerInstanceID: "contract-api-server",
-			LifecycleKey: "flowbee-control", TargetEpoch: 1, ProfileID: "flowbee-control",
+			HostID: "contract-api-host", StoreID: storeID, TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "contract-api-server",
+			LifecycleOwnership: "driver_managed",
+			LifecycleKey:       "flowbee-control", TargetEpoch: 1, ProfileID: "flowbee-control",
 			WorkspaceRootID: "workspace-root", WorkspaceRelativePath: "flowbee",
 			SessionID: "flowbee-control-session", PaneInstanceID: "flowbee-control-pane",
 			AgentRunID: "flowbee-control-run",
 		},
 		{
 			WorkerIdentity: orchestrator, Role: store.DriverOrchestratorRole,
-			HostID: "contract-api-host", StoreID: storeID, TmuxServerInstanceID: "contract-api-server",
-			LifecycleKey: "orchestrator-" + orchestrator, TargetEpoch: 1, ProfileID: "orchestrator",
+			HostID: "contract-api-host", StoreID: storeID, TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "contract-api-server",
+			LifecycleOwnership: "driver_managed",
+			LifecycleKey:       "orchestrator-" + orchestrator, TargetEpoch: 1, ProfileID: "orchestrator",
 			WorkspaceRootID: "workspace-root", WorkspaceRelativePath: "repo",
 			SessionID:      "orchestrator-session-" + orchestrator,
 			PaneInstanceID: "orchestrator-pane-" + orchestrator,

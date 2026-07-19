@@ -42,8 +42,9 @@ func seedConversationRuntime(t *testing.T, dsn string) (*store.Store, Action, *F
 	}
 	interactor, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		WorkerIdentity: "interactor:default", Role: store.DriverInteractorRole,
-		HostID: "host-1", StoreID: "store-1", TmuxServerInstanceID: "server-1",
-		LifecycleKey: "project-interactor", TargetEpoch: 1, ProfileID: "interactor",
+		HostID: "host-1", StoreID: "store-1", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1",
+		LifecycleOwnership: "driver_managed",
+		LifecycleKey:       "project-interactor", TargetEpoch: 1, ProfileID: "interactor",
 		WorkspaceRootID: "root", WorkspaceRelativePath: "project",
 		SessionID: "interactor-session", PaneInstanceID: "interactor-pane", AgentRunID: "interactor-run",
 	}, now)
@@ -132,6 +133,41 @@ func TestConversationRuntimeRoutesOnceAndRequiresSeparateProcessingEvidence(t *t
 	}
 }
 
+func TestConversationRuntimeRoutesToAdoptedInteractorWithoutManagedEnsure(t *testing.T) {
+	ctx := context.Background()
+	st, baseline, fake, now, _ := seedConversationRuntime(t, ":memory:")
+	defer st.Close()
+	const watchID = "88888888-8888-4888-8888-888888888888"
+	if _, err := st.DB.ExecContext(ctx, `UPDATE driver_session_bindings
+		SET lifecycle_ownership='external_observed',external_watch_id=?,
+		workspace_root_id='',workspace_relative_path=''
+		WHERE binding_id IN (SELECT target_binding_id FROM conversation_message_actions WHERE id=?)`,
+		watchID, baseline.ActionID); err != nil {
+		t.Fatal(err)
+	}
+	action, _, _, err := scanConversationDriverAction(st.DB.QueryRowContext(ctx,
+		conversationActionSelect+` WHERE a.id=?`, baseline.ActionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.TargetLifecycleOwnership != "external_observed" || action.ExternalWatchID != watchID ||
+		action.WorkspaceRootID != "" || action.WorkspaceRelativePath != "" {
+		t.Fatalf("external action lost adoption authority: %+v", action)
+	}
+	external := action.SessionTarget().Identity
+	external.Ownership = "external_observed"
+	fake.Sessions = map[string]Identity{external.SessionID: external}
+
+	runtime := ConversationRuntime{Port: fake,
+		Store:    ConversationSQLStore{DB: st.DB, ControlOriginAvailable: true},
+		Evidence: ConversationStageEvidence{DB: st.DB}, Owner: "external-conversation-runtime"}
+	report, err := runtime.Tick(ctx, now.Add(3*time.Minute))
+	if err != nil || report.Delivered != 1 || fake.SendCalls != 1 || fake.EnsureCalls != 0 {
+		t.Fatalf("external delivery=%+v sends=%d managed_ensures=%d err=%v",
+			report, fake.SendCalls, fake.EnsureCalls, err)
+	}
+}
+
 func TestConversationRuntimeRestartAfterClaimNeverBlindlySends(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "flowbee.db")
@@ -193,8 +229,9 @@ func TestConversationRuntimeFencesReplacementBeforeDriverMutation(t *testing.T) 
 	defer st.Close()
 	if _, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		WorkerIdentity: "interactor:default", Role: store.DriverInteractorRole,
-		HostID: "host-1", StoreID: "store-1", TmuxServerInstanceID: "server-1",
-		LifecycleKey: "project-interactor", TargetEpoch: 2, ProfileID: "interactor",
+		HostID: "host-1", StoreID: "store-1", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1",
+		LifecycleOwnership: "driver_managed",
+		LifecycleKey:       "project-interactor", TargetEpoch: 2, ProfileID: "interactor",
 		WorkspaceRootID: "root", WorkspaceRelativePath: "project",
 		SessionID: "interactor-session-v2", PaneInstanceID: "interactor-pane-v2",
 		AgentRunID: "interactor-run-v2",
@@ -259,8 +296,9 @@ func TestConversationRuntimeNeverAcceptsOldInteractorEvidenceAfterReplacement(t 
 	}
 	if _, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		WorkerIdentity: "interactor:default", Role: store.DriverInteractorRole,
-		HostID: "host-1", StoreID: "store-1", TmuxServerInstanceID: "server-1",
-		LifecycleKey: "project-interactor", TargetEpoch: 2, ProfileID: "interactor",
+		HostID: "host-1", StoreID: "store-1", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1",
+		LifecycleOwnership: "driver_managed",
+		LifecycleKey:       "project-interactor", TargetEpoch: 2, ProfileID: "interactor",
 		WorkspaceRootID: "root", WorkspaceRelativePath: "project",
 		SessionID: "interactor-session-v2", PaneInstanceID: "interactor-pane-v2",
 		AgentRunID: "interactor-run-v2",

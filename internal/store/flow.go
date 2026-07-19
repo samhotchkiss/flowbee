@@ -173,15 +173,6 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 				}
 				return err
 			}
-			if !s.HasDriverControlOrigin() {
-				detail := ErrDriverControlOriginUnavailable.Error()
-				if err := markReviewClaimBindingHoldTx(ctx, tx, projectID, epicID, p.JobID,
-					p.Identity, detail, p.Now); err != nil {
-					return err
-				}
-				bindingHold = fmt.Errorf("%w: %s", ErrDriverSessionBindingMissing, detail)
-				return nil
-			}
 			if s.EnableCapacityV2 {
 				decision, routeErr := capacityRouteForSeatQuery(ctx, tx, p.SeatID, p.Now, 5*time.Minute)
 				if routeErr != nil {
@@ -201,6 +192,17 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 			if routeErr != nil {
 				detail := fmt.Sprintf("reviewer %s cannot be routed through an exact active Driver binding: %v", p.Identity, routeErr)
 				if err := markReviewClaimBindingHoldTx(ctx, tx, projectID, epicID, p.JobID, p.Identity, detail, p.Now); err != nil {
+					return err
+				}
+				bindingHold = fmt.Errorf("%w: %s", ErrDriverSessionBindingMissing, detail)
+				return nil
+			}
+			if !s.HasDriverControlOriginForBinding(recipientBinding) {
+				detail := fmt.Sprintf("%s: reviewer endpoint %s/%s/%s is not ready",
+					ErrDriverControlOriginUnavailable, recipientBinding.HostID, recipientBinding.StoreID,
+					recipientBinding.TmuxServerDomainID)
+				if err := markReviewClaimBindingHoldTx(ctx, tx, projectID, epicID, p.JobID,
+					p.Identity, detail, p.Now); err != nil {
 					return err
 				}
 				bindingHold = fmt.Errorf("%w: %s", ErrDriverSessionBindingMissing, detail)
@@ -390,16 +392,16 @@ func ensureReviewWakeActionTx(ctx context.Context, tx *sql.Tx, p reviewWakeActio
 	_, err = tx.ExecContext(ctx, `INSERT INTO epic_actions
 		(id,project_id,epic_id,kind,state,action_epoch,dedup_key,payload_json,payload_sha256,
 		 evidence_baseline_store_seq,evidence_baseline_uncertainty_epoch,
-		 executor_kind,target_role,target_host_id,target_store_id,target_server_id,lifecycle_key,
+		 executor_kind,target_role,target_host_id,target_store_id,target_server_domain_id,target_server_id,lifecycle_key,
 		 target_epoch,profile_id,workspace_root_id,workspace_relative_path,lease_id,lease_epoch,
 		 sender_principal_id,recipient_session_id,recipient_pane_instance_id,
 		 recipient_agent_run_id,grant_id,grant_epoch,grant_expires_at,head_sha,base_sha,
 		 next_attempt_at,created_at,updated_at)
-		VALUES (?,?,?,'review_wake','pending',0,?,?,?,?,?,'driver','code_reviewer',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)`,
+		VALUES (?,?,?,'review_wake','pending',0,?,?,?,?,?,'driver','code_reviewer',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)`,
 		actionID, p.ProjectID, p.EpicID, dedup, string(payloadBytes),
 		"sha256:"+hex.EncodeToString(payloadHash[:]), evidenceBaselineStoreSeq,
 		evidenceBaselineUncertaintyEpoch, p.Recipient.HostID, p.Recipient.StoreID,
-		p.Recipient.TmuxServerInstanceID, p.Recipient.LifecycleKey, p.Recipient.TargetEpoch,
+		p.Recipient.TmuxServerDomainID, p.Recipient.TmuxServerInstanceID, p.Recipient.LifecycleKey, p.Recipient.TargetEpoch,
 		p.Recipient.ProfileID, p.Recipient.WorkspaceRootID, p.Recipient.WorkspaceRelativePath,
 		p.LeaseID, p.LeaseEpoch, DriverControlIdentity,
 		p.Recipient.SessionID, p.Recipient.PaneInstanceID, p.Recipient.AgentRunID, grantID,

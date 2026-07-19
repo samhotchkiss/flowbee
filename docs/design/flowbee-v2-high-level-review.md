@@ -168,7 +168,7 @@ That changes the failure model:
 - If a reviewer dies, the review becomes eligible for safe reassignment.
 - If a builder pauses because of account usage, its epic remains owned and visible.
 - If a process restarts, it reconstructs work from durable state rather than remembered chat context.
-- If an expected transition does not happen, reconciliation detects the mismatch, repairs it when safe, and raises an alert.
+- If an expected transition does not happen, reconciliation detects the mismatch, repairs it when safe, and commits a visible alert obligation to that project's exact Interactor. An unavailable route becomes a durable hold rather than a provider fallback.
 
 The production stall that motivated this work—CI green, no reviewer verdict, no active reviewer, and no alert—becomes a named, visible state:
 
@@ -310,7 +310,7 @@ The human sees none of the terminal traffic. They see a calm summary, one genuin
 2. **Flowbee owns epics only.** Loose issues and PRs do not become shadow work.
 3. **Ready work advances automatically.** Human approval is a judgment gate, not a plumbing command.
 4. **Durable state outranks session memory.** Restarting an agent cannot erase an obligation.
-5. **No silent stalls.** Missing progress becomes a visible state, an owned recovery action, and an alert.
+5. **No silent stalls.** Missing progress becomes a visible state, an owned recovery action, and a durable alert to the exact project Interactor; route loss is itself a visible hold.
 6. **Concurrency requires isolation.** Every epic has protected branch, workspace, session, and scope.
 7. **Review is independent.** Model diversity and explicit reviewer ownership protect quality.
 8. **Capacity must be live and attributable.** Unknown or stale headroom never authorizes new work.

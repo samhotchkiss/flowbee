@@ -120,7 +120,8 @@ func bootstrapHumanLoginLinkChecked(ctx context.Context, baseURL, projectID, ide
 	if pid, ok := active(); ok {
 		return "", "", fmt.Errorf("control plane is active as pid %d; stop it before creating an offline bootstrap link", pid)
 	}
-	if err := store.MigrateUp(ctx, st.DB); err != nil {
+	if _, err := migrateWithRollbackSnapshot(ctx, st.DB,
+		envOr("FLOWBEE_BACKUP_DIR", defaultBackupDir())); err != nil {
 		return "", "", err
 	}
 

@@ -56,15 +56,92 @@ single-repo keys are ignored.
 | `build_provider` | `FLOWBEE_BUILD_PROVIDER` _(env only)_ | `codex` | provider backing the v2 build capacity pool. |
 | `review_provider` | `FLOWBEE_REVIEW_PROVIDER` _(env only)_ | `grok` | provider backing the v2 review capacity pool. |
 | `operations_provider` | `FLOWBEE_OPERATIONS_PROVIDER` _(env only)_ | `grok` | provider backing the operational recovery pool. |
-| `alert_webhook_url` | `FLOWBEE_ALERT_WEBHOOK_URL` _(env only)_ | — | authenticated immediate/dead-letter alert sink; required when v2 is active. |
-| `alert_webhook_secret_file` | `FLOWBEE_ALERT_WEBHOOK_SECRET_FILE` _(env only)_ | — | owner-only file containing the HMAC-SHA256 key for outbound alert payloads; required when v2 is active. Inline/argv secrets are not accepted. |
+| `alert_webhook_url` | `FLOWBEE_ALERT_WEBHOOK_URL` _(watchdog only)_ | — | signed Flowbee control-alert ingress used by the independent dead-man. It must use the same hostname as `FLOWBEE_WATCHDOG_HEALTH_URL` and the exact `/v1/control-alerts/ingress` path; schemes and ports may differ. It is **not** a `flowbee serve` output or provider sink. |
+| `alert_webhook_secret_file` | `FLOWBEE_ALERT_WEBHOOK_SECRET_FILE` _(serve ingress + watchdog)_ | — | canonical owner-only HMAC key for Flowbee's signed control-alert ingress and independent dead-man submissions. It is not authority to bypass the exact-project Interactor route. |
 | `external_watchdog_id` | `FLOWBEE_EXTERNAL_WATCHDOG_ID` _(env only)_ | — | configured independent dead-man identity; required when v2 is active. |
-| `driver_socket` | `FLOWBEE_DRIVER_SOCKET` _(env only)_ | — | tmux-driver v2.4 Unix socket (for example `/tmp/tmux-driver-<uid>/default/api.sock`); required when v2 is active. |
-| `driver_token_file` | `FLOWBEE_DRIVER_TOKEN_FILE` _(env only)_ | — | owner-only file containing the Driver control-plane bearer; required when v2 is active. |
-| `driver_instance_ref` | `FLOWBEE_DRIVER_INSTANCE_REF` _(env only)_ | `local-driver` | Flowbee-owned inventory key for the configured Driver endpoint. A new Driver `store_id` under this key is handled as a fenced store reset, never cursor continuation. |
+| `watchdog_project_id` | `FLOWBEE_WATCHDOG_PROJECT_ID` _(serve ingress + watchdog)_ | — | exact active project authorized for the signed dead-man ingress. Both `flowbee serve` and its independent watchdog require the same explicit value; there is no default or inference. |
+| `driver_endpoints_file` | `FLOWBEE_DRIVER_ENDPOINTS_FILE` _(env only)_ | — | absolute path to the owner-only v2 multi-endpoint Driver inventory. Required for the P1 actor split; it never falls back to the legacy single-endpoint variables. |
+| `driver_socket` | `FLOWBEE_DRIVER_SOCKET` _(env only)_ | — | legacy single-endpoint compatibility input used only while v2 is off; never a v2 routing fallback. |
+| `driver_token_file` | `FLOWBEE_DRIVER_TOKEN_FILE` _(env only)_ | — | legacy single-endpoint compatibility input used only while v2 is off; v2 bearer paths belong in the endpoint inventory. |
+| `driver_instance_ref` | `FLOWBEE_DRIVER_INSTANCE_REF` _(env only)_ | `local-driver` | legacy single-endpoint observation key used only while v2 is off; v2 keys belong in the endpoint inventory. |
 | `human_session_key_file` | `FLOWBEE_HUMAN_SESSION_KEY_FILE` _(env only)_ | — | owner-only file containing at least 32 random bytes used to sign expiring dashboard sessions. Required when Phase 1 is enabled or the dashboard listens off-loopback. The key is read from this file; it is never fetched from 1Password or accepted in `flowbee.yaml`. |
 | `human_grants_file` | `FLOWBEE_HUMAN_GRANTS_FILE` _(env only)_ | — | owner-only file of explicit `identity@project=role` grants (newline or comma separated). `identity@*=role` is the distinct portfolio grant. Must be configured with the session-key file. |
 | `human_loopback_dev` | `FLOWBEE_HUMAN_LOOPBACK_DEV` _(env only)_ | `false` | explicit unauthenticated browser posture for a loopback-only development listener. It is rejected on Tailnet/LAN listeners. |
+
+### P1 human-notification routing
+
+Every P1 alert is a durable, project-scoped obligation to that project's exact
+Interactor. Flowbee commits the obligation before attempting delivery and routes it
+only through the Interactor's exact Driver endpoint, grant, and receipt path. If the
+Interactor binding, endpoint capability, or recipient incarnation is unavailable,
+the alert remains in a visible durable hold; it is never redirected to another
+project, session, provider webhook, or global default.
+
+The independent dead-man uses the signed control-alert ingress because it must retain
+incidents while Flowbee is unavailable. Its state and immutable notification are
+bound to an explicit project ID. The ingress acknowledges only after its Acceptor has
+durably retained the exact key/body hash and project obligation; Flowbee projects that
+retained item to the exact Interactor after recovery. There is no Matrix or other
+provider-specific human sink in P1.
+
+### Driver endpoint isolation inventory
+
+P1 uses two independently authorized tmux-server domains: the adopted external
+Interactor belongs to the Driver `default` domain, while Flowbee-created
+Orchestrators and workers belong to a non-default `managed_dedicated` domain.
+Configure them in an owner-only JSON file and export its absolute path:
+
+```json
+{
+  "format_version": "flowbee.driver-endpoints/v1",
+  "endpoints": [
+    {
+      "instance_ref": "external-default",
+      "uds_path": "/tmp/tmux-driver-501/default/api.sock",
+      "token_file": "/Users/example/.config/flowbee/driver-external.token",
+      "expected_host_id": "11111111-1111-4111-8111-111111111111",
+      "expected_store_id": "22222222-2222-4222-8222-222222222222",
+      "expected_tmux_server_domain_id": "default",
+      "expected_tmux_server_ownership": "external"
+    },
+    {
+      "instance_ref": "flowbee-managed",
+      "uds_path": "/tmp/tmux-driver-501/flowbee/api.sock",
+      "token_file": "/Users/example/.config/flowbee/driver-managed.token",
+      "expected_host_id": "11111111-1111-4111-8111-111111111111",
+      "expected_store_id": "33333333-3333-4333-8333-333333333333",
+      "expected_tmux_server_domain_id": "flowbee",
+      "expected_tmux_server_ownership": "managed_dedicated"
+    }
+  ]
+}
+```
+
+```bash
+chmod 600 /absolute/path/driver-endpoints.json \
+  /absolute/path/driver-external.token \
+  /absolute/path/driver-managed.token
+export FLOWBEE_DRIVER_ENDPOINTS_FILE=/absolute/path/driver-endpoints.json
+```
+
+The inventory rejects unknown fields, inline bearer values, relative paths,
+symlinked or non-owner-accessible files, duplicate inventory references, and
+duplicate `(host_id, store_id, tmux_server_domain_id)` authority. It requires at
+least one `external/default` endpoint and at least one
+`managed_dedicated/non-default` endpoint. Resolution is always by the complete
+host/store/domain tuple; there is no single-default fallback. The legacy
+`FLOWBEE_DRIVER_SOCKET`, `FLOWBEE_DRIVER_TOKEN_FILE`, and
+`FLOWBEE_DRIVER_INSTANCE_REF` variables remain only for v2-off compatibility and
+are never synthesized into this inventory. The global inventory may contain
+external/default endpoints for multiple hosts; project activation separately
+requires the exact adopted-Interactor and managed-actor endpoints for that project.
+At runtime Flowbee runs an independently supervised observation fold and
+authenticated control-capability probe for every `instance_ref`. Message
+materialization and action claims consult only the recipient binding's exact
+host/store/domain capability; aggregate health is display state, never routing
+authority. A Driver tmux-server incarnation change fences readiness and requires
+the endpoint inventory/resolver to be rebuilt rather than silently refreshing an
+existing route.
 
 Before enabling automatic v2 builder launch, explicitly bind every build seat to
 its Driver inventory/profile/workspace target:
@@ -94,12 +171,13 @@ an independent service manager, preferably on another tailnet host. See the
 | env | default | meaning |
 |-----|---------|---------|
 | `FLOWBEE_EXTERNAL_WATCHDOG_ID` | — | required stable observer identity; becomes part of every incident idempotency key |
+| `FLOWBEE_WATCHDOG_PROJECT_ID` | — | required exact stable project ID shared with the Flowbee ingress; binds the watchdog state, immutable queue, signed envelope, and destination Interactor with no default or inference |
 | `FLOWBEE_WATCHDOG_HEALTH_URL` | `http://127.0.0.1:7001/healthz` | independently reachable Flowbee health endpoint |
 | `FLOWBEE_WATCHDOG_STATE_FILE` | `$XDG_STATE_HOME/flowbee/watchdog.json` or `~/.local/state/flowbee/watchdog.json` | owner-only local incident and notification-outbox state |
-| `FLOWBEE_WATCHDOG_INTERVAL` | `30s` | health polling and durable delivery retry cadence |
+| `FLOWBEE_WATCHDOG_INTERVAL` | `30s` | health polling, signed lease heartbeat, and durable delivery retry cadence; must be `<=1m` for the two-minute readiness lease |
 | `FLOWBEE_WATCHDOG_TIMEOUT` | `5s` | health and alert HTTP request timeout |
-| `FLOWBEE_ALERT_WEBHOOK_URL` | — | required alert receiver shared with the in-process alert drainer |
-| `FLOWBEE_ALERT_WEBHOOK_SECRET_FILE` | — | required owner-only file containing the HMAC key; the watchdog does not accept the key through argv or an inline secret environment variable |
+| `FLOWBEE_ALERT_WEBHOOK_URL` | — | required signed Flowbee control-alert ingress on the same hostname as `FLOWBEE_WATCHDOG_HEALTH_URL`, with exact path `/v1/control-alerts/ingress`; this is durable ingress for later exact-Interactor delivery, not an outbound human/provider webhook |
+| `FLOWBEE_ALERT_WEBHOOK_SECRET_FILE` | — | required owner-only file containing the canonical Flowbee ingress HMAC key; the watchdog does not accept the key through argv or an inline secret environment variable |
 
 ## Durability (auto-backup)
 
@@ -196,7 +274,25 @@ Empty `worker_auth_secret` = loopback-only dev (the listener must stay on
 |-----|--------------|---------|---------|
 | `worker_auth_secret` | `FLOWBEE_WORKER_AUTH_SECRET` | — | HMAC key signing per-worker bearer tokens (DESIGN §7.6) |
 | `enrolled_identities` | `FLOWBEE_ENROLLED_IDENTITIES` (CSV) | — | allowlist of worker identities permitted to authenticate |
+| `worker_attestations` | `FLOWBEE_WORKER_ATTESTATIONS_JSON` | — | strict identity → `role:`/`model_family:`/`tool:` authorization map. Authentication alone grants no scheduler capability; an enrolled identity omitted here may authenticate but cannot claim work. |
 | `auth_loopback_bypass` | `FLOWBEE_AUTH_LOOPBACK_BYPASS` | `true` | same-box (127.0.0.1) workers may skip the token |
+
+Bind reviewer families in `enrolled_identities` and authorize only their intended
+role. For example:
+
+```yaml
+enrolled_identities: ["reviewer-russ:grok", "capacity-local"]
+worker_attestations:
+  reviewer-russ: ["role:code_reviewer"]
+  capacity-local: []
+auth_loopback_bypass: false
+```
+
+`flowbee serve` always installs this strict map; it never inherits the API's open
+dev/test attestation default. `flowbee project status` also compares a durable
+heartbeat/fingerprint from the writer process with the invoking CLI configuration,
+so exporting secure variables in a shell cannot make an insecure running service
+look green.
 
 ## Dashboard human authentication
 

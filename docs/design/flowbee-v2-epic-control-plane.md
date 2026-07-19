@@ -1372,15 +1372,23 @@ automatic failover assumes overlapping SQLite writers.
 
 Phase 0 also ships:
 
-- an outbound authenticated webhook publisher for `TierHumanImmediate` and all
-  dead-letter conditions, driven from a durable alert outbox; and
-- `flowbee watchdog`, run by cron/service on a second host, which polls the control
-  plane's last completed reconcile pass and digest advance and sends through the same
-  webhook when stale. It does not depend on Flowbee readiness, SSE, or the database
-  writer process.
+- a durable alert projector which converts every human-facing alert into an immutable
+  `system` message for the exact current project Interactor, then uses the normal
+  Driver grant/action/receipt/evidence path. There is no Matrix, provider-specific
+  sink, or alternate terminal transport. Driver submission is not acknowledgement;
+  the source alert remains outstanding until exact Interactor processing evidence is
+  committed. If the Interactor route is unavailable, the alert remains visibly held
+  and retryable; and
+- `flowbee watchdog`, run by cron/service independently of the Flowbee writer, which
+  polls the last completed reconcile pass and digest advance. It durably retains each
+  project-bound incident and submits it to Flowbee's signed control-alert ingress;
+  after acceptance, the same Interactor projection owns delivery. A Flowbee process
+  outage therefore cannot lose the incident, although Interactor delivery waits for
+  the ingress to become reachable again.
 
-Active v2 mode fails readiness if no immediate push sink and no external watchdog
-identity are configured.
+Active v2 mode fails readiness if the exact project Interactor notification route or
+the configured external watchdog identity/project binding is absent. It never falls
+back to a generic webhook destination or another project's Interactor.
 
 ### 8.11 Builder launch and audited re-home
 
@@ -1794,7 +1802,8 @@ deployable with the flag off, and PR I.4 may activate before P0.CAP or P0.CONTRA
    durable review work but leaves the flag in observe/shadow mode.
 4. **I.4 — recovery, visibility, and independent alerting.** Enable the primary
    handoff and fact-based stall reconciler, delivery-wide state clocks/backstop,
-   alert drainer, push webhook, supervised-loop heartbeat/watchdog, external dead-man,
+   durable exact-project Interactor alert projection, supervised-loop
+   heartbeat/watchdog, signed project-bound external dead-man ingress,
    `built · awaiting review dispatch`, and digest-sequence reads. Activate only after
    the exact #4950/#4951 crash test, poison-fact test, adoption-race test, and
    queued-capacity-wait test pass. I.4's activation registry is limited to admission,
@@ -2186,7 +2195,7 @@ environment overrides. Proposed keys/defaults are:
 | `work_intent_route_stall_s` | `300` | eligible promotion hop deadline before repair+alert |
 | `actor_contract_strict` | `true` | refuse leases/routes to an actor that has not acknowledged the compatible contract |
 | `control_plane_lock_path` | `<database>.writer.lock` | process-lifetime exclusive writer lock |
-| `alert_webhook_url` | secret environment value | required immediate/dead-letter push sink in active v2 mode |
+| `control_alert_ingress_secret_file` | secret environment value | owner-only HMAC key used by the independent watchdog to submit a project-bound incident to Flowbee; human delivery is always through that project's Interactor |
 | `external_watchdog_max_age_s` | `180` | independent dead-man threshold for last completed reconcile pass |
 | `project_default_id` | `default` | single-project migration/backfill identity |
 | `project_starvation_bound_s` | `900` | alert bound for continuously eligible project work |
@@ -2909,7 +2918,8 @@ Quarterly or pre-release drills should kill each process/session at the crash po
 - Exactly one control-plane writer is OS-lock enforced; every outbox effect is
   atomic-claim/epoch fenced.
 - Reconciler panic/heartbeat failure and pre-readiness crashloops are detected by
-  supervised loops, durable watchdog state, external dead-man, and push alerting.
+  supervised loops and durable project-bound watchdog state; every retained incident
+  is projected to the exact project Interactor when Flowbee ingress is reachable.
 
 ### 14.2 Phase 1 acceptance
 
@@ -3466,7 +3476,7 @@ revision itself does not constitute implementation or a new sign-off.
 | 8. incomplete ledger/digest | `control_events` has global AUTOINCREMENT `seq`; digest is `MAX(seq)` across state, job, action, capacity, and alert changes; cutover is seeded above Unix-millis | restart/digest test observes pre-stall delivery/action changes |
 | 9. dead reconcilers/pull-only alerts | supervised per-item recovery, heartbeat/watchdog, external dead-man, push/dead-letter channel, poison-fact quarantine | poison panic and pre-readiness crash tests page independently |
 | 10. overlapping writers/outbox | process-lifetime OS lock/leader incarnation; all outboxes atomic-claim with epoch | two-process writer and duplicate-effect tests |
-| 11. observer/actuator mismatch | observation-only Tmux Driver is separate from `tmux-send`; status 0–6 and pane-instance fence are normative | actuator status matrix and uncertain-send tests |
+| 11. observer/actuator mismatch | Tmux Driver is the sole observation and routed-actuation boundary; Flowbee never calls raw tmux or a standalone `tmux-send`. Exact pane/run fencing, grants, idempotency, and uncertain receipts are normative. | routed actuator status matrix and uncertain-send tests |
 | 12. zero builder pool invisibility | durable `capacity_pool_exhausted` attention/reconciler/threshold/push path | zero-routable-pool exit test |
 | 13. unknown windows/green-by-absence | provider required-window rules, Grok known-zero carveout, strict real-success/all-checks/not-truncated green predicate | missing-window, Grok-zero, and CI predicate tests |
 | 14. fail-open reviewer selector | one per-seat freshness/identity/lineage route gate for builder/reviewer/operations; legacy `usage_pct` selector retired/hardened | stale selector and legacy-writer regression tests |

@@ -18,16 +18,18 @@ type ConversationDeliveryReconcileReport struct {
 }
 
 // ReconcileConversationMessageActions materializes the durable transport
-// action for each human message. The message already is durable intent; absence
-// of a live exact Driver route is therefore a visible hold, never a dropped
-// in-memory handoff.
+// action for each human message and linked Flowbee system alert. The message
+// already is durable intent; absence of a live exact Driver route is therefore
+// a visible hold, never a dropped in-memory handoff.
 func (s *Store) ReconcileConversationMessageActions(ctx context.Context, now time.Time) (ConversationDeliveryReconcileReport, error) {
 	var out ConversationDeliveryReconcileReport
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT m.project_id,m.thread_id,m.id
 			FROM conversation_messages m
 			JOIN conversation_message_deliveries d ON d.message_id=m.id
-			WHERE m.role='human' AND m.stream_state='complete'
+			WHERE (m.role='human' OR (m.role='system' AND EXISTS
+			       (SELECT 1 FROM control_alert_interactor_projections p WHERE p.message_id=m.id)))
+			  AND m.stream_state='complete'
 			  AND d.state IN ('pending','failed')
 			  AND NOT EXISTS (SELECT 1 FROM conversation_message_actions a
 			    WHERE a.message_id=m.id AND a.state<>'fenced')
@@ -49,22 +51,15 @@ func (s *Store) ReconcileConversationMessageActions(ctx context.Context, now tim
 			return err
 		}
 		for _, item := range candidates {
-			if !s.HasDriverControlOrigin() {
-				out.RoutesHeld++
-				if err := holdConversationRouteTx(ctx, tx, item.projectID, item.threadID,
-					item.messageID, ErrDriverControlOriginUnavailable.Error(), now); err != nil {
-					return err
-				}
-				continue
-			}
-			created, err := materializeConversationMessageActionTx(ctx, tx, item.projectID, item.threadID, item.messageID, now)
+			created, err := s.materializeConversationMessageActionTx(ctx, tx, item.projectID, item.threadID, item.messageID, now)
 			if err == nil {
 				if created {
 					out.ActionsCreated++
 				}
 				continue
 			}
-			if !errors.Is(err, ErrConversationInteractorRouteUnavailable) {
+			if !errors.Is(err, ErrConversationInteractorRouteUnavailable) &&
+				!errors.Is(err, ErrDriverControlOriginUnavailable) {
 				return err
 			}
 			out.RoutesHeld++
@@ -77,12 +72,16 @@ func (s *Store) ReconcileConversationMessageActions(ctx context.Context, now tim
 	return out, err
 }
 
-func materializeConversationMessageActionTx(ctx context.Context, tx *sql.Tx, projectID, threadID, messageID string, now time.Time) (bool, error) {
-	var actorID, content, contentHash, streamState, threadActor string
+func (s *Store) materializeConversationMessageActionTx(ctx context.Context, tx *sql.Tx, projectID, threadID, messageID string, now time.Time) (bool, error) {
+	var actorID, content, contentHash, streamState, messageRole, threadActor, threadBinding string
 	err := tx.QueryRowContext(ctx, `SELECT m.actor_id,m.content_text,m.content_sha256,m.stream_state,
-		t.interactor_actor_id FROM conversation_messages m JOIN conversation_threads t ON t.id=m.thread_id
-		WHERE m.project_id=? AND m.thread_id=? AND m.id=? AND m.role='human' AND t.state='active'`,
-		projectID, threadID, messageID).Scan(&actorID, &content, &contentHash, &streamState, &threadActor)
+		m.role,t.interactor_actor_id,t.interactor_binding_id
+		FROM conversation_messages m JOIN conversation_threads t ON t.id=m.thread_id
+		WHERE m.project_id=? AND m.thread_id=? AND m.id=?
+		  AND (m.role='human' OR (m.role='system' AND EXISTS
+		      (SELECT 1 FROM control_alert_interactor_projections p WHERE p.message_id=m.id)))
+		  AND t.state='active'`, projectID, threadID, messageID).
+		Scan(&actorID, &content, &contentHash, &streamState, &messageRole, &threadActor, &threadBinding)
 	if err != nil {
 		return false, err
 	}
@@ -94,12 +93,22 @@ func materializeConversationMessageActionTx(ctx context.Context, tx *sql.Tx, pro
 	if payloadHash != contentHash {
 		return false, errors.New("conversation immutable message hash is corrupt")
 	}
-	recipient, err := activeDriverSessionBindingTx(ctx, tx, projectID, threadActor, DriverInteractorRole)
+	var recipient DriverSessionBinding
+	if messageRole == "system" {
+		recipient, err = exactActiveDriverSessionBindingTx(ctx, tx, projectID, threadActor,
+			DriverInteractorRole, threadBinding)
+	} else {
+		recipient, err = activeDriverSessionBindingTx(ctx, tx, projectID, threadActor, DriverInteractorRole)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("%w: project Interactor binding missing", ErrConversationInteractorRouteUnavailable)
 	}
 	if err != nil {
 		return false, err
+	}
+	if !s.HasDriverControlOriginForBinding(recipient) {
+		return false, fmt.Errorf("%w: Interactor endpoint %s/%s/%s is not control-origin ready",
+			ErrDriverControlOriginUnavailable, recipient.HostID, recipient.StoreID, recipient.TmuxServerDomainID)
 	}
 	var baselineSeq, uncertaintyEpoch uint64
 	var instanceState string
@@ -179,12 +188,24 @@ func holdConversationRouteTx(ctx context.Context, tx *sql.Tx, projectID, threadI
 	dedup := "conversation_interactor_route_unavailable:" + messageID
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO control_alerts
 		(id,project_id,epic_id,kind,dedup_key,payload_json,state,created_at,updated_at)
-		VALUES (?,?,NULL,'conversation_interactor_route_unavailable',?,
-		json_object('thread_id',?,'message_id',?,'reason',?),'pending',?,?)`,
-		"conversation-route-"+stableID(dedup), projectID, dedup, threadID, messageID, reason, stamp, stamp); err != nil {
+		SELECT ?,?,NULL,'conversation_interactor_route_unavailable',?,
+		json_object('thread_id',?,'message_id',?,'reason',?),'pending',?,?
+		WHERE NOT EXISTS (SELECT 1 FROM control_alert_interactor_projections p WHERE p.message_id=?)`,
+		"conversation-route-"+stableID(dedup), projectID, dedup, threadID, messageID, reason, stamp, stamp,
+		messageID); err != nil {
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `UPDATE conversation_message_deliveries SET last_error=?,updated_at=?
 		WHERE message_id=? AND state IN ('pending','failed')`, reason, stamp, messageID)
 	return err
+}
+
+func exactActiveDriverSessionBindingTx(ctx context.Context, tx *sql.Tx, projectID, workerIdentity, role, bindingID string) (DriverSessionBinding, error) {
+	return activeDriverSessionBindingRow(tx.QueryRowContext(ctx, `SELECT
+		binding_id,project_id,worker_identity,role,seat_id,binding_epoch,host_id,store_id,
+		tmux_server_domain_id,tmux_server_instance_id,lifecycle_ownership,external_watch_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
+		workspace_relative_path,session_id,pane_instance_id,agent_run_id,provider,
+		conversation_id,observed_at
+		FROM driver_session_bindings WHERE project_id=? AND worker_identity=? AND role=?
+		  AND binding_id=? AND state='active'`, projectID, workerIdentity, role, bindingID))
 }

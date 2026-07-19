@@ -12,9 +12,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/alertingress"
 	"github.com/samhotchkiss/flowbee/internal/deadman"
 )
 
@@ -28,9 +30,10 @@ func runWatchdogContext(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("watchdog", flag.ContinueOnError)
 	healthURL := fs.String("health-url", envOr("FLOWBEE_WATCHDOG_HEALTH_URL", "http://127.0.0.1:7001/healthz"), "independently reachable Flowbee /healthz URL")
 	stateFile := fs.String("state-file", envOr("FLOWBEE_WATCHDOG_STATE_FILE", defaultWatchdogStatePath()), "owner-only durable watchdog state file")
-	webhookURL := fs.String("webhook-url", os.Getenv("FLOWBEE_ALERT_WEBHOOK_URL"), "alert receiver URL")
+	webhookURL := fs.String("webhook-url", os.Getenv("FLOWBEE_ALERT_WEBHOOK_URL"), "signed Flowbee control-alert ingress URL")
 	secretFile := fs.String("secret-file", os.Getenv("FLOWBEE_ALERT_WEBHOOK_SECRET_FILE"), "owner-only file containing the HMAC webhook key")
 	watchdogID := fs.String("id", os.Getenv("FLOWBEE_EXTERNAL_WATCHDOG_ID"), "stable identity for this external watchdog")
+	projectID := fs.String("project-id", os.Getenv("FLOWBEE_WATCHDOG_PROJECT_ID"), "exact stable Flowbee project id for every notification (required)")
 	interval := fs.Duration("interval", envDuration("FLOWBEE_WATCHDOG_INTERVAL", 30*time.Second), "health polling interval")
 	timeout := fs.Duration("timeout", envDuration("FLOWBEE_WATCHDOG_TIMEOUT", 5*time.Second), "per-request timeout")
 	once := fs.Bool("once", false, "perform one durable probe/delivery pass and exit (for cron/testing)")
@@ -48,6 +51,12 @@ func runWatchdogContext(ctx context.Context, args []string) error {
 	if *watchdogID == "" {
 		return errors.New("--id or FLOWBEE_EXTERNAL_WATCHDOG_ID is required")
 	}
+	if *projectID == "" {
+		return errors.New("--project-id or FLOWBEE_WATCHDOG_PROJECT_ID is required")
+	}
+	if err := deadman.ValidateProjectID(*projectID); err != nil {
+		return err
+	}
 	if *webhookURL == "" {
 		return errors.New("--webhook-url or FLOWBEE_ALERT_WEBHOOK_URL is required")
 	}
@@ -57,10 +66,14 @@ func runWatchdogContext(ctx context.Context, args []string) error {
 	if *interval <= 0 || *timeout <= 0 {
 		return errors.New("--interval and --timeout must be positive")
 	}
+	if *interval > phase1WatchdogLeaseFreshness/2 {
+		return fmt.Errorf("--interval must be <= %s so the signed external-watchdog lease cannot expire between healthy passes",
+			phase1WatchdogLeaseFreshness/2)
+	}
 	if err := validateHTTPURL(*healthURL, "health"); err != nil {
 		return err
 	}
-	if err := validateHTTPURL(*webhookURL, "webhook"); err != nil {
+	if err := validateControlAlertIngressURL(*webhookURL, *healthURL); err != nil {
 		return err
 	}
 	secret, err := deadman.ReadOwnerOnlySecret(*secretFile)
@@ -74,12 +87,14 @@ func runWatchdogContext(ctx context.Context, args []string) error {
 	}
 	defer lock.Close()
 	client := &http.Client{Timeout: *timeout}
+	publisher := deadman.WebhookPublisher{URL: *webhookURL, Secret: secret, ProjectID: *projectID, Client: client}
 	runner := deadman.Runner{
-		WatchdogID: *watchdogID, Target: *healthURL, Store: state,
+		ProjectID: *projectID, WatchdogID: *watchdogID, Target: *healthURL, Store: state,
 		Probe:     deadman.HTTPProbe{URL: *healthURL, Client: client},
-		Publisher: deadman.WebhookPublisher{URL: *webhookURL, Secret: secret, Client: client},
+		Publisher: publisher, HeartbeatPublisher: publisher,
 	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("component", "external-deadman", "watchdog_id", *watchdogID)
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("component", "external-deadman",
+		"project_id", *projectID, "watchdog_id", *watchdogID)
 	pass := func() error {
 		report, err := runner.RunOnce(ctx)
 		attrs := []any{"healthy", report.Observation.Healthy, "reason", report.Observation.Reason,
@@ -120,6 +135,24 @@ func validateHTTPURL(raw, label string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return fmt.Errorf("invalid %s URL %q (want http:// or https:// with a host)", label, raw)
+	}
+	return nil
+}
+
+func validateControlAlertIngressURL(raw, healthRaw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("invalid control-alert ingress URL %q (want http(s) Flowbee origin plus %s)",
+			raw, alertingress.ControlAlertIngressPath)
+	}
+	if u.User != nil || u.Path != alertingress.ControlAlertIngressPath || u.RawPath != "" ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("control-alert ingress URL must use exact path %s with no userinfo, query, fragment, or escaped path",
+			alertingress.ControlAlertIngressPath)
+	}
+	health, err := url.Parse(healthRaw)
+	if err != nil || health.Hostname() == "" || !strings.EqualFold(u.Hostname(), health.Hostname()) {
+		return fmt.Errorf("control-alert ingress hostname must match the independently probed Flowbee health hostname")
 	}
 	return nil
 }
@@ -167,8 +200,9 @@ sudo install -o flowbee-watchdog -g flowbee-watchdog -m 0600 /dev/null /etc/flow
 
 # 2. Write /etc/flowbee-watchdog.env (this file contains references, not the key):
 FLOWBEE_EXTERNAL_WATCHDOG_ID=<stable-host-id>
-FLOWBEE_WATCHDOG_HEALTH_URL=http://<tailnet-control-plane-host>:7001/healthz
-FLOWBEE_ALERT_WEBHOOK_URL=https://<alert-receiver>/flowbee
+FLOWBEE_WATCHDOG_PROJECT_ID=<exact-flowbee-project-id>
+FLOWBEE_WATCHDOG_HEALTH_URL=http://<tailnet-flowbee-host>:7001/healthz
+FLOWBEE_ALERT_WEBHOOK_URL=https://<tailnet-flowbee-host>:7443/v1/control-alerts/ingress
 FLOWBEE_ALERT_WEBHOOK_SECRET_FILE=/etc/flowbee-watchdog.secret
 FLOWBEE_WATCHDOG_STATE_FILE=/var/lib/flowbee-watchdog/state.json
 FLOWBEE_WATCHDOG_INTERVAL=30s

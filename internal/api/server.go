@@ -164,6 +164,7 @@ type Server struct {
 	// a live capability. Health/config therefore reflect revocation and recovery
 	// without restarting the API server.
 	driverControlCurrent func() DriverControlReadiness
+	phase1ProjectCurrent func() Phase1ProjectReadiness
 
 	// projectFairMu serializes the read-pick-claim scheduling turn. The lease
 	// claim commits the selected turn in its own SQLite transaction, so this
@@ -219,6 +220,31 @@ type DriverControlReadiness struct {
 	Status    string `json:"status"`
 	Gap       string `json:"gap,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+}
+
+type Phase1ProjectReadiness struct {
+	Required  bool     `json:"required"`
+	Available bool     `json:"available"`
+	ProjectID string   `json:"project_id,omitempty"`
+	Status    string   `json:"status"`
+	Reason    string   `json:"reason,omitempty"`
+	Holds     []string `json:"holds,omitempty"`
+}
+
+func (r Phase1ProjectReadiness) normalized() Phase1ProjectReadiness {
+	if !r.Required {
+		r.Available = false
+		if r.Status == "" {
+			r.Status = "disabled"
+		}
+		return r
+	}
+	if r.Available {
+		r.Status, r.Reason, r.Holds = "ready", "", nil
+	} else if r.Status == "" {
+		r.Status = "held"
+	}
+	return r
 }
 
 func (r DriverControlReadiness) normalized() DriverControlReadiness {
@@ -322,6 +348,7 @@ type Config struct {
 	// config, and dashboard read models. It never enables a transport path.
 	DriverControl        DriverControlReadiness
 	DriverControlCurrent func() DriverControlReadiness
+	Phase1ProjectCurrent func() Phase1ProjectReadiness
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -405,6 +432,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		runningConfig:              runningConfig,
 		driverControl:              driverControl,
 		driverControlCurrent:       cfg.DriverControlCurrent,
+		phase1ProjectCurrent:       cfg.Phase1ProjectCurrent,
 	}
 	// seed GitHub health to "just succeeded" so the age metric starts ~0, not at the
 	// unix epoch, before the first sweep runs.
@@ -475,24 +503,25 @@ func (s *Server) HealthHandler() http.Handler {
 // dashboard/SSE views are served without auth (they expose no Domain-A write and
 // bind to loopback/Tailscale).
 func (s *Server) PrivateHandler() http.Handler {
+	roleWorker := func(h http.HandlerFunc) http.Handler { return s.requireWorkerRole(h) }
 	// the authenticated worker-protocol surface (every mutating call + lease).
 	worker := http.NewServeMux()
 	worker.HandleFunc("POST /v1/workers/register", s.register)
 	worker.HandleFunc("POST /v1/workers/usage", s.usage)
 	// dispatch control: a client (the russ worker, an operator) tells the dispatcher to
 	// pause — globally ("pause everything") or for one repo ({"repo":"russ"}).
-	worker.HandleFunc("POST /v1/control/pause", s.controlPause)
-	worker.HandleFunc("POST /v1/control/resume", s.controlResume)
-	worker.HandleFunc("GET /v1/control", s.controlStatus)
-	worker.HandleFunc("GET /v1/lease", s.lease)
-	worker.HandleFunc("POST /v1/jobs/{job}/heartbeat", s.heartbeat)
-	worker.HandleFunc("POST /v1/jobs/{job}/result", s.result)
-	worker.HandleFunc("POST /v1/jobs/{job}/review", s.review)
-	worker.HandleFunc("POST /v1/jobs/{job}/spec", s.specSubmit)
-	worker.HandleFunc("POST /v1/jobs/{job}/spec-review", s.specReview)
-	worker.HandleFunc("POST /v1/jobs/{job}/release", s.release)
-	worker.HandleFunc("POST /v1/jobs/{job}/rebase-conflict", s.rebaseConflict)
-	worker.HandleFunc("GET /v1/jobs/{job}/bundle", s.bundle)
+	worker.Handle("POST /v1/control/pause", roleWorker(s.controlPause))
+	worker.Handle("POST /v1/control/resume", roleWorker(s.controlResume))
+	worker.Handle("GET /v1/control", roleWorker(s.controlStatus))
+	worker.Handle("GET /v1/lease", roleWorker(s.lease))
+	worker.Handle("POST /v1/jobs/{job}/heartbeat", roleWorker(s.heartbeat))
+	worker.Handle("POST /v1/jobs/{job}/result", roleWorker(s.result))
+	worker.Handle("POST /v1/jobs/{job}/review", roleWorker(s.review))
+	worker.Handle("POST /v1/jobs/{job}/spec", roleWorker(s.specSubmit))
+	worker.Handle("POST /v1/jobs/{job}/spec-review", roleWorker(s.specReview))
+	worker.Handle("POST /v1/jobs/{job}/release", roleWorker(s.release))
+	worker.Handle("POST /v1/jobs/{job}/rebase-conflict", roleWorker(s.rebaseConflict))
+	worker.Handle("GET /v1/jobs/{job}/bundle", roleWorker(s.bundle))
 	worker.HandleFunc("GET /v1/config", s.configJSON)
 	worker.HandleFunc("GET /configz", s.configJSON)
 	authed := auth.Middleware(s.authn, worker)
@@ -532,7 +561,9 @@ func (s *Server) PrivateHandler() http.Handler {
 	s.MountProjectCircuitBreakerRoutes(mux)
 	mux.Handle("GET /v1/decisions/audit", s.HumanDecisionAuditHandler())
 	mux.Handle("GET /v1/projects", human(s.projectsList))
+	mux.Handle("GET /v1/portfolio", human(s.portfolio))
 	mux.Handle("GET /v1/projects/{project_id}", human(s.projectOne))
+	mux.Handle("GET /v1/projects/{project_id}/epics", human(s.projectEpics))
 	mux.Handle("GET /v1/decisions", human(s.decisionsList))
 	mux.Handle("GET /v1/decisions/{id}", human(s.decisionOne))
 	mux.Handle("GET /v1/projects/{project_id}/work-intents", human(s.workIntentsList))
@@ -558,7 +589,9 @@ func (s *Server) PrivateHandler() http.Handler {
 	// secure posture. (They previously sat on the bare mux, unauthenticated even with
 	// worker_auth_secret set; the read-only dashboard endpoints above stay open by design.)
 	// auth.Middleware(nil, h) == h, so this is a no-op in the loopback-only dev default.
-	op := func(h http.HandlerFunc) http.Handler { return auth.Middleware(s.authn, h) }
+	op := func(h http.HandlerFunc) http.Handler {
+		return auth.Middleware(s.authn, s.requireWorkerRole(h))
+	}
 	mux.Handle("POST /v1/jobs/{job}/design", op(s.resolveDesign))
 	mux.Handle("POST /v1/jobs/{job}/promote", op(s.promoteBacklog))
 	mux.Handle("POST /v1/jobs/{job}/adopt", op(s.adoptOptIn))
@@ -613,6 +646,25 @@ func (s *Server) PrivateHandler() http.Handler {
 	return mux
 }
 
+// requireWorkerRole keeps an enrolled capacity-only credential on its narrow
+// registration/usage/config surface. Authentication alone answers who called;
+// this independent authorization check prevents that principal from pausing or
+// resuming dispatch, injecting/cancelling work, or mutating supervision state.
+// With auth disabled the existing loopback development posture is unchanged.
+func (s *Server) requireWorkerRole(next http.Handler) http.Handler {
+	if s.authn == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		identity, ok := auth.IdentityFrom(r)
+		if !ok || !s.registry.HasRoleAuthority(identity) {
+			http.Error(w, "forbidden: worker identity has no authorized role", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // configJSON exposes the RUNNING control plane's effective, redacted config. It is
 // read-only and contains no secret material; token/secret fields are booleans only.
 func (s *Server) configJSON(w http.ResponseWriter, r *http.Request) {
@@ -630,6 +682,13 @@ func (s *Server) currentDriverControl() DriverControlReadiness {
 		return s.driverControlCurrent().normalized()
 	}
 	return s.driverControl
+}
+
+func (s *Server) currentPhase1Project() Phase1ProjectReadiness {
+	if s.phase1ProjectCurrent != nil {
+		return s.phase1ProjectCurrent().normalized()
+	}
+	return Phase1ProjectReadiness{}.normalized()
 }
 
 func requestFromLoopback(r *http.Request) bool {
@@ -868,14 +927,20 @@ func (s *Server) fleetHealthJSON(w http.ResponseWriter, r *http.Request) {
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	dbOK := s.store.Ping(r.Context()) == nil
 	driverControl := s.currentDriverControl()
+	phase1Project := s.currentPhase1Project()
 	status, code := "ok", http.StatusOK
 	if !dbOK {
 		status, code = "unavailable", http.StatusServiceUnavailable
 	}
 	resp := map[string]any{"status": status, "db": dbOK, "version": s.version,
 		"github_last_success_age_seconds": s.clock.Now().Unix() - s.ghLastSuccess.Load(),
-		"driver_control":                  driverControl}
+		"driver_control":                  driverControl,
+		"phase1_project":                  phase1Project}
 	if dbOK && driverControl.Required && !driverControl.Available {
+		status, code = "degraded", http.StatusServiceUnavailable
+		resp["status"] = status
+	}
+	if dbOK && phase1Project.Required && !phase1Project.Available {
 		status, code = "degraded", http.StatusServiceUnavailable
 		resp["status"] = status
 	}
@@ -1082,6 +1147,29 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	if bound, ok := auth.IdentityFrom(r); ok {
+		if reg.Identity != "" && reg.Identity != bound {
+			http.Error(w, "registration identity does not match authenticated identity", http.StatusForbidden)
+			return
+		}
+		reg.Identity = bound
+	}
+	if reg.Identity == "" {
+		http.Error(w, "registration identity is required", http.StatusBadRequest)
+		return
+	}
+	existing, err := s.store.WorkerIDForIdentity(r.Context(), reg.Identity)
+	if err != nil {
+		http.Error(w, "register failed", http.StatusInternalServerError)
+		return
+	}
+	if existing != "" {
+		if reg.WorkerID != "" && reg.WorkerID != existing {
+			http.Error(w, "worker_id does not belong to authenticated identity", http.StatusConflict)
+			return
+		}
+		reg.WorkerID = existing
+	}
 	if reg.WorkerID == "" {
 		// Reuse the worker_id already registered under this identity so a RE-registration
 		// (a worker that restarted, possibly with a changed model_family/role) UPDATES its
@@ -1089,14 +1177,14 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		// UNIQUE(identity) constraint and fails — which would freeze the worker's stored
 		// capabilities at its first registration (the stale-roster bug). Mint only for a
 		// genuinely new identity.
-		if existing, err := s.store.WorkerIDForIdentity(r.Context(), reg.Identity); err == nil && existing != "" {
-			reg.WorkerID = existing
-		} else {
-			reg.WorkerID = s.minter.New()
-		}
+		reg.WorkerID = s.minter.New()
 	}
 	resp, err := s.registry.Register(r.Context(), reg, s.clock.Now())
 	if err != nil {
+		if errors.Is(err, worker.ErrWorkerIDReassignment) {
+			http.Error(w, "worker_id does not belong to authenticated identity", http.StatusConflict)
+			return
+		}
 		http.Error(w, "register failed", http.StatusInternalServerError)
 		return
 	}
@@ -1412,7 +1500,7 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.RecordWorkerSeen(r.Context(), identity, s.clock.Now())
 	}
 
-	attested, err := s.registry.AttestedFor(r.Context(), identity)
+	attested, err := s.registry.AttestedFor(r.Context(), identity, s.clock.Now())
 	if err != nil {
 		http.Error(w, "lease error", http.StatusInternalServerError)
 		return

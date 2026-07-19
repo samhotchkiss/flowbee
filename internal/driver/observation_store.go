@@ -21,6 +21,7 @@ type ObservationSQLStore struct {
 
 type DriverInstanceState struct {
 	InstanceRef, HostID, StoreID, ProducerBootID string
+	TmuxServerDomainID, TmuxServerOwnership      string
 	State, Cursor, LastEventID                   string
 	HighStoreSeq, ResetCount                     uint64
 }
@@ -42,7 +43,8 @@ func (s ObservationSQLStore) now() string {
 // EnsureInstance establishes the Flowbee-owned inventory key. A changed
 // store_id fences the old cursor domain and drops only its derived projections.
 func (s ObservationSQLStore) EnsureInstance(ctx context.Context, instanceRef string, meta DriverMetadata) (bool, error) {
-	if s.DB == nil || instanceRef == "" || meta.HostID == "" || meta.StoreID == "" || meta.ProducerBootID == "" {
+	if s.DB == nil || instanceRef == "" || meta.HostID == "" || meta.StoreID == "" || meta.ProducerBootID == "" ||
+		meta.TmuxServer.DomainID == "" || meta.TmuxServer.Ownership == "" {
 		return false, errors.New("driver observation store: incomplete instance identity")
 	}
 	tx, err := s.DB.BeginTx(ctx, nil)
@@ -50,15 +52,17 @@ func (s ObservationSQLStore) EnsureInstance(ctx context.Context, instanceRef str
 		return false, err
 	}
 	defer tx.Rollback()
-	var oldHost, oldStore string
+	var oldHost, oldStore, oldDomain, oldOwnership string
 	var resetCount uint64
-	err = tx.QueryRowContext(ctx, `SELECT host_id,store_id,reset_count FROM driver_instances WHERE instance_ref=?`, instanceRef).
-		Scan(&oldHost, &oldStore, &resetCount)
+	err = tx.QueryRowContext(ctx, `SELECT host_id,store_id,tmux_server_domain_id,tmux_server_ownership,reset_count
+		FROM driver_instances WHERE instance_ref=?`, instanceRef).
+		Scan(&oldHost, &oldStore, &oldDomain, &oldOwnership, &resetCount)
 	now := s.now()
 	if errors.Is(err, sql.ErrNoRows) {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO driver_instances
-			(instance_ref,host_id,store_id,producer_boot_id,state,created_at,updated_at)
-			VALUES (?,?,?,?,'resyncing',?,?)`, instanceRef, meta.HostID, meta.StoreID, meta.ProducerBootID, now, now); err != nil {
+			(instance_ref,host_id,store_id,producer_boot_id,tmux_server_domain_id,tmux_server_ownership,state,created_at,updated_at)
+			VALUES (?,?,?,?,?,?,'resyncing',?,?)`, instanceRef, meta.HostID, meta.StoreID,
+			meta.ProducerBootID, meta.TmuxServer.DomainID, meta.TmuxServer.Ownership, now, now); err != nil {
 			return false, err
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO driver_observation_cursors
@@ -80,8 +84,13 @@ func (s ObservationSQLStore) EnsureInstance(ctx context.Context, instanceRef str
 		if oldHost != meta.HostID {
 			return false, errors.New("driver observation store: host changed without store reset")
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE driver_instances SET producer_boot_id=?,updated_at=? WHERE instance_ref=?`,
-			meta.ProducerBootID, now, instanceRef)
+		if (oldDomain != "" && oldDomain != meta.TmuxServer.DomainID) ||
+			(oldOwnership != "" && oldOwnership != meta.TmuxServer.Ownership) {
+			return false, errors.New("driver observation store: tmux server domain changed without store reset")
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE driver_instances SET producer_boot_id=?,
+			tmux_server_domain_id=?,tmux_server_ownership=?,updated_at=? WHERE instance_ref=?`,
+			meta.ProducerBootID, meta.TmuxServer.DomainID, meta.TmuxServer.Ownership, now, instanceRef)
 		if err != nil {
 			return false, err
 		}
@@ -102,8 +111,10 @@ func (s ObservationSQLStore) EnsureInstance(ctx context.Context, instanceRef str
 		return false, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE driver_instances SET host_id=?,store_id=?,producer_boot_id=?,
+		tmux_server_domain_id=?,tmux_server_ownership=?,
 		state='resyncing',reset_count=reset_count+1,last_error='',updated_at=? WHERE instance_ref=?`,
-		meta.HostID, meta.StoreID, meta.ProducerBootID, now, instanceRef); err != nil {
+		meta.HostID, meta.StoreID, meta.ProducerBootID, meta.TmuxServer.DomainID,
+		meta.TmuxServer.Ownership, now, instanceRef); err != nil {
 		return false, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO driver_instance_events
@@ -117,10 +128,12 @@ func (s ObservationSQLStore) EnsureInstance(ctx context.Context, instanceRef str
 func (s ObservationSQLStore) Instance(ctx context.Context, instanceRef string) (DriverInstanceState, error) {
 	var out DriverInstanceState
 	err := s.DB.QueryRowContext(ctx, `SELECT i.instance_ref,i.host_id,i.store_id,i.producer_boot_id,
+		i.tmux_server_domain_id,i.tmux_server_ownership,
 		i.state,COALESCE(c.cursor,''),COALESCE(c.last_event_id,''),COALESCE(c.high_store_seq,0),i.reset_count
 		FROM driver_instances i LEFT JOIN driver_observation_cursors c ON c.store_id=i.store_id AND c.active=1
 		WHERE i.instance_ref=?`, instanceRef).Scan(&out.InstanceRef, &out.HostID, &out.StoreID,
-		&out.ProducerBootID, &out.State, &out.Cursor, &out.LastEventID, &out.HighStoreSeq, &out.ResetCount)
+		&out.ProducerBootID, &out.TmuxServerDomainID, &out.TmuxServerOwnership,
+		&out.State, &out.Cursor, &out.LastEventID, &out.HighStoreSeq, &out.ResetCount)
 	return out, err
 }
 
@@ -173,8 +186,9 @@ func (s ObservationSQLStore) ReplaceSnapshot(ctx context.Context, instanceRef st
 		return err
 	}
 	defer tx.Rollback()
-	var hostID, storeID string
-	if err := tx.QueryRowContext(ctx, `SELECT host_id,store_id FROM driver_instances WHERE instance_ref=?`, instanceRef).Scan(&hostID, &storeID); err != nil {
+	var hostID, storeID, serverDomainID string
+	if err := tx.QueryRowContext(ctx, `SELECT host_id,store_id,tmux_server_domain_id
+		FROM driver_instances WHERE instance_ref=?`, instanceRef).Scan(&hostID, &storeID, &serverDomainID); err != nil {
 		return err
 	}
 	if hostID != snapshot.HostID || storeID != snapshot.StoreID {
@@ -186,7 +200,7 @@ func (s ObservationSQLStore) ReplaceSnapshot(ctx context.Context, instanceRef st
 	now := s.now()
 	for _, session := range snapshot.Sessions {
 		id := session.Identity
-		if id.HostID != hostID || id.StoreID != storeID || id.SessionID == "" ||
+		if id.HostID != hostID || id.StoreID != storeID || id.TmuxServerDomainID != serverDomainID || id.SessionID == "" ||
 			(session.Lifecycle != "ended" && (id.PaneInstanceID == "" || id.AgentRunID == "" || id.TmuxServerInstanceID == "")) {
 			return ErrIdentityMismatch
 		}
@@ -195,11 +209,11 @@ func (s ObservationSQLStore) ReplaceSnapshot(ctx context.Context, instanceRef st
 			raw = json.RawMessage(`{}`)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO driver_session_projections
-			(store_id,session_id,host_id,pane_instance_id,agent_run_id,tmux_server_instance_id,
+			(store_id,session_id,host_id,pane_instance_id,agent_run_id,tmux_server_domain_id,tmux_server_instance_id,
 			 provider,conversation_id,lifecycle,phase,binding_status,binding_epoch,state_revision,
 			 as_of_cursor,started_at,ended_at,end_reason,raw_state_json,source,updated_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, storeID, id.SessionID, hostID,
-			id.PaneInstanceID, id.AgentRunID, id.TmuxServerInstanceID, id.Provider, id.ConversationID,
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, storeID, id.SessionID, hostID,
+			id.PaneInstanceID, id.AgentRunID, id.TmuxServerDomainID, id.TmuxServerInstanceID, id.Provider, id.ConversationID,
 			session.Lifecycle, session.Phase, session.BindingStatus, session.BindingEpoch,
 			session.StateRevision, snapshot.AsOfCursor, session.StartedAt, session.EndedAt,
 			session.EndReason, string(raw), "snapshot", now); err != nil {
@@ -288,12 +302,12 @@ func (s ObservationSQLStore) Fold(ctx context.Context, instanceRef string, batch
 		return result, err
 	}
 	defer tx.Rollback()
-	var hostID, storeID string
+	var hostID, storeID, serverDomainID string
 	var high, uncertaintyEpoch uint64
-	if err := tx.QueryRowContext(ctx, `SELECT i.host_id,i.store_id,COALESCE(c.high_store_seq,0),
+	if err := tx.QueryRowContext(ctx, `SELECT i.host_id,i.store_id,i.tmux_server_domain_id,COALESCE(c.high_store_seq,0),
 		COALESCE(c.uncertainty_epoch,0)
 		FROM driver_instances i JOIN driver_observation_cursors c ON c.store_id=i.store_id AND c.active=1
-		WHERE i.instance_ref=?`, instanceRef).Scan(&hostID, &storeID, &high, &uncertaintyEpoch); err != nil {
+		WHERE i.instance_ref=?`, instanceRef).Scan(&hostID, &storeID, &serverDomainID, &high, &uncertaintyEpoch); err != nil {
 		return result, err
 	}
 	if batch.StoreID == "" {
@@ -314,6 +328,7 @@ func (s ObservationSQLStore) Fold(ctx context.Context, instanceRef string, batch
 		if lastSeq > 0 && event.StoreSeq <= lastSeq {
 			return result, errors.New("driver observation store: event page is not strictly store_seq ordered")
 		}
+		event.Identity.TmuxServerDomainID = serverDomainID
 		lastSeq = event.StoreSeq
 		raw, digest, err := observationEnvelope(event)
 		if err != nil {
@@ -573,10 +588,10 @@ func invalidateConversationEvidenceTx(ctx context.Context, tx *sql.Tx, storeID, 
 func foldSessionEvent(ctx context.Context, tx *sql.Tx, event Observation, now string) error {
 	id := event.Identity
 	_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO driver_session_projections
-		(store_id,session_id,host_id,pane_instance_id,agent_run_id,tmux_server_instance_id,
+		(store_id,session_id,host_id,pane_instance_id,agent_run_id,tmux_server_domain_id,tmux_server_instance_id,
 		 provider,conversation_id,last_store_seq,last_event_id,as_of_cursor,source,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,'events',?)`, id.StoreID, id.SessionID, id.HostID,
-		id.PaneInstanceID, id.AgentRunID, id.TmuxServerInstanceID, id.Provider, id.ConversationID,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'events',?)`, id.StoreID, id.SessionID, id.HostID,
+		id.PaneInstanceID, id.AgentRunID, id.TmuxServerDomainID, id.TmuxServerInstanceID, id.Provider, id.ConversationID,
 		event.StoreSeq, event.EventID, event.Cursor, now)
 	if err != nil {
 		return err
@@ -650,11 +665,12 @@ func (s ObservationSQLStore) Session(ctx context.Context, storeID, sessionID str
 	var out SessionProjection
 	var raw string
 	err := s.DB.QueryRowContext(ctx, `SELECT host_id,store_id,session_id,pane_instance_id,agent_run_id,
-		tmux_server_instance_id,provider,conversation_id,lifecycle,phase,binding_status,binding_epoch,
+		tmux_server_domain_id,tmux_server_instance_id,provider,conversation_id,lifecycle,phase,binding_status,binding_epoch,
 		state_revision,as_of_cursor,started_at,ended_at,end_reason,raw_state_json
 		FROM driver_session_projections WHERE store_id=? AND session_id=?`, storeID, sessionID).
 		Scan(&out.Identity.HostID, &out.Identity.StoreID, &out.Identity.SessionID,
-			&out.Identity.PaneInstanceID, &out.Identity.AgentRunID, &out.Identity.TmuxServerInstanceID,
+			&out.Identity.PaneInstanceID, &out.Identity.AgentRunID, &out.Identity.TmuxServerDomainID,
+			&out.Identity.TmuxServerInstanceID,
 			&out.Identity.Provider, &out.Identity.ConversationID, &out.Lifecycle, &out.Phase,
 			&out.BindingStatus, &out.BindingEpoch, &out.StateRevision, &out.AsOfCursor,
 			&out.StartedAt, &out.EndedAt, &out.EndReason, &raw)
@@ -667,16 +683,19 @@ func (s ObservationSQLStore) Session(ctx context.Context, storeID, sessionID str
 // falls back to CWD, raw pane IDs, tmux names, PIDs, provider, or timestamps.
 func (s ObservationSQLStore) IsCurrentIdentity(ctx context.Context, instanceRef string, identity Identity) (bool, error) {
 	if identity.HostID == "" || identity.StoreID == "" || identity.SessionID == "" ||
-		identity.PaneInstanceID == "" || identity.AgentRunID == "" || identity.TmuxServerInstanceID == "" {
+		identity.PaneInstanceID == "" || identity.AgentRunID == "" ||
+		identity.TmuxServerDomainID == "" || identity.TmuxServerInstanceID == "" {
 		return false, nil
 	}
 	var count int
 	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM driver_instances i
 		JOIN driver_session_projections s ON s.store_id=i.store_id
 		WHERE i.instance_ref=? AND i.state='live' AND i.host_id=? AND i.store_id=?
+		  AND i.tmux_server_domain_id=? AND s.tmux_server_domain_id=?
 		  AND s.session_id=? AND s.pane_instance_id=? AND s.agent_run_id=?
 		  AND s.tmux_server_instance_id=? AND s.lifecycle<>'ended'`, instanceRef, identity.HostID,
-		identity.StoreID, identity.SessionID, identity.PaneInstanceID, identity.AgentRunID,
+		identity.StoreID, identity.TmuxServerDomainID, identity.TmuxServerDomainID,
+		identity.SessionID, identity.PaneInstanceID, identity.AgentRunID,
 		identity.TmuxServerInstanceID).Scan(&count)
 	return count == 1, err
 }

@@ -355,15 +355,7 @@ func (s *Store) ReconcileWorkIntents(ctx context.Context, now time.Time, ackTime
 			}
 			actionID := item.DeliveryActionID
 			if to == workintent.StateReadyForOrchestrator && item.OrchestratorRegistration != "" {
-				if !s.HasDriverControlOrigin() {
-					if err := holdWorkIntentDeliveryTx(ctx, tx, item, now, ackTimeout,
-						ErrDriverControlOriginUnavailable.Error()); err != nil {
-						return err
-					}
-					out.Held++
-					continue
-				}
-				created, id, err := ensureWorkIntentDeliveryActionTx(ctx, tx, item, now)
+				created, id, err := s.ensureWorkIntentDeliveryActionTx(ctx, tx, item, now)
 				if errors.Is(err, ErrWorkIntentRouteUnavailable) {
 					if err := holdWorkIntentDeliveryTx(ctx, tx, item, now, ackTimeout, err.Error()); err != nil {
 						return err
@@ -484,6 +476,15 @@ func (s *Store) CancelWorkIntent(ctx context.Context, projectID, id string, expe
 			AND state IN ('pending','claimed','uncertain')`, now.UTC().Format(rfc3339), id); err != nil {
 			return err
 		}
+		// Cancellation may race the periodic admission loop after the Orchestrator
+		// has durably prepared a contract. Keep the contract ledger total in the
+		// same transaction as the intent transition: after restart there must be no
+		// apparently actionable `prepared` row for a terminal intent.
+		if _, err := tx.ExecContext(ctx, `UPDATE work_intent_epic_contracts
+			SET state='cancelled' WHERE project_id=? AND work_intent_id=?
+			AND state='prepared'`, projectID, id); err != nil {
+			return err
+		}
 		payload, _ := json.Marshal(map[string]string{"work_intent_id": id, "reason": reason})
 		return appendDecisionControlEventTx(ctx, tx, projectID, "", "work_intent_cancelled",
 			from, string(workintent.StateCancelled), expectedVersion+1, "human", actor, string(payload), now)
@@ -521,7 +522,7 @@ func allGatesAccepted(gates []workintent.Gate) bool {
 	return true
 }
 
-func ensureWorkIntentDeliveryActionTx(ctx context.Context, tx *sql.Tx, item WorkIntent, now time.Time) (bool, string, error) {
+func (s *Store) ensureWorkIntentDeliveryActionTx(ctx context.Context, tx *sql.Tx, item WorkIntent, now time.Time) (bool, string, error) {
 	recipient, err := activeDriverSessionBindingTx(ctx, tx, item.ProjectID,
 		item.OrchestratorRegistration, DriverOrchestratorRole)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -529,6 +530,10 @@ func ensureWorkIntentDeliveryActionTx(ctx context.Context, tx *sql.Tx, item Work
 	}
 	if err != nil {
 		return false, "", err
+	}
+	if !s.HasDriverControlOriginForBinding(recipient) {
+		return false, "", fmt.Errorf("%w: Orchestrator endpoint %s/%s/%s is not control-origin ready",
+			ErrWorkIntentRouteUnavailable, recipient.HostID, recipient.StoreID, recipient.TmuxServerDomainID)
 	}
 	var baselineSeq, uncertaintyEpoch uint64
 	var instanceState string

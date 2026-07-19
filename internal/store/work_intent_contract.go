@@ -235,8 +235,17 @@ func scanPreparedWorkIntentEpicContract(row interface{ Scan(...any) error }) (Pr
 
 func (s *Store) ReconcileWorkIntentAdmissions(ctx context.Context, now time.Time) (WorkIntentAdmissionReconcileResult, error) {
 	var out WorkIntentAdmissionReconcileResult
-	rows, err := s.DB.QueryContext(ctx, `SELECT id FROM work_intent_epic_contracts
-		WHERE state='prepared' ORDER BY created_at,id`)
+	// A prepared contract is a durable admission obligation, but the owning work
+	// intent remains the authority for whether that obligation may run. In
+	// particular, an operator can pause after contract preparation but before this
+	// reconciler executes. Joining the exact intent incarnation prevents a restart
+	// from admitting through that hold (and prevents terminal intent rows from
+	// becoming poison entries that are retried forever).
+	rows, err := s.DB.QueryContext(ctx, `SELECT c.id FROM work_intent_epic_contracts c
+		JOIN work_intents w ON w.project_id=c.project_id AND w.id=c.work_intent_id
+			AND w.intent_version=c.intent_version
+		WHERE c.state='prepared' AND w.state='submitting' AND w.hold_kind<>'paused'
+		ORDER BY c.created_at,c.id`)
 	if err != nil {
 		return out, err
 	}

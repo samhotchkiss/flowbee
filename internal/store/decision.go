@@ -389,8 +389,7 @@ func (s *Store) RespondDecision(ctx context.Context, projectID string, in Decisi
 		// whenever the exact project Interactor is live. If it is temporarily
 		// unbound, ensureDecisionResponseActionTx commits a visible durable hold;
 		// the response itself is never discarded and the reconciler recovers it.
-		if _, _, err := ensureDecisionResponseActionTx(ctx, tx, projectID, responseID, now,
-			s.HasDriverControlOrigin()); err != nil {
+		if _, _, err := s.ensureDecisionResponseActionTx(ctx, tx, projectID, responseID, now); err != nil {
 			return err
 		}
 		out = DecisionResponse{ID: responseID, ProjectID: projectID, RequestID: in.RequestID,

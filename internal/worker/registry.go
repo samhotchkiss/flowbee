@@ -10,6 +10,7 @@
 //     rubber-stamp its own builds, §9.4.1);
 //   - arch:* / os:* are attested against the worker's submitted handshake (the
 //     arch-lottery fix: a worker can't claim arch:arm64 from an x86 box).
+//
 // An unattested capability is dropped and therefore never matched at lease time.
 package worker
 
@@ -23,6 +24,11 @@ import (
 
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
+
+// ErrWorkerIDReassignment means a registration tried to reuse a durable
+// worker_id that belongs to another authenticated identity. Worker IDs are
+// stable row keys, never bearer capabilities that may be transferred.
+var ErrWorkerIDReassignment = errors.New("worker_id belongs to another identity")
 
 // Registration is a worker's self-described enrollment. claimed capabilities are
 // ATTESTED by the server (M5: against the allowlist + handshake); only the
@@ -95,6 +101,20 @@ func (a Allowlist) permits(identity, cap string) bool {
 	return false
 }
 
+// hasRoleAuthority distinguishes a scheduling worker from an enrolled
+// capacity-only principal. Open mode preserves the development/test behavior.
+func (a Allowlist) hasRoleAuthority(identity string) bool {
+	if a.Open {
+		return true
+	}
+	for _, capability := range a.Permit[identity] {
+		if strings.HasPrefix(capability, "role:") && capability != "role:" {
+			return true
+		}
+	}
+	return false
+}
+
 // attest filters claimed capabilities to the attested subset for an identity,
 // given the worker's handshake (arch/os). It is a PURE function of its inputs.
 //   - arch:* / os:* : attested iff the value matches the handshake.
@@ -150,7 +170,7 @@ func (r *Registry) Register(ctx context.Context, reg Registration, now time.Time
 	attested := r.allow.attest(reg.Identity, reg.Capabilities, reg.Arch, reg.OS)
 	claimedJSON, _ := json.Marshal(reg.Capabilities)
 	attestedJSON, _ := json.Marshal(attested)
-	_, err := r.st.DB.ExecContext(ctx, `
+	result, err := r.st.DB.ExecContext(ctx, `
 		INSERT INTO workers (worker_id, identity, host, arch, os,
 		                     claimed_capabilities, attested_capabilities,
 		                     attestation_expires_at, registered_at, last_seen_at)
@@ -162,12 +182,18 @@ func (r *Registry) Register(ctx context.Context, reg Registration, now time.Time
 		    claimed_capabilities = excluded.claimed_capabilities,
 		    attested_capabilities = excluded.attested_capabilities,
 		    attestation_expires_at = excluded.attestation_expires_at,
-		    last_seen_at = excluded.last_seen_at`,
+		    last_seen_at = excluded.last_seen_at
+		WHERE workers.identity = excluded.identity`,
 		reg.WorkerID, reg.Identity, reg.Host, reg.Arch, reg.OS,
 		string(claimedJSON), string(attestedJSON),
 		expires.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	if err != nil {
 		return RegisterResponse{}, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return RegisterResponse{}, err
+	} else if affected != 1 {
+		return RegisterResponse{}, ErrWorkerIDReassignment
 	}
 
 	// F6: persist the box's per-model concurrency + distribution weight + named
@@ -200,23 +226,38 @@ func (r *Registry) Register(ctx context.Context, reg Registration, now time.Time
 	}, nil
 }
 
-// AttestedFor returns the attested capability set for an identity (used by the
-// scheduler at lease time). Unknown identity -> empty set.
-func (r *Registry) AttestedFor(ctx context.Context, identity string) ([]string, error) {
-	var blob string
+// AttestedFor returns the capability set that is authoritative at lease time.
+// Persisted attestations are audit/cache material only: every read checks their
+// expiry and re-applies the registry's current policy to the original claims and
+// stored arch/OS handshake. This makes a restart from an old open policy to a
+// strict production policy fail closed before the worker re-registers.
+func (r *Registry) AttestedFor(ctx context.Context, identity string, now time.Time) ([]string, error) {
+	var claimed, expires, arch, osName string
 	err := r.st.DB.QueryRowContext(ctx,
-		`SELECT attested_capabilities FROM workers WHERE identity = ?`, identity).Scan(&blob)
+		`SELECT claimed_capabilities,attestation_expires_at,arch,os
+		 FROM workers WHERE identity = ?`, identity).Scan(&claimed, &expires, &arch, &osName)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	var caps []string
-	if err := json.Unmarshal([]byte(blob), &caps); err != nil {
+	expiresAt, err := time.Parse(time.RFC3339Nano, expires)
+	if err != nil || !now.Before(expiresAt) {
+		return nil, nil
+	}
+	var claims []string
+	if err := json.Unmarshal([]byte(claimed), &claims); err != nil {
 		return nil, err
 	}
-	return caps, nil
+	return r.allow.attest(identity, claims, arch, osName), nil
+}
+
+// HasRoleAuthority reports whether the current operator policy grants an
+// identity any worker role. It is used to keep capacity-only credentials off
+// control-plane and work-mutation endpoints.
+func (r *Registry) HasRoleAuthority(identity string) bool {
+	return r.allow.hasRoleAuthority(identity)
 }
 
 // TouchLastSeen records a worker's most-recent contact (heartbeat liveness for

@@ -203,7 +203,7 @@ func TestReviewWakeStaleIncarnationIsFencedBeforeGrantOrSend(t *testing.T) {
 	// the old pane/run. Driver returning the current incarnation must fence it.
 	newBinding := store.DriverSessionBinding{
 		WorkerIdentity: "route-reviewer", Role: store.DriverReviewerRole,
-		HostID: "host-review", StoreID: "store-review", TmuxServerInstanceID: "server-review",
+		HostID: "host-review", StoreID: "store-review", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-review", LifecycleOwnership: "driver_managed",
 		LifecycleKey: "reviewer-route-reviewer", TargetEpoch: 2, ProfileID: "code-reviewer",
 		WorkspaceRootID: "workspace-root", WorkspaceRelativePath: "repo",
 		SessionID: "session-route-reviewer", PaneInstanceID: "pane-route-reviewer-v2", AgentRunID: "run-route-reviewer-v2",
@@ -214,7 +214,7 @@ func TestReviewWakeStaleIncarnationIsFencedBeforeGrantOrSend(t *testing.T) {
 	fake := driver.NewFake()
 	port := &staleIdentityPort{FakePort: fake, identity: driver.Identity{
 		HostID: newBinding.HostID, StoreID: newBinding.StoreID,
-		TmuxServerInstanceID: newBinding.TmuxServerInstanceID, LifecycleKey: newBinding.LifecycleKey,
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: newBinding.TmuxServerInstanceID, LifecycleKey: newBinding.LifecycleKey,
 		TargetEpoch: newBinding.TargetEpoch, SessionID: newBinding.SessionID,
 		PaneInstanceID: newBinding.PaneInstanceID, AgentRunID: newBinding.AgentRunID,
 	}}
@@ -244,7 +244,8 @@ func TestDriverSessionBindingReplayAndIncarnationHistory(t *testing.T) {
 	now := time.Date(2026, 7, 19, 13, 0, 0, 0, time.UTC)
 	b := store.DriverSessionBinding{
 		WorkerIdentity: "reviewer", Role: store.DriverReviewerRole, HostID: "host", StoreID: "store",
-		TmuxServerInstanceID: "server", LifecycleKey: "life", TargetEpoch: 1, ProfileID: "reviewer",
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server", LifecycleOwnership: "driver_managed",
+		LifecycleKey: "life", TargetEpoch: 1, ProfileID: "reviewer",
 		WorkspaceRootID: "root", WorkspaceRelativePath: "repo", SessionID: "session",
 		PaneInstanceID: "pane-1", AgentRunID: "run-1",
 	}

@@ -28,8 +28,9 @@ func TestRejectSyntheticDriverControlBinding(t *testing.T) {
 	_, err = st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		ProjectID: "default", WorkerIdentity: store.DriverControlIdentity,
 		Role: store.DriverControlRole, HostID: "host", StoreID: "store",
-		TmuxServerInstanceID: "server", LifecycleKey: "flowbee-control",
-		TargetEpoch: 1, ProfileID: "flowbee-control", WorkspaceRootID: "root",
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server", LifecycleKey: "flowbee-control",
+		LifecycleOwnership: "driver_managed",
+		TargetEpoch:        1, ProfileID: "flowbee-control", WorkspaceRootID: "root",
 		WorkspaceRelativePath: ".", SessionID: "session", PaneInstanceID: "pane",
 		AgentRunID: "run", Provider: "flowbee",
 	}, time.Now())
@@ -100,9 +101,10 @@ func TestDriverControlStateReadyRevokedRestored(t *testing.T) {
 	// inventory can appear after startup, but can never elevate it to authority.
 	binding, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		ProjectID: "default", WorkerIdentity: store.DriverControlIdentity, Role: store.DriverControlRole,
-		HostID: "host", StoreID: "store", TmuxServerInstanceID: "server",
+		HostID: "host", StoreID: "store", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server",
 		LifecycleKey: "synthetic-control", TargetEpoch: 1, ProfileID: "flowbee-control",
-		WorkspaceRootID: "root", WorkspaceRelativePath: ".", SessionID: "session",
+		LifecycleOwnership: "driver_managed",
+		WorkspaceRootID:    "root", WorkspaceRelativePath: ".", SessionID: "session",
 		PaneInstanceID: "pane", AgentRunID: "run", Provider: "flowbee",
 	}, time.Now())
 	if err != nil {
@@ -116,5 +118,43 @@ func TestDriverControlStateReadyRevokedRestored(t *testing.T) {
 	}
 	if got := probeDriverControlState(ctx, state, st.DB, fake); !got.Available || !state.Available() {
 		t.Fatalf("clean binding registry did not recover: %+v", got)
+	}
+}
+
+func TestDriverEndpointControlStateNeverCollapsesExactDomains(t *testing.T) {
+	external := serveDriverEndpoint{InstanceRef: "external-default", Key: driver.EndpointKey{
+		HostID: "host", StoreID: "external-store", TmuxServerDomainID: "default",
+	}}
+	managed := serveDriverEndpoint{InstanceRef: "flowbee-managed", Key: driver.EndpointKey{
+		HostID: "host", StoreID: "managed-store", TmuxServerDomainID: "flowbee",
+	}}
+	state := newDriverEndpointControlState([]serveDriverEndpoint{external, managed})
+	if state.Available() {
+		t.Fatal("unproven endpoint inventory must be held")
+	}
+	state.Update(external.InstanceRef, api.DriverControlReadiness{Required: true, Available: true, Status: "ready"})
+	if state.Available() {
+		t.Fatal("one healthy domain must not authorize the other domain")
+	}
+	if !state.AvailableFor(external.Key) || state.AvailableFor(managed.Key) {
+		t.Fatal("endpoint-scoped readiness did not remain isolated")
+	}
+	if state.AvailableFor(driver.EndpointKey{HostID: "host", StoreID: "external-store", TmuxServerDomainID: "flowbee"}) {
+		t.Fatal("mixed host/store/domain tuple received routing authority")
+	}
+	state.Update(managed.InstanceRef, api.DriverControlReadiness{Required: true, Available: true, Status: "ready"})
+	if !state.Available() {
+		t.Fatalf("all exact endpoint proofs should make the capability inventory ready: %+v", state.Snapshot())
+	}
+	state.Update(external.InstanceRef, api.DriverControlReadiness{Required: true, Status: "route_unavailable", Reason: "revoked"})
+	got := state.Snapshot()
+	if got.Available || !strings.Contains(got.Reason, "external-default: revoked") {
+		t.Fatalf("revoked external domain did not close aggregate inventory proof: %+v", got)
+	}
+	// Unknown references are ignored; a caller cannot add or overwrite routing
+	// authority after the immutable inventory has been constructed.
+	state.Update("single-default-fallback", api.DriverControlReadiness{Required: true, Available: true, Status: "ready"})
+	if state.EndpointSnapshot("single-default-fallback").Available || state.Snapshot().Available {
+		t.Fatal("unknown endpoint reference became routing authority")
 	}
 }

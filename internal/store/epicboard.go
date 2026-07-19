@@ -32,7 +32,14 @@ func (s *Store) EpicDigestSeq(ctx context.Context) (int64, error) {
 		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM wip_markers
 		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM epic_deliveries
 		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM epic_artifacts
-		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM epic_actions`)
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM epic_actions
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM projects
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM project_repos
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM project_actor_routes
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM driver_session_bindings
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM project_circuit_breakers
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM project_scheduler_state
+		UNION ALL SELECT COALESCE(MAX(created_at),'') FROM project_scheduler_turns`)
 	if err != nil {
 		return 0, err
 	}

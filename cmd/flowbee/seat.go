@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,20 +18,22 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/acctprobe"
+	"github.com/samhotchkiss/flowbee/internal/capacitycollector"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/config"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
-// runSeat is the `flowbee seat <add|list|probe|discover|bind-capacity|bind-driver>` CLI: the SEAT registry (plan
+// runSeat is the `flowbee seat <add|list|probe|capacity-probe|discover|bind-capacity|bind-driver>` CLI: the SEAT registry (plan
 // §15.13, 0028_epic_capacity.sql) — where each account is already logged-in-and-usable
-// on a box. Store-direct like `flowbee host` (pure registry CRUD, no serve round-trip).
+// on a box. Mutations are offline registry operations and take the same exclusive
+// writer lock as serve; list remains available while the control plane is live.
 // Flowbee NEVER logs in; discovery only READS what a human already authenticated, and
 // this command NEVER prints a token or secret value (acctprobe's parsers only surface
 // non-secret identity + server percentages).
 func runSeat(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: flowbee seat <add|list|probe|discover|bind-capacity|bind-driver> ...")
+		return fmt.Errorf("usage: flowbee seat <add|list|probe|capacity-probe|discover|bind-capacity|bind-driver> ...")
 	}
 	sub, rest := args[0], args[1:]
 
@@ -44,6 +47,11 @@ func runSeat(args []string) error {
 		return err
 	}
 	defer st.Close()
+	if sub != "list" && sub != "ls" && sub != "capacity-probe" {
+		if err := st.AcquireWriterLock(); err != nil {
+			return fmt.Errorf("seat inventory mutation requires the control-plane writer to be stopped: %w", err)
+		}
+	}
 
 	switch sub {
 	case "add":
@@ -52,6 +60,8 @@ func runSeat(args []string) error {
 		return runSeatList(ctx, st, rest)
 	case "probe":
 		return runSeatProbe(ctx, st, rest)
+	case "capacity-probe":
+		return runSeatCapacityProbe(ctx, st, rest)
 	case "discover":
 		return runSeatDiscover(ctx, st, rest)
 	case "set-max-concurrent":
@@ -61,8 +71,120 @@ func runSeat(args []string) error {
 	case "bind-driver":
 		return runSeatBindDriver(ctx, st, rest)
 	default:
-		return fmt.Errorf("unknown `flowbee seat` subcommand %q (want add|list|probe|discover|set-max-concurrent|bind-capacity|bind-driver)", sub)
+		return fmt.Errorf("unknown `flowbee seat` subcommand %q (want add|list|probe|capacity-probe|discover|set-max-concurrent|bind-capacity|bind-driver)", sub)
 	}
+}
+
+type capacityIdentityObservation struct {
+	SeatID            string    `json:"seat_id"`
+	HostID            string    `json:"host_id"`
+	Provider          string    `json:"provider"`
+	AccountKey        string    `json:"account_key"`
+	CredentialLineage string    `json:"credential_lineage"`
+	Source            string    `json:"source"`
+	TrustState        string    `json:"trust_state"`
+	CapturedAt        time.Time `json:"captured_at"`
+}
+
+type capacityLiveProber interface {
+	ProbeLive(context.Context, capacitycollector.Seat) (capacitycollector.ProbeResult, error)
+}
+
+// runSeatCapacityProbe uses the exact production v2 provider adapter to reveal
+// the non-secret identity facts an operator must approve before bind-capacity.
+// It never updates the seat or active generation and remains safe while serve is
+// running. Remote homes stay fail-closed until an authenticated remote collector
+// transport exists; this command never substitutes SSH or cached usage.
+func runSeatCapacityProbe(ctx context.Context, st *store.Store, args []string) error {
+	fs := flag.NewFlagSet("seat capacity-probe", flag.ContinueOnError)
+	box := fs.String("box", "", "registered host identity; only the local empty box is currently supported")
+	family := fs.String("family", "", "agent family: claude|codex|grok (required)")
+	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR / GROK_HOME")
+	codexHome := fs.String("codex-home", "", "CODEX_HOME for a codex seat")
+	hostID := fs.String("host-id", "", "authenticated local capacity collector host identity (required)")
+	jsonOutput := fs.Bool("json", false, "emit machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *family == "" || *hostID == "" {
+		return errors.New("usage: flowbee seat capacity-probe --family <claude|codex|grok> [--config-dir D | --codex-home D] --host-id <id> [--json]")
+	}
+	seatRef := store.Seat{Box: *box, AgentFamily: *family, ConfigDir: *configDir, CodexHome: *codexHome}
+	seat, err := st.GetSeat(ctx, seatRef.ComposeID())
+	if err != nil {
+		return err
+	}
+	obs, err := observeCapacityIdentity(ctx, capacitycollector.AcctProbe{}, seat, *hostID)
+	if err != nil {
+		return err
+	}
+	if *jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"schema_version": "flowbee.capacity-identity-observation/v1", "observation": obs,
+		})
+	}
+	fmt.Printf("seat=%s host=%s provider=%s account=%s lineage=%s source=%s trust=%s captured=%s\n",
+		obs.SeatID, obs.HostID, obs.Provider, obs.AccountKey, obs.CredentialLineage,
+		obs.Source, obs.TrustState, obs.CapturedAt.UTC().Format(time.RFC3339))
+	fmt.Printf("Next (explicit approval, while serve is stopped): flowbee seat bind-capacity --box %q --family %s %s --host-id %q --account-key %q --credential-lineage %q\n",
+		seat.Box, seat.AgentFamily, seatIdentityFlag(seat), obs.HostID, obs.AccountKey, obs.CredentialLineage)
+	return nil
+}
+
+func observeCapacityIdentity(ctx context.Context, probe capacityLiveProber, seat store.Seat,
+	hostID string) (capacityIdentityObservation, error) {
+	if probe == nil || hostID == "" || seat.ID == "" || seat.Box != "" {
+		return capacityIdentityObservation{}, errors.New("capacity identity discovery requires a registered local seat and explicit host id")
+	}
+	configHome := seat.ConfigDir
+	if seat.AgentFamily == "codex" {
+		configHome = seat.CodexHome
+	}
+	report, err := probe.ProbeLive(ctx, capacitycollector.Seat{
+		ID: seat.ID, HostID: hostID, Provider: seat.AgentFamily, ConfigHome: configHome,
+		ExpectedOrgFingerprint: seat.ExtraEnv["FLOWBEE_EXPECTED_ORG_FINGERPRINT"], Local: true,
+	})
+	if err != nil {
+		return capacityIdentityObservation{}, fmt.Errorf("live v2 capacity probe: %w", err)
+	}
+	if report.Result == nil {
+		return capacityIdentityObservation{}, errors.New("live v2 capacity probe returned no result")
+	}
+	r := report.Result
+	lineage := r.Identity.LineageDigest
+	if lineage == "" {
+		lineage = r.Identity.CredentialDigest
+	}
+	obs := capacityIdentityObservation{SeatID: seat.ID, HostID: hostID,
+		Provider: string(r.Identity.Provider), AccountKey: r.Identity.AccountKey,
+		CredentialLineage: lineage, Source: normalizeCapacityProbeSource(r.Source), TrustState: string(r.TrustState),
+		CapturedAt: r.CapturedAt}
+	live := obs.Source == "live_app_server" || obs.Source == "live_billing"
+	if obs.Provider != seat.AgentFamily || obs.AccountKey == "" || obs.CredentialLineage == "" ||
+		!r.Identity.Verified || obs.TrustState != string(acctprobe.TrustVerified) || !live || obs.CapturedAt.IsZero() {
+		return capacityIdentityObservation{}, fmt.Errorf("live v2 capacity identity is not bindable (provider=%q account_present=%t lineage_present=%t verified=%t source=%q captured=%t)",
+			obs.Provider, obs.AccountKey != "", obs.CredentialLineage != "", r.Identity.Verified,
+			obs.Source, !obs.CapturedAt.IsZero())
+	}
+	return obs, nil
+}
+
+func normalizeCapacityProbeSource(source string) string {
+	switch source {
+	case "codex_app_server":
+		return "live_app_server"
+	case "grok_billing_api", "anthropic_usage_api":
+		return "live_billing"
+	default:
+		return source
+	}
+}
+
+func seatIdentityFlag(seat store.Seat) string {
+	if seat.AgentFamily == "codex" {
+		return fmt.Sprintf("--codex-home %q", seat.CodexHome)
+	}
+	return fmt.Sprintf("--config-dir %q", seat.ConfigDir)
 }
 
 // runSeatBindDriver explicitly joins a capacity seat to a configured Driver
@@ -77,6 +199,7 @@ func runSeatBindDriver(ctx context.Context, st *store.Store, args []string) erro
 	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR / GROK_HOME")
 	codexHome := fs.String("codex-home", "", "CODEX_HOME for a codex seat")
 	instanceRef := fs.String("instance-ref", "", "Flowbee Driver inventory key (required)")
+	domainID := fs.String("tmux-server-domain-id", "", "Driver tmux server domain (required)")
 	serverID := fs.String("tmux-server-instance-id", "", "Driver tmux server incarnation (required)")
 	profileID := fs.String("profile-id", "", "Driver launch profile identity (required)")
 	workspaceRootID := fs.String("workspace-root-id", "", "Driver workspace root identity (required)")
@@ -85,9 +208,9 @@ func runSeatBindDriver(ctx context.Context, st *store.Store, args []string) erro
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 0 || *family == "" || *instanceRef == "" || *serverID == "" ||
+	if fs.NArg() != 0 || *family == "" || *instanceRef == "" || *domainID == "" || *serverID == "" ||
 		*profileID == "" || *workspaceRootID == "" || *workspaceBase == "" {
-		return errors.New("usage: flowbee seat bind-driver --box <stable-host-id> --family <claude|codex|grok> [--config-dir D | --codex-home D] --instance-ref <ref> --tmux-server-instance-id <id> --profile-id <id> --workspace-root-id <id> --workspace-relative-base <path> [--project-id P]")
+		return errors.New("usage: flowbee seat bind-driver --box <stable-host-id> --family <claude|codex|grok> [--config-dir D | --codex-home D] --instance-ref <ref> --tmux-server-domain-id <domain> --tmux-server-instance-id <id> --profile-id <id> --workspace-root-id <id> --workspace-relative-base <path> [--project-id P]")
 	}
 	seat := store.Seat{Box: *box, AgentFamily: *family, ConfigDir: *configDir, CodexHome: *codexHome}
 	id := seat.ComposeID()
@@ -100,7 +223,7 @@ func runSeatBindDriver(ctx context.Context, st *store.Store, args []string) erro
 	}
 	if err := st.UpsertBuilderDriverTarget(ctx, store.BuilderDriverTarget{
 		ProjectID: *projectID, SeatID: id, InstanceRef: *instanceRef,
-		TmuxServerInstanceID: *serverID, ProfileID: *profileID,
+		TmuxServerDomainID: *domainID, TmuxServerInstanceID: *serverID, ProfileID: *profileID,
 		WorkspaceRootID: *workspaceRootID, WorkspaceRelativeBase: *workspaceBase,
 		Enabled: !*disabled,
 	}, time.Now()); err != nil {

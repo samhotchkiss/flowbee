@@ -22,25 +22,32 @@ type builderLaunchHarness struct {
 }
 
 func newBuilderLaunchHarness(t *testing.T, maximum int) builderLaunchHarness {
+	return newBuilderLaunchHarnessForHost(t, maximum, "host-build", "host-build")
+}
+
+// newBuilderLaunchHarnessForHost separates the legacy execution locator
+// (seats.box) from the authenticated v2 host identity. A local seat has an empty
+// locator and is still bound to a concrete Driver/capacity host.
+func newBuilderLaunchHarnessForHost(t *testing.T, maximum int, seatBox, capacityHost string) builderLaunchHarness {
 	t.Helper()
 	ctx := context.Background()
 	st := testutil.NewStore(t)
 	st.EnableCapacityV2 = true
 	st.EnableDriverControlOrigin = true // future-capability fake route
 	now := time.Date(2026, 7, 19, 19, 0, 0, 0, time.UTC)
-	seat := store.Seat{Box: "host-build", AgentFamily: "codex", CodexHome: "/codex/build",
+	seat := store.Seat{Box: seatBox, AgentFamily: "codex", CodexHome: "/codex/build",
 		Health: store.SeatReady, MaxConcurrent: maximum}
 	if err := st.AddSeat(ctx, seat, now); err != nil {
 		t.Fatal(err)
 	}
 	seat.ID = seat.ComposeID()
 	if err := st.BindCapacitySeatIdentity(ctx, store.CapacitySeatIdentity{SeatID: seat.ID,
-		HostID: seat.Box, AccountKey: "account-build", CredentialLineage: "lineage-build",
+		HostID: capacityHost, AccountKey: "account-build", CredentialLineage: "lineage-build",
 		ReservePct: 10, AccountMaximum: maximum}, now); err != nil {
 		t.Fatal(err)
 	}
 	obs := store.CapacitySeatObservation{ObservationID: "builder-observation", SeatID: seat.ID,
-		HostID: seat.Box, Provider: "codex", AccountKey: "account-build",
+		HostID: capacityHost, Provider: "codex", AccountKey: "account-build",
 		CredentialLineage: "lineage-build", CollectorID: "collector-build",
 		Source: "live_app_server", TrustState: "verified", IntegrityState: "verified",
 		Windows:   []capacity.RouteWindow{{Kind: "weekly", Applicable: true, Known: true, Percent: 20}},
@@ -68,11 +75,22 @@ func newBuilderLaunchHarness(t *testing.T, maximum int) builderLaunchHarness {
 		Observations: []store.CapacitySeatObservation{obs, reviewObs}}, now); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
+		ProjectID: "default", WorkerIdentity: "builder-harness-reviewer", Role: store.DriverReviewerRole,
+		SeatID: reviewer.ID, HostID: reviewer.Box, StoreID: "store-review",
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-review",
+		LifecycleOwnership: "driver_managed", LifecycleKey: "builder-harness-reviewer",
+		TargetEpoch: 1, ProfileID: "grok-reviewer", WorkspaceRootID: "workspace-review",
+		WorkspaceRelativePath: "russ", SessionID: "review-session", PaneInstanceID: "review-pane",
+		AgentRunID: "review-run", Provider: "grok", ObservedAt: now,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
 	stamp := now.UTC().Format(time.RFC3339Nano)
 	instanceRef := "builder-driver"
 	if _, err := st.DB.ExecContext(ctx, `INSERT INTO driver_instances
-		(instance_ref,host_id,store_id,producer_boot_id,state,created_at,updated_at)
-		VALUES (?,?,?,'boot-builder','live',?,?)`, instanceRef, seat.Box, "store-build", stamp, stamp); err != nil {
+		(instance_ref,host_id,store_id,producer_boot_id,tmux_server_domain_id,tmux_server_ownership,state,created_at,updated_at)
+		VALUES (?,?,?,'boot-builder','flowbee','managed_dedicated','live',?,?)`, instanceRef, capacityHost, "store-build", stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.DB.ExecContext(ctx, `INSERT INTO driver_observation_cursors
@@ -81,14 +99,14 @@ func newBuilderLaunchHarness(t *testing.T, maximum int) builderLaunchHarness {
 		t.Fatal(err)
 	}
 	if err := st.UpsertBuilderDriverTarget(ctx, store.BuilderDriverTarget{ProjectID: "default",
-		SeatID: seat.ID, InstanceRef: instanceRef, TmuxServerInstanceID: "server-build",
+		SeatID: seat.ID, InstanceRef: instanceRef, TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-build",
 		ProfileID: "codex-builder", WorkspaceRootID: "workspace-build",
 		WorkspaceRelativeBase: "repos", Enabled: true}, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		ProjectID: "default", WorkerIdentity: store.DriverControlIdentity, Role: store.DriverControlRole,
-		HostID: seat.Box, StoreID: "store-build", TmuxServerInstanceID: "server-build",
+		HostID: capacityHost, StoreID: "store-build", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-build", LifecycleOwnership: "driver_managed",
 		LifecycleKey: "flowbee-control", TargetEpoch: 1, ProfileID: "flowbee-control",
 		WorkspaceRootID: "workspace-build", WorkspaceRelativePath: "control",
 		SessionID: "flowbee-control-session", PaneInstanceID: "flowbee-control-pane",
@@ -97,6 +115,99 @@ func newBuilderLaunchHarness(t *testing.T, maximum int) builderLaunchHarness {
 		t.Fatal(err)
 	}
 	return builderLaunchHarness{st: st, seat: seat, now: now, instanceRef: instanceRef}
+}
+
+func TestBuilderLaunchCapacityV2UsesBoundLocalIdentityAndFailsClosedOnDrift(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("local seat routes by expected host and account", func(t *testing.T) {
+		h := newBuilderLaunchHarnessForHost(t, 1, "", "driver-host-local")
+		h.addEpic(t, "launch-local")
+		rep, err := h.st.ReconcileBuilderLaunches(ctx, h.now.Add(time.Minute),
+			5*time.Minute, "codex", 5)
+		if err != nil || rep.ActionsCreated != 1 || rep.CapacityHeld != 0 {
+			t.Fatalf("local launch reconcile=%+v err=%v", rep, err)
+		}
+		var targetHost, accountKey string
+		if err := h.st.DB.QueryRowContext(ctx, `SELECT target_host_id FROM epic_actions
+			WHERE epic_id='launch-local' AND kind='builder_launch'`).Scan(&targetHost); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.st.DB.QueryRowContext(ctx, `SELECT account_key FROM epics
+			WHERE id='launch-local'`).Scan(&accountKey); err != nil {
+			t.Fatal(err)
+		}
+		if targetHost != "driver-host-local" || accountKey != "account-build" {
+			t.Fatalf("target_host=%q account_key=%q", targetHost, accountKey)
+		}
+	})
+
+	t.Run("changed credential lineage fences the active generation", func(t *testing.T) {
+		h := newBuilderLaunchHarnessForHost(t, 1, "", "driver-host-local")
+		// Operator expectations are authority. Rebinding invalidates the older
+		// active projection immediately; routing must wait for a new observation
+		// of the newly approved credential incarnation.
+		if err := h.st.BindCapacitySeatIdentity(ctx, store.CapacitySeatIdentity{
+			SeatID: h.seat.ID, HostID: "driver-host-local", AccountKey: "account-build",
+			CredentialLineage: "lineage-replaced", ReservePct: 10, AccountMaximum: 1,
+		}, h.now.Add(30*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		h.addEpic(t, "launch-lineage-drift")
+		rep, err := h.st.ReconcileBuilderLaunches(ctx, h.now.Add(time.Minute),
+			5*time.Minute, "codex", 5)
+		if err != nil || rep.ActionsCreated != 0 || rep.CapacityHeld != 1 {
+			t.Fatalf("lineage-drift reconcile=%+v err=%v", rep, err)
+		}
+		var actions int
+		var hold string
+		_ = h.st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM epic_actions
+			WHERE epic_id='launch-lineage-drift' AND kind='builder_launch'`).Scan(&actions)
+		_ = h.st.DB.QueryRowContext(ctx, `SELECT hold_kind FROM epic_deliveries
+			WHERE epic_id='launch-lineage-drift'`).Scan(&hold)
+		if actions != 0 || hold != "builder_capacity_unavailable" {
+			t.Fatalf("actions=%d hold=%q", actions, hold)
+		}
+	})
+
+	t.Run("stale observation fences local target", func(t *testing.T) {
+		h := newBuilderLaunchHarnessForHost(t, 1, "", "driver-host-local")
+		h.addEpic(t, "launch-stale-local")
+		rep, err := h.st.ReconcileBuilderLaunches(ctx, h.now.Add(6*time.Minute),
+			5*time.Minute, "codex", 5)
+		if err != nil || rep.ActionsCreated != 0 || rep.CapacityHeld != 1 {
+			t.Fatalf("stale local reconcile=%+v err=%v", rep, err)
+		}
+		var actions int
+		_ = h.st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM epic_actions
+			WHERE epic_id='launch-stale-local' AND kind='builder_launch'`).Scan(&actions)
+		if actions != 0 {
+			t.Fatalf("stale capacity created %d launch actions", actions)
+		}
+	})
+
+	t.Run("capacity v2 disabled preserves legacy box and account", func(t *testing.T) {
+		h := newBuilderLaunchHarness(t, 1)
+		h.st.EnableCapacityV2 = false
+		if _, err := h.st.DB.ExecContext(ctx, `UPDATE seats SET account_key='legacy-account'
+			WHERE id=?`, h.seat.ID); err != nil {
+			t.Fatal(err)
+		}
+		h.addEpic(t, "launch-legacy-identity")
+		rep, err := h.st.ReconcileBuilderLaunches(ctx, h.now.Add(time.Minute),
+			5*time.Minute, "codex", 5)
+		if err != nil || rep.ActionsCreated != 1 {
+			t.Fatalf("legacy launch reconcile=%+v err=%v", rep, err)
+		}
+		var accountKey string
+		if err := h.st.DB.QueryRowContext(ctx, `SELECT account_key FROM epics
+			WHERE id='launch-legacy-identity'`).Scan(&accountKey); err != nil {
+			t.Fatal(err)
+		}
+		if accountKey != "legacy-account" {
+			t.Fatalf("legacy account_key=%q", accountKey)
+		}
+	})
 }
 
 func (h builderLaunchHarness) addEpic(t *testing.T, id string) {
@@ -300,7 +411,7 @@ func insertBuilderContractEvidence(t *testing.T, h builderLaunchHarness, action 
 		ProducerBootID: "boot-builder", Kind: "message.completed",
 		ObservedAt: h.now.Add(7 * time.Minute).UTC().Format(time.RFC3339Nano),
 		Identity: driver.Identity{HostID: action.TargetHostID, StoreID: action.TargetStoreID,
-			TmuxServerInstanceID: action.TargetServerID, SessionID: action.RecipientSessionID,
+			TmuxServerDomainID: "flowbee", TmuxServerInstanceID: action.TargetServerID, SessionID: action.RecipientSessionID,
 			PaneInstanceID: action.RecipientPaneInstanceID, AgentRunID: action.RecipientAgentRunID,
 			StateCursor: "tdc2.builder-contract"}, Source: source,
 		Correlation: json.RawMessage(`{"turn_id":"turn-builder","message_id":"builder-contract-message","tool_call_id":null,"attention_id":null}`),

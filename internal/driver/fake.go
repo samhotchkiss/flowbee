@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -17,12 +18,17 @@ type FakePort struct {
 	Sessions            map[string]Identity
 	Receipts            map[string]Receipt
 	LifecycleReceipts   map[string]LifecycleReceipt
+	Watches             map[string]ExternalWatch
 	Observations        []Observation
 	Batches             []ObservationBatch
 	ObserveCalls        []string
 	SendRequests        []SendRequest
 	SendCalls           int
 	EnsureCalls         int
+	WatchCalls          int
+	AdoptCalls          int
+	ReattachCalls       int
+	ReleaseCalls        int
 	StopCalls           int
 	NextStatus          ReceiptStatus
 	NextLifecycleStatus string
@@ -30,7 +36,12 @@ type FakePort struct {
 }
 
 func NewFake() *FakePort {
-	return &FakePort{Capability: ControlOriginCapability{
+	return &FakePort{Meta: DriverMetadata{
+		LifecycleControl: true,
+		TmuxServer: TmuxServerMetadata{DomainID: "flowbee", Ownership: "managed_dedicated",
+			InstanceID: "00000000-0000-4000-8000-000000000003", ConnectionVisibility: "isolated_socket"},
+		Contracts: defaultDriverContractCapabilities(),
+	}, Capability: ControlOriginCapability{
 		FormatVersion: controlOriginCapabilityFormat, Supported: true, Authorized: true,
 		PrincipalID: "flowbee-control", PrincipalKind: "control_plane",
 		RequiredScopes:   []string{"messages:send", "routes:manage"},
@@ -38,7 +49,120 @@ func NewFake() *FakePort {
 		RouteGrantFormat: controlRouteGrantFormat, DeliveryReceiptFormat: controlDeliveryReceiptFormat,
 		GrantEndpoint: "/v2/routes/grants", MessageEndpoint: "/v2/messages",
 		OnBehalfOfSessionIDRule: "forbidden",
-	}, Grants: map[string]Grant{}, Sessions: map[string]Identity{}, Receipts: map[string]Receipt{}, LifecycleReceipts: map[string]LifecycleReceipt{}}
+	}, Grants: map[string]Grant{}, Sessions: map[string]Identity{}, Receipts: map[string]Receipt{},
+		LifecycleReceipts: map[string]LifecycleReceipt{}, Watches: map[string]ExternalWatch{}}
+}
+
+func (f *FakePort) EnsureExternalWatch(_ context.Context, paneID, provider, profile string) (ExternalWatch, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(paneID) < 2 || paneID[0] != '%' || provider == "" || (profile != "interactive" && profile != "build") {
+		return ExternalWatch{}, ErrIdentityMismatch
+	}
+	if watch, ok := f.Watches[paneID]; ok {
+		if watch.Provider != provider || watch.Profile != profile {
+			return ExternalWatch{}, ErrIdentityMismatch
+		}
+		return watch, nil
+	}
+	f.WatchCalls++
+	watch := ExternalWatch{WatchID: fmt.Sprintf("00000000-0000-4000-8000-%012d", f.WatchCalls),
+		PaneID: paneID, Enabled: true, Lifecycle: "active", Provider: provider, Profile: profile}
+	f.Watches[paneID] = watch
+	return watch, nil
+}
+
+func (f *FakePort) AdoptSession(_ context.Context, t SessionTarget, a Action) (LifecycleReceipt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.LifecycleReceipts[a.ActionID]; ok {
+		return r, nil
+	}
+	if !fakeHasWatch(f.Watches, t.ExternalWatchID) || t.Identity.Ownership != "" ||
+		t.LifecycleKey == "" || t.TargetEpoch < 1 || t.ProfileID == "" ||
+		t.LeaseID == "" || t.LeaseEpoch < 1 || !identityHasExactDriverTuple(t.Identity) {
+		return LifecycleReceipt{}, ErrIdentityMismatch
+	}
+	f.AdoptCalls++
+	after := t.Identity
+	after.LifecycleKey, after.TargetEpoch, after.Ownership = t.LifecycleKey, t.TargetEpoch, "external_observed"
+	f.Sessions[after.SessionID] = after
+	r := LifecycleReceipt{FormatVersion: "tmux-driver.lifecycle-receipt/v2",
+		LifecycleReceiptID: "lifecycle-" + a.ActionID, Operation: "adopt",
+		ActionID: a.ActionID, ActionEpoch: a.Epoch, LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch,
+		LifecycleKey: t.LifecycleKey, TmuxServerDomainID: after.TmuxServerDomainID,
+		ExternalWatchID: t.ExternalWatchID, TargetEpoch: t.TargetEpoch, Status: "adopted", IdentityAfter: after}
+	f.LifecycleReceipts[a.ActionID] = r
+	return r, nil
+}
+
+func (f *FakePort) ReleaseSession(_ context.Context, t SessionTarget, a Action) (LifecycleReceipt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.LifecycleReceipts[a.ActionID]; ok {
+		return r, nil
+	}
+	if !fakeHasWatch(f.Watches, t.ExternalWatchID) || t.Identity.Ownership != "external_observed" ||
+		t.LifecycleKey == "" || t.TargetEpoch < 1 || t.LeaseID == "" || t.LeaseEpoch < 1 ||
+		!identityHasExactDriverTuple(t.Identity) {
+		return LifecycleReceipt{}, ErrIdentityMismatch
+	}
+	f.ReleaseCalls++
+	if current, ok := f.Sessions[t.Identity.SessionID]; ok {
+		current.Ownership, current.LifecycleKey, current.TargetEpoch = "", "", 0
+		f.Sessions[current.SessionID] = current
+	}
+	r := LifecycleReceipt{FormatVersion: "tmux-driver.lifecycle-receipt/v2",
+		LifecycleReceiptID: "lifecycle-" + a.ActionID, Operation: "release",
+		ActionID: a.ActionID, ActionEpoch: a.Epoch, LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch,
+		LifecycleKey: t.LifecycleKey, TmuxServerDomainID: t.Identity.TmuxServerDomainID,
+		ExternalWatchID: t.ExternalWatchID, TargetEpoch: t.TargetEpoch, Status: "released", IdentityBefore: t.Identity}
+	f.LifecycleReceipts[a.ActionID] = r
+	return r, nil
+}
+
+func (f *FakePort) ReattachSession(_ context.Context, t SessionTarget, a Action) (LifecycleReceipt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.LifecycleReceipts[a.ActionID]; ok {
+		return r, nil
+	}
+	if !identityHasExactDriverTuple(t.Identity) || t.LifecycleKey == "" || t.TargetEpoch < 1 ||
+		t.LeaseID == "" || t.LeaseEpoch < 1 ||
+		(t.Identity.Ownership != "driver_managed" && t.Identity.Ownership != "external_observed") ||
+		(t.Identity.Ownership == "external_observed" && (!fakeHasWatch(f.Watches, t.ExternalWatchID))) {
+		return LifecycleReceipt{}, ErrIdentityMismatch
+	}
+	current, ok := f.Sessions[t.Identity.SessionID]
+	if !ok || !lifecycleIdentityMatches(current, t.Identity) {
+		return LifecycleReceipt{}, ErrIdentityMismatch
+	}
+	f.ReattachCalls++
+	r := LifecycleReceipt{FormatVersion: "tmux-driver.lifecycle-receipt/v2",
+		LifecycleReceiptID: "lifecycle-" + a.ActionID, Operation: "reattach",
+		ActionID: a.ActionID, ActionEpoch: a.Epoch, LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch,
+		LifecycleKey: t.LifecycleKey, TmuxServerDomainID: t.Identity.TmuxServerDomainID,
+		ExternalWatchID: t.ExternalWatchID, TargetEpoch: t.TargetEpoch, Status: "reattached",
+		IdentityBefore: t.Identity, IdentityAfter: current}
+	f.LifecycleReceipts[a.ActionID] = r
+	return r, nil
+}
+
+func fakeHasWatch(watches map[string]ExternalWatch, watchID string) bool {
+	if watchID == "" {
+		return false
+	}
+	for _, watch := range watches {
+		if watch.WatchID == watchID && watch.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+func identityHasExactDriverTuple(id Identity) bool {
+	return id.HostID != "" && id.StoreID != "" && id.TmuxServerDomainID != "" &&
+		id.TmuxServerInstanceID != "" && id.SessionID != "" && id.PaneInstanceID != "" && id.AgentRunID != ""
 }
 
 func (f *FakePort) ControlOriginCapability(_ context.Context) (ControlOriginCapability, error) {
@@ -76,8 +200,11 @@ func (f *FakePort) EnsureSession(_ context.Context, t SessionTarget, _ Action) (
 	if t.Identity.StoreID == "" || t.Identity.SessionID == "" || t.Identity.PaneInstanceID == "" {
 		return Identity{}, ErrIdentityMismatch
 	}
-	if current, ok := f.Sessions[t.Identity.SessionID]; ok && current != t.Identity {
-		return Identity{}, ErrIdentityMismatch
+	if current, ok := f.Sessions[t.Identity.SessionID]; ok {
+		if !identityMatchesTarget(current, t) {
+			return Identity{}, ErrIdentityMismatch
+		}
+		return current, nil
 	}
 	return t.Identity, nil
 }
@@ -85,7 +212,8 @@ func (f *FakePort) EnsureSession(_ context.Context, t SessionTarget, _ Action) (
 func (f *FakePort) EnsureLifecycleSession(_ context.Context, t SessionTarget, a Action) (LifecycleReceipt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if t.Identity.StoreID == "" || t.Identity.HostID == "" || t.Identity.TmuxServerInstanceID == "" ||
+	if t.Identity.StoreID == "" || t.Identity.HostID == "" || t.Identity.TmuxServerDomainID == "" ||
+		t.Identity.TmuxServerInstanceID == "" ||
 		t.LifecycleKey == "" || t.TargetEpoch < 1 {
 		return LifecycleReceipt{}, ErrIdentityMismatch
 	}
@@ -103,15 +231,18 @@ func (f *FakePort) EnsureLifecycleSession(_ context.Context, t SessionTarget, a 
 		id.AgentRunID = "run-" + a.ActionID
 	}
 	id.LifecycleKey, id.TargetEpoch = t.LifecycleKey, t.TargetEpoch
+	id.Ownership = "driver_managed"
 	if id.SessionID == "" || id.PaneInstanceID == "" || id.AgentRunID == "" {
 		return LifecycleReceipt{}, ErrIdentityMismatch
 	}
 	f.EnsureCalls++
 	f.Sessions[id.SessionID] = id
-	r := LifecycleReceipt{LifecycleReceiptID: "lifecycle-" + a.ActionID,
-		Operation: "ensure", ActionID: a.ActionID, ActionEpoch: a.Epoch,
+	r := LifecycleReceipt{FormatVersion: "tmux-driver.lifecycle-receipt/v2",
+		LifecycleReceiptID: "lifecycle-" + a.ActionID,
+		Operation:          "ensure", ActionID: a.ActionID, ActionEpoch: a.Epoch,
 		LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch, LifecycleKey: t.LifecycleKey,
-		TargetEpoch: t.TargetEpoch, Status: "ensured", IdentityAfter: id}
+		TmuxServerDomainID: id.TmuxServerDomainID, TargetEpoch: t.TargetEpoch,
+		Status: "ensured", IdentityAfter: id}
 	f.LifecycleReceipts[a.ActionID] = r
 	return r, nil
 }
@@ -124,15 +255,17 @@ func (f *FakePort) StopSession(_ context.Context, t SessionTarget, a Action) (Li
 	}
 	id := t.Identity
 	if id.SessionID == "" || id.PaneInstanceID == "" || id.AgentRunID == "" ||
-		id.StoreID == "" || id.HostID == "" || id.TmuxServerInstanceID == "" {
+		id.StoreID == "" || id.HostID == "" || id.TmuxServerDomainID == "" || id.TmuxServerInstanceID == "" {
 		return LifecycleReceipt{}, ErrIdentityMismatch
 	}
 	f.StopCalls++
 	delete(f.Sessions, id.SessionID)
-	r := LifecycleReceipt{LifecycleReceiptID: "lifecycle-" + a.ActionID,
-		Operation: "stop", ActionID: a.ActionID, ActionEpoch: a.Epoch,
+	r := LifecycleReceipt{FormatVersion: "tmux-driver.lifecycle-receipt/v2",
+		LifecycleReceiptID: "lifecycle-" + a.ActionID,
+		Operation:          "stop", ActionID: a.ActionID, ActionEpoch: a.Epoch,
 		LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch, LifecycleKey: t.LifecycleKey,
-		TargetEpoch: t.TargetEpoch, Status: "stopped", IdentityBefore: id,
+		TmuxServerDomainID: id.TmuxServerDomainID, TargetEpoch: t.TargetEpoch,
+		Status: "stopped", IdentityBefore: id,
 		AbsenceObservedAt: "2026-07-19T00:00:00Z"}
 	f.LifecycleReceipts[a.ActionID] = r
 	return r, nil
@@ -188,6 +321,17 @@ func (f *FakePort) LifecycleTargetPresence(_ context.Context, lifecycleKey strin
 func (f *FakePort) Grant(_ context.Context, g Grant) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if g.SenderPrincipalID != "" {
+		if g.SenderSessionID != "" || g.SenderAgentRunID != "" || g.ExpectedRecipientAgentRunID == "" {
+			return ErrIdentityMismatch
+		}
+		if current, ok := f.Sessions[g.RecipientSessionID]; ok &&
+			current.AgentRunID != g.ExpectedRecipientAgentRunID {
+			return ErrIdentityMismatch
+		}
+	} else if g.ExpectedRecipientAgentRunID != "" {
+		return ErrIdentityMismatch
+	}
 	if existing, ok := f.Grants[g.GrantID]; ok && existing != g {
 		return ErrIdempotencyBody
 	}
@@ -227,9 +371,10 @@ func (f *FakePort) Send(_ context.Context, req SendRequest) (Receipt, error) {
 	}
 	r := Receipt{DeliveryID: "delivery-" + req.ActionID, ActionID: req.ActionID, GrantID: req.GrantID,
 		GrantEpoch: req.GrantEpoch, Sender: Identity{SessionID: g.SenderSessionID, AgentRunID: g.SenderAgentRunID},
-		SenderPrincipalID: g.SenderPrincipalID,
-		Recipient:         Identity{SessionID: req.RecipientSessionID, PaneInstanceID: req.RecipientPaneInstanceID},
-		PayloadSHA256:     req.PayloadSHA256, Status: status, CompatibilityCode: 0}
+		SenderPrincipalID:           g.SenderPrincipalID,
+		Recipient:                   Identity{SessionID: req.RecipientSessionID, PaneInstanceID: req.RecipientPaneInstanceID},
+		ExpectedRecipientAgentRunID: req.ExpectedRecipientAgentRunID,
+		PayloadSHA256:               req.PayloadSHA256, Status: status, CompatibilityCode: 0}
 	f.Receipts[req.ActionID] = r
 	return r, nil
 }

@@ -14,6 +14,19 @@ func fixtureGrant() Grant {
 	return Grant{GrantID: "g1", SenderSessionID: "a", SenderAgentRunID: "run-a", RecipientSessionID: "b", RecipientPaneInstanceID: "pane-b", Epoch: 4, MaximumPayloadBytes: 1000}
 }
 
+func TestLifecycleReceiptResolvedStatusesIncludeReattach(t *testing.T) {
+	for _, status := range []string{"ensured", "stopped", "target_absent", "adopted", "reattached", "released"} {
+		if !(LifecycleReceipt{Status: status}).Resolved() {
+			t.Fatalf("terminal lifecycle status %q was not resolved", status)
+		}
+	}
+	for _, status := range []string{"accepted", "executing", "verifying", "uncertain", "failed"} {
+		if (LifecycleReceipt{Status: status}).Resolved() {
+			t.Fatalf("non-terminal lifecycle status %q was resolved", status)
+		}
+	}
+}
+
 func TestFakeIdempotentReplayAndReceiptNotStage(t *testing.T) {
 	f := NewFake()
 	g := fixtureGrant()
@@ -64,7 +77,8 @@ func TestFakeDeniesStalePaneIncarnationWithoutSend(t *testing.T) {
 func TestFakeDeniesMixedControlOriginWithoutSend(t *testing.T) {
 	f := NewFake()
 	g := Grant{GrantID: "control-grant", SenderPrincipalID: "flowbee-control",
-		RecipientSessionID: "recipient", RecipientPaneInstanceID: "pane", Epoch: 2}
+		RecipientSessionID: "recipient", RecipientPaneInstanceID: "pane",
+		ExpectedRecipientAgentRunID: "recipient-run", Epoch: 2}
 	_ = f.Grant(context.Background(), g)
 	a := NewAction("control-action", "hello", 2)
 	a.SenderPrincipalID = "flowbee-control"
@@ -193,11 +207,13 @@ func TestExecutorSeparatesTransportReceiptFromStageEvidence(t *testing.T) {
 
 func TestExecutorUsesDirectControlOriginWithoutOnBehalf(t *testing.T) {
 	f := NewFake()
-	target := SessionTarget{Identity: Identity{StoreID: "store", SessionID: "recipient", PaneInstanceID: "pane"}}
+	target := SessionTarget{Identity: Identity{StoreID: "store", SessionID: "recipient", PaneInstanceID: "pane", AgentRunID: "recipient-run"}}
 	g := Grant{GrantID: "grant", SenderPrincipalID: "flowbee-control",
-		RecipientSessionID: "recipient", RecipientPaneInstanceID: "pane", Epoch: 3}
+		RecipientSessionID: "recipient", RecipientPaneInstanceID: "pane",
+		ExpectedRecipientAgentRunID: "recipient-run", Epoch: 3}
 	a := NewAction("control-action", "payload", 3)
 	a.SenderPrincipalID = "flowbee-control"
+	a.RecipientSessionID, a.RecipientPaneInstanceID, a.RecipientAgentRunID = "recipient", "pane", "recipient-run"
 	result, err := (Executor{Port: f, Store: &memoryCommit{}}).Execute(context.Background(), target, g, a)
 	if err != nil || !result.Receipt.Submitted() || len(f.SendRequests) != 1 {
 		t.Fatalf("result=%+v requests=%d err=%v", result, len(f.SendRequests), err)
@@ -206,6 +222,37 @@ func TestExecutorUsesDirectControlOriginWithoutOnBehalf(t *testing.T) {
 	if req.OnBehalfOfSessionID != "" || req.SenderPrincipalID != "flowbee-control" ||
 		req.SenderSessionID != "" || result.Receipt.SenderPrincipalID != "flowbee-control" {
 		t.Fatalf("control send impersonated a session: request=%+v receipt=%+v", req, result.Receipt)
+	}
+}
+
+func TestExecutorRoutesToExactObservedSessionWithoutLifecycleMutation(t *testing.T) {
+	fake := NewFake()
+	id := Identity{HostID: "host", StoreID: "store", TmuxServerDomainID: "default", TmuxServerInstanceID: "server",
+		SessionID: "session", PaneInstanceID: "pane", AgentRunID: "run", Provider: "claude"}
+	fake.Snapshot = SessionSnapshot{HostID: id.HostID, StoreID: id.StoreID, AsOfCursor: "tdc2.4",
+		Sessions: []SessionProjection{{Identity: id, Lifecycle: "active", AsOfCursor: "tdc2.4"}}}
+	port := &portOverride{FakePort: fake, ensureErr: errors.New("lifecycle ensure must not be called")}
+	a := NewAction("observed-control-action", "payload", 2)
+	a.ExecutorKind, a.TargetRole = "driver", "interactor"
+	a.TargetHostID, a.TargetStoreID, a.TargetServerDomainID, a.TargetServerID = id.HostID, id.StoreID, id.TmuxServerDomainID, id.TmuxServerInstanceID
+	a.LeaseID, a.LeaseEpoch = "lease", 1
+	a.SenderPrincipalID = "flowbee-control"
+	a.RecipientSessionID, a.RecipientPaneInstanceID, a.RecipientAgentRunID = id.SessionID, id.PaneInstanceID, id.AgentRunID
+	a.GrantID, a.GrantEpoch = "grant", 2
+	grant := a.RouteGrant()
+	result, err := (Executor{Port: port, Store: &memoryCommit{}}).Execute(context.Background(), a.SessionTarget(), grant, a)
+	if err != nil || !result.Receipt.Submitted() || fake.SendCalls != 1 || port.EnsureCalls != 0 {
+		t.Fatalf("result=%+v sends=%d ensures=%d err=%v", result, fake.SendCalls, port.EnsureCalls, err)
+	}
+
+	stale := NewFake()
+	stale.Snapshot = fake.Snapshot
+	stale.Snapshot.Sessions[0].Identity.AgentRunID = "replacement-run"
+	if _, err := (Executor{Port: stale, Store: &memoryCommit{}}).Execute(context.Background(), a.SessionTarget(), grant, a); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("stale observed target err=%v", err)
+	}
+	if stale.SendCalls != 0 || len(stale.Grants) != 0 {
+		t.Fatalf("stale target mutated Driver: sends=%d grants=%d", stale.SendCalls, len(stale.Grants))
 	}
 }
 

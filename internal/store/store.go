@@ -71,16 +71,87 @@ type Store struct {
 	// above so a token revocation or daemon downgrade closes every new
 	// materialization seam without restarting Flowbee.
 	DriverControlOriginGate func() bool
+	// DriverControlOriginEndpointGate is the production capability predicate for
+	// multi-Driver deployments. Capability is scoped to the exact Driver routing
+	// domain that owns the recipient binding; readiness on one endpoint must never
+	// authorize a send through another. When installed, endpoint-less/global
+	// checks fail closed.
+	DriverControlOriginEndpointGate func(hostID, storeID, tmuxServerDomainID string) bool
+}
+
+// WriterLock is an OS-enforced exclusive lease for every process that mutates a
+// control-plane database outside the serving process. It is intentionally
+// independent of an open SQLite connection so destructive file operations such
+// as restore can hold the same fence while atomically replacing the database.
+type WriterLock struct {
+	file *os.File
+}
+
+// AcquireWriterLockForDSN takes the same non-blocking writer fence used by
+// Store.AcquireWriterLock without opening SQLite. Callers must Close the result.
+// Memory databases need no cross-process fence and return a no-op lock.
+func AcquireWriterLockForDSN(dsn string) (*WriterLock, error) {
+	path, ok := SQLiteFilePath(dsn)
+	if !ok {
+		return &WriterLock{}, nil
+	}
+	f, err := os.OpenFile(path+".writer.lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open control-plane writer lock: %w", err)
+	}
+	if err := os.Chmod(path+".writer.lock", 0o600); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("secure control-plane writer lock: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("control-plane writer already active for %s: %w", path, err)
+	}
+	return &WriterLock{file: f}, nil
+}
+
+// Close releases the writer fence. It is safe for a no-op in-memory lock and
+// safe to call more than once.
+func (l *WriterLock) Close() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	f := l.file
+	l.file = nil
+	unlockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	closeErr := f.Close()
+	if unlockErr != nil {
+		return unlockErr
+	}
+	return closeErr
 }
 
 // HasDriverControlOrigin is the single runtime predicate for Flowbee-authored
 // terminal messages. The callback is deliberately process-local capability
 // state; durable bindings remain inventory and never confer authority.
 func (s *Store) HasDriverControlOrigin() bool {
+	if s != nil && s.DriverControlOriginEndpointGate != nil {
+		return false
+	}
 	if s != nil && s.DriverControlOriginGate != nil {
 		return s.DriverControlOriginGate()
 	}
 	return s != nil && s.EnableDriverControlOrigin
+}
+
+// HasDriverControlOriginForBinding proves control-origin authority for the
+// exact endpoint tuple carried by an already-resolved durable binding. The
+// legacy process-wide seam remains available only when no endpoint gate has
+// been installed, which keeps focused pre-multi-endpoint tests compatible while
+// making production multi-endpoint routing fail closed.
+func (s *Store) HasDriverControlOriginForBinding(binding DriverSessionBinding) bool {
+	if s == nil || binding.HostID == "" || binding.StoreID == "" || binding.TmuxServerDomainID == "" {
+		return false
+	}
+	if s.DriverControlOriginEndpointGate != nil {
+		return s.DriverControlOriginEndpointGate(binding.HostID, binding.StoreID, binding.TmuxServerDomainID)
+	}
+	return s.HasDriverControlOrigin()
 }
 
 // Open opens the SQLite database with WAL + a busy timeout. A single open
@@ -109,7 +180,30 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping: %w", err)
 	}
+	if path, ok := SQLiteFilePath(dsn); ok {
+		for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+			if err := os.Chmod(candidate, 0o600); err != nil && !os.IsNotExist(err) {
+				_ = db.Close()
+				return nil, fmt.Errorf("secure sqlite file %q: %w", candidate, err)
+			}
+		}
+	}
 	return &Store{DB: db, dsn: dsn}, nil
+}
+
+// SQLiteFilePath resolves only filesystem-backed SQLite DSNs. Keeping this in
+// one exported seam prevents permissions, writer locking, and destructive
+// offline operations from disagreeing about file URIs, query parameters, or
+// in-memory stores.
+func SQLiteFilePath(dsn string) (string, bool) {
+	path := strings.TrimPrefix(dsn, "file:")
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	if path == "" || path == ":memory:" || strings.Contains(dsn, ":memory:") || strings.Contains(dsn, "mode=memory") {
+		return "", false
+	}
+	return path, true
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.DB.PingContext(ctx) }
@@ -122,22 +216,11 @@ func (s *Store) AcquireWriterLock() error {
 	if s.writerLock != nil {
 		return nil
 	}
-	path := strings.TrimPrefix(s.dsn, "file:")
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
-	if path == "" || path == ":memory:" || strings.Contains(s.dsn, ":memory:") || strings.Contains(s.dsn, "mode=memory") {
-		return nil
-	}
-	f, err := os.OpenFile(path+".writer.lock", os.O_CREATE|os.O_RDWR, 0600)
+	lock, err := AcquireWriterLockForDSN(s.dsn)
 	if err != nil {
-		return fmt.Errorf("open control-plane writer lock: %w", err)
+		return err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("control-plane writer already active for %s: %w", path, err)
-	}
-	s.writerLock = f
+	s.writerLock = lock.file
 	return nil
 }
 

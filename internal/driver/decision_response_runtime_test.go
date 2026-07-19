@@ -32,8 +32,9 @@ func seedDecisionResponseRuntime(t *testing.T) (*store.Store, Action, string, *F
 	}
 	interactor, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		WorkerIdentity: "interactor:default", Role: store.DriverInteractorRole,
-		HostID: "host-1", StoreID: "store-1", TmuxServerInstanceID: "server-1",
-		LifecycleKey: "interactor-default", TargetEpoch: 1, ProfileID: "interactor",
+		HostID: "host-1", StoreID: "store-1", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1",
+		LifecycleOwnership: "driver_managed",
+		LifecycleKey:       "interactor-default", TargetEpoch: 1, ProfileID: "interactor",
 		WorkspaceRootID: "workspace-root", WorkspaceRelativePath: "repo",
 		SessionID: "interactor-session", PaneInstanceID: "interactor-pane", AgentRunID: "interactor-run",
 	}, now)
@@ -154,8 +155,9 @@ func TestDecisionResponseReplacementBindingFencesOldRouteBeforeSend(t *testing.T
 	st, old, responseID, fake, now := seedDecisionResponseRuntime(t)
 	replacement, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		WorkerIdentity: "interactor:default", Role: store.DriverInteractorRole,
-		HostID: "host-1", StoreID: "store-1", TmuxServerInstanceID: "server-1",
-		LifecycleKey: "interactor-default", TargetEpoch: 2, ProfileID: "interactor",
+		HostID: "host-1", StoreID: "store-1", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1",
+		LifecycleOwnership: "driver_managed",
+		LifecycleKey:       "interactor-default", TargetEpoch: 2, ProfileID: "interactor",
 		WorkspaceRootID: "workspace-root", WorkspaceRelativePath: "repo",
 		SessionID: "interactor-session-2", PaneInstanceID: "interactor-pane-2", AgentRunID: "interactor-run-2",
 	}, now.Add(2*time.Minute))
@@ -165,7 +167,7 @@ func TestDecisionResponseReplacementBindingFencesOldRouteBeforeSend(t *testing.T
 	insertDecisionProjection(t, st, replacement, 10, now.Add(2*time.Minute).Format(time.RFC3339Nano))
 	fake.Sessions = map[string]Identity{replacement.SessionID: {
 		HostID: replacement.HostID, StoreID: replacement.StoreID,
-		TmuxServerInstanceID: replacement.TmuxServerInstanceID, LifecycleKey: replacement.LifecycleKey,
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: replacement.TmuxServerInstanceID, LifecycleKey: replacement.LifecycleKey,
 		TargetEpoch: replacement.TargetEpoch, SessionID: replacement.SessionID,
 		PaneInstanceID: replacement.PaneInstanceID, AgentRunID: replacement.AgentRunID,
 	}}

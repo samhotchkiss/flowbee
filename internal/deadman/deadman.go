@@ -11,11 +11,24 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
 
-const StateVersion = 1
+const StateVersion = 2
+
+var stableProjectIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+// ValidateProjectID applies the same stable identifier shape used by Flowbee's
+// project portfolio. The watchdog must be explicitly scoped; it never infers a
+// project from its URL, host, state path, or receiver.
+func ValidateProjectID(projectID string) error {
+	if !stableProjectIDPattern.MatchString(projectID) {
+		return errors.New("watchdog project id must match ^[a-z0-9][a-z0-9-]{0,62}$")
+	}
+	return nil
+}
 
 type Observation struct {
 	Healthy              bool     `json:"healthy"`
@@ -32,6 +45,10 @@ type Probe interface {
 
 type Publisher interface {
 	Publish(context.Context, Notification) error
+}
+
+type HeartbeatPublisher interface {
+	PublishHeartbeat(context.Context, Heartbeat) error
 }
 
 type StateStore interface {
@@ -58,12 +75,22 @@ type Notification struct {
 	FormatVersion string    `json:"format_version"`
 	ID            string    `json:"id"`
 	DedupKey      string    `json:"dedup_key"`
+	ProjectID     string    `json:"project_id"`
 	WatchdogID    string    `json:"watchdog_id"`
 	Target        string    `json:"target"`
 	Status        string    `json:"status"` // firing or resolved
 	Incident      Incident  `json:"incident"`
 	ObservedAt    time.Time `json:"observed_at"`
 	ResolvedAt    time.Time `json:"resolved_at,omitempty"`
+}
+
+type Heartbeat struct {
+	FormatVersion string    `json:"format_version"`
+	ProjectID     string    `json:"project_id"`
+	WatchdogID    string    `json:"watchdog_id"`
+	Target        string    `json:"target"`
+	Sequence      int64     `json:"sequence"`
+	ObservedAt    time.Time `json:"observed_at"`
 }
 
 type PendingNotification struct {
@@ -80,25 +107,30 @@ type Resolution struct {
 }
 
 type State struct {
-	Version         int                   `json:"version"`
-	WatchdogID      string                `json:"watchdog_id"`
-	Target          string                `json:"target"`
-	NextIncident    int64                 `json:"next_incident_sequence"`
-	Active          *Incident             `json:"active_incident,omitempty"`
-	Pending         []PendingNotification `json:"pending_notifications,omitempty"`
-	LastResolution  *Resolution           `json:"last_resolution,omitempty"`
-	LastCheckAt     time.Time             `json:"last_check_at,omitempty"`
-	LastHealthyAt   time.Time             `json:"last_healthy_at,omitempty"`
-	LastObservation Observation           `json:"last_observation"`
+	Version               int                   `json:"version"`
+	ProjectID             string                `json:"project_id"`
+	WatchdogID            string                `json:"watchdog_id"`
+	Target                string                `json:"target"`
+	NextIncident          int64                 `json:"next_incident_sequence"`
+	Active                *Incident             `json:"active_incident,omitempty"`
+	Pending               []PendingNotification `json:"pending_notifications,omitempty"`
+	LastResolution        *Resolution           `json:"last_resolution,omitempty"`
+	NextHeartbeatSequence int64                 `json:"next_heartbeat_sequence,omitempty"`
+	PendingHeartbeat      *Heartbeat            `json:"pending_heartbeat,omitempty"`
+	LastCheckAt           time.Time             `json:"last_check_at,omitempty"`
+	LastHealthyAt         time.Time             `json:"last_healthy_at,omitempty"`
+	LastObservation       Observation           `json:"last_observation"`
 }
 
 type Runner struct {
-	WatchdogID string
-	Target     string
-	Probe      Probe
-	Publisher  Publisher
-	Store      StateStore
-	Now        func() time.Time
+	ProjectID          string
+	WatchdogID         string
+	Target             string
+	Probe              Probe
+	Publisher          Publisher
+	HeartbeatPublisher HeartbeatPublisher
+	Store              StateStore
+	Now                func() time.Time
 }
 
 type Report struct {
@@ -116,8 +148,11 @@ type Report struct {
 // notification under the same idempotency key.
 func (r Runner) RunOnce(ctx context.Context) (Report, error) {
 	var out Report
+	if err := ValidateProjectID(r.ProjectID); err != nil {
+		return out, err
+	}
 	if strings.TrimSpace(r.WatchdogID) == "" || strings.TrimSpace(r.Target) == "" {
-		return out, errors.New("watchdog id and target are required")
+		return out, errors.New("watchdog project id, watchdog id, and target are required")
 	}
 	if r.Probe == nil || r.Publisher == nil || r.Store == nil {
 		return out, errors.New("watchdog requires probe, publisher, and state store")
@@ -130,8 +165,28 @@ func (r Runner) RunOnce(ctx context.Context) (Report, error) {
 	if err != nil {
 		return out, fmt.Errorf("load watchdog state: %w", err)
 	}
-	if err := bindState(&state, r.WatchdogID, r.Target); err != nil {
+	if err := bindState(&state, r.ProjectID, r.WatchdogID, r.Target); err != nil {
 		return out, err
+	}
+	var heartbeatErr error
+	if r.HeartbeatPublisher != nil {
+		if state.PendingHeartbeat == nil {
+			state.NextHeartbeatSequence++
+			state.PendingHeartbeat = &Heartbeat{FormatVersion: "flowbee.deadman-heartbeat/v1",
+				ProjectID: r.ProjectID, WatchdogID: r.WatchdogID, Target: r.Target,
+				Sequence: state.NextHeartbeatSequence, ObservedAt: now}
+			if err := r.Store.Save(state); err != nil {
+				return out, fmt.Errorf("persist watchdog heartbeat: %w", err)
+			}
+		}
+		if err := r.HeartbeatPublisher.PublishHeartbeat(ctx, *state.PendingHeartbeat); err != nil {
+			heartbeatErr = fmt.Errorf("publish watchdog heartbeat: %w", err)
+		} else {
+			state.PendingHeartbeat = nil
+			if err := r.Store.Save(state); err != nil {
+				return out, fmt.Errorf("persist watchdog heartbeat acknowledgement: %w", err)
+			}
+		}
 	}
 	obs, err := r.Probe.Probe(ctx)
 	if err != nil {
@@ -149,7 +204,7 @@ func (r Runner) RunOnce(ctx context.Context) (Report, error) {
 			incident := *state.Active
 			incident.LastObservedAt = now
 			state.Pending = append(state.Pending, PendingNotification{Notification: notificationFor(
-				r.WatchdogID, r.Target, "resolved", incident, now,
+				r.ProjectID, r.WatchdogID, r.Target, "resolved", incident, now,
 			)})
 			out.IncidentResolved = true
 			out.IncidentID = incident.ID
@@ -159,14 +214,14 @@ func (r Runner) RunOnce(ctx context.Context) (Report, error) {
 	} else if state.Active == nil {
 		state.NextIncident++
 		incident := Incident{
-			ID: incidentID(r.WatchdogID, r.Target, state.NextIncident), Sequence: state.NextIncident,
+			ID: incidentID(r.ProjectID, r.WatchdogID, r.Target, state.NextIncident), Sequence: state.NextIncident,
 			StartedAt: now, Reason: obs.Reason, Detail: obs.Detail, HTTPStatus: obs.HTTPStatus,
 			ReconcilerOverdue:    obs.ReconcilerOverdue,
 			ReconcilerOverdueIDs: append([]string(nil), obs.ReconcilerOverdueIDs...), LastObservedAt: now,
 		}
 		state.Active = &incident
 		state.Pending = append(state.Pending, PendingNotification{Notification: notificationFor(
-			r.WatchdogID, r.Target, "firing", incident, now,
+			r.ProjectID, r.WatchdogID, r.Target, "firing", incident, now,
 		)})
 		out.IncidentStarted = true
 		out.IncidentID = incident.ID
@@ -208,12 +263,21 @@ func (r Runner) RunOnce(ctx context.Context) (Report, error) {
 		out.NotificationsSent++
 	}
 	out.NotificationsLeft = len(state.Pending)
+	if heartbeatErr != nil {
+		return out, heartbeatErr
+	}
 	return out, nil
 }
 
-func bindState(state *State, watchdogID, target string) error {
+func bindState(state *State, projectID, watchdogID, target string) error {
 	if state.Version == 0 {
+		if state.ProjectID != "" || state.WatchdogID != "" || state.Target != "" || state.NextIncident != 0 ||
+			state.Active != nil || len(state.Pending) != 0 || state.LastResolution != nil ||
+			state.NextHeartbeatSequence != 0 || state.PendingHeartbeat != nil || !state.LastCheckAt.IsZero() {
+			return errors.New("unversioned watchdog state contains durable data and cannot be assigned to a project")
+		}
 		state.Version = StateVersion
+		state.ProjectID = projectID
 		state.WatchdogID = watchdogID
 		state.Target = target
 		return nil
@@ -221,22 +285,22 @@ func bindState(state *State, watchdogID, target string) error {
 	if state.Version != StateVersion {
 		return fmt.Errorf("unsupported watchdog state version %d", state.Version)
 	}
-	if state.WatchdogID != watchdogID || state.Target != target {
-		return fmt.Errorf("watchdog state belongs to id=%q target=%q, not id=%q target=%q",
-			state.WatchdogID, state.Target, watchdogID, target)
+	if state.ProjectID != projectID || state.WatchdogID != watchdogID || state.Target != target {
+		return fmt.Errorf("watchdog state belongs to project=%q id=%q target=%q, not project=%q id=%q target=%q",
+			state.ProjectID, state.WatchdogID, state.Target, projectID, watchdogID, target)
 	}
 	return nil
 }
 
-func incidentID(watchdogID, target string, sequence int64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d", watchdogID, target, sequence)))
+func incidentID(projectID, watchdogID, target string, sequence int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%d", projectID, watchdogID, target, sequence)))
 	return "deadman-" + hex.EncodeToString(sum[:12])
 }
 
-func notificationFor(watchdogID, target, status string, incident Incident, now time.Time) Notification {
+func notificationFor(projectID, watchdogID, target, status string, incident Incident, now time.Time) Notification {
 	id := incident.ID + ":" + status
 	n := Notification{FormatVersion: "flowbee.deadman-alert/v1", ID: id, DedupKey: id,
-		WatchdogID: watchdogID, Target: target, Status: status, Incident: incident, ObservedAt: now}
+		ProjectID: projectID, WatchdogID: watchdogID, Target: target, Status: status, Incident: incident, ObservedAt: now}
 	if status == "resolved" {
 		n.ResolvedAt = now
 	}

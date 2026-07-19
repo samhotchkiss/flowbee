@@ -25,8 +25,25 @@
         <dl>
           <div><dt>Active</dt><dd>{{.Active}}</dd></div>
           <div><dt>Parked</dt><dd>{{.Parked}}</dd></div>
+          <div><dt>Allocated</dt><dd>{{.Allocated}}</dd></div>
           <div><dt>Needs you</dt><dd class="{{if .NeedsYou}}warn{{end}}">{{.NeedsYou}}</dd></div>
         </dl>
+        <div class="pf-scheduler" aria-label="Capacity allocation and scheduler fairness">
+          {{range .Scheduler}}
+          <div class="pf-pool {{if .Starved}}starved{{end}}" data-pool="{{.Pool}}" data-starved="{{.Starved}}">
+            <strong>{{.PoolLabel}}</strong>
+            <span>{{.Allocated}} allocated</span>
+            <span>service {{.ServiceTurns}}/{{.PoolServiceTurns}} · {{.ServiceShare}}</span>
+            <span>weight share {{.WeightShare}}</span>
+            {{if .Eligible}}<span>{{.Eligible}} eligible · oldest {{.EligibleWait}}</span>{{else}}<span>0 eligible</span>{{end}}
+            {{if .Starved}}<b>starvation bound exceeded</b>{{end}}
+          </div>
+          {{end}}
+        </div>
+        <div class="pf-actors" aria-label="Project actor routes">
+          <span class="{{.InteractorStatus}}">Interactor · {{.InteractorStatus}}</span>
+          <span class="{{.OrchestratorStatus}}">Orchestrator · {{.OrchestratorStatus}}</span>
+        </div>
         {{if .Blocker}}<p class="pf-blocker"><span>Oldest blocker{{if .BlockerAge}} · {{.BlockerAge}}{{end}}</span><strong>{{.Blocker}}</strong>{{if .BlockerKind}}<small>{{.BlockerKind}}</small>{{end}}</p>{{else}}<p class="pf-clear">No blocking fact</p>{{end}}
         <footer><span>priority {{.Priority}}</span><span>weight {{.Weight}}</span><span>cap {{if .Cap}}{{.Cap}}{{else}}fleet{{end}}</span></footer>
       </a>

@@ -13,10 +13,19 @@ import (
 // obeys the identical commit-before-mutate, action-epoch, exact-binding, grant,
 // receipt, and independent-evidence laws.
 type WorkIntentSQLStore struct {
-	DB                     *sql.DB
-	Now                    func() time.Time
-	ControlOriginAvailable bool
-	ControlOriginGate      func() bool
+	DB                        *sql.DB
+	Now                       func() time.Time
+	ControlOriginAvailable    bool
+	ControlOriginGate         func() bool
+	EndpointControlOriginGate func(EndpointKey) bool
+}
+
+func (s WorkIntentSQLStore) controlOriginAvailableFor(a Action) bool {
+	if s.EndpointControlOriginGate != nil {
+		return s.EndpointControlOriginGate(EndpointKey{HostID: a.TargetHostID, StoreID: a.TargetStoreID,
+			TmuxServerDomainID: a.TargetServerDomainID})
+	}
+	return s.controlOriginAvailable()
 }
 
 func (s WorkIntentSQLStore) controlOriginAvailable() bool {
@@ -48,9 +57,10 @@ const workIntentActionSelect = `SELECT
 	a.payload_json,a.payload_sha256,a.evidence_baseline_store_seq,
 	a.evidence_baseline_uncertainty_epoch,a.grant_id,a.grant_epoch,a.grant_expires_at,
 	a.sender_principal_id,COALESCE(s.host_id,''),COALESCE(s.store_id,''),
-	COALESCE(s.tmux_server_instance_id,''),COALESCE(s.session_id,''),COALESCE(s.agent_run_id,''),
-	r.host_id,r.store_id,r.tmux_server_instance_id,r.lifecycle_key,r.target_epoch,
-	r.profile_id,r.workspace_root_id,r.workspace_relative_path,r.session_id,
+	COALESCE(s.tmux_server_domain_id,''),COALESCE(s.tmux_server_instance_id,''),
+	COALESCE(s.session_id,''),COALESCE(s.agent_run_id,''),
+	r.host_id,r.store_id,r.tmux_server_domain_id,r.tmux_server_instance_id,r.lifecycle_ownership,
+	r.lifecycle_key,r.target_epoch,r.profile_id,r.external_watch_id,r.workspace_root_id,r.workspace_relative_path,r.session_id,
 	r.pane_instance_id,r.agent_run_id
 	FROM work_intent_actions a
 	LEFT JOIN driver_session_bindings s ON s.binding_id=a.sender_binding_id
@@ -59,21 +69,24 @@ const workIntentActionSelect = `SELECT
 func scanWorkIntentDriverAction(row interface{ Scan(...any) error }) (Action, string, error) {
 	var a Action
 	var workIntentID string
-	var senderHost, senderStore, senderServer string
+	var senderHost, senderStore, senderDomain, senderServer string
 	err := row.Scan(&a.ActionID, &a.ProjectID, &workIntentID, &a.Kind, &a.Epoch,
 		&a.DedupKey, &a.Payload, &a.PayloadSHA256, &a.EvidenceBaselineStoreSeq,
 		&a.EvidenceBaselineUncertaintyEpoch, &a.GrantID, &a.GrantEpoch,
-		&a.GrantExpiresAt, &a.SenderPrincipalID, &senderHost, &senderStore, &senderServer,
+		&a.GrantExpiresAt, &a.SenderPrincipalID, &senderHost, &senderStore, &senderDomain, &senderServer,
 		&a.SenderSessionID, &a.SenderAgentRunID, &a.TargetHostID, &a.TargetStoreID,
-		&a.TargetServerID, &a.LifecycleKey, &a.TargetEpoch, &a.ProfileID,
+		&a.TargetServerDomainID, &a.TargetServerID, &a.TargetLifecycleOwnership,
+		&a.LifecycleKey, &a.TargetEpoch, &a.ProfileID, &a.ExternalWatchID,
 		&a.WorkspaceRootID, &a.WorkspaceRelativePath, &a.RecipientSessionID,
 		&a.RecipientPaneInstanceID, &a.RecipientAgentRunID)
 	if err != nil {
 		return Action{}, "", err
 	}
-	if a.SenderPrincipalID == "" && (senderHost == "" || senderStore == "" || senderServer == "") {
+	if a.SenderPrincipalID == "" && (senderHost == "" || senderStore == "" || senderDomain == "" || senderServer == "") {
 		return Action{}, "", ErrIdentityMismatch
 	}
+	a.SenderHostID, a.SenderStoreID = senderHost, senderStore
+	a.SenderServerDomainID, a.SenderServerID = senderDomain, senderServer
 	a.ExecutorKind = "driver"
 	a.TargetRole = "orchestrator"
 	a.LeaseID = "work-intent-route:" + workIntentID
@@ -174,9 +187,6 @@ func (s WorkIntentSQLStore) FenceStaleRoutes(ctx context.Context, now time.Time)
 // Driver grant before the executor can observe the claim.
 func (s WorkIntentSQLStore) ClaimNext(ctx context.Context, owner string, now time.Time, ttl,
 	ackTTL time.Duration) (Action, bool, error) {
-	if !s.controlOriginAvailable() {
-		return Action{}, false, nil
-	}
 	if s.DB == nil || owner == "" {
 		return Action{}, false, errors.New("work-intent Driver claim requires database and owner")
 	}
@@ -203,6 +213,9 @@ func (s WorkIntentSQLStore) ClaimNext(ctx context.Context, owner string, now tim
 	}
 	if err != nil {
 		return Action{}, false, err
+	}
+	if !s.controlOriginAvailableFor(a) {
+		return Action{}, false, nil
 	}
 	deadline := now.Add(ttl).UTC().Format(time.RFC3339Nano)
 	ackDue := now.Add(ackTTL).UTC().Format(time.RFC3339Nano)
@@ -236,11 +249,12 @@ func (s WorkIntentSQLStore) ClaimNext(ctx context.Context, owner string, now tim
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO driver_grants
 		(grant_id,project_id,action_id,sender_session_id,sender_agent_run_id,sender_principal_id,
-		 recipient_session_id,recipient_pane_instance_id,grant_epoch,
+		 recipient_session_id,recipient_pane_instance_id,expected_recipient_agent_run_id,grant_epoch,
 		 maximum_payload_bytes,allow_draft_stash,issued_at,expires_at)
-		VALUES (?,?,?,?,?,?,?,?,?,65536,0,?,?)`, a.GrantID, a.ProjectID, a.ActionID,
+		VALUES (?,?,?,?,?,?,?,?,?,?,65536,0,?,?)`, a.GrantID, a.ProjectID, a.ActionID,
 		a.SenderSessionID, a.SenderAgentRunID, a.SenderPrincipalID, a.RecipientSessionID,
-		a.RecipientPaneInstanceID, a.Epoch, now.UTC().Format(time.RFC3339Nano), expires)
+		a.RecipientPaneInstanceID, controlRecipientRunFence(a), a.Epoch,
+		now.UTC().Format(time.RFC3339Nano), expires)
 	if err != nil {
 		return Action{}, false, err
 	}
@@ -528,6 +542,7 @@ func (s WorkIntentSQLStore) Acknowledge(ctx context.Context, a Action, owner str
 
 type WorkIntentRuntime struct {
 	Port               DriverPort
+	Resolver           *EndpointResolver
 	Store              WorkIntentSQLStore
 	Evidence           StageEvidence
 	Owner              string
@@ -542,7 +557,7 @@ type WorkIntentRuntimeReport struct {
 
 func (r WorkIntentRuntime) Tick(ctx context.Context, now time.Time) (WorkIntentRuntimeReport, error) {
 	var out WorkIntentRuntimeReport
-	if r.Port == nil || r.Store.DB == nil || r.Owner == "" {
+	if (r.Resolver == nil && nilDriverPort(r.Port)) || r.Store.DB == nil || r.Owner == "" {
 		return out, errors.New("work-intent runtime requires port, store, and owner")
 	}
 	if r.ClaimTTL <= 0 {
@@ -572,7 +587,11 @@ func (r WorkIntentRuntime) Tick(ctx context.Context, now time.Time) (WorkIntentR
 	if a, ok, err := r.Store.ClaimNextVerifying(ctx, r.Owner, now, r.ClaimTTL); err != nil {
 		return out, err
 	} else if ok {
-		receipt, found, lookupErr := r.Port.ReceiptByAction(ctx, a.ExpectedReceipt())
+		port, resolveErr := resolveRuntimePort(r.Resolver, r.Port, a)
+		if resolveErr != nil {
+			return out, r.Store.ReleaseVerification(ctx, a, r.Owner, resolveErr.Error(), now)
+		}
+		receipt, found, lookupErr := port.ReceiptByAction(ctx, a.ExpectedReceipt())
 		if lookupErr != nil || !found {
 			detail := "no durable Driver receipt; awaiting mechanical evidence before retry"
 			if lookupErr != nil {
@@ -611,7 +630,14 @@ func (r WorkIntentRuntime) Tick(ctx context.Context, now time.Time) (WorkIntentR
 	if err := validateRuntimeRoute(a); err != nil {
 		return out, r.fail(ctx, a, err, now, out)
 	}
-	result, execErr := (Executor{Port: r.Port, Store: r.Store, Evidence: nil}).
+	if err := validateSessionOriginEndpoint(a); err != nil {
+		return out, r.fail(ctx, a, err, now, out)
+	}
+	port, err := resolveRuntimeSendPort(r.Resolver, r.Port, a)
+	if err != nil {
+		return out, r.fail(ctx, a, err, now, out)
+	}
+	result, execErr := (Executor{Port: port, Store: r.Store, Evidence: nil}).
 		ExecuteClaimed(ctx, a.SessionTarget(), a.RouteGrant(), a)
 	if execErr != nil {
 		if result.Uncertain || errors.Is(execErr, ErrUncertain) {

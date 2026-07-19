@@ -514,11 +514,19 @@ type epicsView struct {
 }
 
 type projectPortfolioCard struct {
-	ID, Name, State, StateClass       string
-	PauseReason, Blocker, BlockerKind string
-	Priority, Weight, Cap             int
-	Active, Parked, NeedsYou          int
-	BlockerAge                        string
+	ID, Name, State, StateClass          string
+	PauseReason, Blocker, BlockerKind    string
+	InteractorStatus, OrchestratorStatus string
+	Priority, Weight, Cap                int
+	Active, Parked, NeedsYou, Allocated  int
+	BlockerAge                           string
+	Scheduler                            []projectSchedulerCard
+}
+
+type projectSchedulerCard struct {
+	Pool, PoolLabel, ServiceShare, WeightShare, EligibleWait string
+	Allocated, ServiceTurns, PoolServiceTurns, Eligible      int64
+	Starved                                                  bool
 }
 
 const dashboardCompletedLimit = 24
@@ -566,6 +574,7 @@ func (u *UI) epics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "project portfolio error", http.StatusInternalServerError)
 		return
 	}
+	store.EvaluateProjectDashboardStarvation(projects, u.clock.Now(), store.ProjectStarvationBound)
 
 	view := u.buildEpics(epics, seats, supervisors, windows, attention, u.clock.Now())
 	view.NeedsYou = buildNeedsYou(decisions, u.clock.Now())
@@ -582,7 +591,23 @@ func buildProjectPortfolio(rows []store.ProjectDashboardRow, now time.Time) []pr
 			StateClass: strings.ToLower(row.Project.State), PauseReason: row.Project.PauseReason,
 			Priority: row.Project.Priority, Weight: row.Project.SchedulerWeight,
 			Cap: row.Project.ConcurrencyCap, Active: row.ActiveEpics, Parked: row.ParkedEpics,
-			NeedsYou: row.NeedsYou, Blocker: row.OldestBlocker, BlockerKind: humanizeToken(row.BlockerKind),
+			NeedsYou: row.NeedsYou, Allocated: row.Capacity.Allocated,
+			Blocker: row.OldestBlocker, BlockerKind: humanizeToken(row.BlockerKind),
+			InteractorStatus: row.Interactor.Status, OrchestratorStatus: row.Orchestrator.Status,
+		}
+		for _, metric := range row.Scheduler {
+			schedulerCard := projectSchedulerCard{
+				Pool: metric.Pool, PoolLabel: humanizeToken(metric.Pool),
+				Allocated: int64(metric.Allocated), ServiceTurns: metric.ServiceTurns,
+				PoolServiceTurns: metric.PoolServiceTurns, Eligible: int64(metric.Eligible),
+				ServiceShare: formatBasisPoints(metric.ServiceShareBasisPoints),
+				WeightShare:  formatBasisPoints(metric.ConfiguredWeightShareBasisPoints),
+				Starved:      metric.Starved,
+			}
+			if metric.Eligible > 0 {
+				schedulerCard.EligibleWait = durationAge(time.Duration(metric.EligibleWaitSeconds) * time.Second)
+			}
+			card.Scheduler = append(card.Scheduler, schedulerCard)
 		}
 		if !row.BlockedSince.IsZero() {
 			card.BlockerAge = humanAgo(row.BlockedSince, now)
@@ -590,6 +615,13 @@ func buildProjectPortfolio(rows []store.ProjectDashboardRow, now time.Time) []pr
 		out = append(out, card)
 	}
 	return out
+}
+
+func formatBasisPoints(value int) string {
+	if value < 0 {
+		value = 0
+	}
+	return fmt.Sprintf("%d.%02d%%", value/100, value%100)
 }
 
 func buildNeedsYou(rows []store.DecisionInboxRow, now time.Time) needsYouView {

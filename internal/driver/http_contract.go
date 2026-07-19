@@ -13,9 +13,9 @@ import (
 const (
 	controlOriginCapabilityFormat = "tmux-driver.control-principal-origin-capability/v1"
 	sessionRouteGrantFormat       = "tmux-driver.route-grant/v1"
-	controlRouteGrantFormat       = "tmux-driver.control-route-grant/v1"
+	controlRouteGrantFormat       = "tmux-driver.control-route-grant/v2"
 	sessionDeliveryReceiptFormat  = "tmux-driver.delivery-receipt/v1"
-	controlDeliveryReceiptFormat  = "tmux-driver.control-delivery-receipt/v1"
+	controlDeliveryReceiptFormat  = "tmux-driver.control-delivery-receipt/v2"
 	deliveryMediaType             = "text/plain; charset=utf-8"
 )
 
@@ -74,21 +74,22 @@ func validateControlOriginCapability(c ControlOriginCapability) error {
 // issuer and timestamps; Flowbee verifies that it did not narrow, widen, or
 // redirect the immutable A-to-B route it projected.
 type routeGrantWire struct {
-	FormatVersion           string  `json:"format_version"`
-	GrantID                 string  `json:"grant_id"`
-	IssuerPrincipalID       string  `json:"issuer_principal_id"`
-	SenderPrincipalID       string  `json:"sender_principal_id,omitempty"`
-	SenderSessionID         string  `json:"sender_session_id"`
-	SenderAgentRunID        string  `json:"sender_agent_run_id"`
-	RecipientSessionID      string  `json:"recipient_session_id"`
-	RecipientPaneInstanceID string  `json:"recipient_pane_instance_id"`
-	Operation               string  `json:"operation"`
-	Epoch                   int64   `json:"epoch"`
-	MaximumPayloadBytes     int     `json:"maximum_payload_bytes"`
-	AllowDraftStash         bool    `json:"allow_draft_stash"`
-	IssuedAt                string  `json:"issued_at"`
-	ExpiresAt               *string `json:"expires_at"`
-	RevokedAt               *string `json:"revoked_at"`
+	FormatVersion               string  `json:"format_version"`
+	GrantID                     string  `json:"grant_id"`
+	IssuerPrincipalID           string  `json:"issuer_principal_id"`
+	SenderPrincipalID           string  `json:"sender_principal_id,omitempty"`
+	SenderSessionID             string  `json:"sender_session_id"`
+	SenderAgentRunID            string  `json:"sender_agent_run_id"`
+	RecipientSessionID          string  `json:"recipient_session_id"`
+	RecipientPaneInstanceID     string  `json:"recipient_pane_instance_id"`
+	ExpectedRecipientAgentRunID string  `json:"expected_recipient_agent_run_id,omitempty"`
+	Operation                   string  `json:"operation"`
+	Epoch                       int64   `json:"epoch"`
+	MaximumPayloadBytes         int     `json:"maximum_payload_bytes"`
+	AllowDraftStash             bool    `json:"allow_draft_stash"`
+	IssuedAt                    string  `json:"issued_at"`
+	ExpiresAt                   *string `json:"expires_at"`
+	RevokedAt                   *string `json:"revoked_at"`
 }
 
 func (w *routeGrantWire) UnmarshalJSON(data []byte) error {
@@ -138,25 +139,26 @@ func (w *routeGrantWire) UnmarshalJSON(data []byte) error {
 	case controlRouteGrantFormat:
 		if err := requireExactWireKeys(data, []string{
 			"format_version", "grant_id", "issuer_principal_id", "sender_principal_id",
-			"recipient_session_id", "recipient_pane_instance_id", "operation", "epoch",
+			"recipient_session_id", "recipient_pane_instance_id", "expected_recipient_agent_run_id", "operation", "epoch",
 			"maximum_payload_bytes", "allow_draft_stash", "issued_at", "expires_at", "revoked_at",
 		}); err != nil {
 			return err
 		}
 		var value struct {
-			FormatVersion           string  `json:"format_version"`
-			GrantID                 string  `json:"grant_id"`
-			IssuerPrincipalID       string  `json:"issuer_principal_id"`
-			SenderPrincipalID       string  `json:"sender_principal_id"`
-			RecipientSessionID      string  `json:"recipient_session_id"`
-			RecipientPaneInstanceID string  `json:"recipient_pane_instance_id"`
-			Operation               string  `json:"operation"`
-			Epoch                   int64   `json:"epoch"`
-			MaximumPayloadBytes     int     `json:"maximum_payload_bytes"`
-			AllowDraftStash         bool    `json:"allow_draft_stash"`
-			IssuedAt                string  `json:"issued_at"`
-			ExpiresAt               *string `json:"expires_at"`
-			RevokedAt               *string `json:"revoked_at"`
+			FormatVersion               string  `json:"format_version"`
+			GrantID                     string  `json:"grant_id"`
+			IssuerPrincipalID           string  `json:"issuer_principal_id"`
+			SenderPrincipalID           string  `json:"sender_principal_id"`
+			RecipientSessionID          string  `json:"recipient_session_id"`
+			RecipientPaneInstanceID     string  `json:"recipient_pane_instance_id"`
+			ExpectedRecipientAgentRunID string  `json:"expected_recipient_agent_run_id"`
+			Operation                   string  `json:"operation"`
+			Epoch                       int64   `json:"epoch"`
+			MaximumPayloadBytes         int     `json:"maximum_payload_bytes"`
+			AllowDraftStash             bool    `json:"allow_draft_stash"`
+			IssuedAt                    string  `json:"issued_at"`
+			ExpiresAt                   *string `json:"expires_at"`
+			RevokedAt                   *string `json:"revoked_at"`
 		}
 		if err := decodeStrictWire(data, &value); err != nil {
 			return err
@@ -164,7 +166,8 @@ func (w *routeGrantWire) UnmarshalJSON(data []byte) error {
 		decoded = routeGrantWire{FormatVersion: value.FormatVersion, GrantID: value.GrantID,
 			IssuerPrincipalID: value.IssuerPrincipalID, SenderPrincipalID: value.SenderPrincipalID,
 			RecipientSessionID: value.RecipientSessionID, RecipientPaneInstanceID: value.RecipientPaneInstanceID,
-			Operation: value.Operation, Epoch: value.Epoch, MaximumPayloadBytes: value.MaximumPayloadBytes,
+			ExpectedRecipientAgentRunID: value.ExpectedRecipientAgentRunID,
+			Operation:                   value.Operation, Epoch: value.Epoch, MaximumPayloadBytes: value.MaximumPayloadBytes,
 			AllowDraftStash: value.AllowDraftStash, IssuedAt: value.IssuedAt,
 			ExpiresAt: value.ExpiresAt, RevokedAt: value.RevokedAt}
 	default:
@@ -221,13 +224,19 @@ func validateGrantRequest(g Grant) error {
 	}
 	switch {
 	case g.SenderPrincipalID != "":
-		if g.SenderSessionID != "" || g.SenderAgentRunID != "" {
+		if g.SenderSessionID != "" || g.SenderAgentRunID != "" || g.ExpectedRecipientAgentRunID == "" {
 			return errors.New("driver route grant: mixed sender origins")
 		}
 		if err := validatePrincipalID(g.SenderPrincipalID, "sender_principal_id"); err != nil {
 			return err
 		}
+		if err := validateCanonicalUUID(g.ExpectedRecipientAgentRunID, "expected_recipient_agent_run_id"); err != nil {
+			return err
+		}
 	case g.SenderSessionID != "" && g.SenderAgentRunID != "":
+		if g.ExpectedRecipientAgentRunID != "" {
+			return errors.New("driver route grant: session origin carries control run fence")
+		}
 		if err := validateCanonicalUUID(g.SenderSessionID, "sender_session_id"); err != nil {
 			return err
 		}
@@ -265,6 +274,7 @@ func validateProjectedGrant(w routeGrantWire, want Grant, revoked bool) error {
 		w.SenderAgentRunID != want.SenderAgentRunID ||
 		w.RecipientSessionID != want.RecipientSessionID ||
 		w.RecipientPaneInstanceID != want.RecipientPaneInstanceID ||
+		w.ExpectedRecipientAgentRunID != want.ExpectedRecipientAgentRunID ||
 		w.Epoch != want.Epoch || w.MaximumPayloadBytes != maximum ||
 		w.AllowDraftStash != want.AllowDraftStash || !driverTimesEquivalent(expires, want.ExpiresAt) ||
 		revoked != (w.RevokedAt != nil) {
@@ -293,14 +303,17 @@ func validateRouteGrantWire(w routeGrantWire) error {
 		}
 	}
 	if w.FormatVersion == controlRouteGrantFormat {
-		if w.SenderSessionID != "" || w.SenderAgentRunID != "" {
+		if w.SenderSessionID != "" || w.SenderAgentRunID != "" || w.ExpectedRecipientAgentRunID == "" {
 			return errors.New("driver route grant: mixed control origin")
 		}
 		if err := validatePrincipalID(w.SenderPrincipalID, "sender_principal_id"); err != nil {
 			return err
 		}
+		if err := validateCanonicalUUID(w.ExpectedRecipientAgentRunID, "expected_recipient_agent_run_id"); err != nil {
+			return err
+		}
 	} else {
-		if w.SenderPrincipalID != "" {
+		if w.SenderPrincipalID != "" || w.ExpectedRecipientAgentRunID != "" {
 			return errors.New("driver route grant: mixed session origin")
 		}
 		if err := validateCanonicalUUID(w.SenderSessionID, "sender_session_id"); err != nil {
@@ -338,14 +351,17 @@ func validateDeliveryReceiptWire(w deliveryReceiptWire) error {
 		}
 	}
 	if w.FormatVersion == controlDeliveryReceiptFormat {
-		if w.SenderSessionID != "" || w.SenderAgentRunID != "" {
+		if w.SenderSessionID != "" || w.SenderAgentRunID != "" || w.ExpectedRecipientAgentRunID == "" {
 			return errors.New("driver delivery receipt: mixed control origin")
 		}
 		if err := validatePrincipalID(w.SenderPrincipalID, "sender_principal_id"); err != nil {
 			return err
 		}
+		if err := validateCanonicalUUID(w.ExpectedRecipientAgentRunID, "expected_recipient_agent_run_id"); err != nil {
+			return err
+		}
 	} else {
-		if w.SenderPrincipalID != "" {
+		if w.SenderPrincipalID != "" || w.ExpectedRecipientAgentRunID != "" {
 			return errors.New("driver delivery receipt: mixed session origin")
 		}
 		if err := validateCanonicalUUID(w.SenderSessionID, "sender_session_id"); err != nil {

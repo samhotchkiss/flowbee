@@ -112,3 +112,39 @@ func TestHealthEndpointReadsLiveDriverControlState(t *testing.T) {
 		t.Fatalf("restored health code=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestHealthEndpointReevaluatesPhase1ProjectReadiness(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir()+"/flowbee.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
+		t.Fatal(err)
+	}
+	current := api.Phase1ProjectReadiness{Required: true, ProjectID: "russ", Status: "held",
+		Holds: []string{"external_watchdog_lease_missing_or_stale"}}
+	srv := api.New(st, clock.NewFake(time.Unix(1000, 0)), ulid.NewMinter(nil), api.Config{
+		Phase1ProjectCurrent: func() api.Phase1ProjectReadiness { return current },
+	}, "v2")
+	request := func() *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		srv.HealthHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		return recorder
+	}
+	if recorder := request(); recorder.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(recorder.Body.String(), "external_watchdog_lease_missing_or_stale") {
+		t.Fatalf("missing lease readiness code=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	current = api.Phase1ProjectReadiness{Required: true, Available: true, ProjectID: "russ", Status: "ready"}
+	if recorder := request(); recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"phase1_project":{"required":true,"available":true`) {
+		t.Fatalf("recovered readiness code=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	current = api.Phase1ProjectReadiness{Required: true, ProjectID: "russ", Status: "held",
+		Holds: []string{"orchestrator_endpoint_control_unavailable"}}
+	if recorder := request(); recorder.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(recorder.Body.String(), "orchestrator_endpoint_control_unavailable") {
+		t.Fatalf("later drift did not close readiness code=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}

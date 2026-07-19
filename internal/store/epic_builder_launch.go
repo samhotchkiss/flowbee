@@ -18,9 +18,9 @@ import (
 // The current store_id is intentionally resolved through instance_ref when an
 // action is committed; a store reset therefore fences already-committed work.
 type BuilderDriverTarget struct {
-	ProjectID, SeatID, InstanceRef, TmuxServerInstanceID string
-	ProfileID, WorkspaceRootID, WorkspaceRelativeBase    string
-	Enabled                                              bool
+	ProjectID, SeatID, InstanceRef, TmuxServerDomainID, TmuxServerInstanceID string
+	ProfileID, WorkspaceRootID, WorkspaceRelativeBase                        string
+	Enabled                                                                  bool
 }
 
 func (s *Store) UpsertBuilderDriverTarget(ctx context.Context, in BuilderDriverTarget, now time.Time) error {
@@ -29,6 +29,7 @@ func (s *Store) UpsertBuilderDriverTarget(ctx context.Context, in BuilderDriverT
 	}
 	for name, value := range map[string]string{
 		"project_id": in.ProjectID, "seat_id": in.SeatID, "instance_ref": in.InstanceRef,
+		"tmux_server_domain_id":   in.TmuxServerDomainID,
 		"tmux_server_instance_id": in.TmuxServerInstanceID, "profile_id": in.ProfileID,
 		"workspace_root_id": in.WorkspaceRootID, "workspace_relative_base": in.WorkspaceRelativeBase,
 	} {
@@ -40,18 +41,32 @@ func (s *Store) UpsertBuilderDriverTarget(ctx context.Context, in BuilderDriverT
 	if clean != in.WorkspaceRelativeBase || clean == "." || strings.HasPrefix(clean, "../") || path.IsAbs(clean) {
 		return errors.New("builder Driver target workspace_relative_base must be a clean relative path")
 	}
-	var seatHost, driverHost string
-	if err := s.DB.QueryRowContext(ctx, `SELECT box FROM seats WHERE id=?`, in.SeatID).Scan(&seatHost); err != nil {
+	var seatBox, expectedHost, driverHost, driverDomain, driverOwnership string
+	if err := s.DB.QueryRowContext(ctx, `SELECT box,expected_host_id FROM seats WHERE id=?`, in.SeatID).
+		Scan(&seatBox, &expectedHost); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrSeatNotFound
 		}
 		return err
 	}
-	if err := s.DB.QueryRowContext(ctx, `SELECT host_id FROM driver_instances WHERE instance_ref=?`, in.InstanceRef).Scan(&driverHost); err != nil {
+	if err := s.DB.QueryRowContext(ctx, `SELECT host_id,tmux_server_domain_id,tmux_server_ownership
+		FROM driver_instances WHERE instance_ref=?`, in.InstanceRef).Scan(&driverHost, &driverDomain, &driverOwnership); err != nil {
 		return fmt.Errorf("builder Driver target instance: %w", err)
 	}
+	// v2 capacity enrollment carries the stable authenticated host_id. seat.box
+	// is only an execution/SSH locator and is empty for a local seat; treating the
+	// empty locator as a Driver identity made a local v2 seat impossible to bind.
+	// Preserve the legacy fallback only for pre-v2 seats that have not enrolled a
+	// capacity host yet.
+	seatHost := expectedHost
+	if seatHost == "" {
+		seatHost = seatBox
+	}
 	if seatHost != driverHost {
-		return fmt.Errorf("builder Driver target host %q does not match seat host %q", driverHost, seatHost)
+		return fmt.Errorf("builder Driver target host %q does not match seat capacity host %q", driverHost, seatHost)
+	}
+	if driverDomain == "" || in.TmuxServerDomainID != driverDomain || driverOwnership != "managed_dedicated" {
+		return errors.New("builder Driver target requires the exact managed tmux server domain")
 	}
 	enabled := 0
 	if in.Enabled {
@@ -59,16 +74,17 @@ func (s *Store) UpsertBuilderDriverTarget(ctx context.Context, in BuilderDriverT
 	}
 	stamp := now.UTC().Format(rfc3339)
 	_, err := s.DB.ExecContext(ctx, `INSERT INTO builder_driver_targets
-		(project_id,seat_id,instance_ref,tmux_server_instance_id,profile_id,
+		(project_id,seat_id,instance_ref,tmux_server_domain_id,tmux_server_instance_id,profile_id,
 		 workspace_root_id,workspace_relative_base,enabled,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(project_id,seat_id) DO UPDATE SET
 		 instance_ref=excluded.instance_ref,
+		 tmux_server_domain_id=excluded.tmux_server_domain_id,
 		 tmux_server_instance_id=excluded.tmux_server_instance_id,
 		 profile_id=excluded.profile_id,workspace_root_id=excluded.workspace_root_id,
 		 workspace_relative_base=excluded.workspace_relative_base,
 		 enabled=excluded.enabled,updated_at=excluded.updated_at`, in.ProjectID, in.SeatID,
-		in.InstanceRef, in.TmuxServerInstanceID, in.ProfileID, in.WorkspaceRootID,
+		in.InstanceRef, in.TmuxServerDomainID, in.TmuxServerInstanceID, in.ProfileID, in.WorkspaceRootID,
 		in.WorkspaceRelativeBase, enabled, stamp, stamp)
 	return err
 }
@@ -78,9 +94,9 @@ type BuilderLaunchReconcileResult struct {
 }
 
 type builderLaunchCandidate struct {
-	seatID, hostID, storeID, serverID, profileID, workspaceRootID, workspaceBase string
-	family, accountKey                                                           string
-	maxConcurrent                                                                int
+	seatID, hostID, storeID, serverDomainID, serverID, profileID, workspaceRootID, workspaceBase string
+	family, accountKey                                                                           string
+	maxConcurrent                                                                                int
 }
 
 // ReconcileBuilderLaunches is the durable admitted -> building scheduler. It
@@ -183,7 +199,7 @@ func (s *Store) reconcileOneBuilderLaunch(ctx context.Context, epicID string, no
 			return errors.New("builder launch compute lease has no live action")
 		}
 
-		candidates, err := builderLaunchCandidatesTx(ctx, tx, projectID, provider)
+		candidates, err := builderLaunchCandidatesTx(ctx, tx, projectID, provider, s.EnableCapacityV2)
 		if err != nil {
 			return err
 		}
@@ -230,13 +246,13 @@ func (s *Store) reconcileOneBuilderLaunch(ctx context.Context, epicID string, no
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO epic_actions
 			(id,project_id,epic_id,kind,state,action_epoch,dedup_key,payload_json,payload_sha256,
-			 executor_kind,target_role,target_host_id,target_store_id,target_server_id,lifecycle_key,
+			 executor_kind,target_role,target_host_id,target_store_id,target_server_domain_id,target_server_id,lifecycle_key,
 			 target_epoch,profile_id,workspace_root_id,workspace_relative_path,lease_id,lease_epoch,
 			 next_attempt_at,created_at,updated_at)
-			VALUES (?,?,?,'builder_launch','pending',0,?,?,?,'driver_lifecycle','builder',?,?,?,?,1,?,?,?,?,1,?,?,?)`,
+			VALUES (?,?,?,'builder_launch','pending',0,?,?,?,'driver_lifecycle','builder',?,?,?,?,?,1,?,?,?,?,1,?,?,?)`,
 			actionID, projectID, epicID, dedup, string(payload),
 			"sha256:"+hex.EncodeToString(payloadHash[:]), selected.hostID, selected.storeID,
-			selected.serverID, "flowbee-builder:"+projectID+":"+epicID, selected.profileID,
+			selected.serverDomainID, selected.serverID, "flowbee-builder:"+projectID+":"+epicID, selected.profileID,
 			selected.workspaceRootID, workspacePath, "builder-compute:"+epicID, stamp, stamp, stamp)
 		if err != nil {
 			return err
@@ -263,14 +279,35 @@ func (s *Store) reconcileOneBuilderLaunch(ctx context.Context, epicID string, no
 	return out, err
 }
 
-func builderLaunchCandidatesTx(ctx context.Context, tx *sql.Tx, projectID, provider string) ([]builderLaunchCandidate, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT s.id,i.host_id,i.store_id,t.tmux_server_instance_id,
-		t.profile_id,t.workspace_root_id,t.workspace_relative_base,s.agent_family,s.account_key,
+func builderLaunchCandidatesTx(ctx context.Context, tx *sql.Tx, projectID, provider string,
+	capacityV2 bool) ([]builderLaunchCandidate, error) {
+	// A v2 seat is addressed by the authenticated identity approved by
+	// bind-capacity, not by the legacy execution locator. In particular, a local
+	// seat intentionally has box='', while Driver still reports its stable
+	// host_id. Using seats.box here made the documented local probe/bind path
+	// impossible and copying seats.account_key into the epic could account the
+	// lease against a different provider identity than the active generation.
+	//
+	// Keep the legacy query deliberately separate. This avoids making a partially
+	// enrolled v2 seat look like a legacy seat and preserves the old box/account
+	// semantics when capacity-v2 is explicitly disabled.
+	identityHost := "s.box"
+	accountKey := "s.account_key"
+	identityEnrollment := ""
+	if capacityV2 {
+		identityHost = "s.expected_host_id"
+		accountKey = "s.expected_account_key"
+		identityEnrollment = ` AND s.expected_host_id<>'' AND s.expected_account_key<>''
+			AND s.expected_credential_lineage<>''`
+	}
+	query := `SELECT s.id,i.host_id,i.store_id,t.tmux_server_domain_id,t.tmux_server_instance_id,
+		t.profile_id,t.workspace_root_id,t.workspace_relative_base,s.agent_family,` + accountKey + `,
 		s.max_concurrent FROM builder_driver_targets t JOIN seats s ON s.id=t.seat_id
 		JOIN driver_instances i ON i.instance_ref=t.instance_ref
 		JOIN driver_observation_cursors c ON c.instance_ref=i.instance_ref AND c.store_id=i.store_id AND c.active=1
 		WHERE t.project_id=? AND t.enabled=1 AND s.enabled=1 AND s.agent_family=?
-		AND i.state='live' AND i.host_id=s.box ORDER BY s.id`, projectID, provider)
+		AND i.state='live' AND i.host_id=` + identityHost + identityEnrollment + ` ORDER BY s.id`
+	rows, err := tx.QueryContext(ctx, query, projectID, provider)
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +315,7 @@ func builderLaunchCandidatesTx(ctx context.Context, tx *sql.Tx, projectID, provi
 	var out []builderLaunchCandidate
 	for rows.Next() {
 		var c builderLaunchCandidate
-		if err := rows.Scan(&c.seatID, &c.hostID, &c.storeID, &c.serverID, &c.profileID,
+		if err := rows.Scan(&c.seatID, &c.hostID, &c.storeID, &c.serverDomainID, &c.serverID, &c.profileID,
 			&c.workspaceRootID, &c.workspaceBase, &c.family, &c.accountKey, &c.maxConcurrent); err != nil {
 			return nil, err
 		}

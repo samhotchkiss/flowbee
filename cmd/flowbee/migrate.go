@@ -29,9 +29,17 @@ func runMigrate(args []string) error {
 		return err
 	}
 	defer st.Close()
+	if err := st.AcquireWriterLock(); err != nil {
+		return fmt.Errorf("migration requires the control-plane writer to be stopped: %w", err)
+	}
 
-	if err := store.MigrateUp(ctx, st.DB); err != nil {
+	snapshot, err := migrateWithRollbackSnapshot(ctx, st.DB,
+		envOr("FLOWBEE_BACKUP_DIR", defaultBackupDir()))
+	if err != nil {
 		return err
+	}
+	if snapshot != "" {
+		fmt.Printf("pre-migration snapshot verified: %s\n", snapshot)
 	}
 	fmt.Println("migrations applied")
 	return nil

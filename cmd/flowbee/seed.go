@@ -58,7 +58,11 @@ func runSeed(args []string) error {
 		return err
 	}
 	defer st.Close()
-	if err := store.MigrateUp(ctx, st.DB); err != nil {
+	if err := st.AcquireWriterLock(); err != nil {
+		return fmt.Errorf("seed requires the control-plane writer to be stopped: %w", err)
+	}
+	if _, err := migrateWithRollbackSnapshot(ctx, st.DB,
+		envOr("FLOWBEE_BACKUP_DIR", defaultBackupDir())); err != nil {
 		return err
 	}
 

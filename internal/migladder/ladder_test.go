@@ -47,6 +47,26 @@ func writeMigrations(t *testing.T, stems ...string) string {
 	return dir
 }
 
+func ladderWith(stems ...string) string {
+	return "# Migration number ladder\n\n" + beginMarker + "\n```text\n" +
+		strings.Join(stems, "\n") + "\n```\n" + endMarker + "\n"
+}
+
+func baseSetFromDir(t *testing.T, dir string) BaseSet {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := NewBaseSet()
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			set[strings.TrimSuffix(entry.Name(), ".sql")] = struct{}{}
+		}
+	}
+	return set
+}
+
 func TestParseIgnoresProseAndFences(t *testing.T) {
 	l, err := Parse([]byte(sampleLadder))
 	if err != nil {
@@ -118,7 +138,7 @@ func TestCheckCleanTree(t *testing.T) {
 	p := writeLadder(t, sampleLadder)
 	// files are a strict subset of the ladder (0027 is reserved but has no file yet).
 	dir := writeMigrations(t, "0001_init", "0023_adopted_pr_diff_empty", "0023_self_unblock", "0026_epics")
-	v, err := Check(dir, p)
+	v, err := Check(dir, p, NewBaseSet("0001_init", "0023_adopted_pr_diff_empty", "0023_self_unblock", "0026_epics"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +150,7 @@ func TestCheckCleanTree(t *testing.T) {
 func TestCheckFailsOnUnreservedNumber(t *testing.T) {
 	p := writeLadder(t, sampleLadder)
 	dir := writeMigrations(t, "0001_init", "0028_sneaky") // 0028 not in ladder
-	v, err := Check(dir, p)
+	v, err := Check(dir, p, NewBaseSet("0001_init"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +166,7 @@ func TestCheckFailsOnUnreservedNumber(t *testing.T) {
 func TestCheckRejectsDuplicateNumber(t *testing.T) {
 	p := writeLadder(t, sampleLadder)
 	dir := writeMigrations(t, "0026_epics", "0026_collision") // duplicate 0026, only one sanctioned
-	v, err := Check(dir, p)
+	v, err := Check(dir, p, NewBaseSet("0026_epics"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +184,7 @@ func TestCheckRejectsDuplicateNumber(t *testing.T) {
 func TestCheckAllowsGrandfatheredDouble(t *testing.T) {
 	p := writeLadder(t, sampleLadder)
 	dir := writeMigrations(t, "0023_adopted_pr_diff_empty", "0023_self_unblock")
-	v, err := Check(dir, p)
+	v, err := Check(dir, p, NewBaseSet("0023_adopted_pr_diff_empty", "0023_self_unblock"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +196,7 @@ func TestCheckAllowsGrandfatheredDouble(t *testing.T) {
 func TestCheckFlagsBadFilename(t *testing.T) {
 	p := writeLadder(t, sampleLadder)
 	dir := writeMigrations(t, "0001_init", "not_a_migration")
-	v, err := Check(dir, p)
+	v, err := Check(dir, p, NewBaseSet("0001_init"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,12 +211,119 @@ func TestRealLadderMatchesRealMigrations(t *testing.T) {
 	root := repoRoot(t)
 	dir := filepath.Join(root, "internal", "store", "migrations")
 	ladder := filepath.Join(dir, "LADDER.md")
-	v, err := Check(dir, ladder)
+	v, err := Check(dir, ladder, baseSetFromDir(t, dir))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(v) != 0 {
 		t.Fatalf("committed ladder has violations against the committed migrations: %v", v)
+	}
+}
+
+func TestCheckBaseAwareAllowsGrandfatheredHistoryAndNextBatch(t *testing.T) {
+	stems := []string{
+		"0001_init",
+		"0023_old_a",
+		"0023_old_b",
+		"0026_previous",
+		"0027_first_new",
+		"0028_second_new",
+		"0031_after_reserved_gap",
+	}
+	p := writeLadder(t, ladderWith(stems...))
+	dir := writeMigrations(t, stems...)
+	base := NewBaseSet("0001_init", "0023_old_a", "0023_old_b", "0026_previous")
+
+	v, err := Check(dir, p, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 0 {
+		t.Fatalf("next candidate batch should pass while preserving base duplicate and reserved gaps: %v", v)
+	}
+}
+
+func TestCheckBaseAwareRejectsBackfillAtOrBelowBaseMax(t *testing.T) {
+	stems := []string{"0001_init", "0025_backfill", "0026_previous"}
+	p := writeLadder(t, ladderWith(stems...))
+	dir := writeMigrations(t, stems...)
+
+	v, err := Check(dir, p, NewBaseSet("0001_init", "0026_previous"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(v, "\n")
+	if !strings.Contains(joined, "at or below max(base) 0026") {
+		t.Fatalf("expected base-backfill violation, got: %v", v)
+	}
+}
+
+func TestCheckBaseAwareRequiresCandidateToStartAtNextNumber(t *testing.T) {
+	stems := []string{"0001_init", "0026_previous", "0028_skipped_next"}
+	p := writeLadder(t, ladderWith(stems...))
+	dir := writeMigrations(t, stems...)
+
+	v, err := Check(dir, p, NewBaseSet("0001_init", "0026_previous"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(v, "\n")
+	if !strings.Contains(joined, "first new migration is 0028, want exactly 0027") {
+		t.Fatalf("expected max(base)+1 violation, got: %v", v)
+	}
+}
+
+func TestCheckBaseAwareRejectsNewDuplicateEvenWhenLadderRecordsBoth(t *testing.T) {
+	stems := []string{"0001_init", "0026_previous", "0027_branch_a", "0027_branch_b"}
+	p := writeLadder(t, ladderWith(stems...))
+	dir := writeMigrations(t, stems...)
+
+	v, err := Check(dir, p, NewBaseSet("0001_init", "0026_previous"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(v, "\n"), "only duplicates wholly present at the merge base are grandfathered") {
+		t.Fatalf("expected new-duplicate violation, got: %v", v)
+	}
+}
+
+func TestCheckMergeOrderRejectsSecondPRUntilRenumbered(t *testing.T) {
+	// branch_a has already merged as 0027. A stale branch that also reserved
+	// 0027 must fail after rebase even if it carries both ladder entries.
+	stems := []string{"0001_init", "0026_previous", "0027_branch_a", "0027_branch_b"}
+	p := writeLadder(t, ladderWith(stems...))
+	dir := writeMigrations(t, stems...)
+	base := NewBaseSet("0001_init", "0026_previous", "0027_branch_a")
+
+	v, err := Check(dir, p, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(v, "\n")
+	if !strings.Contains(joined, "at or below max(base) 0027") ||
+		!strings.Contains(joined, "new migration number 0027 is duplicated") {
+		t.Fatalf("expected stale second PR to require rebase+renumber, got: %v", v)
+	}
+}
+
+func TestCheckBaseAwareRejectsDeletedMigrationHistory(t *testing.T) {
+	p := writeLadder(t, ladderWith("0001_init", "0026_previous"))
+	dir := writeMigrations(t, "0001_init")
+
+	v, err := Check(dir, p, NewBaseSet("0001_init", "0026_previous"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(v, "\n"), "base migration 0026_previous.sql was deleted or renamed") {
+		t.Fatalf("expected immutable-history violation, got: %v", v)
+	}
+}
+
+func TestCheckRequiresBaseSet(t *testing.T) {
+	p := writeLadder(t, ladderWith("0001_init"))
+	dir := writeMigrations(t, "0001_init")
+	if _, err := Check(dir, p, nil); err == nil || !strings.Contains(err.Error(), "base set is required") {
+		t.Fatalf("expected missing-base-set error, got %v", err)
 	}
 }
 

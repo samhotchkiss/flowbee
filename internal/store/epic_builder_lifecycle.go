@@ -13,24 +13,24 @@ import (
 )
 
 type BuilderLifecycleIdentity struct {
-	HostID, StoreID, TmuxServerInstanceID, LifecycleKey string
-	TargetEpoch                                         int64
-	SessionID, PaneInstanceID, AgentRunID               string
-	Provider, ConversationID                            string
+	HostID, StoreID, TmuxServerDomainID, TmuxServerInstanceID, LifecycleOwnership, LifecycleKey string
+	TargetEpoch                                                                                 int64
+	SessionID, PaneInstanceID, AgentRunID                                                       string
+	Provider, ConversationID                                                                    string
 }
 
 type BuilderLifecycleActionProjection struct {
-	ActionID                                                         string
-	Epoch                                                            int64
-	ProjectID, EpicID, Kind, DedupKey                                string
-	Payload, PayloadSHA256                                           string
-	HeadSHA, BaseSHA                                                 string
-	TargetHostID, TargetStoreID, TargetServerID, LifecycleKey        string
-	TargetEpoch                                                      int64
-	ProfileID, WorkspaceRootID, WorkspaceRelativePath                string
-	LeaseID                                                          string
-	LeaseEpoch                                                       int64
-	RecipientSessionID, RecipientPaneInstanceID, RecipientAgentRunID string
+	ActionID                                                                        string
+	Epoch                                                                           int64
+	ProjectID, EpicID, Kind, DedupKey                                               string
+	Payload, PayloadSHA256                                                          string
+	HeadSHA, BaseSHA                                                                string
+	TargetHostID, TargetStoreID, TargetServerDomainID, TargetServerID, LifecycleKey string
+	TargetEpoch                                                                     int64
+	ProfileID, WorkspaceRootID, WorkspaceRelativePath                               string
+	LeaseID                                                                         string
+	LeaseEpoch                                                                      int64
+	RecipientSessionID, RecipientPaneInstanceID, RecipientAgentRunID                string
 }
 
 type BuilderLifecycleReceiptProjection struct {
@@ -74,14 +74,15 @@ func (s *Store) PrepareBuilderLaunch(ctx context.Context, action BuilderLifecycl
 		if leaseEpoch > action.Epoch {
 			return errors.New("builder launch claimant epoch is stale")
 		}
-		var currentHost, currentStore, currentServer string
-		if err := tx.QueryRowContext(ctx, `SELECT i.host_id,i.store_id,t.tmux_server_instance_id
+		var currentHost, currentStore, currentDomain, currentServer string
+		if err := tx.QueryRowContext(ctx, `SELECT i.host_id,i.store_id,t.tmux_server_domain_id,t.tmux_server_instance_id
 			FROM builder_driver_targets t JOIN driver_instances i ON i.instance_ref=t.instance_ref
 			WHERE t.project_id=? AND t.seat_id=? AND t.enabled=1 AND i.state='live'`,
-			projectID, seatID).Scan(&currentHost, &currentStore, &currentServer); err != nil {
+			projectID, seatID).Scan(&currentHost, &currentStore, &currentDomain, &currentServer); err != nil {
 			return fmt.Errorf("builder launch Driver target is no longer live: %w", err)
 		}
 		if currentHost != action.TargetHostID || currentStore != action.TargetStoreID ||
+			currentDomain != action.TargetServerDomainID ||
 			currentServer != action.TargetServerID {
 			return errors.New("builder launch Driver store/server incarnation changed after action commit")
 		}
@@ -354,14 +355,14 @@ func ensureBuilderLifecycleActionTx(ctx context.Context, tx *sql.Tx, p builderLi
 	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO epic_actions
 		(id,project_id,epic_id,kind,state,action_epoch,dedup_key,payload_json,payload_sha256,
-		 executor_kind,target_role,target_host_id,target_store_id,target_server_id,lifecycle_key,
+		 executor_kind,target_role,target_host_id,target_store_id,target_server_domain_id,target_server_id,lifecycle_key,
 		 target_epoch,profile_id,workspace_root_id,workspace_relative_path,lease_id,lease_epoch,
 		 recipient_session_id,recipient_pane_instance_id,recipient_agent_run_id,
 		 head_sha,base_sha,next_attempt_at,created_at,updated_at)
-		VALUES (?,?,?,?,'pending',0,?,?,?,'driver_lifecycle','builder',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,'pending',0,?,?,?,'driver_lifecycle','builder',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		actionID, p.ProjectID, p.EpicID, p.Kind, p.Dedup, p.Payload,
 		"sha256:"+hex.EncodeToString(payloadHash[:]), p.Binding.HostID, p.Binding.StoreID,
-		p.Binding.TmuxServerInstanceID, p.Binding.LifecycleKey, p.TargetEpoch, p.Binding.ProfileID,
+		p.Binding.TmuxServerDomainID, p.Binding.TmuxServerInstanceID, p.Binding.LifecycleKey, p.TargetEpoch, p.Binding.ProfileID,
 		p.Binding.WorkspaceRootID, p.Binding.WorkspaceRelativePath,
 		"builder-affinity:"+p.EpicID, p.LeaseEpoch, sessionID, paneID, runID, p.HeadSHA, p.BaseSHA,
 		nowText, nowText, nowText)
@@ -371,19 +372,19 @@ func ensureBuilderLifecycleActionTx(ctx context.Context, tx *sql.Tx, p builderLi
 	if !isUniqueConstraintErr(err) {
 		return err
 	}
-	var kind, hash, host, storeID, server, lifecycle, recipientSession, recipientPane, recipientRun string
+	var kind, hash, host, storeID, domain, server, lifecycle, recipientSession, recipientPane, recipientRun string
 	var targetEpoch, leaseEpoch int64
 	if qerr := tx.QueryRowContext(ctx, `SELECT kind,payload_sha256,target_host_id,target_store_id,
-		target_server_id,lifecycle_key,target_epoch,lease_epoch,recipient_session_id,
+		target_server_domain_id,target_server_id,lifecycle_key,target_epoch,lease_epoch,recipient_session_id,
 		recipient_pane_instance_id,recipient_agent_run_id FROM epic_actions
 		WHERE dedup_key=? AND state<>'cancelled_superseded'`, p.Dedup).Scan(&kind, &hash,
-		&host, &storeID, &server, &lifecycle, &targetEpoch, &leaseEpoch,
+		&host, &storeID, &domain, &server, &lifecycle, &targetEpoch, &leaseEpoch,
 		&recipientSession, &recipientPane, &recipientRun); qerr != nil {
 		return err
 	}
 	if kind != p.Kind || hash != "sha256:"+hex.EncodeToString(payloadHash[:]) ||
 		host != p.Binding.HostID || storeID != p.Binding.StoreID ||
-		server != p.Binding.TmuxServerInstanceID || lifecycle != p.Binding.LifecycleKey ||
+		domain != p.Binding.TmuxServerDomainID || server != p.Binding.TmuxServerInstanceID || lifecycle != p.Binding.LifecycleKey ||
 		targetEpoch != p.TargetEpoch || leaseEpoch != p.LeaseEpoch ||
 		recipientSession != sessionID || recipientPane != paneID || recipientRun != runID {
 		return fmt.Errorf("builder lifecycle action dedup collision for %s", p.Dedup)
@@ -393,8 +394,8 @@ func ensureBuilderLifecycleActionTx(ctx context.Context, tx *sql.Tx, p builderLi
 
 func latestDriverSessionBindingTx(ctx context.Context, tx *sql.Tx, projectID, workerIdentity, role string) (DriverSessionBinding, error) {
 	return activeDriverSessionBindingRow(tx.QueryRowContext(ctx, `SELECT
-		binding_id,project_id,worker_identity,role,binding_epoch,host_id,store_id,
-		tmux_server_instance_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
+		binding_id,project_id,worker_identity,role,seat_id,binding_epoch,host_id,store_id,
+		tmux_server_domain_id,tmux_server_instance_id,lifecycle_ownership,external_watch_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
 		workspace_relative_path,session_id,pane_instance_id,agent_run_id,provider,
 		conversation_id,observed_at FROM driver_session_bindings
 		WHERE project_id=? AND worker_identity=? AND role=?
@@ -414,25 +415,26 @@ func (s *Store) ProjectBuilderLifecycleResult(ctx context.Context, action Builde
 		case "builder_park":
 			return projectBuilderParkTx(ctx, tx, action, receipt, now)
 		case "builder_launch":
-			return projectBuilderLaunchTx(ctx, tx, action, receipt, now, s.HasDriverControlOrigin())
+			return s.projectBuilderLaunchTx(ctx, tx, action, receipt, now)
 		case "builder_rework":
-			return projectBuilderRelaunchTx(ctx, tx, action, receipt, now, s.HasDriverControlOrigin())
+			return s.projectBuilderRelaunchTx(ctx, tx, action, receipt, now)
 		case "conflict_resolution":
-			return projectBuilderConflictRelaunchTx(ctx, tx, action, receipt, now, s.HasDriverControlOrigin())
+			return s.projectBuilderConflictRelaunchTx(ctx, tx, action, receipt, now)
 		default:
 			return fmt.Errorf("unsupported lifecycle action %s", action.Kind)
 		}
 	})
 }
 
-func projectBuilderLaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLifecycleActionProjection,
-	receipt BuilderLifecycleReceiptProjection, now time.Time, controlOriginAvailable bool) error {
+func (s *Store) projectBuilderLaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLifecycleActionProjection,
+	receipt BuilderLifecycleReceiptProjection, now time.Time) error {
 	if receipt.Operation != "ensure" || receipt.Status != "ensured" {
 		return fmt.Errorf("builder launch not ensured: %s", receipt.Status)
 	}
 	id := receipt.IdentityAfter
 	if id.HostID != action.TargetHostID || id.StoreID != action.TargetStoreID ||
-		id.TmuxServerInstanceID != action.TargetServerID || id.LifecycleKey != action.LifecycleKey ||
+		id.TmuxServerDomainID != action.TargetServerDomainID || id.TmuxServerInstanceID != action.TargetServerID ||
+		id.LifecycleOwnership != "driver_managed" || id.LifecycleKey != action.LifecycleKey ||
 		id.TargetEpoch != action.TargetEpoch || id.SessionID == "" || id.PaneInstanceID == "" || id.AgentRunID == "" {
 		return errors.New("Driver builder launch returned a different incarnation fence")
 	}
@@ -455,7 +457,7 @@ func projectBuilderLaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLifec
 			current.AgentRunID != id.AgentRunID || current.TargetEpoch != id.TargetEpoch {
 			return errors.New("builder launch replay found a different active incarnation")
 		}
-		if !controlOriginAvailable {
+		if !s.HasDriverControlOriginForBinding(current) {
 			return holdBuilderControlOriginTx(ctx, tx, projectID, action.EpicID, now)
 		}
 		return ensureBuilderLaunchContractTx(ctx, tx, action, current, now)
@@ -466,7 +468,8 @@ func projectBuilderLaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLifec
 	binding := DriverSessionBinding{ProjectID: projectID,
 		WorkerIdentity: BuilderDriverIdentity(action.EpicID), Role: DriverBuilderRole,
 		BindingEpoch: 1, HostID: id.HostID, StoreID: id.StoreID,
-		TmuxServerInstanceID: id.TmuxServerInstanceID, LifecycleKey: id.LifecycleKey,
+		TmuxServerDomainID: id.TmuxServerDomainID, TmuxServerInstanceID: id.TmuxServerInstanceID,
+		LifecycleOwnership: id.LifecycleOwnership, LifecycleKey: id.LifecycleKey,
 		TargetEpoch: id.TargetEpoch, ProfileID: action.ProfileID,
 		WorkspaceRootID: action.WorkspaceRootID, WorkspaceRelativePath: action.WorkspaceRelativePath,
 		SessionID: id.SessionID, PaneInstanceID: id.PaneInstanceID, AgentRunID: id.AgentRunID,
@@ -474,18 +477,19 @@ func projectBuilderLaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLifec
 	binding.BindingID = driverBindingID(binding, binding.BindingEpoch)
 	_, err := tx.ExecContext(ctx, `INSERT INTO driver_session_bindings
 		(binding_id,project_id,worker_identity,role,binding_epoch,state,host_id,store_id,
-		 tmux_server_instance_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
+		 tmux_server_domain_id,tmux_server_instance_id,lifecycle_ownership,lifecycle_key,target_epoch,profile_id,workspace_root_id,
 		 workspace_relative_path,session_id,pane_instance_id,agent_run_id,provider,
 		 conversation_id,observed_at,created_at,updated_at)
-		VALUES (?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, binding.BindingID,
+		VALUES (?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, binding.BindingID,
 		projectID, binding.WorkerIdentity, binding.Role, binding.BindingEpoch, id.HostID,
-		id.StoreID, id.TmuxServerInstanceID, id.LifecycleKey, id.TargetEpoch,
+		id.StoreID, id.TmuxServerDomainID, id.TmuxServerInstanceID, id.LifecycleOwnership,
+		id.LifecycleKey, id.TargetEpoch,
 		action.ProfileID, action.WorkspaceRootID, action.WorkspaceRelativePath, id.SessionID,
 		id.PaneInstanceID, id.AgentRunID, id.Provider, id.ConversationID, stamp, stamp, stamp)
 	if err != nil {
 		return err
 	}
-	if !controlOriginAvailable {
+	if !s.HasDriverControlOriginForBinding(binding) {
 		return holdBuilderControlOriginTx(ctx, tx, projectID, action.EpicID, now)
 	}
 	if err := ensureBuilderLaunchContractTx(ctx, tx, action, binding, now); err != nil {
@@ -517,14 +521,14 @@ func ensureBuilderLaunchContractTx(ctx context.Context, tx *sql.Tx,
 	_, err := tx.ExecContext(ctx, `INSERT INTO epic_actions
 		(id,project_id,epic_id,kind,state,action_epoch,dedup_key,payload_json,payload_sha256,
 		 evidence_baseline_store_seq,evidence_baseline_uncertainty_epoch,
-		 executor_kind,target_role,target_host_id,target_store_id,target_server_id,lifecycle_key,
+		 executor_kind,target_role,target_host_id,target_store_id,target_server_domain_id,target_server_id,lifecycle_key,
 		 target_epoch,profile_id,workspace_root_id,workspace_relative_path,lease_id,lease_epoch,
 		 sender_principal_id,recipient_session_id,recipient_pane_instance_id,
 		 recipient_agent_run_id,grant_id,grant_epoch,grant_expires_at,next_attempt_at,created_at,updated_at)
 		VALUES (?,?,?,'builder_launch_contract','pending',0,?,?,?,?,?,'driver','builder',
-		?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)`, actionID, parent.ProjectID, parent.EpicID,
+		?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)`, actionID, parent.ProjectID, parent.EpicID,
 		dedup, payload, "sha256:"+hex.EncodeToString(hash[:]), baselineSeq, uncertainty,
-		recipient.HostID, recipient.StoreID, recipient.TmuxServerInstanceID,
+		recipient.HostID, recipient.StoreID, recipient.TmuxServerDomainID, recipient.TmuxServerInstanceID,
 		recipient.LifecycleKey, recipient.TargetEpoch, recipient.ProfileID,
 		recipient.WorkspaceRootID, recipient.WorkspaceRelativePath,
 		"builder-compute:"+parent.EpicID, parent.Epoch, DriverControlIdentity,
@@ -551,14 +555,15 @@ func ensureBuilderLaunchContractTx(ctx context.Context, tx *sql.Tx,
 	return nil
 }
 
-func projectBuilderConflictRelaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLifecycleActionProjection,
-	receipt BuilderLifecycleReceiptProjection, now time.Time, controlOriginAvailable bool) error {
+func (s *Store) projectBuilderConflictRelaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLifecycleActionProjection,
+	receipt BuilderLifecycleReceiptProjection, now time.Time) error {
 	if receipt.Operation != "ensure" || receipt.Status != "ensured" {
 		return fmt.Errorf("conflict resolver relaunch not ensured: %s", receipt.Status)
 	}
 	id := receipt.IdentityAfter
 	if id.HostID != action.TargetHostID || id.StoreID != action.TargetStoreID ||
-		id.TmuxServerInstanceID != action.TargetServerID || id.LifecycleKey != action.LifecycleKey ||
+		id.TmuxServerDomainID != action.TargetServerDomainID || id.TmuxServerInstanceID != action.TargetServerID ||
+		id.LifecycleOwnership != "driver_managed" || id.LifecycleKey != action.LifecycleKey ||
 		id.TargetEpoch != action.TargetEpoch || id.SessionID == "" || id.PaneInstanceID == "" || id.AgentRunID == "" {
 		return errors.New("Driver conflict relaunch returned a different incarnation fence")
 	}
@@ -570,7 +575,12 @@ func projectBuilderConflictRelaunchTx(ctx context.Context, tx *sql.Tx, action Bu
 		return err
 	}
 	if affinity == "active" && state == "conflict_resolution" {
-		if !controlOriginAvailable {
+		current, err := activeDriverSessionBindingTx(ctx, tx, projectID,
+			BuilderDriverIdentity(action.EpicID), DriverBuilderRole)
+		if err != nil {
+			return err
+		}
+		if !s.HasDriverControlOriginForBinding(current) {
 			return holdBuilderControlOriginTx(ctx, tx, projectID, action.EpicID, now)
 		}
 		return ensureBuilderReworkWakeTx(ctx, tx, action, id, now)
@@ -593,7 +603,8 @@ func projectBuilderConflictRelaunchTx(ctx context.Context, tx *sql.Tx, action Bu
 	newBinding := DriverSessionBinding{ProjectID: projectID,
 		WorkerIdentity: BuilderDriverIdentity(action.EpicID), Role: DriverBuilderRole,
 		BindingEpoch: newEpoch, HostID: id.HostID, StoreID: id.StoreID,
-		TmuxServerInstanceID: id.TmuxServerInstanceID, LifecycleKey: id.LifecycleKey,
+		TmuxServerDomainID: id.TmuxServerDomainID, TmuxServerInstanceID: id.TmuxServerInstanceID,
+		LifecycleOwnership: id.LifecycleOwnership, LifecycleKey: id.LifecycleKey,
 		TargetEpoch: id.TargetEpoch, ProfileID: prior.ProfileID,
 		WorkspaceRootID: prior.WorkspaceRootID, WorkspaceRelativePath: prior.WorkspaceRelativePath,
 		SessionID: id.SessionID, PaneInstanceID: id.PaneInstanceID, AgentRunID: id.AgentRunID,
@@ -601,12 +612,13 @@ func projectBuilderConflictRelaunchTx(ctx context.Context, tx *sql.Tx, action Bu
 	newBinding.BindingID = driverBindingID(newBinding, newEpoch)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO driver_session_bindings
 		(binding_id,project_id,worker_identity,role,binding_epoch,state,host_id,store_id,
-		 tmux_server_instance_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
+		 tmux_server_domain_id,tmux_server_instance_id,lifecycle_ownership,lifecycle_key,target_epoch,profile_id,workspace_root_id,
 		 workspace_relative_path,session_id,pane_instance_id,agent_run_id,provider,
 		 conversation_id,observed_at,created_at,updated_at)
-		VALUES (?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, newBinding.BindingID,
+		VALUES (?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, newBinding.BindingID,
 		projectID, newBinding.WorkerIdentity, newBinding.Role, newEpoch, id.HostID, id.StoreID,
-		id.TmuxServerInstanceID, id.LifecycleKey, id.TargetEpoch, prior.ProfileID,
+		id.TmuxServerDomainID, id.TmuxServerInstanceID, id.LifecycleOwnership,
+		id.LifecycleKey, id.TargetEpoch, prior.ProfileID,
 		prior.WorkspaceRootID, prior.WorkspaceRelativePath, id.SessionID, id.PaneInstanceID,
 		id.AgentRunID, id.Provider, id.ConversationID, stamp, stamp, stamp); err != nil {
 		return err
@@ -626,7 +638,7 @@ func projectBuilderConflictRelaunchTx(ctx context.Context, tx *sql.Tx, action Bu
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("conflict resolver relaunch projection changed concurrently")
 	}
-	if !controlOriginAvailable {
+	if !s.HasDriverControlOriginForBinding(newBinding) {
 		return holdBuilderControlOriginTx(ctx, tx, projectID, action.EpicID, now)
 	}
 	if err := ensureBuilderReworkWakeTx(ctx, tx, action, id, now); err != nil {
@@ -699,14 +711,15 @@ func projectBuilderParkTx(ctx context.Context, tx *sql.Tx, action BuilderLifecyc
 		state, state, version+1, "driver", `{"remote_absence":true}`, now)
 }
 
-func projectBuilderRelaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLifecycleActionProjection,
-	receipt BuilderLifecycleReceiptProjection, now time.Time, controlOriginAvailable bool) error {
+func (s *Store) projectBuilderRelaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLifecycleActionProjection,
+	receipt BuilderLifecycleReceiptProjection, now time.Time) error {
 	if receipt.Operation != "ensure" || receipt.Status != "ensured" {
 		return fmt.Errorf("builder relaunch not ensured: %s", receipt.Status)
 	}
 	id := receipt.IdentityAfter
 	if id.HostID != action.TargetHostID || id.StoreID != action.TargetStoreID ||
-		id.TmuxServerInstanceID != action.TargetServerID || id.LifecycleKey != action.LifecycleKey ||
+		id.TmuxServerDomainID != action.TargetServerDomainID || id.TmuxServerInstanceID != action.TargetServerID ||
+		id.LifecycleOwnership != "driver_managed" || id.LifecycleKey != action.LifecycleKey ||
 		id.TargetEpoch != action.TargetEpoch || id.SessionID == "" || id.PaneInstanceID == "" || id.AgentRunID == "" {
 		return errors.New("Driver relaunch returned a different incarnation fence")
 	}
@@ -718,7 +731,12 @@ func projectBuilderRelaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLif
 		return err
 	}
 	if affinity == "active" && state == "rebuild_in_flight" {
-		if !controlOriginAvailable {
+		current, err := activeDriverSessionBindingTx(ctx, tx, projectID,
+			BuilderDriverIdentity(action.EpicID), DriverBuilderRole)
+		if err != nil {
+			return err
+		}
+		if !s.HasDriverControlOriginForBinding(current) {
 			return holdBuilderControlOriginTx(ctx, tx, projectID, action.EpicID, now)
 		}
 		return ensureBuilderReworkWakeTx(ctx, tx, action, id, now)
@@ -732,7 +750,7 @@ func projectBuilderRelaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLif
 		return err
 	}
 	if prior.HostID != action.TargetHostID || prior.StoreID != action.TargetStoreID ||
-		prior.TmuxServerInstanceID != action.TargetServerID || prior.LifecycleKey != action.LifecycleKey ||
+		prior.TmuxServerDomainID != action.TargetServerDomainID || prior.TmuxServerInstanceID != action.TargetServerID || prior.LifecycleKey != action.LifecycleKey ||
 		prior.TargetEpoch+1 != action.TargetEpoch || prior.ProfileID != action.ProfileID ||
 		prior.WorkspaceRootID != action.WorkspaceRootID ||
 		prior.WorkspaceRelativePath != action.WorkspaceRelativePath ||
@@ -749,7 +767,8 @@ func projectBuilderRelaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLif
 	newBinding := DriverSessionBinding{ProjectID: projectID,
 		WorkerIdentity: BuilderDriverIdentity(action.EpicID), Role: DriverBuilderRole,
 		BindingEpoch: newEpoch, HostID: id.HostID, StoreID: id.StoreID,
-		TmuxServerInstanceID: id.TmuxServerInstanceID, LifecycleKey: id.LifecycleKey,
+		TmuxServerDomainID: id.TmuxServerDomainID, TmuxServerInstanceID: id.TmuxServerInstanceID,
+		LifecycleOwnership: id.LifecycleOwnership, LifecycleKey: id.LifecycleKey,
 		TargetEpoch: id.TargetEpoch, ProfileID: prior.ProfileID,
 		WorkspaceRootID: prior.WorkspaceRootID, WorkspaceRelativePath: prior.WorkspaceRelativePath,
 		SessionID: id.SessionID, PaneInstanceID: id.PaneInstanceID, AgentRunID: id.AgentRunID,
@@ -757,12 +776,13 @@ func projectBuilderRelaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLif
 	newBinding.BindingID = driverBindingID(newBinding, newEpoch)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO driver_session_bindings
 		(binding_id,project_id,worker_identity,role,binding_epoch,state,host_id,store_id,
-		 tmux_server_instance_id,lifecycle_key,target_epoch,profile_id,workspace_root_id,
+		 tmux_server_domain_id,tmux_server_instance_id,lifecycle_ownership,lifecycle_key,target_epoch,profile_id,workspace_root_id,
 		 workspace_relative_path,session_id,pane_instance_id,agent_run_id,provider,
 		 conversation_id,observed_at,created_at,updated_at)
-		VALUES (?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, newBinding.BindingID,
+		VALUES (?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, newBinding.BindingID,
 		projectID, newBinding.WorkerIdentity, newBinding.Role, newEpoch, id.HostID, id.StoreID,
-		id.TmuxServerInstanceID, id.LifecycleKey, id.TargetEpoch, prior.ProfileID,
+		id.TmuxServerDomainID, id.TmuxServerInstanceID, id.LifecycleOwnership,
+		id.LifecycleKey, id.TargetEpoch, prior.ProfileID,
 		prior.WorkspaceRootID, prior.WorkspaceRelativePath, id.SessionID, id.PaneInstanceID,
 		id.AgentRunID, id.Provider, id.ConversationID, stamp, stamp, stamp); err != nil {
 		return err
@@ -782,7 +802,7 @@ func projectBuilderRelaunchTx(ctx context.Context, tx *sql.Tx, action BuilderLif
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("builder relaunch projection changed concurrently")
 	}
-	if !controlOriginAvailable {
+	if !s.HasDriverControlOriginForBinding(newBinding) {
 		return holdBuilderControlOriginTx(ctx, tx, projectID, action.EpicID, now)
 	}
 	if err := ensureBuilderReworkWakeTx(ctx, tx, action, id, now); err != nil {
@@ -838,14 +858,14 @@ func ensureBuilderReworkWakeTx(ctx context.Context, tx *sql.Tx, parent BuilderLi
 	stamp := now.UTC().Format(rfc3339)
 	_, err := tx.ExecContext(ctx, `INSERT INTO epic_actions
 		(id,project_id,epic_id,kind,state,action_epoch,dedup_key,payload_json,payload_sha256,
-		 executor_kind,target_role,target_host_id,target_store_id,target_server_id,lifecycle_key,
+		 executor_kind,target_role,target_host_id,target_store_id,target_server_domain_id,target_server_id,lifecycle_key,
 		 target_epoch,profile_id,workspace_root_id,workspace_relative_path,lease_id,lease_epoch,
 		 sender_principal_id,recipient_session_id,recipient_pane_instance_id,
 		 recipient_agent_run_id,grant_id,grant_epoch,grant_expires_at,head_sha,base_sha,
 		 next_attempt_at,created_at,updated_at)
-		VALUES (?,?,?,'builder_rework_wake','pending',0,?,?,?,'driver','builder',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)`,
+		VALUES (?,?,?,'builder_rework_wake','pending',0,?,?,?,'driver','builder',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)`,
 		actionID, parent.ProjectID, parent.EpicID, dedup, parent.Payload, parent.PayloadSHA256,
-		recipient.HostID, recipient.StoreID, recipient.TmuxServerInstanceID,
+		recipient.HostID, recipient.StoreID, recipient.TmuxServerDomainID, recipient.TmuxServerInstanceID,
 		recipient.LifecycleKey, recipient.TargetEpoch, parent.ProfileID,
 		parent.WorkspaceRootID, parent.WorkspaceRelativePath, parent.LeaseID, parent.LeaseEpoch,
 		DriverControlIdentity, recipient.SessionID, recipient.PaneInstanceID,
@@ -857,15 +877,15 @@ func ensureBuilderReworkWakeTx(ctx context.Context, tx *sql.Tx, parent BuilderLi
 	if !isUniqueConstraintErr(err) {
 		return err
 	}
-	var kind, payloadHash, executor, targetHost, targetStore, targetServer, lifecycle string
+	var kind, payloadHash, executor, targetHost, targetStore, targetDomain, targetServer, lifecycle string
 	var targetEpoch, leaseEpoch int64
 	var senderPrincipal, recipientSession, recipientPane, recipientRun, gotGrant string
 	qerr := tx.QueryRowContext(ctx, `SELECT kind,payload_sha256,executor_kind,target_host_id,
-		target_store_id,target_server_id,lifecycle_key,target_epoch,lease_epoch,
+		target_store_id,target_server_domain_id,target_server_id,lifecycle_key,target_epoch,lease_epoch,
 		sender_principal_id,recipient_session_id,recipient_pane_instance_id,
 		recipient_agent_run_id,grant_id FROM epic_actions
 		WHERE dedup_key=? AND state<>'cancelled_superseded'`, dedup).Scan(&kind, &payloadHash,
-		&executor, &targetHost, &targetStore, &targetServer, &lifecycle, &targetEpoch,
+		&executor, &targetHost, &targetStore, &targetDomain, &targetServer, &lifecycle, &targetEpoch,
 		&leaseEpoch, &senderPrincipal, &recipientSession, &recipientPane,
 		&recipientRun, &gotGrant)
 	if qerr != nil {
@@ -873,6 +893,7 @@ func ensureBuilderReworkWakeTx(ctx context.Context, tx *sql.Tx, parent BuilderLi
 	}
 	if kind != "builder_rework_wake" || payloadHash != parent.PayloadSHA256 || executor != "driver" ||
 		targetHost != recipient.HostID || targetStore != recipient.StoreID ||
+		targetDomain != recipient.TmuxServerDomainID ||
 		targetServer != recipient.TmuxServerInstanceID || lifecycle != recipient.LifecycleKey ||
 		targetEpoch != recipient.TargetEpoch || leaseEpoch != parent.LeaseEpoch ||
 		senderPrincipal != DriverControlIdentity ||

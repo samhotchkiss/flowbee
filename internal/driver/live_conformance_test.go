@@ -149,7 +149,7 @@ func runLiveLifecycleConformance(t *testing.T, ctx context.Context, port DriverP
 	leaseID := randomUUID(t)
 	target := SessionTarget{
 		Identity: Identity{HostID: meta.HostID, StoreID: meta.StoreID,
-			TmuxServerInstanceID: serverID},
+			TmuxServerDomainID: meta.TmuxServer.DomainID, TmuxServerInstanceID: serverID},
 		LifecycleKey: key, TargetEpoch: 1, ProfileID: profile,
 		WorkspaceRootID: workspaceRoot, WorkspaceRelativePath: workspacePath,
 		LeaseID: leaseID, LeaseEpoch: 1,
@@ -217,9 +217,10 @@ func runLiveControlOriginConformance(t *testing.T, ctx context.Context, port Dri
 
 	grant := Grant{
 		GrantID: randomUUID(t), SenderPrincipalID: capability.PrincipalID,
-		RecipientSessionID:      target.Identity.SessionID,
-		RecipientPaneInstanceID: target.Identity.PaneInstanceID,
-		Epoch:                   1, MaximumPayloadBytes: 4096,
+		RecipientSessionID:          target.Identity.SessionID,
+		RecipientPaneInstanceID:     target.Identity.PaneInstanceID,
+		ExpectedRecipientAgentRunID: target.Identity.AgentRunID,
+		Epoch:                       1, MaximumPayloadBytes: 4096,
 		ExpiresAt: time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339Nano),
 	}
 	if err := port.Grant(ctx, grant); err != nil {
@@ -237,11 +238,13 @@ func runLiveControlOriginConformance(t *testing.T, ctx context.Context, port Dri
 		". This is a transport-only test; no product action is requested."
 	action := NewAction(randomUUID(t), payload, grant.Epoch)
 	action.SenderPrincipalID = capability.PrincipalID
+	action.RecipientAgentRunID = target.Identity.AgentRunID
 	req := SendRequest{
 		Action: action, GrantID: grant.GrantID,
-		RecipientSessionID:      target.Identity.SessionID,
-		RecipientPaneInstanceID: target.Identity.PaneInstanceID,
-		GrantEpoch:              grant.Epoch,
+		RecipientSessionID:          target.Identity.SessionID,
+		RecipientPaneInstanceID:     target.Identity.PaneInstanceID,
+		ExpectedRecipientAgentRunID: target.Identity.AgentRunID,
+		GrantEpoch:                  grant.Epoch,
 		// v2.4 direct-origin sends must never impersonate a managed session.
 		OnBehalfOfSessionID: "",
 	}

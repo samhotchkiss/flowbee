@@ -35,7 +35,7 @@ func bindReviewDriverRoute(t *testing.T, st *store.Store, reviewer string, now t
 	bindings := []store.DriverSessionBinding{
 		{
 			WorkerIdentity: reviewer, Role: store.DriverReviewerRole,
-			HostID: "host-review", StoreID: "store-review", TmuxServerInstanceID: "server-review",
+			HostID: "host-review", StoreID: "store-review", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-review", LifecycleOwnership: "driver_managed",
 			LifecycleKey: "reviewer-" + reviewer, TargetEpoch: 1, ProfileID: "code-reviewer",
 			WorkspaceRootID: "workspace-root", WorkspaceRelativePath: "repo",
 			SessionID: "session-" + reviewer, PaneInstanceID: "pane-" + reviewer, AgentRunID: "run-" + reviewer,

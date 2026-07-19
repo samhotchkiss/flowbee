@@ -1,7 +1,10 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -28,6 +31,48 @@ func (s *Server) projectsList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"schema_version": "flowbee.projects/v1", "projects": projects})
+}
+
+// portfolio is the Phase-2 global read model. It exposes workload and actor
+// route health together so a missing Interactor/Orchestrator incarnation cannot
+// look like an idle, healthy project. ETag is shared with the dashboard digest;
+// project, binding, breaker, and scheduler mutations all advance that digest.
+func (s *Server) portfolio(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireHumanPortfolio(w, r, auth.HumanProjectRead); !ok {
+		return
+	}
+	seq, err := s.store.EpicDigestSeq(r.Context())
+	if err != nil {
+		http.Error(w, "portfolio digest failed", http.StatusInternalServerError)
+		return
+	}
+	projects, err := s.store.ProjectDashboard(r.Context())
+	if err != nil {
+		http.Error(w, "portfolio read failed", http.StatusInternalServerError)
+		return
+	}
+	store.EvaluateProjectDashboardStarvation(projects, s.clock.Now(), store.ProjectStarvationBound)
+	etag := portfolioETag(seq, projects)
+	if r.Header.Get("If-None-Match") == etag {
+		w.Header().Set("ETag", etag)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("ETag", etag)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"schema_version": "flowbee.portfolio/v1",
+		"digest_seq":     seq,
+		"projects":       projects,
+	})
+}
+
+func portfolioETag(seq int64, projects []store.ProjectDashboardRow) string {
+	payload, _ := json.Marshal(struct {
+		Seq      int64                       `json:"seq"`
+		Projects []store.ProjectDashboardRow `json:"projects"`
+	}{Seq: seq, Projects: projects})
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf(`"%d-%x"`, seq, digest[:8])
 }
 
 func (s *Server) projectOne(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +102,36 @@ func (s *Server) projectOne(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"schema_version": "flowbee.project/v1",
 		"project": project, "repository_ids": repos, "actors": actors})
+}
+
+func (s *Server) projectEpics(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("project_id")
+	if _, ok := s.requireHumanProject(w, r, projectID, auth.HumanProjectRead); !ok {
+		return
+	}
+	if _, err := s.store.GetPortfolioProject(r.Context(), projectID); errors.Is(err, store.ErrProjectNotFound) {
+		http.Error(w, "project not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "project read failed", http.StatusInternalServerError)
+		return
+	}
+	epics, err := s.store.ListEpicRunsForProject(r.Context(), projectID)
+	if err != nil {
+		http.Error(w, "project epics read failed", http.StatusInternalServerError)
+		return
+	}
+	seq, err := s.store.EpicDigestSeq(r.Context())
+	if err != nil {
+		http.Error(w, "project epics digest failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"schema_version": "flowbee.project-epics/v1",
+		"digest_seq":     seq,
+		"project_id":     projectID,
+		"epics":          epics,
+	})
 }
 
 func (s *Server) projectCreate(w http.ResponseWriter, r *http.Request) {

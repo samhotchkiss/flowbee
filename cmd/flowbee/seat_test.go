@@ -11,10 +11,62 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/acctprobe"
+	"github.com/samhotchkiss/flowbee/internal/capacitycollector"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
+
+type fixedCapacityProbe struct {
+	result capacitycollector.ProbeResult
+	err    error
+	seat   capacitycollector.Seat
+}
+
+func (p *fixedCapacityProbe) ProbeLive(_ context.Context, seat capacitycollector.Seat) (capacitycollector.ProbeResult, error) {
+	p.seat = seat
+	return p.result, p.err
+}
+
+func TestObserveCapacityIdentityUsesLiveV2AdapterFactsWithoutWritingBinding(t *testing.T) {
+	now := time.Date(2026, 7, 19, 20, 0, 0, 0, time.UTC)
+	seat := store.Seat{ID: "|codex|/codex/a", AgentFamily: "codex", CodexHome: "/codex/a",
+		ExtraEnv: map[string]string{}}
+	probe := &fixedCapacityProbe{result: capacitycollector.ProbeResult{Result: &acctprobe.Result{
+		Identity: acctprobe.Identity{Provider: acctprobe.ProviderCodex, AccountKey: "account-1",
+			LineageDigest: "sha256-lineage", Verified: true},
+		TrustState: acctprobe.TrustVerified, CapturedAt: now, Source: "codex_app_server",
+	}}}
+	got, err := observeCapacityIdentity(context.Background(), probe, seat, "host-local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountKey != "account-1" || got.CredentialLineage != "sha256-lineage" ||
+		got.Source != "live_app_server" || got.TrustState != "verified" {
+		t.Fatalf("observation=%+v", got)
+	}
+	if !probe.seat.Local || probe.seat.ConfigHome != seat.CodexHome ||
+		probe.seat.ExpectedAccountKey != "" || probe.seat.ExpectedCredentialLineage != "" {
+		t.Fatalf("probe seat=%+v", probe.seat)
+	}
+}
+
+func TestObserveCapacityIdentityFailsClosedForCacheUnverifiedAndRemote(t *testing.T) {
+	now := time.Date(2026, 7, 19, 20, 0, 0, 0, time.UTC)
+	seat := store.Seat{ID: "|grok|/grok/a", AgentFamily: "grok", ConfigDir: "/grok/a", ExtraEnv: map[string]string{}}
+	probe := &fixedCapacityProbe{result: capacitycollector.ProbeResult{Result: &acctprobe.Result{
+		Identity: acctprobe.Identity{Provider: acctprobe.ProviderGrok, AccountKey: "account-1",
+			CredentialDigest: "lineage", Verified: false},
+		TrustState: acctprobe.TrustVerifiedLocal, CapturedAt: now, Source: "/cache/usage.json",
+	}}}
+	if _, err := observeCapacityIdentity(context.Background(), probe, seat, "host-local"); err == nil {
+		t.Fatal("cache-derived identity was accepted")
+	}
+	seat.Box = "remote-host"
+	if _, err := observeCapacityIdentity(context.Background(), probe, seat, "remote-host"); err == nil {
+		t.Fatal("remote seat was accepted through local probe")
+	}
+}
 
 // ── an in-memory acctprobe.FS so discoverSeats is exercised without real ssh ──
 
@@ -205,26 +257,27 @@ func TestSeatBindDriverPersistsOnlyInventoryTargetNotSessionIdentity(t *testing.
 	}
 	stamp := now.UTC().Format(time.RFC3339Nano)
 	if _, err := st.DB.ExecContext(ctx, `INSERT INTO driver_instances
-		(instance_ref,host_id,store_id,producer_boot_id,state,created_at,updated_at)
-		VALUES ('driver-a','stable-host','store-a','boot-a','live',?,?)`, stamp, stamp); err != nil {
+		(instance_ref,host_id,store_id,producer_boot_id,tmux_server_domain_id,tmux_server_ownership,state,created_at,updated_at)
+		VALUES ('driver-a','stable-host','store-a','boot-a','flowbee','managed_dedicated','live',?,?)`, stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
 	if err := runSeatBindDriver(ctx, st, []string{"--box", "stable-host", "--family", "codex",
 		"--codex-home", "/opt/codex-a", "--instance-ref", "driver-a",
+		"--tmux-server-domain-id", "flowbee",
 		"--tmux-server-instance-id", "server-a", "--profile-id", "codex-builder",
 		"--workspace-root-id", "repos", "--workspace-relative-base", "worktrees"}); err != nil {
 		t.Fatal(err)
 	}
-	var instance, server, profile, root, base string
-	if err := st.DB.QueryRowContext(ctx, `SELECT instance_ref,tmux_server_instance_id,
+	var instance, domain, server, profile, root, base string
+	if err := st.DB.QueryRowContext(ctx, `SELECT instance_ref,tmux_server_domain_id,tmux_server_instance_id,
 		profile_id,workspace_root_id,workspace_relative_base FROM builder_driver_targets
-		WHERE project_id='default' AND seat_id=?`, seat.ComposeID()).Scan(&instance, &server,
+		WHERE project_id='default' AND seat_id=?`, seat.ComposeID()).Scan(&instance, &domain, &server,
 		&profile, &root, &base); err != nil {
 		t.Fatal(err)
 	}
-	if instance != "driver-a" || server != "server-a" || profile != "codex-builder" ||
+	if instance != "driver-a" || domain != "flowbee" || server != "server-a" || profile != "codex-builder" ||
 		root != "repos" || base != "worktrees" {
-		t.Fatalf("target=%q/%q/%q/%q/%q", instance, server, profile, root, base)
+		t.Fatalf("target=%q/%q/%q/%q/%q/%q", instance, domain, server, profile, root, base)
 	}
 	var sessions int
 	_ = st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM driver_session_bindings`).Scan(&sessions)

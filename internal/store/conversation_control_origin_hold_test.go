@@ -51,12 +51,12 @@ func TestConversationMessageHoldsWithoutDriverControlOrigin(t *testing.T) {
 	}
 	for _, binding := range []store.DriverSessionBinding{
 		{WorkerIdentity: store.DriverControlIdentity, Role: store.DriverControlRole,
-			HostID: "host", StoreID: "store", TmuxServerInstanceID: "server",
+			HostID: "host", StoreID: "store", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server", LifecycleOwnership: "driver_managed",
 			LifecycleKey: "synthetic-control", TargetEpoch: 1, ProfileID: "synthetic",
 			WorkspaceRootID: "root", WorkspaceRelativePath: "flowbee",
 			SessionID: "synthetic-session", PaneInstanceID: "synthetic-pane", AgentRunID: "synthetic-run"},
 		{WorkerIdentity: "interactor:default", Role: store.DriverInteractorRole,
-			HostID: "host", StoreID: "store", TmuxServerInstanceID: "server",
+			HostID: "host", StoreID: "store", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server", LifecycleOwnership: "driver_managed",
 			LifecycleKey: "interactor", TargetEpoch: 1, ProfileID: "interactor",
 			WorkspaceRootID: "root", WorkspaceRelativePath: "project",
 			SessionID: "interactor-session", PaneInstanceID: "interactor-pane", AgentRunID: "interactor-run"},

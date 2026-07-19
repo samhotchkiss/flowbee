@@ -1,6 +1,7 @@
 package deadman_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -12,10 +13,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/alertingress"
 	"github.com/samhotchkiss/flowbee/internal/deadman"
 )
 
@@ -24,8 +27,57 @@ type mutableProbe struct{ observation deadman.Observation }
 func (p *mutableProbe) Probe(context.Context) (deadman.Observation, error) { return p.observation, nil }
 
 type recordingPublisher struct {
-	notifications []deadman.Notification
-	failures      int
+	notifications     []deadman.Notification
+	heartbeats        []deadman.Heartbeat
+	failures          int
+	heartbeatFailures int
+}
+
+func (p *recordingPublisher) PublishHeartbeat(_ context.Context, heartbeat deadman.Heartbeat) error {
+	p.heartbeats = append(p.heartbeats, heartbeat)
+	if p.heartbeatFailures > 0 {
+		p.heartbeatFailures--
+		return errors.New("heartbeat receiver unavailable")
+	}
+	return nil
+}
+
+func TestHeartbeatSurvivesRestartWithStableSequenceAndNoHumanNotification(t *testing.T) {
+	state := deadman.FileStore{Path: filepath.Join(t.TempDir(), "state.json")}
+	probe := &mutableProbe{observation: deadman.Observation{Healthy: true, HTTPStatus: http.StatusOK}}
+	now := time.Date(2026, 7, 20, 6, 0, 0, 0, time.UTC)
+	failing := &recordingPublisher{heartbeatFailures: 1}
+	runner := deadman.Runner{ProjectID: "russ", WatchdogID: "observer-a", Target: "http://cp/healthz",
+		Probe: probe, Publisher: failing, HeartbeatPublisher: failing, Store: state,
+		Now: func() time.Time { return now }}
+	if report, err := runner.RunOnce(context.Background()); err == nil || report.IncidentStarted {
+		t.Fatalf("failed heartbeat report=%+v err=%v", report, err)
+	}
+	if len(failing.heartbeats) != 1 || len(failing.notifications) != 0 {
+		t.Fatalf("heartbeat failure emitted human notification: %+v %+v", failing.heartbeats, failing.notifications)
+	}
+	original, _ := json.Marshal(failing.heartbeats[0])
+
+	succeeding := &recordingPublisher{}
+	restarted := deadman.Runner{ProjectID: "russ", WatchdogID: "observer-a", Target: "http://cp/healthz",
+		Probe: probe, Publisher: succeeding, HeartbeatPublisher: succeeding, Store: state,
+		Now: func() time.Time { return now.Add(time.Minute) }}
+	if report, err := restarted.RunOnce(context.Background()); err != nil || report.IncidentStarted {
+		t.Fatalf("restart heartbeat report=%+v err=%v", report, err)
+	}
+	retried, _ := json.Marshal(succeeding.heartbeats[0])
+	if !bytes.Equal(original, retried) || succeeding.heartbeats[0].Sequence != 1 || len(succeeding.notifications) != 0 {
+		t.Fatalf("restart changed heartbeat or notified human: first=%s retry=%s notifications=%+v",
+			original, retried, succeeding.notifications)
+	}
+
+	now = now.Add(2 * time.Minute)
+	if _, err := restarted.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(succeeding.heartbeats) != 2 || succeeding.heartbeats[1].Sequence != 2 {
+		t.Fatalf("next interval heartbeat=%+v", succeeding.heartbeats)
+	}
 }
 
 func (p *recordingPublisher) Publish(_ context.Context, n deadman.Notification) error {
@@ -42,13 +94,13 @@ func TestIncidentSurvivesRestartWithoutDuplicateAndResolvesOnce(t *testing.T) {
 	probe := &mutableProbe{observation: deadman.Observation{Reason: "process_unreachable", Detail: "connection refused"}}
 	pub := &recordingPublisher{}
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	runner := deadman.Runner{WatchdogID: "observer-a", Target: "http://cp:7001/healthz",
+	runner := deadman.Runner{ProjectID: "russ", WatchdogID: "observer-a", Target: "http://cp:7001/healthz",
 		Probe: probe, Publisher: pub, Store: state, Now: func() time.Time { return now }}
 	first, err := runner.RunOnce(context.Background())
 	if err != nil || !first.IncidentStarted || first.NotificationsSent != 1 {
 		t.Fatalf("first pass=%+v err=%v", first, err)
 	}
-	if len(pub.notifications) != 1 || pub.notifications[0].Status != "firing" {
+	if len(pub.notifications) != 1 || pub.notifications[0].Status != "firing" || pub.notifications[0].ProjectID != "russ" {
 		t.Fatalf("notifications=%+v", pub.notifications)
 	}
 	incidentID := pub.notifications[0].Incident.ID
@@ -56,7 +108,7 @@ func TestIncidentSurvivesRestartWithoutDuplicateAndResolvesOnce(t *testing.T) {
 	// Constructing a new Runner models a watchdog process restart. The state
 	// file, not process memory, prevents another firing event.
 	restartedPub := &recordingPublisher{}
-	restarted := deadman.Runner{WatchdogID: "observer-a", Target: "http://cp:7001/healthz",
+	restarted := deadman.Runner{ProjectID: "russ", WatchdogID: "observer-a", Target: "http://cp:7001/healthz",
 		Probe: probe, Publisher: restartedPub, Store: state, Now: func() time.Time { return now.Add(time.Minute) }}
 	second, err := restarted.RunOnce(context.Background())
 	if err != nil || second.IncidentStarted || len(restartedPub.notifications) != 0 {
@@ -87,7 +139,7 @@ func TestFailedPublishRetriesImmutableKeyAndBodyAfterRestart(t *testing.T) {
 	probe := &mutableProbe{observation: deadman.Observation{Reason: "control_plane_unhealthy", HTTPStatus: 503}}
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	failing := &recordingPublisher{failures: 1}
-	runner := deadman.Runner{WatchdogID: "observer-a", Target: "http://cp/healthz", Probe: probe,
+	runner := deadman.Runner{ProjectID: "russ", WatchdogID: "observer-a", Target: "http://cp/healthz", Probe: probe,
 		Publisher: failing, Store: state, Now: func() time.Time { return now }}
 	if _, err := runner.RunOnce(context.Background()); err == nil {
 		t.Fatal("expected webhook failure")
@@ -98,7 +150,7 @@ func TestFailedPublishRetriesImmutableKeyAndBodyAfterRestart(t *testing.T) {
 	original, _ := json.Marshal(failing.notifications[0])
 
 	succeeding := &recordingPublisher{}
-	restarted := deadman.Runner{WatchdogID: "observer-a", Target: "http://cp/healthz", Probe: probe,
+	restarted := deadman.Runner{ProjectID: "russ", WatchdogID: "observer-a", Target: "http://cp/healthz", Probe: probe,
 		Publisher: succeeding, Store: state, Now: func() time.Time { return now.Add(time.Minute) }}
 	report, err := restarted.RunOnce(context.Background())
 	if err != nil || report.IncidentStarted || report.NotificationsSent != 1 {
@@ -115,13 +167,13 @@ func TestRecoveryDoesNotOvertakePendingFiringNotification(t *testing.T) {
 	probe := &mutableProbe{observation: deadman.Observation{Reason: "process_unreachable"}}
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	failing := &recordingPublisher{failures: 1}
-	runner := deadman.Runner{WatchdogID: "observer-a", Target: "http://cp/healthz", Probe: probe,
+	runner := deadman.Runner{ProjectID: "russ", WatchdogID: "observer-a", Target: "http://cp/healthz", Probe: probe,
 		Publisher: failing, Store: state, Now: func() time.Time { return now }}
 	_, _ = runner.RunOnce(context.Background())
 
 	probe.observation = deadman.Observation{Healthy: true, HTTPStatus: 200}
 	pub := &recordingPublisher{}
-	restarted := deadman.Runner{WatchdogID: "observer-a", Target: "http://cp/healthz", Probe: probe,
+	restarted := deadman.Runner{ProjectID: "russ", WatchdogID: "observer-a", Target: "http://cp/healthz", Probe: probe,
 		Publisher: pub, Store: state, Now: func() time.Time { return now.Add(time.Minute) }}
 	report, err := restarted.RunOnce(context.Background())
 	if err != nil || report.NotificationsSent != 2 {
@@ -129,6 +181,43 @@ func TestRecoveryDoesNotOvertakePendingFiringNotification(t *testing.T) {
 	}
 	if len(pub.notifications) != 2 || pub.notifications[0].Status != "firing" || pub.notifications[1].Status != "resolved" {
 		t.Fatalf("notification order=%+v", pub.notifications)
+	}
+}
+
+func TestWatchdogStateCannotReplayQueueIntoAnotherProject(t *testing.T) {
+	state := deadman.FileStore{Path: filepath.Join(t.TempDir(), "state.json")}
+	notification := deadman.Notification{FormatVersion: "flowbee.deadman-alert/v1", ID: "old:firing",
+		DedupKey: "old:firing", ProjectID: "russ", WatchdogID: "observer-a", Target: "http://cp/healthz",
+		Status: "firing", Incident: deadman.Incident{ID: "old"}}
+	if err := state.Save(deadman.State{Version: deadman.StateVersion, ProjectID: "russ",
+		WatchdogID: "observer-a", Target: "http://cp/healthz",
+		Pending: []deadman.PendingNotification{{Notification: notification}}}); err != nil {
+		t.Fatal(err)
+	}
+	pub := &recordingPublisher{}
+	runner := deadman.Runner{ProjectID: "mail", WatchdogID: "observer-a", Target: "http://cp/healthz",
+		Probe: &mutableProbe{observation: deadman.Observation{Healthy: true}}, Publisher: pub, Store: state}
+	if _, err := runner.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "belongs to project") {
+		t.Fatalf("project change error=%v", err)
+	}
+	if len(pub.notifications) != 0 {
+		t.Fatalf("old project queue was replayed: %+v", pub.notifications)
+	}
+}
+
+func TestVersionOneStateFailsClosedBecauseProjectIsUnbound(t *testing.T) {
+	state := deadman.FileStore{Path: filepath.Join(t.TempDir(), "state.json")}
+	if err := state.Save(deadman.State{Version: 1, WatchdogID: "observer-a", Target: "http://cp/healthz"}); err != nil {
+		t.Fatal(err)
+	}
+	pub := &recordingPublisher{}
+	runner := deadman.Runner{ProjectID: "russ", WatchdogID: "observer-a", Target: "http://cp/healthz",
+		Probe: &mutableProbe{observation: deadman.Observation{Healthy: true}}, Publisher: pub, Store: state}
+	if _, err := runner.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "unsupported watchdog state version 1") {
+		t.Fatalf("v1 state error=%v", err)
+	}
+	if len(pub.notifications) != 0 {
+		t.Fatal("unbound v1 state reached publisher")
 	}
 }
 
@@ -193,7 +282,7 @@ func TestDriverControlDegradationDoesNotMaskLaterDeadmanEpisodes(t *testing.T) {
 	state := deadman.FileStore{Path: filepath.Join(t.TempDir(), "state.json")}
 	pub := &recordingPublisher{}
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	runner := deadman.Runner{WatchdogID: "observer-a", Target: srv.URL,
+	runner := deadman.Runner{ProjectID: "russ", WatchdogID: "observer-a", Target: srv.URL,
 		Probe: deadman.HTTPProbe{URL: srv.URL}, Publisher: pub, Store: state,
 		Now: func() time.Time { return now }}
 
@@ -258,6 +347,7 @@ func TestWebhookPublisherSignsExactImmutableBody(t *testing.T) {
 		FormatVersion string               `json:"format_version"`
 		ID            string               `json:"id"`
 		DedupKey      string               `json:"dedup_key"`
+		ProjectID     string               `json:"project_id"`
 		Kind          string               `json:"kind"`
 		Payload       deadman.Notification `json:"payload"`
 	}
@@ -275,17 +365,113 @@ func TestWebhookPublisherSignsExactImmutableBody(t *testing.T) {
 		if r.Header.Get("Idempotency-Key") != received.DedupKey {
 			t.Errorf("idempotency key mismatch")
 		}
-		w.WriteHeader(http.StatusNoContent)
+		writeDeadmanReceiverAck(w, received.DedupKey, body, secret)
 	}))
 	defer srv.Close()
 	n := deadman.Notification{FormatVersion: "flowbee.deadman-alert/v1", ID: "i:firing", DedupKey: "i:firing",
-		WatchdogID: "w", Target: "t", Status: "firing", Incident: deadman.Incident{ID: "i"}}
-	if err := (deadman.WebhookPublisher{URL: srv.URL, Secret: secret}).Publish(context.Background(), n); err != nil {
+		ProjectID: "russ", WatchdogID: "w", Target: "t", Status: "firing", Incident: deadman.Incident{ID: "i"}}
+	if err := (deadman.WebhookPublisher{URL: srv.URL, Secret: secret, ProjectID: "russ"}).Publish(context.Background(), n); err != nil {
 		t.Fatal(err)
 	}
 	if received.ID != n.ID || received.FormatVersion != "flowbee.control-alert/v1" ||
-		received.Kind != "external_deadman" || received.Payload.FormatVersion != n.FormatVersion {
+		received.ProjectID != "russ" || received.Kind != "external_deadman" || received.Payload.FormatVersion != n.FormatVersion {
 		t.Fatalf("received=%+v", received)
+	}
+}
+
+func TestWebhookPublisherRequiresExactMatchingProject(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	defer srv.Close()
+	notification := deadman.Notification{FormatVersion: "flowbee.deadman-alert/v1", ID: "i:firing",
+		DedupKey: "i:firing", ProjectID: "russ", WatchdogID: "w", Target: "t", Status: "firing"}
+	for _, publisher := range []deadman.WebhookPublisher{
+		{URL: srv.URL, Secret: "secret"},
+		{URL: srv.URL, Secret: "secret", ProjectID: "mail"},
+		{URL: srv.URL, Secret: "secret", ProjectID: "Russ/Main"},
+	} {
+		if err := publisher.Publish(context.Background(), notification); err == nil {
+			t.Fatal("publisher accepted missing/mismatched project")
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("invalid project publisher made %d HTTP call(s)", calls)
+	}
+}
+
+func writeDeadmanReceiverAck(w http.ResponseWriter, key string, body []byte, secret string) {
+	hash := sha256.Sum256(body)
+	ackBody, _ := json.Marshal(alertingress.Acknowledgement{
+		FormatVersion: alertingress.AckFormatVersion, Status: "accepted",
+		IdempotencyKey: key, BodySHA256: hex.EncodeToString(hash[:]),
+	})
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(ackBody)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Flowbee-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write(ackBody)
+}
+
+type deadmanAckTransport struct {
+	secret string
+	calls  int
+	bodies [][]byte
+}
+
+func (d *deadmanAckTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	body, _ := io.ReadAll(req.Body)
+	d.calls++
+	d.bodies = append(d.bodies, append([]byte(nil), body...))
+	if d.calls == 1 {
+		return nil, errors.New("receiver response lost after acceptance")
+	}
+	recorder := httptest.NewRecorder()
+	writeDeadmanReceiverAck(recorder, req.Header.Get("Idempotency-Key"), body, d.secret)
+	return recorder.Result(), nil
+}
+
+func TestDeadmanPublisherRejectsProxy2xxAndReplaysExactBody(t *testing.T) {
+	secret := "test-key"
+	n := deadman.Notification{FormatVersion: "flowbee.deadman-alert/v1", ID: "i:firing", DedupKey: "i:firing",
+		ProjectID: "russ", WatchdogID: "w", Target: "t", Status: "firing", Incident: deadman.Incident{ID: "i"}}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	if err := (deadman.WebhookPublisher{URL: proxy.URL, Secret: secret, ProjectID: "russ"}).Publish(context.Background(), n); err == nil {
+		proxy.Close()
+		t.Fatal("proxy-generated empty 204 acknowledged dead-man notification")
+	}
+	proxy.Close()
+	redirectedCalls := 0
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectedCalls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer redirectTarget.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL, http.StatusTemporaryRedirect)
+	}))
+	if err := (deadman.WebhookPublisher{URL: redirector.URL, Secret: secret, ProjectID: "russ"}).Publish(context.Background(), n); err == nil {
+		redirector.Close()
+		t.Fatal("redirect unexpectedly acknowledged dead-man notification")
+	}
+	redirector.Close()
+	if redirectedCalls != 0 {
+		t.Fatalf("authenticated dead-man alert followed redirect: calls=%d", redirectedCalls)
+	}
+
+	transport := &deadmanAckTransport{secret: secret}
+	publisher := deadman.WebhookPublisher{URL: "https://receiver.example.test/flowbee", Secret: secret, ProjectID: "russ",
+		Client: &http.Client{Transport: transport}}
+	if err := publisher.Publish(context.Background(), n); err == nil {
+		t.Fatal("lost response unexpectedly succeeded")
+	}
+	if err := publisher.Publish(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	if transport.calls != 2 || !bytes.Equal(transport.bodies[0], transport.bodies[1]) {
+		t.Fatalf("dead-man retry changed immutable body: calls=%d bodies=%q", transport.calls, transport.bodies)
 	}
 }
 
@@ -316,7 +502,7 @@ func TestOwnerOnlySecretRejectsLooseModeAndSymlink(t *testing.T) {
 func TestStateStoreRejectsSymlinkAndOverlappingWriter(t *testing.T) {
 	dir := t.TempDir()
 	store := deadman.FileStore{Path: filepath.Join(dir, "state.json")}
-	if err := store.Save(deadman.State{Version: deadman.StateVersion, WatchdogID: "w", Target: "t"}); err != nil {
+	if err := store.Save(deadman.State{Version: deadman.StateVersion, ProjectID: "russ", WatchdogID: "w", Target: "t"}); err != nil {
 		t.Fatal(err)
 	}
 	link := deadman.FileStore{Path: filepath.Join(dir, "state-link.json")}

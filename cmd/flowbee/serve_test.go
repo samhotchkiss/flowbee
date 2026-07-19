@@ -1,11 +1,56 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/samhotchkiss/flowbee/internal/config"
 )
+
+func TestServeHelpIsSideEffectFree(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "must-not-exist.db")
+	configPath := filepath.Join(dir, "flowbee.yaml")
+	if err := os.WriteFile(configPath, []byte("database_url: "+dbPath+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLOWBEE_CONFIG", configPath)
+
+	var runErr error
+	out := captureStdout(t, func() { runErr = runServe([]string{"--help"}) })
+	if runErr != nil {
+		t.Fatalf("serve --help: %v", runErr)
+	}
+	if !strings.Contains(out, "usage: flowbee serve") {
+		t.Fatalf("serve help missing usage: %q", out)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("serve --help touched database %s: %v", dbPath, err)
+	}
+	if matches, err := filepath.Glob(filepath.Join(dir, "*.writer.lock")); err != nil || len(matches) != 0 {
+		t.Fatalf("serve --help created writer state: matches=%v err=%v", matches, err)
+	}
+}
+
+func TestServeRejectsUnknownArgumentBeforeSideEffects(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "must-not-exist.db")
+	configPath := filepath.Join(dir, "flowbee.yaml")
+	if err := os.WriteFile(configPath, []byte("database_url: "+dbPath+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLOWBEE_CONFIG", configPath)
+
+	err := runServe([]string{"--definitely-unknown"})
+	if err == nil || !strings.Contains(err.Error(), "unknown argument") {
+		t.Fatalf("serve unknown argument error=%v", err)
+	}
+	if _, statErr := os.Stat(dbPath); !os.IsNotExist(statErr) {
+		t.Fatalf("serve unknown argument touched database %s: %v", dbPath, statErr)
+	}
+}
 
 // TestServeSystemdDefaultsToStartable: with no security env set, the --systemd
 // template must still produce a unit that BOOTS. `flowbee serve` refuses to start on
@@ -49,17 +94,18 @@ func TestServeSystemdCarriesV2FileBackedTrustConfiguration(t *testing.T) {
 	t.Setenv("FLOWBEE_EPIC_REVIEW_HANDOFF_V2", "1")
 	t.Setenv("FLOWBEE_PHASE1_DASHBOARD", "1")
 	t.Setenv("FLOWBEE_ALERT_WEBHOOK_SECRET", "inline-secret-must-never-print")
-	t.Setenv("FLOWBEE_ALERT_WEBHOOK_SECRET_FILE", "/etc/flowbee/alert.key")
-	t.Setenv("FLOWBEE_DRIVER_TOKEN_FILE", "/etc/flowbee/driver.token")
-	t.Setenv("FLOWBEE_DRIVER_SOCKET", "/var/run/tmux-driver.sock")
+	t.Setenv("FLOWBEE_ALERT_WEBHOOK_SECRET_FILE", "/etc/flowbee/control-alert-ingress.key")
+	t.Setenv("FLOWBEE_WATCHDOG_PROJECT_ID", "russ")
+	t.Setenv(config.DriverEndpointsFileEnv, "/etc/flowbee/driver-endpoints.json")
 	t.Setenv("FLOWBEE_HUMAN_SESSION_KEY_FILE", "/etc/flowbee/human.key")
 	t.Setenv("FLOWBEE_HUMAN_GRANTS_FILE", "/etc/flowbee/human.grants")
 	out := captureStdout(t, printServeSystemd)
 	for _, want := range []string{
 		"FLOWBEE_EPIC_REVIEW_HANDOFF_V2=1",
 		"FLOWBEE_PHASE1_DASHBOARD=1",
-		"FLOWBEE_ALERT_WEBHOOK_SECRET_FILE=/etc/flowbee/alert.key",
-		"FLOWBEE_DRIVER_TOKEN_FILE=/etc/flowbee/driver.token",
+		"FLOWBEE_ALERT_WEBHOOK_SECRET_FILE=/etc/flowbee/control-alert-ingress.key",
+		"FLOWBEE_WATCHDOG_PROJECT_ID=russ",
+		"FLOWBEE_DRIVER_ENDPOINTS_FILE=/etc/flowbee/driver-endpoints.json",
 		"FLOWBEE_HUMAN_SESSION_KEY_FILE=/etc/flowbee/human.key",
 	} {
 		if !strings.Contains(out, want) {
@@ -68,6 +114,13 @@ func TestServeSystemdCarriesV2FileBackedTrustConfiguration(t *testing.T) {
 	}
 	if strings.Contains(out, "inline-secret-must-never-print") || strings.Contains(out, "FLOWBEE_ALERT_WEBHOOK_SECRET=") {
 		t.Fatalf("v2 template leaked or encouraged an inline alert secret\n%s", out)
+	}
+	if strings.Contains(out, "FLOWBEE_ALERT_WEBHOOK_URL=") {
+		t.Fatalf("v2 serve template must not configure an outbound human-notification webhook; alerts route to the project Interactor\n%s", out)
+	}
+	if strings.Contains(out, "FLOWBEE_DRIVER_SOCKET=") || strings.Contains(out, "FLOWBEE_DRIVER_TOKEN_FILE=") ||
+		strings.Contains(out, "FLOWBEE_DRIVER_INSTANCE_REF=") {
+		t.Fatalf("v2 template emitted a legacy single-endpoint fallback\n%s", out)
 	}
 }
 

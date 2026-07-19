@@ -20,6 +20,10 @@ type SQLActionStore struct {
 	// overrides ControlOriginAvailable so revocation closes pending claims while
 	// the process continues reconciling uncertain/verifying effects.
 	ControlOriginGate func() bool
+	// EndpointControlOriginGate is the production multi-endpoint fence. When
+	// present it is authoritative for message claims: a capability proven on one
+	// host/store/server domain can never authorize an action for another.
+	EndpointControlOriginGate func(EndpointKey) bool
 }
 
 func (s SQLActionStore) controlOriginAvailable() bool {
@@ -29,13 +33,22 @@ func (s SQLActionStore) controlOriginAvailable() bool {
 	return s.ControlOriginAvailable
 }
 
+func (s SQLActionStore) controlOriginAvailableFor(a Action) bool {
+	if s.EndpointControlOriginGate != nil {
+		return s.EndpointControlOriginGate(EndpointKey{HostID: a.TargetHostID, StoreID: a.TargetStoreID,
+			TmuxServerDomainID: a.TargetServerDomainID})
+	}
+	return s.controlOriginAvailable()
+}
+
 type actionScanner interface{ Scan(...any) error }
 
 const actionSelectColumns = `id,project_id,epic_id,kind,action_epoch,dedup_key,
 	payload_json,payload_sha256,evidence_baseline_store_seq,evidence_baseline_uncertainty_epoch,
 	head_sha,base_sha,executor_kind,target_role,
-	target_host_id,target_store_id,target_server_id,lifecycle_key,target_epoch,profile_id,
+	target_host_id,target_store_id,target_server_domain_id,target_server_id,lifecycle_key,target_epoch,profile_id,external_watch_id,
 	workspace_root_id,workspace_relative_path,lease_id,lease_epoch,sender_session_id,
+	sender_host_id,sender_store_id,sender_server_domain_id,sender_server_id,
 	sender_agent_run_id,sender_principal_id,recipient_session_id,recipient_pane_instance_id,
 	recipient_agent_run_id,grant_id,grant_epoch,grant_expires_at`
 
@@ -43,9 +56,10 @@ func scanAction(row actionScanner, a *Action) error {
 	return row.Scan(&a.ActionID, &a.ProjectID, &a.EpicID, &a.Kind, &a.Epoch, &a.DedupKey,
 		&a.Payload, &a.PayloadSHA256, &a.EvidenceBaselineStoreSeq,
 		&a.EvidenceBaselineUncertaintyEpoch, &a.HeadSHA, &a.BaseSHA, &a.ExecutorKind, &a.TargetRole,
-		&a.TargetHostID, &a.TargetStoreID, &a.TargetServerID, &a.LifecycleKey, &a.TargetEpoch,
-		&a.ProfileID, &a.WorkspaceRootID, &a.WorkspaceRelativePath, &a.LeaseID, &a.LeaseEpoch,
-		&a.SenderSessionID, &a.SenderAgentRunID, &a.SenderPrincipalID, &a.RecipientSessionID,
+		&a.TargetHostID, &a.TargetStoreID, &a.TargetServerDomainID, &a.TargetServerID, &a.LifecycleKey, &a.TargetEpoch,
+		&a.ProfileID, &a.ExternalWatchID, &a.WorkspaceRootID, &a.WorkspaceRelativePath, &a.LeaseID, &a.LeaseEpoch,
+		&a.SenderSessionID, &a.SenderHostID, &a.SenderStoreID, &a.SenderServerDomainID, &a.SenderServerID,
+		&a.SenderAgentRunID, &a.SenderPrincipalID, &a.RecipientSessionID,
 		&a.RecipientPaneInstanceID, &a.RecipientAgentRunID, &a.GrantID, &a.GrantEpoch,
 		&a.GrantExpiresAt)
 }
@@ -53,9 +67,6 @@ func scanAction(row actionScanner, a *Action) error {
 // ClaimNextAction atomically moves one due outbox item into delivering and
 // increments its epoch. Only the returned epoch may mutate the action again.
 func (s SQLActionStore) ClaimNextAction(ctx context.Context, owner string, now time.Time, ttl time.Duration) (Action, bool, error) {
-	if !s.controlOriginAvailable() {
-		return Action{}, false, nil
-	}
 	return s.claimNextAction(ctx, owner, "driver", true, now, ttl)
 }
 
@@ -89,6 +100,9 @@ func (s SQLActionStore) claimNextAction(ctx context.Context, owner, executorKind
 	if err != nil {
 		return Action{}, false, err
 	}
+	if projectGrant && !s.controlOriginAvailableFor(a) {
+		return Action{}, false, nil
+	}
 	nextEpoch := a.Epoch + 1
 	nextGrantID := driverGrantUUID(a.ActionID, nextEpoch)
 	res, err := tx.ExecContext(ctx, `
@@ -119,13 +133,20 @@ func (s SQLActionStore) claimNextAction(ctx context.Context, owner, executorKind
 		WHERE action_id=? AND grant_epoch<? AND revoked_at=''`, nowText, a.ActionID, a.GrantEpoch); err != nil {
 		return Action{}, false, fmt.Errorf("fence prior Driver grant projection: %w", err)
 	}
+	recipientRunFence := ""
+	if a.SenderPrincipalID != "" {
+		recipientRunFence = a.RecipientAgentRunID
+	}
+	if a.SenderPrincipalID != "" && recipientRunFence == "" {
+		return Action{}, false, errors.New("persist Driver control grant: missing expected recipient agent run")
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO driver_grants
 		(grant_id,project_id,action_id,sender_session_id,sender_agent_run_id,sender_principal_id,
-		 recipient_session_id,recipient_pane_instance_id,grant_epoch,
+		 recipient_session_id,recipient_pane_instance_id,expected_recipient_agent_run_id,grant_epoch,
 		 maximum_payload_bytes,allow_draft_stash,issued_at,expires_at)
-		VALUES (?,?,?,?,?,?,?,?,?,65536,0,?,?)`, a.GrantID, a.ProjectID, a.ActionID,
+		VALUES (?,?,?,?,?,?,?,?,?,?,65536,0,?,?)`, a.GrantID, a.ProjectID, a.ActionID,
 		a.SenderSessionID, a.SenderAgentRunID, a.SenderPrincipalID, a.RecipientSessionID,
-		a.RecipientPaneInstanceID, a.GrantEpoch, nowText, a.GrantExpiresAt); err != nil {
+		a.RecipientPaneInstanceID, recipientRunFence, a.GrantEpoch, nowText, a.GrantExpiresAt); err != nil {
 		return Action{}, false, fmt.Errorf("persist Driver grant projection: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -374,17 +395,19 @@ func (s SQLActionStore) CommitAction(ctx context.Context, a Action) error {
 		 (id, project_id, epic_id, kind, state, action_epoch, dedup_key,
 		  payload_json, payload_sha256,evidence_baseline_store_seq,evidence_baseline_uncertainty_epoch,
 		  head_sha, base_sha, executor_kind,target_role,
-		  target_host_id,target_store_id,target_server_id,lifecycle_key,target_epoch,profile_id,
+		  target_host_id,target_store_id,target_server_domain_id,target_server_id,lifecycle_key,target_epoch,profile_id,external_watch_id,
 		  workspace_root_id,workspace_relative_path,lease_id,lease_epoch,sender_session_id,
+		  sender_host_id,sender_store_id,sender_server_domain_id,sender_server_id,
 		  sender_agent_run_id,sender_principal_id,recipient_session_id,recipient_pane_instance_id,
 		  recipient_agent_run_id,grant_id,grant_epoch,grant_expires_at,created_at,updated_at)
-		VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ActionID, projectID, a.EpicID, a.Kind, a.Epoch, a.DedupKey,
 		a.Payload, a.PayloadSHA256, a.EvidenceBaselineStoreSeq,
 		a.EvidenceBaselineUncertaintyEpoch, a.HeadSHA, a.BaseSHA, executorKind, a.TargetRole,
-		a.TargetHostID, a.TargetStoreID, a.TargetServerID, a.LifecycleKey, a.TargetEpoch,
-		a.ProfileID, a.WorkspaceRootID, a.WorkspaceRelativePath, a.LeaseID, a.LeaseEpoch,
-		a.SenderSessionID, a.SenderAgentRunID, a.SenderPrincipalID, a.RecipientSessionID, a.RecipientPaneInstanceID,
+		a.TargetHostID, a.TargetStoreID, a.TargetServerDomainID, a.TargetServerID, a.LifecycleKey, a.TargetEpoch,
+		a.ProfileID, a.ExternalWatchID, a.WorkspaceRootID, a.WorkspaceRelativePath, a.LeaseID, a.LeaseEpoch,
+		a.SenderSessionID, a.SenderHostID, a.SenderStoreID, a.SenderServerDomainID, a.SenderServerID,
+		a.SenderAgentRunID, a.SenderPrincipalID, a.RecipientSessionID, a.RecipientPaneInstanceID,
 		a.RecipientAgentRunID, a.GrantID, a.GrantEpoch, a.GrantExpiresAt, now, now)
 	if err == nil {
 		return tx.Commit()
@@ -429,11 +452,12 @@ func (s SQLActionStore) PersistReceipt(ctx context.Context, a Action, r Receipt)
 	result, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO driver_receipts
 		 (delivery_id, action_id, grant_id, grant_epoch, sender_session_id,sender_principal_id,
-		  recipient_session_id, recipient_pane_instance_id, payload_sha256,
+		  recipient_session_id, recipient_pane_instance_id,expected_recipient_agent_run_id,payload_sha256,
 		  status, compatibility_code, diagnostic_code, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.DeliveryID, r.ActionID, r.GrantID, r.GrantEpoch, r.Sender.SessionID,
-		r.SenderPrincipalID, r.Recipient.SessionID, r.Recipient.PaneInstanceID, r.PayloadSHA256,
+		r.SenderPrincipalID, r.Recipient.SessionID, r.Recipient.PaneInstanceID,
+		r.ExpectedRecipientAgentRunID, r.PayloadSHA256,
 		string(r.Status), r.CompatibilityCode, r.DiagnosticCode, now)
 	if err != nil {
 		return fmt.Errorf("persist driver receipt: %w", err)
@@ -443,16 +467,16 @@ func (s SQLActionStore) PersistReceipt(ctx context.Context, a Action, r Receipt)
 	} else if inserted == 1 {
 		return tx.Commit()
 	}
-	var deliveryID, grantID, senderSession, senderPrincipal, recipientSession, recipientPane, payloadHash, status, diagnostic string
+	var deliveryID, grantID, senderSession, senderPrincipal, recipientSession, recipientPane, recipientRun, payloadHash, status, diagnostic string
 	var epoch int64
 	var compatibility int
 	qerr := tx.QueryRowContext(ctx, `
 		SELECT delivery_id, grant_id, grant_epoch, sender_session_id, sender_principal_id,
-		       recipient_session_id, recipient_pane_instance_id, payload_sha256,
+		       recipient_session_id, recipient_pane_instance_id,expected_recipient_agent_run_id,payload_sha256,
 		       status, compatibility_code, diagnostic_code
 		  FROM driver_receipts WHERE action_id = ? AND grant_epoch = ?`,
 		r.ActionID, r.GrantEpoch).Scan(&deliveryID, &grantID, &epoch, &senderSession,
-		&senderPrincipal, &recipientSession, &recipientPane, &payloadHash, &status,
+		&senderPrincipal, &recipientSession, &recipientPane, &recipientRun, &payloadHash, &status,
 		&compatibility, &diagnostic)
 	if qerr != nil {
 		return fmt.Errorf("persist driver receipt: immutable receipt collision: %w", ErrIdempotencyBody)
@@ -460,7 +484,7 @@ func (s SQLActionStore) PersistReceipt(ctx context.Context, a Action, r Receipt)
 	if deliveryID != r.DeliveryID || grantID != r.GrantID || epoch != r.GrantEpoch ||
 		senderSession != r.Sender.SessionID || senderPrincipal != r.SenderPrincipalID ||
 		recipientSession != r.Recipient.SessionID || recipientPane != r.Recipient.PaneInstanceID ||
-		payloadHash != r.PayloadSHA256 {
+		recipientRun != r.ExpectedRecipientAgentRunID || payloadHash != r.PayloadSHA256 {
 		return fmt.Errorf("persist driver receipt %s: %w", r.ActionID, ErrIdempotencyBody)
 	}
 	if !deliveryReceiptTransitionAllowed(ReceiptStatus(status), r.Status) {
@@ -530,7 +554,9 @@ func deliveryReceiptStatusKnown(status ReceiptStatus) bool {
 
 func (s SQLActionStore) PersistLifecycleReceipt(ctx context.Context, r LifecycleReceipt) error {
 	if s.DB == nil || r.LifecycleReceiptID == "" || r.ActionID == "" || r.ActionEpoch < 1 ||
-		r.Operation == "" || r.LifecycleKey == "" || r.TargetEpoch < 1 || r.Status == "" {
+		r.Operation == "" || r.LifecycleKey == "" || r.TmuxServerDomainID == "" || r.TargetEpoch < 1 || r.Status == "" ||
+		((r.Operation == "adopt" || r.Operation == "release") && r.ExternalWatchID == "") ||
+		(r.Operation != "adopt" && r.Operation != "release" && r.Operation != "reattach" && r.ExternalWatchID != "") {
 		return errors.New("driver sql store: incomplete lifecycle receipt")
 	}
 	before, err := json.Marshal(r.IdentityBefore)
@@ -544,28 +570,28 @@ func (s SQLActionStore) PersistLifecycleReceipt(ctx context.Context, r Lifecycle
 	now := s.now()
 	_, err = s.DB.ExecContext(ctx, `INSERT INTO driver_lifecycle_receipts
 		(lifecycle_receipt_id,action_id,action_epoch,operation,lifecycle_key,target_epoch,
-		 lease_id,lease_epoch,status,identity_before_json,identity_after_json,
+		 lease_id,lease_epoch,tmux_server_domain_id,external_watch_id,status,identity_before_json,identity_after_json,
 		 absence_observed_at,diagnostic_code,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.LifecycleReceiptID, r.ActionID,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.LifecycleReceiptID, r.ActionID,
 		r.ActionEpoch, r.Operation, r.LifecycleKey, r.TargetEpoch, r.LeaseID, r.LeaseEpoch,
-		r.Status, string(before), string(after), r.AbsenceObservedAt, r.DiagnosticCode, now, now)
+		r.TmuxServerDomainID, r.ExternalWatchID, r.Status, string(before), string(after), r.AbsenceObservedAt, r.DiagnosticCode, now, now)
 	if err == nil {
 		return nil
 	}
-	var gotID, operation, key, leaseID, status, gotBefore, gotAfter, absent, diagnostic string
+	var gotID, operation, key, leaseID, domainID, watchID, status, gotBefore, gotAfter, absent, diagnostic string
 	var actionEpoch, targetEpoch, leaseEpoch int64
 	qerr := s.DB.QueryRowContext(ctx, `SELECT lifecycle_receipt_id,action_epoch,operation,
-		lifecycle_key,target_epoch,lease_id,lease_epoch,status,identity_before_json,
+		lifecycle_key,target_epoch,lease_id,lease_epoch,tmux_server_domain_id,external_watch_id,status,identity_before_json,
 		identity_after_json,absence_observed_at,diagnostic_code
 		FROM driver_lifecycle_receipts WHERE action_id=?`,
 		r.ActionID).Scan(&gotID, &actionEpoch, &operation, &key, &targetEpoch,
-		&leaseID, &leaseEpoch, &status, &gotBefore, &gotAfter, &absent, &diagnostic)
+		&leaseID, &leaseEpoch, &domainID, &watchID, &status, &gotBefore, &gotAfter, &absent, &diagnostic)
 	if qerr != nil {
 		return fmt.Errorf("persist Driver lifecycle receipt: %w", err)
 	}
 	if gotID != r.LifecycleReceiptID || actionEpoch > r.ActionEpoch || operation != r.Operation ||
 		key != r.LifecycleKey || targetEpoch != r.TargetEpoch || leaseID != r.LeaseID ||
-		leaseEpoch > r.LeaseEpoch {
+		leaseEpoch > r.LeaseEpoch || domainID != r.TmuxServerDomainID || watchID != r.ExternalWatchID {
 		return fmt.Errorf("persist Driver lifecycle receipt %s: %w", r.ActionID, ErrIdempotencyBody)
 	}
 	var existingBefore, existingAfter Identity

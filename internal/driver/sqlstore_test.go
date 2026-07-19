@@ -30,6 +30,7 @@ func seedSQLStoreEpic(t *testing.T) (SQLActionStore, Action) {
 	a.ProjectID, a.EpicID, a.Kind = "default", "epic-1", "review_dispatch"
 	a.DedupKey, a.HeadSHA, a.BaseSHA = "review:epic-1:head:base", "head", "base"
 	a.SenderPrincipalID = "flowbee-control"
+	a.RecipientSessionID, a.RecipientPaneInstanceID, a.RecipientAgentRunID = "reviewer", "pane-1", "run-1"
 	return SQLActionStore{DB: st.DB, Now: func() time.Time { return time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC) }, ControlOriginAvailable: true}, a
 }
 
@@ -76,22 +77,73 @@ func TestSQLActionStoreControlOriginDisabledNeverClaimsPreexistingMessage(t *tes
 	}
 }
 
+func TestSQLActionStoreControlOriginIsAuthorizedByExactEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		target, ready EndpointKey
+		wantClaim     bool
+	}{
+		{name: "external capability authorizes external", target: EndpointKey{HostID: "mac", StoreID: "external", TmuxServerDomainID: "default"}, ready: EndpointKey{HostID: "mac", StoreID: "external", TmuxServerDomainID: "default"}, wantClaim: true},
+		{name: "external capability cannot authorize managed", target: EndpointKey{HostID: "mac", StoreID: "managed", TmuxServerDomainID: "flowbee"}, ready: EndpointKey{HostID: "mac", StoreID: "external", TmuxServerDomainID: "default"}},
+		{name: "managed capability cannot authorize external", target: EndpointKey{HostID: "mac", StoreID: "external", TmuxServerDomainID: "default"}, ready: EndpointKey{HostID: "mac", StoreID: "managed", TmuxServerDomainID: "flowbee"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, a := seedSQLStoreEpic(t)
+			a.TargetHostID, a.TargetStoreID, a.TargetServerDomainID = tc.target.HostID, tc.target.StoreID, tc.target.TmuxServerDomainID
+			a.TargetServerID = "server-instance"
+			if err := s.CommitAction(context.Background(), a); err != nil {
+				t.Fatal(err)
+			}
+			s.ControlOriginAvailable = true // must not bypass the keyed production fence.
+			s.EndpointControlOriginGate = func(key EndpointKey) bool { return key == tc.ready }
+			claimed, ok, err := s.ClaimNextAction(context.Background(), "endpoint-runtime", time.Now(), time.Minute)
+			if err != nil || ok != tc.wantClaim {
+				t.Fatalf("claimed=%+v ok=%v want=%v err=%v", claimed, ok, tc.wantClaim, err)
+			}
+			if tc.wantClaim && (claimed.TargetHostID != tc.target.HostID || claimed.TargetStoreID != tc.target.StoreID || claimed.TargetServerDomainID != tc.target.TmuxServerDomainID) {
+				t.Fatalf("claim escaped exact endpoint: %+v", claimed)
+			}
+			if !tc.wantClaim {
+				var state string
+				var epoch int64
+				if err := s.DB.QueryRow(`SELECT state,action_epoch FROM epic_actions WHERE id=?`, a.ActionID).Scan(&state, &epoch); err != nil {
+					t.Fatal(err)
+				}
+				if state != "pending" || epoch != a.Epoch {
+					t.Fatalf("denied endpoint mutated state=%s epoch=%d", state, epoch)
+				}
+			}
+		})
+	}
+}
+
 func TestSQLActionStorePersistsReceiptIdempotentlyAndRejectsMutation(t *testing.T) {
 	s, a := seedSQLStoreEpic(t)
 	ctx := context.Background()
 	a.GrantID, a.GrantEpoch = "grant-1", a.Epoch
-	a.RecipientSessionID, a.RecipientPaneInstanceID = "reviewer", "pane-1"
+	a.RecipientSessionID, a.RecipientPaneInstanceID, a.RecipientAgentRunID = "reviewer", "pane-1", "run-1"
 	if err := s.CommitAction(ctx, a); err != nil {
 		t.Fatal(err)
 	}
 	r := Receipt{DeliveryID: "delivery-1", ActionID: a.ActionID, GrantID: "grant-1", GrantEpoch: a.Epoch,
 		SenderPrincipalID: "flowbee-control", Recipient: Identity{SessionID: "reviewer", PaneInstanceID: "pane-1"},
-		PayloadSHA256: a.PayloadSHA256, Status: ReceiptSubmitted}
+		ExpectedRecipientAgentRunID: "run-1",
+		PayloadSHA256:               a.PayloadSHA256, Status: ReceiptSubmitted}
 	if err := s.PersistReceipt(ctx, a, r); err != nil {
 		t.Fatal(err)
 	}
+	var storedRun string
+	if err := s.DB.QueryRowContext(ctx, `SELECT expected_recipient_agent_run_id FROM driver_receipts WHERE action_id=?`, a.ActionID).Scan(&storedRun); err != nil || storedRun != "run-1" {
+		t.Fatalf("stored recipient run=%q err=%v", storedRun, err)
+	}
 	if err := s.PersistReceipt(ctx, a, r); err != nil {
 		t.Fatalf("exact replay: %v", err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE driver_receipts SET expected_recipient_agent_run_id='other-run' WHERE action_id=?`, a.ActionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PersistReceipt(ctx, a, r); !errors.Is(err, ErrIdempotencyBody) {
+		t.Fatalf("stored recipient run mismatch replay err=%v", err)
 	}
 	changed := r
 	changed.GrantID = "grant-2"
@@ -104,14 +156,15 @@ func TestSQLActionStoreReceiptProgressesMonotonicallyAndFencesIdentity(t *testin
 	s, a := seedSQLStoreEpic(t)
 	ctx := context.Background()
 	a.GrantID, a.GrantEpoch = "grant-1", a.Epoch
-	a.RecipientSessionID, a.RecipientPaneInstanceID = "reviewer", "pane-1"
+	a.RecipientSessionID, a.RecipientPaneInstanceID, a.RecipientAgentRunID = "reviewer", "pane-1", "run-1"
 	if err := s.CommitAction(ctx, a); err != nil {
 		t.Fatal(err)
 	}
 	accepted := Receipt{DeliveryID: "delivery-1", ActionID: a.ActionID, GrantID: a.GrantID,
 		GrantEpoch: a.GrantEpoch, SenderPrincipalID: a.SenderPrincipalID,
-		Recipient:     Identity{SessionID: a.RecipientSessionID, PaneInstanceID: a.RecipientPaneInstanceID},
-		PayloadSHA256: a.PayloadSHA256, Status: ReceiptAccepted}
+		Recipient:                   Identity{SessionID: a.RecipientSessionID, PaneInstanceID: a.RecipientPaneInstanceID},
+		ExpectedRecipientAgentRunID: a.RecipientAgentRunID,
+		PayloadSHA256:               a.PayloadSHA256, Status: ReceiptAccepted}
 	if err := s.PersistReceipt(ctx, a, accepted); err != nil {
 		t.Fatal(err)
 	}
@@ -167,14 +220,18 @@ func TestSQLActionStoreLifecycleReceiptResolvesUncertainWithoutChangingIntent(t 
 	}
 	uncertain := LifecycleReceipt{LifecycleReceiptID: "lifecycle-1", ActionID: a.ActionID,
 		ActionEpoch: a.Epoch, Operation: "ensure", LifecycleKey: "builder-1", TargetEpoch: 2,
-		LeaseID: "builder-affinity:epic-1", LeaseEpoch: 2, Status: "uncertain"}
+		LeaseID: "builder-affinity:epic-1", LeaseEpoch: 2, TmuxServerDomainID: "flowbee", Status: "uncertain"}
 	if err := s.PersistLifecycleReceipt(ctx, uncertain); err != nil {
 		t.Fatal(err)
+	}
+	var storedDomain string
+	if err := s.DB.QueryRowContext(ctx, `SELECT tmux_server_domain_id FROM driver_lifecycle_receipts WHERE action_id=?`, a.ActionID).Scan(&storedDomain); err != nil || storedDomain != "flowbee" {
+		t.Fatalf("stored lifecycle domain=%q err=%v", storedDomain, err)
 	}
 	resolved := uncertain
 	resolved.Status = "ensured"
 	resolved.IdentityAfter = Identity{HostID: "host", StoreID: "store",
-		TmuxServerInstanceID: "server", LifecycleKey: "builder-1", TargetEpoch: 2,
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server", LifecycleKey: "builder-1", TargetEpoch: 2,
 		SessionID: "session-2", PaneInstanceID: "pane-2", AgentRunID: "run-2"}
 	if err := s.PersistLifecycleReceipt(ctx, resolved); err != nil {
 		t.Fatalf("canonical uncertain receipt did not resolve: %v", err)
@@ -209,6 +266,10 @@ func TestSQLActionStoreClaimsAndFencesActionEpoch(t *testing.T) {
 	if _, ok, err := s.ClaimNextAction(ctx, "executor-b", now, time.Minute); err != nil || ok {
 		t.Fatalf("double claim ok=%v err=%v", ok, err)
 	}
+	var storedRun string
+	if err := s.DB.QueryRowContext(ctx, `SELECT expected_recipient_agent_run_id FROM driver_grants WHERE action_id=?`, a.ActionID).Scan(&storedRun); err != nil || storedRun != a.RecipientAgentRunID {
+		t.Fatalf("stored grant recipient run=%q err=%v", storedRun, err)
+	}
 	if err := s.AcknowledgeAction(ctx, a.ActionID, "executor-a", 0, now); !errors.Is(err, ErrStaleActionEpoch) {
 		t.Fatalf("stale epoch accepted: %v", err)
 	}
@@ -218,6 +279,38 @@ func TestSQLActionStoreClaimsAndFencesActionEpoch(t *testing.T) {
 	var state string
 	if err := s.DB.QueryRowContext(ctx, `SELECT state FROM epic_actions WHERE id=?`, a.ActionID).Scan(&state); err != nil || state != "acknowledged" {
 		t.Fatalf("state=%q err=%v", state, err)
+	}
+}
+
+func TestSQLActionStoreExternalLifecycleReceiptFencesWatchAndDomainOnReplay(t *testing.T) {
+	s, a := seedSQLStoreEpic(t)
+	ctx := context.Background()
+	if err := s.CommitAction(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	r := LifecycleReceipt{FormatVersion: "tmux-driver.lifecycle-receipt/v2",
+		LifecycleReceiptID: "lifecycle-adopt-1", ActionID: a.ActionID, ActionEpoch: a.Epoch,
+		Operation: "adopt", LifecycleKey: "project:default:interactor", TargetEpoch: 2,
+		LeaseID: "project-bind:default", LeaseEpoch: 1, TmuxServerDomainID: "default",
+		ExternalWatchID: "88888888-8888-4888-8888-888888888888", Status: "adopted",
+		IdentityAfter: Identity{HostID: "host", StoreID: "store", TmuxServerDomainID: "default",
+			TmuxServerInstanceID: "server", Ownership: "external_observed",
+			LifecycleKey: "project:default:interactor", TargetEpoch: 2,
+			SessionID: "session", PaneInstanceID: "pane", AgentRunID: "run"}}
+	if err := s.PersistLifecycleReceipt(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	var domain, watch string
+	if err := s.DB.QueryRowContext(ctx, `SELECT tmux_server_domain_id,external_watch_id
+		FROM driver_lifecycle_receipts WHERE action_id=?`, a.ActionID).Scan(&domain, &watch); err != nil ||
+		domain != r.TmuxServerDomainID || watch != r.ExternalWatchID {
+		t.Fatalf("stored lifecycle fences domain=%q watch=%q err=%v", domain, watch, err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE driver_lifecycle_receipts SET external_watch_id='99999999-9999-4999-8999-999999999999' WHERE action_id=?`, a.ActionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PersistLifecycleReceipt(ctx, r); !errors.Is(err, ErrIdempotencyBody) {
+		t.Fatalf("stored watch mismatch replay err=%v", err)
 	}
 }
 

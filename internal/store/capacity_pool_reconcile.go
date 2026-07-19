@@ -39,7 +39,7 @@ func (s *Store) CapacityPoolDemand(ctx context.Context, buildProvider, reviewPro
 		(SELECT COUNT(*) FROM epic_deliveries d WHERE d.project_id=p.id
 		 AND d.state IN ('awaiting_review_dispatch','review_queued')),
 		(SELECT COUNT(*) FROM control_alerts a WHERE a.project_id=p.id
-		 AND a.state IN ('pending','delivering'))
+		 AND a.state IN ('pending','delivering','projected'))
 		FROM projects p WHERE p.state='active' ORDER BY p.id`)
 	if err != nil {
 		return nil, err

@@ -61,7 +61,15 @@ func (e Executor) executeCommitted(ctx context.Context, target SessionTarget, gr
 			return ExecuteResult{}, err
 		}
 	}
-	identity, err := e.Port.EnsureSession(ctx, target, action)
+	var identity Identity
+	var err error
+	if action.ExecutorKind == "driver" && target.Identity.Ownership == "external_observed" {
+		identity, err = exactExternalLifecycleIdentity(ctx, e.Port, target)
+	} else if action.ExecutorKind == "driver" && observedOnlyTarget(target) {
+		identity, err = exactObservedIdentity(ctx, e.Port, target.Identity)
+	} else {
+		identity, err = e.Port.EnsureSession(ctx, target, action)
+	}
 	if err != nil {
 		return ExecuteResult{}, err
 	}
@@ -82,9 +90,13 @@ func (e Executor) executeCommitted(ctx context.Context, target SessionTarget, gr
 		receiptAction.SenderSessionID, receiptAction.SenderAgentRunID = grant.SenderSessionID, grant.SenderAgentRunID
 		receiptAction.RecipientSessionID = grant.RecipientSessionID
 		receiptAction.RecipientPaneInstanceID = grant.RecipientPaneInstanceID
+		if grant.SenderPrincipalID != "" {
+			receiptAction.RecipientAgentRunID = grant.ExpectedRecipientAgentRunID
+		}
 	}
 	req := SendRequest{Action: receiptAction, GrantID: grant.GrantID, RecipientSessionID: grant.RecipientSessionID,
-		RecipientPaneInstanceID: grant.RecipientPaneInstanceID, GrantEpoch: grant.Epoch}
+		RecipientPaneInstanceID:     grant.RecipientPaneInstanceID,
+		ExpectedRecipientAgentRunID: grant.ExpectedRecipientAgentRunID, GrantEpoch: grant.Epoch}
 	// A direct control-origin action is authored by the authenticated Flowbee
 	// principal and must omit on_behalf_of_session_id entirely. The field remains
 	// only for the frozen legacy session-origin compatibility path.
@@ -124,6 +136,66 @@ func (e Executor) executeCommitted(ctx context.Context, target SessionTarget, gr
 	return result, nil
 }
 
+// exactExternalLifecycleIdentity proves that an already-adopted external actor
+// is still the same Driver lifecycle target. It is intentionally read-only:
+// routed delivery must never convert observation ownership into Ensure/launch
+// authority or mutate the operator's pre-existing tmux session.
+func exactExternalLifecycleIdentity(ctx context.Context, port DriverPort, target SessionTarget) (Identity, error) {
+	want := target.Identity
+	if target.ExternalWatchID == "" || target.LifecycleKey == "" || target.TargetEpoch < 1 ||
+		want.Ownership != "external_observed" || want.HostID == "" || want.StoreID == "" ||
+		want.TmuxServerDomainID == "" || want.TmuxServerInstanceID == "" || want.SessionID == "" ||
+		want.PaneInstanceID == "" || want.AgentRunID == "" {
+		return Identity{}, ErrIdentityMismatch
+	}
+	presence, err := port.LifecycleTargetPresence(ctx, target.LifecycleKey, target.TargetEpoch)
+	if err != nil {
+		return Identity{}, err
+	}
+	if presence.Presence != "present" || !identityMatchesTarget(presence.Identity, target) ||
+		presence.Identity.Ownership != "external_observed" {
+		return Identity{}, ErrIdentityMismatch
+	}
+	return presence.Identity, nil
+}
+
+func observedOnlyTarget(target SessionTarget) bool {
+	return target.LifecycleKey == "" && target.TargetEpoch == 0 && target.ProfileID == "" &&
+		target.WorkspaceRootID == "" && target.WorkspaceRelativePath == ""
+}
+
+// exactObservedIdentity is the non-mutating route for an operator-adopted actor.
+// It proves the full stable incarnation against Driver's current snapshot and
+// never falls back to a tmux name, raw pane id, CWD, PID, provider, or proximity.
+func exactObservedIdentity(ctx context.Context, port DriverPort, want Identity) (Identity, error) {
+	if want.HostID == "" || want.StoreID == "" || want.TmuxServerDomainID == "" ||
+		want.TmuxServerInstanceID == "" || want.Ownership != "" ||
+		want.SessionID == "" || want.PaneInstanceID == "" || want.AgentRunID == "" {
+		return Identity{}, ErrIdentityMismatch
+	}
+	snapshot, err := port.SnapshotSessions(ctx)
+	if err != nil {
+		return Identity{}, err
+	}
+	if snapshot.HostID != want.HostID || snapshot.StoreID != want.StoreID {
+		return Identity{}, ErrIdentityMismatch
+	}
+	for _, session := range snapshot.Sessions {
+		got := session.Identity
+		if got.SessionID != want.SessionID {
+			continue
+		}
+		if session.Lifecycle == "ended" || got.HostID != want.HostID || got.StoreID != want.StoreID ||
+			got.TmuxServerDomainID != want.TmuxServerDomainID || got.Ownership != "" ||
+			got.TmuxServerInstanceID != want.TmuxServerInstanceID || got.PaneInstanceID != want.PaneInstanceID ||
+			got.AgentRunID != want.AgentRunID {
+			return Identity{}, ErrIdentityMismatch
+		}
+		return got, nil
+	}
+	return Identity{}, ErrIdentityMismatch
+}
+
 // validateBoundRoute prevents an executor caller from swapping the immutable
 // outbox target or widening A→B into lateral traffic. It runs before Ensure,
 // grant projection, or send, so a mismatch produces zero Driver mutation.
@@ -131,14 +203,17 @@ func validateBoundRoute(a Action, target SessionTarget, grant Grant) error {
 	want := a.SessionTarget()
 	if target.Identity.HostID != want.Identity.HostID ||
 		target.Identity.StoreID != want.Identity.StoreID ||
+		target.Identity.TmuxServerDomainID != want.Identity.TmuxServerDomainID ||
 		target.Identity.TmuxServerInstanceID != want.Identity.TmuxServerInstanceID ||
+		target.Identity.Ownership != want.Identity.Ownership ||
 		target.Identity.SessionID != want.Identity.SessionID ||
 		target.Identity.PaneInstanceID != want.Identity.PaneInstanceID ||
 		target.Identity.AgentRunID != want.Identity.AgentRunID ||
 		target.LifecycleKey != want.LifecycleKey || target.TargetEpoch != want.TargetEpoch ||
 		target.ProfileID != want.ProfileID || target.WorkspaceRootID != want.WorkspaceRootID ||
 		target.WorkspaceRelativePath != want.WorkspaceRelativePath ||
-		target.LeaseID != want.LeaseID || target.LeaseEpoch != want.LeaseEpoch {
+		target.LeaseID != want.LeaseID || target.LeaseEpoch != want.LeaseEpoch ||
+		target.ExternalWatchID != want.ExternalWatchID {
 		return fmt.Errorf("Driver target differs from immutable action: %w", ErrIdentityMismatch)
 	}
 	if grant.GrantID != a.GrantID || grant.Epoch != a.Epoch ||
@@ -147,7 +222,8 @@ func validateBoundRoute(a Action, target SessionTarget, grant Grant) error {
 		grant.SenderSessionID != a.SenderSessionID ||
 		grant.SenderAgentRunID != a.SenderAgentRunID ||
 		grant.RecipientSessionID != a.RecipientSessionID ||
-		grant.RecipientPaneInstanceID != a.RecipientPaneInstanceID {
+		grant.RecipientPaneInstanceID != a.RecipientPaneInstanceID ||
+		grant.ExpectedRecipientAgentRunID != a.RouteGrant().ExpectedRecipientAgentRunID {
 		return fmt.Errorf("Driver grant differs from immutable action: %w", ErrGrantDenied)
 	}
 	controlOrigin := grant.SenderPrincipalID != "" && grant.SenderSessionID == "" && grant.SenderAgentRunID == ""
@@ -163,7 +239,10 @@ func identityMatchesTarget(got Identity, target SessionTarget) bool {
 	if target.LifecycleKey == "" && want.LifecycleKey == "" && want.TmuxServerInstanceID == "" {
 		return got == want // deterministic fake/legacy contract fixtures.
 	}
-	if got.HostID != want.HostID || got.StoreID != want.StoreID || got.TmuxServerInstanceID != want.TmuxServerInstanceID {
+	if got.HostID != want.HostID || got.StoreID != want.StoreID ||
+		got.TmuxServerDomainID != want.TmuxServerDomainID ||
+		(want.Ownership != "" && got.Ownership != want.Ownership) ||
+		got.TmuxServerInstanceID != want.TmuxServerInstanceID {
 		return false
 	}
 	key := target.LifecycleKey

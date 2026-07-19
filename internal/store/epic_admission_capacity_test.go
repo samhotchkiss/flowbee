@@ -72,6 +72,25 @@ func commitAdmissionCapacity(t *testing.T, st *store.Store, id string, now time.
 	}
 }
 
+func bindAdmissionReviewer(t *testing.T, st *store.Store, projectID, workerIdentity string,
+	seat store.Seat, now time.Time) store.DriverSessionBinding {
+	t.Helper()
+	binding, err := st.UpsertDriverSessionBinding(context.Background(), store.DriverSessionBinding{
+		ProjectID: projectID, WorkerIdentity: workerIdentity, Role: store.DriverReviewerRole,
+		SeatID: seat.ID, HostID: seat.Box, StoreID: "store-" + workerIdentity,
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-" + workerIdentity,
+		LifecycleOwnership: "driver_managed", LifecycleKey: "reviewer-" + workerIdentity,
+		TargetEpoch: 1, ProfileID: seat.AgentFamily + "-reviewer",
+		WorkspaceRootID: "projects", WorkspaceRelativePath: projectID,
+		SessionID: "session-" + workerIdentity, PaneInstanceID: "pane-" + workerIdentity,
+		AgentRunID: "run-" + workerIdentity, Provider: seat.AgentFamily, ObservedAt: now,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return binding
+}
+
 func TestV2AdmissionRejectsNoReviewerWithoutPartialRows(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.NewStore(t)
@@ -98,12 +117,51 @@ func TestV2AdmissionRejectsFreshSameFamilyCapacity(t *testing.T) {
 	codex, codexObservation := addAdmissionCapacitySeat(t, st, "codex", "codex-host", "codex-account", now)
 	commitAdmissionCapacity(t, st, "same-family", now, []store.Seat{codex},
 		[]store.CapacitySeatObservation{codexObservation})
+	bindAdmissionReviewer(t, st, "default", "codex-reviewer", codex, now)
 	err := st.AddEpicRun(ctx, store.EpicRun{ID: "same-family", ProjectID: "default",
 		AdmissionKey: "same-family:v1", BuilderModelFamily: "codex", Repo: "russ",
 		Branch: "epic/same-family"}, 1, now.Add(time.Minute))
 	if !errors.Is(err, store.ErrEpicDistinctReviewerUnavailable) ||
-		!strings.Contains(err.Error(), "no configured review seat from a distinct family") {
+		!strings.Contains(err.Error(), "no active project-bound review seat from a distinct family") {
 		t.Fatalf("same-family admission error=%v", err)
+	}
+}
+
+func TestV2AdmissionRejectsFreshUnboundDistinctFamilySeat(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	st.EnableCapacityV2 = true
+	now := time.Date(2026, 7, 19, 18, 15, 0, 0, time.UTC)
+	grok, observation := addAdmissionCapacitySeat(t, st, "grok", "grok-unbound", "grok-unbound", now)
+	commitAdmissionCapacity(t, st, "unbound-distinct", now, []store.Seat{grok},
+		[]store.CapacitySeatObservation{observation})
+	err := st.AddEpicRun(ctx, store.EpicRun{ID: "unbound-distinct", ProjectID: "default",
+		AdmissionKey: "unbound-distinct:v1", BuilderModelFamily: "codex", Repo: "russ",
+		Branch: "epic/unbound-distinct"}, 1, now.Add(time.Minute))
+	if !errors.Is(err, store.ErrEpicDistinctReviewerUnavailable) ||
+		!strings.Contains(err.Error(), "no active project-bound review seat from a distinct family") {
+		t.Fatalf("unbound distinct-family admission error=%v", err)
+	}
+}
+
+func TestV2AdmissionRejectsReviewerBoundToAnotherProject(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	st.EnableCapacityV2 = true
+	now := time.Date(2026, 7, 19, 18, 17, 0, 0, time.UTC)
+	if _, err := st.CreatePortfolioProject(ctx, store.PortfolioProject{ID: "other", Name: "Other"}, now); err != nil {
+		t.Fatal(err)
+	}
+	grok, observation := addAdmissionCapacitySeat(t, st, "grok", "grok-other", "grok-other", now)
+	commitAdmissionCapacity(t, st, "other-project", now, []store.Seat{grok},
+		[]store.CapacitySeatObservation{observation})
+	bindAdmissionReviewer(t, st, "other", "other-reviewer", grok, now)
+	err := st.AddEpicRun(ctx, store.EpicRun{ID: "wrong-project", ProjectID: "default",
+		AdmissionKey: "wrong-project:v1", BuilderModelFamily: "codex", Repo: "russ",
+		Branch: "epic/wrong-project"}, 1, now.Add(time.Minute))
+	if !errors.Is(err, store.ErrEpicDistinctReviewerUnavailable) ||
+		!strings.Contains(err.Error(), "no active project-bound review seat from a distinct family") {
+		t.Fatalf("unrelated-project reviewer admission error=%v", err)
 	}
 }
 
@@ -115,6 +173,7 @@ func TestV2AdmissionWithDistinctFreshReviewerIsExactlyOnceAcrossLostAck(t *testi
 	grok, grokObservation := addAdmissionCapacitySeat(t, st, "grok", "grok-host", "grok-account", now)
 	commitAdmissionCapacity(t, st, "distinct-reviewer", now, []store.Seat{grok},
 		[]store.CapacitySeatObservation{grokObservation})
+	bindAdmissionReviewer(t, st, "default", "grok-reviewer", grok, now)
 	epic := store.EpicRun{ID: "distinct-reviewer", ProjectID: "default",
 		AdmissionKey: "distinct-reviewer:v1", ContractHash: "contract-v1",
 		BuilderModelFamily: "codex", Repo: "russ", Branch: "epic/distinct-reviewer"}
@@ -182,6 +241,7 @@ func TestWorkIntentAdmissionCapacityHoldIsDurableAndRecovers(t *testing.T) {
 	grok, observation := addAdmissionCapacitySeat(t, st, "grok", "grok-recovery", "grok-recovery", now.Add(6*time.Minute))
 	commitAdmissionCapacity(t, st, "recovered-reviewer", now.Add(6*time.Minute),
 		[]store.Seat{grok}, []store.CapacitySeatObservation{observation})
+	bindAdmissionReviewer(t, st, "default", "grok-recovery-reviewer", grok, now.Add(6*time.Minute))
 	report, err = st.ReconcileWorkIntentAdmissions(ctx, now.Add(7*time.Minute))
 	if err != nil || report.Admitted != 1 {
 		t.Fatalf("recovered admission=%+v err=%v", report, err)

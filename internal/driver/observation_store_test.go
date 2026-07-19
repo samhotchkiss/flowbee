@@ -30,7 +30,7 @@ func snapshot(storeID, cursor string, sessions ...SessionProjection) SessionSnap
 
 func session(storeID, sessionID, paneID, runID string) SessionProjection {
 	return SessionProjection{Identity: Identity{HostID: "host-1", StoreID: storeID,
-		TmuxServerInstanceID: "server-1", SessionID: sessionID, PaneInstanceID: paneID,
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1", SessionID: sessionID, PaneInstanceID: paneID,
 		AgentRunID: runID, Provider: "codex"}, Lifecycle: "observing", Phase: "idle",
 		StateRevision: 1, RawState: json.RawMessage(`{"working_directory":"/same/repo"}`)}
 }
@@ -42,7 +42,8 @@ func newObservationHarness(t *testing.T) (ObservationSQLStore, *FakePort, Observ
 	sqlStore := ObservationSQLStore{DB: st.DB, Now: func() time.Time { return now }}
 	fake := NewFake()
 	fake.Meta = DriverMetadata{HostID: "host-1", StoreID: "store-1", ProducerBootID: "boot-1",
-		ReplayFloorCursor: "tdc2.floor-1", DurableHighWaterCursor: "tdc2.snap-1"}
+		ReplayFloorCursor: "tdc2.floor-1", DurableHighWaterCursor: "tdc2.snap-1",
+		TmuxServer: TmuxServerMetadata{DomainID: "flowbee", Ownership: "managed_dedicated"}}
 	ingestor := ObservationIngestor{InstanceRef: "local-driver", Port: fake, Store: sqlStore}
 	return sqlStore, fake, ingestor
 }
@@ -63,8 +64,8 @@ func TestObservationSnapshotKeepsSameCWDSessionsSeparateByStableIdentity(t *test
 		t.Fatalf("result=%+v", result)
 	}
 	for _, want := range []Identity{
-		{HostID: "host-1", StoreID: "store-1", TmuxServerInstanceID: "server-1", SessionID: "session-a", PaneInstanceID: "pane-a", AgentRunID: "run-a"},
-		{HostID: "host-1", StoreID: "store-1", TmuxServerInstanceID: "server-1", SessionID: "session-b", PaneInstanceID: "pane-b", AgentRunID: "run-b"},
+		{HostID: "host-1", StoreID: "store-1", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1", SessionID: "session-a", PaneInstanceID: "pane-a", AgentRunID: "run-a"},
+		{HostID: "host-1", StoreID: "store-1", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1", SessionID: "session-b", PaneInstanceID: "pane-b", AgentRunID: "run-b"},
 	} {
 		ok, err := sqlStore.IsCurrentIdentity(context.Background(), "local-driver", want)
 		if err != nil || !ok {
@@ -85,7 +86,7 @@ func TestObservationFoldFencesPaneReuseAndDeduplicatesEvent(t *testing.T) {
 	if err != nil || result.Inserted != 1 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	old := Identity{HostID: "host-1", StoreID: "store-1", TmuxServerInstanceID: "server-1",
+	old := Identity{HostID: "host-1", StoreID: "store-1", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1",
 		SessionID: "session-a", PaneInstanceID: "pane-old", AgentRunID: "run-a"}
 	current := old
 	current.PaneInstanceID = "pane-new"
@@ -153,7 +154,8 @@ func TestStoreResetFencesOldDomainWithoutDeletingObservationOrFlowbeeAudit(t *te
 	}
 
 	fake.Meta = DriverMetadata{HostID: "host-1", StoreID: "store-2", ProducerBootID: "boot-2",
-		ReplayFloorCursor: "tdc2.floor-2", DurableHighWaterCursor: "tdc2.snap-2"}
+		ReplayFloorCursor: "tdc2.floor-2", DurableHighWaterCursor: "tdc2.snap-2",
+		TmuxServer: TmuxServerMetadata{DomainID: "flowbee", Ownership: "managed_dedicated"}}
 	fake.Snapshot = snapshot("store-2", "tdc2.snap-2", session("store-2", "session-new", "pane-new", "run-new"))
 	fake.Batches = []ObservationBatch{{StoreID: "store-2", NextCursor: "tdc2.snap-2",
 		DurableHighWaterCursor: "tdc2.snap-2", HistoryComplete: true}}

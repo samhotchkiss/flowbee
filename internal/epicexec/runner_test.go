@@ -39,8 +39,9 @@ func seedApprovedEpic(t *testing.T, id string, now time.Time) (*store.Store, *fl
 	}
 	if _, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		ProjectID: "default", WorkerIdentity: store.BuilderDriverIdentity(id), Role: store.DriverBuilderRole,
-		HostID: "host-1", StoreID: "driver-store", TmuxServerInstanceID: "server-1",
-		LifecycleKey: "builder-" + id, TargetEpoch: 1, ProfileID: "codex",
+		HostID: "host-1", StoreID: "driver-store", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1",
+		LifecycleOwnership: "driver_managed",
+		LifecycleKey:       "builder-" + id, TargetEpoch: 1, ProfileID: "codex",
 		WorkspaceRootID: "workspace-1", WorkspaceRelativePath: id,
 		SessionID: "session-" + id, PaneInstanceID: "pane-" + id, AgentRunID: "run-" + id,
 	}, now); err != nil {
@@ -48,8 +49,9 @@ func seedApprovedEpic(t *testing.T, id string, now time.Time) (*store.Store, *fl
 	}
 	if _, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		ProjectID: "default", WorkerIdentity: store.DriverControlIdentity, Role: store.DriverControlRole,
-		HostID: "control-host", StoreID: "control-store", TmuxServerInstanceID: "control-server",
-		LifecycleKey: "flowbee-control", TargetEpoch: 1, ProfileID: "flowbee",
+		HostID: "control-host", StoreID: "control-store", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "control-server",
+		LifecycleOwnership: "driver_managed",
+		LifecycleKey:       "flowbee-control", TargetEpoch: 1, ProfileID: "flowbee",
 		WorkspaceRootID: "control-workspace", WorkspaceRelativePath: ".",
 		SessionID: "control-session", PaneInstanceID: "control-pane", AgentRunID: "control-run",
 	}, now); err != nil {
@@ -305,13 +307,13 @@ func TestConflictResolutionNewHeadRequiresFreshCIAndReview(t *testing.T) {
 	}
 	var lifecycle store.BuilderLifecycleActionProjection
 	if err := st.DB.QueryRowContext(ctx, `SELECT id,action_epoch,project_id,epic_id,kind,dedup_key,
-		payload_json,payload_sha256,head_sha,base_sha,target_host_id,target_store_id,target_server_id,
+		payload_json,payload_sha256,head_sha,base_sha,target_host_id,target_store_id,target_server_domain_id,target_server_id,
 		lifecycle_key,target_epoch,profile_id,workspace_root_id,workspace_relative_path,lease_id,lease_epoch
 		FROM epic_actions WHERE epic_id='effect-conflict' AND kind='conflict_resolution'`).Scan(
 		&lifecycle.ActionID, &lifecycle.Epoch, &lifecycle.ProjectID, &lifecycle.EpicID,
 		&lifecycle.Kind, &lifecycle.DedupKey, &lifecycle.Payload, &lifecycle.PayloadSHA256,
 		&lifecycle.HeadSHA, &lifecycle.BaseSHA, &lifecycle.TargetHostID, &lifecycle.TargetStoreID,
-		&lifecycle.TargetServerID, &lifecycle.LifecycleKey, &lifecycle.TargetEpoch,
+		&lifecycle.TargetServerDomainID, &lifecycle.TargetServerID, &lifecycle.LifecycleKey, &lifecycle.TargetEpoch,
 		&lifecycle.ProfileID, &lifecycle.WorkspaceRootID, &lifecycle.WorkspaceRelativePath,
 		&lifecycle.LeaseID, &lifecycle.LeaseEpoch); err != nil {
 		t.Fatal(err)
@@ -320,7 +322,8 @@ func TestConflictResolutionNewHeadRequiresFreshCIAndReview(t *testing.T) {
 		ActionEpoch: lifecycle.Epoch, Operation: "ensure", LifecycleKey: lifecycle.LifecycleKey,
 		TargetEpoch: lifecycle.TargetEpoch, Status: "ensured", IdentityAfter: store.BuilderLifecycleIdentity{
 			HostID: lifecycle.TargetHostID, StoreID: lifecycle.TargetStoreID,
-			TmuxServerInstanceID: lifecycle.TargetServerID, LifecycleKey: lifecycle.LifecycleKey,
+			TmuxServerDomainID: "flowbee", TmuxServerInstanceID: lifecycle.TargetServerID,
+			LifecycleOwnership: "driver_managed", LifecycleKey: lifecycle.LifecycleKey,
 			TargetEpoch: lifecycle.TargetEpoch, SessionID: "resolver-session",
 			PaneInstanceID: "resolver-pane", AgentRunID: "resolver-run"}}
 	if err := st.ProjectBuilderLifecycleResult(ctx, lifecycle, receipt, now.Add(350*time.Second)); err != nil {

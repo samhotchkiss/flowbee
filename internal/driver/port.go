@@ -25,7 +25,9 @@ var (
 type Identity struct {
 	HostID               string `json:"host_id"`
 	StoreID              string `json:"store_id"`
+	TmuxServerDomainID   string `json:"tmux_server_domain_id"`
 	TmuxServerInstanceID string `json:"tmux_server_instance_id"`
+	Ownership            string `json:"ownership,omitempty"`
 	LifecycleKey         string `json:"lifecycle_key"`
 	TargetEpoch          int64  `json:"target_epoch"`
 	SessionID            string `json:"session_id"`
@@ -45,6 +47,7 @@ type SessionTarget struct {
 	WorkspaceRelativePath string
 	LeaseID               string
 	LeaseEpoch            int64
+	ExternalWatchID       string
 	Role                  string // legacy alias for ProfileID; production requires ProfileID.
 }
 
@@ -53,15 +56,16 @@ type Grant struct {
 	// Exactly one origin variant is permitted. Control-plane product actions use
 	// SenderPrincipalID; the session pair remains only for legacy/session A->B
 	// compatibility at this low-level boundary.
-	SenderPrincipalID       string `json:"sender_principal_id,omitempty"`
-	SenderSessionID         string `json:"sender_session_id"`
-	SenderAgentRunID        string `json:"sender_agent_run_id"`
-	RecipientSessionID      string `json:"recipient_session_id"`
-	RecipientPaneInstanceID string `json:"recipient_pane_instance_id"`
-	Epoch                   int64  `json:"epoch"`
-	MaximumPayloadBytes     int    `json:"maximum_payload_bytes,omitempty"`
-	AllowDraftStash         bool   `json:"allow_draft_stash,omitempty"`
-	ExpiresAt               string `json:"expires_at,omitempty"`
+	SenderPrincipalID           string `json:"sender_principal_id,omitempty"`
+	SenderSessionID             string `json:"sender_session_id"`
+	SenderAgentRunID            string `json:"sender_agent_run_id"`
+	RecipientSessionID          string `json:"recipient_session_id"`
+	RecipientPaneInstanceID     string `json:"recipient_pane_instance_id"`
+	ExpectedRecipientAgentRunID string `json:"expected_recipient_agent_run_id,omitempty"`
+	Epoch                       int64  `json:"epoch"`
+	MaximumPayloadBytes         int    `json:"maximum_payload_bytes,omitempty"`
+	AllowDraftStash             bool   `json:"allow_draft_stash,omitempty"`
+	ExpiresAt                   string `json:"expires_at,omitempty"`
 }
 
 type Action struct {
@@ -81,9 +85,12 @@ type Action struct {
 	HeadSHA, BaseSHA                  string
 	ExecutorKind                      string
 	TargetRole                        string
+	InstanceRef                       string
 	TargetHostID                      string
 	TargetStoreID                     string
+	TargetServerDomainID              string
 	TargetServerID                    string
+	TargetLifecycleOwnership          string
 	LifecycleKey                      string
 	TargetEpoch                       int64
 	ProfileID                         string
@@ -91,6 +98,11 @@ type Action struct {
 	WorkspaceRelativePath             string
 	LeaseID                           string
 	LeaseEpoch                        int64
+	ExternalWatchID                   string
+	SenderHostID                      string
+	SenderStoreID                     string
+	SenderServerDomainID              string
+	SenderServerID                    string
 	SenderSessionID                   string
 	SenderAgentRunID                  string
 	SenderPrincipalID                 string
@@ -108,32 +120,44 @@ func NewAction(id, payload string, epoch int64) Action {
 }
 
 func (a Action) SessionTarget() SessionTarget {
+	ownership := ""
+	if a.TargetLifecycleOwnership == "external_observed" {
+		ownership = a.TargetLifecycleOwnership
+	}
 	return SessionTarget{
 		Identity: Identity{HostID: a.TargetHostID, StoreID: a.TargetStoreID,
-			TmuxServerInstanceID: a.TargetServerID, LifecycleKey: a.LifecycleKey,
-			TargetEpoch: a.TargetEpoch, SessionID: a.RecipientSessionID,
+			TmuxServerDomainID:   a.TargetServerDomainID,
+			TmuxServerInstanceID: a.TargetServerID, Ownership: ownership,
+			LifecycleKey: a.LifecycleKey,
+			TargetEpoch:  a.TargetEpoch, SessionID: a.RecipientSessionID,
 			PaneInstanceID: a.RecipientPaneInstanceID, AgentRunID: a.RecipientAgentRunID},
 		LifecycleKey: a.LifecycleKey, TargetEpoch: a.TargetEpoch, ProfileID: a.ProfileID,
 		WorkspaceRootID: a.WorkspaceRootID, WorkspaceRelativePath: a.WorkspaceRelativePath,
 		LeaseID: a.LeaseID, LeaseEpoch: a.LeaseEpoch,
+		ExternalWatchID: a.ExternalWatchID,
 	}
 }
 
 func (a Action) RouteGrant() Grant {
-	return Grant{GrantID: a.GrantID, SenderPrincipalID: a.SenderPrincipalID,
+	g := Grant{GrantID: a.GrantID, SenderPrincipalID: a.SenderPrincipalID,
 		SenderSessionID:  a.SenderSessionID,
 		SenderAgentRunID: a.SenderAgentRunID, RecipientSessionID: a.RecipientSessionID,
 		RecipientPaneInstanceID: a.RecipientPaneInstanceID, Epoch: a.Epoch,
 		MaximumPayloadBytes: 65536, ExpiresAt: a.GrantExpiresAt}
+	if a.SenderPrincipalID != "" {
+		g.ExpectedRecipientAgentRunID = a.RecipientAgentRunID
+	}
+	return g
 }
 
 type SendRequest struct {
 	Action
-	GrantID                 string `json:"grant_id"`
-	RecipientSessionID      string `json:"recipient_session_id"`
-	RecipientPaneInstanceID string `json:"recipient_pane_instance_id"`
-	GrantEpoch              int64  `json:"grant_epoch"`
-	OnBehalfOfSessionID     string `json:"on_behalf_of_session_id,omitempty"`
+	GrantID                     string `json:"grant_id"`
+	RecipientSessionID          string `json:"recipient_session_id"`
+	RecipientPaneInstanceID     string `json:"recipient_pane_instance_id"`
+	ExpectedRecipientAgentRunID string `json:"expected_recipient_agent_run_id,omitempty"`
+	GrantEpoch                  int64  `json:"grant_epoch"`
+	OnBehalfOfSessionID         string `json:"on_behalf_of_session_id,omitempty"`
 }
 
 type ReceiptStatus string
@@ -165,17 +189,18 @@ func (r Receipt) MutationUncertain() bool {
 }
 
 type Receipt struct {
-	DeliveryID        string        `json:"delivery_id"`
-	ActionID          string        `json:"action_id"`
-	GrantID           string        `json:"grant_id"`
-	GrantEpoch        int64         `json:"grant_epoch"`
-	Sender            Identity      `json:"-"`
-	SenderPrincipalID string        `json:"sender_principal_id,omitempty"`
-	Recipient         Identity      `json:"-"`
-	PayloadSHA256     string        `json:"payload_sha256"`
-	Status            ReceiptStatus `json:"status"`
-	CompatibilityCode int           `json:"compatibility_code"`
-	DiagnosticCode    string        `json:"diagnostic_code"`
+	DeliveryID                  string        `json:"delivery_id"`
+	ActionID                    string        `json:"action_id"`
+	GrantID                     string        `json:"grant_id"`
+	GrantEpoch                  int64         `json:"grant_epoch"`
+	Sender                      Identity      `json:"-"`
+	SenderPrincipalID           string        `json:"sender_principal_id,omitempty"`
+	Recipient                   Identity      `json:"-"`
+	ExpectedRecipientAgentRunID string        `json:"expected_recipient_agent_run_id,omitempty"`
+	PayloadSHA256               string        `json:"payload_sha256"`
+	Status                      ReceiptStatus `json:"status"`
+	CompatibilityCode           int           `json:"compatibility_code"`
+	DiagnosticCode              string        `json:"diagnostic_code"`
 }
 
 // ReceiptExpectation is Flowbee's immutable authorization for reading and
@@ -183,16 +208,17 @@ type Receipt struct {
 // shorthand for "any sender": exactly one of SenderPrincipalID or the complete
 // SenderSessionID/SenderAgentRunID pair must be present.
 type ReceiptExpectation struct {
-	ActionID                string
-	ActionEpoch             int64
-	GrantID                 string
-	GrantEpoch              int64
-	PayloadSHA256           string
-	SenderPrincipalID       string
-	SenderSessionID         string
-	SenderAgentRunID        string
-	RecipientSessionID      string
-	RecipientPaneInstanceID string
+	ActionID                    string
+	ActionEpoch                 int64
+	GrantID                     string
+	GrantEpoch                  int64
+	PayloadSHA256               string
+	SenderPrincipalID           string
+	SenderSessionID             string
+	SenderAgentRunID            string
+	RecipientSessionID          string
+	RecipientPaneInstanceID     string
+	ExpectedRecipientAgentRunID string
 }
 
 func (a Action) ExpectedReceipt() ReceiptExpectation {
@@ -200,11 +226,15 @@ func (a Action) ExpectedReceipt() ReceiptExpectation {
 	if grantEpoch == 0 {
 		grantEpoch = a.Epoch
 	}
-	return ReceiptExpectation{ActionID: a.ActionID, ActionEpoch: a.Epoch,
+	e := ReceiptExpectation{ActionID: a.ActionID, ActionEpoch: a.Epoch,
 		GrantID: a.GrantID, GrantEpoch: grantEpoch, PayloadSHA256: a.PayloadSHA256,
 		SenderPrincipalID: a.SenderPrincipalID, SenderSessionID: a.SenderSessionID,
 		SenderAgentRunID: a.SenderAgentRunID, RecipientSessionID: a.RecipientSessionID,
 		RecipientPaneInstanceID: a.RecipientPaneInstanceID}
+	if a.SenderPrincipalID != "" {
+		e.ExpectedRecipientAgentRunID = a.RecipientAgentRunID
+	}
+	return e
 }
 
 func (e ReceiptExpectation) Validate(r Receipt) error {
@@ -212,6 +242,12 @@ func (e ReceiptExpectation) Validate(r Receipt) error {
 	sessionOrigin := e.SenderPrincipalID == "" && e.SenderSessionID != "" && e.SenderAgentRunID != ""
 	if !controlOrigin && !sessionOrigin {
 		return fmt.Errorf("receipt expectation has incomplete or mixed sender origin: %w", ErrIdentityMismatch)
+	}
+	if controlOrigin && e.ExpectedRecipientAgentRunID == "" {
+		return fmt.Errorf("control receipt expectation lacks recipient agent run: %w", ErrIdentityMismatch)
+	}
+	if sessionOrigin && e.ExpectedRecipientAgentRunID != "" {
+		return fmt.Errorf("session receipt expectation carries control run fence: %w", ErrIdentityMismatch)
 	}
 	if e.ActionID == "" || e.ActionEpoch < 1 || e.GrantID == "" || e.GrantEpoch < 1 ||
 		e.ActionEpoch != e.GrantEpoch ||
@@ -222,6 +258,7 @@ func (e ReceiptExpectation) Validate(r Receipt) error {
 		r.GrantEpoch != e.GrantEpoch || r.PayloadSHA256 != e.PayloadSHA256 ||
 		r.Recipient.SessionID != e.RecipientSessionID ||
 		r.Recipient.PaneInstanceID != e.RecipientPaneInstanceID ||
+		r.ExpectedRecipientAgentRunID != e.ExpectedRecipientAgentRunID ||
 		r.SenderPrincipalID != e.SenderPrincipalID ||
 		r.Sender.SessionID != e.SenderSessionID || r.Sender.AgentRunID != e.SenderAgentRunID {
 		return ErrIdentityMismatch
@@ -233,6 +270,7 @@ func (e ReceiptExpectation) Validate(r Receipt) error {
 // It is intentionally distinct from a routed-message receipt: stopped proves
 // positive target absence, while ensured returns a newly fenced incarnation.
 type LifecycleReceipt struct {
+	FormatVersion      string   `json:"format_version"`
 	LifecycleReceiptID string   `json:"lifecycle_receipt_id"`
 	Operation          string   `json:"operation"`
 	ActionID           string   `json:"action_id"`
@@ -240,6 +278,8 @@ type LifecycleReceipt struct {
 	LeaseID            string   `json:"lease_id"`
 	LeaseEpoch         int64    `json:"lease_epoch"`
 	LifecycleKey       string   `json:"lifecycle_key"`
+	TmuxServerDomainID string   `json:"tmux_server_domain_id"`
+	ExternalWatchID    string   `json:"external_watch_id"`
 	TargetEpoch        int64    `json:"target_epoch"`
 	Status             string   `json:"status"`
 	IdentityBefore     Identity `json:"identity_before"`
@@ -265,7 +305,8 @@ type LifecycleGate interface {
 }
 
 func (r LifecycleReceipt) Resolved() bool {
-	return r.Status == "ensured" || r.Status == "stopped" || r.Status == "target_absent"
+	return r.Status == "ensured" || r.Status == "stopped" || r.Status == "target_absent" ||
+		r.Status == "adopted" || r.Status == "reattached" || r.Status == "released"
 }
 
 func (r LifecycleReceipt) Uncertain() bool {
@@ -278,6 +319,10 @@ type DriverPort interface {
 	SnapshotSessions(context.Context) (SessionSnapshot, error)
 	EnsureSession(context.Context, SessionTarget, Action) (Identity, error)
 	EnsureLifecycleSession(context.Context, SessionTarget, Action) (LifecycleReceipt, error)
+	EnsureExternalWatch(context.Context, string, string, string) (ExternalWatch, error)
+	AdoptSession(context.Context, SessionTarget, Action) (LifecycleReceipt, error)
+	ReattachSession(context.Context, SessionTarget, Action) (LifecycleReceipt, error)
+	ReleaseSession(context.Context, SessionTarget, Action) (LifecycleReceipt, error)
 	StopSession(context.Context, SessionTarget, Action) (LifecycleReceipt, error)
 	VerifyLifecycleEffect(context.Context, string, SessionTarget, Action) (LifecycleReceipt, error)
 	LifecycleTargetPresence(context.Context, string, int64) (LifecyclePresence, error)
@@ -287,6 +332,18 @@ type DriverPort interface {
 	Send(context.Context, SendRequest) (Receipt, error)
 	ReceiptByAction(context.Context, ReceiptExpectation) (Receipt, bool, error)
 	Observe(context.Context, string) (ObservationBatch, error)
+}
+
+// ExternalWatch is bootstrap-only authority: PaneID may be used once to ask
+// Driver for a durable watch UUID, but it is never persisted as lifecycle or
+// routing identity. Adopt/Release use WatchID plus the stable Driver tuple.
+type ExternalWatch struct {
+	WatchID   string
+	PaneID    string
+	Enabled   bool
+	Lifecycle string
+	Provider  string
+	Profile   string
 }
 
 // ControlOriginCapability is Driver's authenticated proof that this exact
@@ -353,10 +410,35 @@ type DriverMetadata struct {
 	ProducerBootID         string
 	ReplayFloorCursor      string
 	DurableHighWaterCursor string
+	TmuxServer             TmuxServerMetadata
+	Contracts              DriverContractCapabilities
 	// ControlPrincipalOrigin is true only when Driver's protocol metadata
 	// explicitly advertises features.control_principal_origin=true. Missing,
 	// false, or malformed metadata never enables control-origin delivery.
 	ControlPrincipalOrigin bool
+	LifecycleControl       bool
+}
+
+type TmuxServerMetadata struct {
+	DomainID             string `json:"domain_id"`
+	Ownership            string `json:"ownership"`
+	InstanceID           string `json:"instance_id"`
+	ConnectionVisibility string `json:"connection_visibility"`
+}
+
+type DriverContractCapability struct {
+	Supported  bool   `json:"supported"`
+	ContractID string `json:"contract_id"`
+}
+
+type DriverContractCapabilities struct {
+	FormatVersion                       string                   `json:"format_version"`
+	ManagedTmuxServerDomain             DriverContractCapability `json:"managed_tmux_server_domain"`
+	ManagedTmuxServerIsolation          DriverContractCapability `json:"managed_tmux_server_isolation"`
+	LifecycleEnsure                     DriverContractCapability `json:"lifecycle_ensure"`
+	LifecycleExternalAdopt              DriverContractCapability `json:"lifecycle_external_adopt"`
+	LifecycleExternalRelease            DriverContractCapability `json:"lifecycle_external_release"`
+	ControlOriginRecipientAgentRunFence DriverContractCapability `json:"control_origin_recipient_agent_run_fence"`
 }
 
 // SessionProjection is Driver-derived snapshot state. It contains stable IDs and
@@ -364,6 +446,7 @@ type DriverMetadata struct {
 // prose as identity or routing authority.
 type SessionProjection struct {
 	Identity      Identity
+	WatchID       string
 	Lifecycle     string
 	Phase         string
 	BindingStatus string
@@ -398,13 +481,16 @@ func ValidateSend(req SendRequest, grant Grant) error {
 	switch {
 	case grant.SenderPrincipalID != "":
 		if grant.SenderSessionID != "" || grant.SenderAgentRunID != "" ||
+			grant.ExpectedRecipientAgentRunID == "" ||
+			req.ExpectedRecipientAgentRunID != grant.ExpectedRecipientAgentRunID ||
 			req.SenderPrincipalID != grant.SenderPrincipalID ||
 			req.SenderSessionID != "" || req.SenderAgentRunID != "" ||
 			req.OnBehalfOfSessionID != "" {
 			return ErrIdentityMismatch
 		}
 	case grant.SenderSessionID != "" && grant.SenderAgentRunID != "":
-		if req.SenderPrincipalID != "" ||
+		if grant.ExpectedRecipientAgentRunID != "" || req.ExpectedRecipientAgentRunID != "" ||
+			req.SenderPrincipalID != "" ||
 			(req.SenderSessionID != "" && req.SenderSessionID != grant.SenderSessionID) ||
 			(req.SenderAgentRunID != "" && req.SenderAgentRunID != grant.SenderAgentRunID) ||
 			(req.OnBehalfOfSessionID != "" && req.OnBehalfOfSessionID != grant.SenderSessionID) {

@@ -174,7 +174,7 @@ func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, seatCap int, now time
 			if e.BuilderModelFamily == "" {
 				e.BuilderModelFamily = "codex"
 			}
-			decision, err := distinctReviewerCapacityTx(ctx, tx, e.BuilderModelFamily, now, 5*time.Minute)
+			decision, err := distinctReviewerCapacityTx(ctx, tx, e.ProjectID, e.BuilderModelFamily, now, 5*time.Minute)
 			if err != nil {
 				return err
 			}
@@ -420,6 +420,16 @@ func (s *Store) ListEpicRuns(ctx context.Context) ([]EpicRun, error) {
 	return queryEpicRuns(ctx, s.DB, epicRunSelect+` ORDER BY id`)
 }
 
+// ListEpicRunsForProject is the Phase-2 project workspace projection. Project
+// ownership is matched from durable project_id; repository names and branch
+// prefixes are never used as an authorization or namespace proxy.
+func (s *Store) ListEpicRunsForProject(ctx context.Context, projectID string) ([]EpicRun, error) {
+	if strings.TrimSpace(projectID) == "" {
+		return nil, ErrProjectNotFound
+	}
+	return queryEpicRuns(ctx, s.DB, epicRunSelect+` WHERE project_id=? ORDER BY id`, projectID)
+}
+
 // epicActiveStatesSQL is the "still in flight" IN-clause: what the scope/host
 // launch gates and the status-ingestion tick both consider ACTIVE. 'pending' is
 // excluded (nothing has reserved anything yet — see the migration comment, no
@@ -444,7 +454,7 @@ func queryEpicRuns(ctx context.Context, db *sql.DB, query string, args ...any) (
 		return nil, err
 	}
 	defer rows.Close()
-	var out []EpicRun
+	out := make([]EpicRun, 0)
 	for rows.Next() {
 		e, err := scanEpicRun(rows)
 		if err != nil {

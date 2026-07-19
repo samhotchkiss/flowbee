@@ -89,6 +89,13 @@ its migration is written); that is expected and not a violation.
 0046_phase2_project_breakers
 0047_phase2_project_fair_dispatch
 0048_driver_control_principal
+0049_driver_reviewer_seat
+0050_driver_tmux_server_domain
+0051_driver_external_watch_authority
+0052_project_actor_lifecycle_outbox
+0053_interactor_control_alert_projection
+0054_deadman_ingress_storage
+0055_external_watchdog_heartbeat
 ```
 <!-- ladder:reserved:end -->
 

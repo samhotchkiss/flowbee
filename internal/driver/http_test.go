@@ -11,6 +11,8 @@ import (
 	"testing"
 )
 
+const controlRecipientRunID = "77777777-7777-4777-8777-777777777777"
+
 func TestHTTPPortCheckRequiresBothMetaAndInstance(t *testing.T) {
 	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -18,6 +20,10 @@ func TestHTTPPortCheckRequiresBothMetaAndInstance(t *testing.T) {
 			t.Fatalf("authorization=%q", r.Header.Get("Authorization"))
 		}
 		paths = append(paths, r.URL.Path)
+		if r.URL.Path == "/v2/meta" {
+			_ = json.NewEncoder(w).Encode(controlOriginMetaFixture(true, true))
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
@@ -49,7 +55,7 @@ func TestHTTPPortLifecycleEnsureUsesExactV23WireContract(t *testing.T) {
 			t.Errorf("top-level fields=%v", got)
 		}
 		target := body["target"].(map[string]any)
-		if got := sortedKeys(target); !reflect.DeepEqual(got, []string{"expected_host_id", "expected_store_id", "expected_tmux_server_instance_id", "lifecycle_key", "target_epoch"}) {
+		if got := sortedKeys(target); !reflect.DeepEqual(got, []string{"expected_host_id", "expected_store_id", "expected_tmux_server_domain_id", "expected_tmux_server_instance_id", "lifecycle_key", "target_epoch"}) {
 			t.Errorf("target fields=%v", got)
 		}
 		launch := body["launch"].(map[string]any)
@@ -58,11 +64,13 @@ func TestHTTPPortLifecycleEnsureUsesExactV23WireContract(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"api_version": "v2", "receipt": map[string]any{
+			"format_version":       "tmux-driver.lifecycle-receipt/v2",
 			"lifecycle_receipt_id": "77777777-7777-4777-8777-777777777777",
 			"operation":            "ensure", "action_id": "action-1", "action_epoch": 4,
 			"lease_id": "lease-1", "lease_epoch": 9, "lifecycle_key": "builder-seat-7",
-			"target_epoch": 3, "status": "ensured", "identity_after": map[string]any{
-				"host_id": host, "store_id": store, "tmux_server_instance_id": server,
+			"tmux_server_domain_id": "flowbee", "target_epoch": 3, "status": "ensured", "identity_after": map[string]any{
+				"host_id": host, "store_id": store, "tmux_server_domain_id": "flowbee", "tmux_server_instance_id": server,
+				"ownership":     "driver_managed",
 				"lifecycle_key": "builder-seat-7", "target_epoch": 3, "session_id": session,
 				"pane_instance_id": pane, "agent_run_id": run, "provider": "codex",
 				"conversation_id": nil, "state_cursor": nil,
@@ -71,7 +79,7 @@ func TestHTTPPortLifecycleEnsureUsesExactV23WireContract(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := &HTTPPort{BaseURL: srv.URL, Token: "secret"}
-	target := SessionTarget{Identity: Identity{HostID: host, StoreID: store, TmuxServerInstanceID: server}, LifecycleKey: "builder-seat-7", TargetEpoch: 3, ProfileID: "codex_builder", WorkspaceRootID: "flowbee", WorkspaceRelativePath: "project/epic", LeaseID: "lease-1", LeaseEpoch: 9}
+	target := SessionTarget{Identity: Identity{HostID: host, StoreID: store, TmuxServerDomainID: "flowbee", TmuxServerInstanceID: server}, LifecycleKey: "builder-seat-7", TargetEpoch: 3, ProfileID: "codex_builder", WorkspaceRootID: "flowbee", WorkspaceRelativePath: "project/epic", LeaseID: "lease-1", LeaseEpoch: 9}
 	got, err := p.EnsureSession(context.Background(), target, NewAction("action-1", "assignment", 4))
 	if err != nil {
 		t.Fatal(err)
@@ -106,15 +114,17 @@ func TestHTTPPortLifecycleStopAndVerifyUseExactV23WireContract(t *testing.T) {
 				t.Errorf("stop fields=%v", got)
 			}
 			target := body["target"].(map[string]any)
-			if got := sortedKeys(target); !reflect.DeepEqual(got, []string{"expected_agent_run_id", "expected_host_id", "expected_pane_instance_id", "expected_session_id", "expected_store_id", "expected_tmux_server_instance_id", "lifecycle_key", "target_epoch"}) {
+			if got := sortedKeys(target); !reflect.DeepEqual(got, []string{"expected_agent_run_id", "expected_host_id", "expected_pane_instance_id", "expected_session_id", "expected_store_id", "expected_tmux_server_domain_id", "expected_tmux_server_instance_id", "lifecycle_key", "target_epoch"}) {
 				t.Errorf("stop target fields=%v", got)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"api_version": "v2", "receipt": map[string]any{
+				"format_version":       "tmux-driver.lifecycle-receipt/v2",
 				"lifecycle_receipt_id": receiptID, "operation": "stop", "action_id": "park-action",
 				"action_epoch": 4, "lease_id": "lease-1", "lease_epoch": 9,
-				"lifecycle_key": "builder-seat-7", "target_epoch": 3, "status": "uncertain",
+				"lifecycle_key": "builder-seat-7", "tmux_server_domain_id": "flowbee", "target_epoch": 3, "status": "uncertain",
 				"identity_before": map[string]any{"host_id": host, "store_id": storeID,
-					"tmux_server_instance_id": server, "lifecycle_key": "builder-seat-7", "target_epoch": 3,
+					"tmux_server_domain_id": "flowbee", "tmux_server_instance_id": server,
+					"ownership": "driver_managed", "lifecycle_key": "builder-seat-7", "target_epoch": 3,
 					"session_id": session, "pane_instance_id": pane, "agent_run_id": run},
 			}})
 		case "/v2/lifecycle/receipts/" + receiptID + "/verify":
@@ -123,9 +133,10 @@ func TestHTTPPortLifecycleStopAndVerifyUseExactV23WireContract(t *testing.T) {
 				t.Errorf("verify fields=%v", got)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"api_version": "v2", "replayed": true, "receipt": map[string]any{
+				"format_version":       "tmux-driver.lifecycle-receipt/v2",
 				"lifecycle_receipt_id": receiptID, "operation": "stop", "action_id": "park-action",
 				"action_epoch": 5, "lease_id": "lease-1", "lease_epoch": 9,
-				"lifecycle_key": "builder-seat-7", "target_epoch": 3, "status": "stopped",
+				"lifecycle_key": "builder-seat-7", "tmux_server_domain_id": "flowbee", "target_epoch": 3, "status": "stopped",
 				"absence_observed_at": "2026-07-19T12:00:00Z",
 			}})
 		default:
@@ -135,7 +146,7 @@ func TestHTTPPortLifecycleStopAndVerifyUseExactV23WireContract(t *testing.T) {
 	defer srv.Close()
 	p := &HTTPPort{BaseURL: srv.URL, Token: "secret"}
 	target := SessionTarget{Identity: Identity{HostID: host, StoreID: storeID,
-		TmuxServerInstanceID: server, SessionID: session, PaneInstanceID: pane, AgentRunID: run},
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: server, SessionID: session, PaneInstanceID: pane, AgentRunID: run},
 		LifecycleKey: "builder-seat-7", TargetEpoch: 3, LeaseID: "lease-1", LeaseEpoch: 9}
 	action := NewAction("park-action", "park", 4)
 	uncertain, err := p.StopSession(context.Background(), target, action)
@@ -256,8 +267,8 @@ func TestHTTPPortControlOriginCapabilityRequiresExactAuthorizedContract(t *testi
 			"required_scopes":         []string{"messages:send", "routes:manage"},
 			"granted_scopes":          []string{"messages:send", "routes:manage", "messages:read:any"},
 			"missing_scopes":          []string{},
-			"route_grant_format":      "tmux-driver.control-route-grant/v1",
-			"delivery_receipt_format": "tmux-driver.control-delivery-receipt/v1",
+			"route_grant_format":      "tmux-driver.control-route-grant/v2",
+			"delivery_receipt_format": "tmux-driver.control-delivery-receipt/v2",
 			"grant_endpoint":          "/v2/routes/grants", "message_endpoint": "/v2/messages",
 			"on_behalf_of_session_id": "forbidden",
 		}})
@@ -275,8 +286,8 @@ func TestHTTPPortControlOriginCapabilityFailsClosed(t *testing.T) {
 		"supported":      true, "authorized": false, "principal_id": "flowbee-control",
 		"principal_kind": "control_plane", "required_scopes": []string{"messages:send", "routes:manage"},
 		"granted_scopes": []string{"routes:manage"}, "missing_scopes": []string{"messages:send"},
-		"route_grant_format":      "tmux-driver.control-route-grant/v1",
-		"delivery_receipt_format": "tmux-driver.control-delivery-receipt/v1",
+		"route_grant_format":      "tmux-driver.control-route-grant/v2",
+		"delivery_receipt_format": "tmux-driver.control-delivery-receipt/v2",
 		"grant_endpoint":          "/v2/routes/grants", "message_endpoint": "/v2/messages",
 		"on_behalf_of_session_id": "forbidden",
 	}
@@ -344,7 +355,7 @@ func TestHTTPPortControlOriginGrantSendAndOwnReceiptLookup(t *testing.T) {
 			grantCreated = true
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			want := []string{"epoch", "grant_id", "maximum_payload_bytes", "recipient_pane_instance_id", "recipient_session_id", "sender_principal_id"}
+			want := []string{"epoch", "expected_recipient_agent_run_id", "grant_id", "maximum_payload_bytes", "recipient_pane_instance_id", "recipient_session_id", "sender_principal_id"}
 			if got := sortedKeys(body); !reflect.DeepEqual(got, want) {
 				t.Errorf("control grant fields=%v", got)
 			}
@@ -356,7 +367,7 @@ func TestHTTPPortControlOriginGrantSendAndOwnReceiptLookup(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/messages":
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			if got := sortedKeys(body); !reflect.DeepEqual(got, []string{"action_id", "grant_epoch", "grant_id", "payload", "payload_sha256", "recipient_session_id"}) {
+			if got := sortedKeys(body); !reflect.DeepEqual(got, []string{"action_id", "expected_recipient_agent_run_id", "grant_epoch", "grant_id", "payload", "payload_sha256", "recipient_session_id"}) {
 				t.Errorf("control message fields=%v", got)
 			}
 			if _, present := body["on_behalf_of_session_id"]; present {
@@ -375,7 +386,8 @@ func TestHTTPPortControlOriginGrantSendAndOwnReceiptLookup(t *testing.T) {
 	defer srv.Close()
 	p := &HTTPPort{BaseURL: srv.URL, Token: "secret"}
 	g := Grant{GrantID: grantID, SenderPrincipalID: "flowbee-control", RecipientSessionID: recipientID,
-		RecipientPaneInstanceID: paneID, Epoch: 7, MaximumPayloadBytes: 1024}
+		RecipientPaneInstanceID: paneID, ExpectedRecipientAgentRunID: controlRecipientRunID,
+		Epoch: 7, MaximumPayloadBytes: 1024}
 	if err := p.Grant(context.Background(), g); err != nil {
 		t.Fatal(err)
 	}
@@ -383,8 +395,10 @@ func TestHTTPPortControlOriginGrantSendAndOwnReceiptLookup(t *testing.T) {
 	a.SenderPrincipalID = "flowbee-control"
 	a.GrantID, a.GrantEpoch = g.GrantID, g.Epoch
 	a.RecipientSessionID, a.RecipientPaneInstanceID = g.RecipientSessionID, g.RecipientPaneInstanceID
+	a.RecipientAgentRunID = controlRecipientRunID
 	receipt, err := p.Send(context.Background(), SendRequest{Action: a, GrantID: grantID,
-		GrantEpoch: 7, RecipientSessionID: recipientID, RecipientPaneInstanceID: paneID})
+		GrantEpoch: 7, RecipientSessionID: recipientID, RecipientPaneInstanceID: paneID,
+		ExpectedRecipientAgentRunID: controlRecipientRunID})
 	if err != nil || receipt.SenderPrincipalID != "flowbee-control" || receipt.Sender.SessionID != "" {
 		t.Fatalf("receipt=%+v err=%v", receipt, err)
 	}
@@ -405,6 +419,7 @@ func TestHTTPPortRejectsMixedControlOriginWireObjects(t *testing.T) {
 		GrantID: "11111111-1111-4111-8111-111111111111", SenderPrincipalID: "flowbee-control",
 		RecipientSessionID:      "44444444-4444-4444-8444-444444444444",
 		RecipientPaneInstanceID: "55555555-5555-4555-8555-555555555555", Epoch: 7, MaximumPayloadBytes: 1024,
+		ExpectedRecipientAgentRunID: controlRecipientRunID,
 	})
 	if err == nil {
 		t.Fatal("mixed control grant was accepted")
@@ -539,7 +554,10 @@ func TestHTTPPortObservationUsesFullV2EnvelopeAndStableSnapshotIdentity(t *testi
 		case "/v2/meta":
 			_ = json.NewEncoder(w).Encode(map[string]any{"api_version": "2.3", "host_id": host,
 				"store_id": store, "instance": "local", "producer_boot_id": boot,
-				"replay_floor_cursor": "tdc2.floor", "durable_high_water_cursor": "tdc2.high"})
+				"replay_floor_cursor": "tdc2.floor", "durable_high_water_cursor": "tdc2.high",
+				"features": map[string]any{"lifecycle_control": true}, "tmux_server": map[string]any{
+					"domain_id": "flowbee", "ownership": "managed_dedicated", "instance_id": server,
+					"connection_visibility": "isolated_socket"}, "contracts": driverContractsFixture()})
 		case "/v2/sessions":
 			_ = json.NewEncoder(w).Encode(map[string]any{"api_version": "2.3", "as_of_cursor": "tdc2.high",
 				"sessions": []map[string]any{{"session_id": sessionID}}, "next_cursor": nil})
@@ -572,7 +590,8 @@ func TestHTTPPortObservationUsesFullV2EnvelopeAndStableSnapshotIdentity(t *testi
 		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
 	}
 	identity := snapshot.Sessions[0].Identity
-	if identity.SessionID != sessionID || identity.PaneInstanceID != pane || identity.AgentRunID != run || identity.TmuxServerInstanceID != server {
+	if identity.SessionID != sessionID || identity.PaneInstanceID != pane || identity.AgentRunID != run ||
+		identity.TmuxServerDomainID != "flowbee" || identity.Ownership != "" || identity.TmuxServerInstanceID != server {
 		t.Fatalf("identity=%+v", identity)
 	}
 	batch, err := p.Observe(context.Background(), "tdc2.old")
@@ -612,10 +631,11 @@ func receiptFixture() map[string]any {
 
 func controlGrantFixture(grantID, recipientID, paneID string) map[string]any {
 	return map[string]any{
-		"format_version": "tmux-driver.control-route-grant/v1", "grant_id": grantID,
+		"format_version": "tmux-driver.control-route-grant/v2", "grant_id": grantID,
 		"issuer_principal_id": "flowbee-control", "sender_principal_id": "flowbee-control",
 		"recipient_session_id": recipientID, "recipient_pane_instance_id": paneID,
-		"operation": "message", "epoch": 7, "maximum_payload_bytes": 1024,
+		"expected_recipient_agent_run_id": controlRecipientRunID,
+		"operation":                       "message", "epoch": 7, "maximum_payload_bytes": 1024,
 		"allow_draft_stash": false, "issued_at": "2026-07-19T12:00:00.000Z",
 		"expires_at": nil, "revoked_at": nil,
 	}
@@ -623,12 +643,13 @@ func controlGrantFixture(grantID, recipientID, paneID string) map[string]any {
 
 func controlReceiptFixture(grantID, recipientID, paneID string) map[string]any {
 	return map[string]any{
-		"format_version": "tmux-driver.control-delivery-receipt/v1",
+		"format_version": "tmux-driver.control-delivery-receipt/v2",
 		"delivery_id":    "66666666-6666-4666-8666-666666666666", "action_id": "action-msg",
 		"grant_id": grantID, "grant_epoch": 7, "sender_principal_id": "flowbee-control",
 		"recipient_session_id": recipientID, "recipient_pane_instance_id": paneID,
-		"payload_sha256": NewAction("action-msg", "review this", 7).PayloadSHA256,
-		"payload_bytes":  11, "payload_media_type": "text/plain; charset=utf-8",
+		"expected_recipient_agent_run_id": controlRecipientRunID,
+		"payload_sha256":                  NewAction("action-msg", "review this", 7).PayloadSHA256,
+		"payload_bytes":                   11, "payload_media_type": "text/plain; charset=utf-8",
 		"request_fingerprint": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		"status":              "submitted", "compatibility_code": 0, "verification": "strong",
 		"pane_hash_before": nil, "pane_hash_after": nil, "enter_attempts": 1,
@@ -639,6 +660,7 @@ func controlReceiptFixture(grantID, recipientID, paneID string) map[string]any {
 
 func controlOriginMetaFixture(enabled, include bool) map[string]any {
 	features := map[string]any{}
+	features["lifecycle_control"] = true
 	if include {
 		features["control_principal_origin"] = enabled
 	}
@@ -648,7 +670,18 @@ func controlOriginMetaFixture(enabled, include bool) map[string]any {
 		"producer_boot_id":    "33333333-3333-4333-8333-333333333333",
 		"replay_floor_cursor": "tdc2.floor", "durable_high_water_cursor": "tdc2.high",
 		"features": features,
+		"tmux_server": map[string]any{"domain_id": "flowbee", "ownership": "managed_dedicated",
+			"instance_id": "44444444-4444-4444-8444-444444444444", "connection_visibility": "isolated_socket"},
+		"contracts": driverContractsFixture(),
 	}
+}
+
+func driverContractsFixture() map[string]any {
+	contracts := defaultDriverContractCapabilities()
+	raw, _ := json.Marshal(contracts)
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	return out
 }
 
 func sortedKeys(m map[string]any) []string {

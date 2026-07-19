@@ -80,9 +80,10 @@ Do not replace this with the legacy SSH cache probe or a routed terminal message
 The scheduling/reconciliation pass supplies project-scoped required build, review,
 and operations pools to `Store.ReconcileCapacityPools`. Queued work with zero
 routable seats immediately opens durable `capacity_pool_exhausted` attention. If the
-condition survives the configured threshold, one episode-scoped control alert is
-queued for push delivery. A fresh routable generation resolves the attention and
-advances the control-event digest.
+condition survives the configured threshold, one episode-scoped alert obligation is
+queued for the exact project Interactor. If that Driver route is unavailable, the
+obligation remains in a visible durable hold. A fresh routable generation resolves
+the attention and advances the control-event digest.
 
 ## Activation gates
 
@@ -91,7 +92,8 @@ advances the control-event digest.
 - one complete shadow generation contains one observation per enabled seat;
 - missing/old/live-unavailable observations are visibly held, never routed;
 - a forced provider outage survives process restart without a probe storm;
-- a queued zero-capacity pool produces attention and exactly one pushed alert;
+- a queued zero-capacity pool produces attention and exactly one project-Interactor
+  alert obligation (or a visible route hold);
 - the legacy fold regression test stays green with the v2 flag enabled.
 
 The current local-only release gate additionally requires that every enabled seat has

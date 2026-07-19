@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/samhotchkiss/flowbee/internal/alertingress"
 )
 
 type HTTPProbe struct {
@@ -125,34 +127,67 @@ func controlOnlyDegraded(httpStatus int, status string, db *bool, overdue *int, 
 }
 
 type WebhookPublisher struct {
-	URL, Secret string
-	Client      *http.Client
+	URL, Secret, ProjectID string
+	Client                 *http.Client
 }
 
 type controlAlertEnvelope struct {
-	FormatVersion string       `json:"format_version"`
-	ID            string       `json:"id"`
-	DedupKey      string       `json:"dedup_key"`
-	ProjectID     string       `json:"project_id"`
-	EpicID        string       `json:"epic_id,omitempty"`
-	Kind          string       `json:"kind"`
-	Payload       Notification `json:"payload"`
+	FormatVersion string `json:"format_version"`
+	ID            string `json:"id"`
+	DedupKey      string `json:"dedup_key"`
+	ProjectID     string `json:"project_id"`
+	EpicID        string `json:"epic_id,omitempty"`
+	Kind          string `json:"kind"`
+	Payload       any    `json:"payload"`
 }
 
 func (p WebhookPublisher) Publish(ctx context.Context, notification Notification) error {
 	if strings.TrimSpace(p.URL) == "" || p.Secret == "" {
 		return fmt.Errorf("alert webhook URL and secret are required")
 	}
-	// Keep the same outer contract as the in-process alert drainer so one
-	// receiver can authenticate and route both alert sources.
+	if err := ValidateProjectID(p.ProjectID); err != nil {
+		return err
+	}
+	if notification.ProjectID != p.ProjectID {
+		return fmt.Errorf("dead-man notification belongs to project %q, not publisher project %q",
+			notification.ProjectID, p.ProjectID)
+	}
+	// Use Flowbee's signed ingress contract. The receiver durably projects this
+	// exact-project obligation to the Interactor; it is not a human webhook sink.
 	body, err := json.Marshal(controlAlertEnvelope{
 		FormatVersion: "flowbee.control-alert/v1", ID: notification.ID,
-		DedupKey: notification.DedupKey, ProjectID: "default",
+		DedupKey: notification.DedupKey, ProjectID: p.ProjectID,
 		Kind: "external_deadman", Payload: notification,
 	})
 	if err != nil {
 		return err
 	}
+	return p.publishEnvelope(ctx, body, notification.DedupKey)
+}
+
+func (p WebhookPublisher) PublishHeartbeat(ctx context.Context, heartbeat Heartbeat) error {
+	if strings.TrimSpace(p.URL) == "" || p.Secret == "" {
+		return fmt.Errorf("alert webhook URL and secret are required")
+	}
+	if err := ValidateProjectID(p.ProjectID); err != nil {
+		return err
+	}
+	if heartbeat.ProjectID != p.ProjectID || heartbeat.FormatVersion != alertingress.ExternalWatchdogHeartbeatFormatVersion ||
+		heartbeat.WatchdogID == "" || heartbeat.Target == "" || heartbeat.Sequence < 1 || heartbeat.ObservedAt.IsZero() {
+		return fmt.Errorf("watchdog heartbeat is incomplete or belongs to the wrong project")
+	}
+	key := fmt.Sprintf("deadman-heartbeat:%s:%s:%d", heartbeat.ProjectID, heartbeat.WatchdogID, heartbeat.Sequence)
+	body, err := json.Marshal(controlAlertEnvelope{
+		FormatVersion: alertingress.FormatVersion, ID: key, DedupKey: key,
+		ProjectID: p.ProjectID, Kind: alertingress.ExternalWatchdogHeartbeatKind, Payload: heartbeat,
+	})
+	if err != nil {
+		return err
+	}
+	return p.publishEnvelope(ctx, body, key)
+}
+
+func (p WebhookPublisher) publishEnvelope(ctx context.Context, body []byte, key string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.URL, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -160,13 +195,15 @@ func (p WebhookPublisher) Publish(ctx context.Context, notification Notification
 	mac := hmac.New(sha256.New, []byte(p.Secret))
 	_, _ = mac.Write(body)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Idempotency-Key", notification.DedupKey)
+	req.Header.Set("Idempotency-Key", key)
 	req.Header.Set("X-Flowbee-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
 	client := p.Client
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	resp, err := client.Do(req)
+	noRedirectClient := *client
+	noRedirectClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := noRedirectClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -175,5 +212,14 @@ func (p WebhookPublisher) Publish(ctx context.Context, notification Notification
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("alert webhook status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
-	return nil
+	if resp.Header.Get("Content-Type") != "application/json" {
+		return fmt.Errorf("control-alert ingress 2xx did not return application/json acknowledgement")
+	}
+	ackBody, err := io.ReadAll(io.LimitReader(resp.Body, (64<<10)+1))
+	if err != nil {
+		return fmt.Errorf("read control-alert ingress acknowledgement: %w", err)
+	}
+	hash := sha256.Sum256(body)
+	return alertingress.ValidateAcknowledgement(ackBody, resp.Header.Get("X-Flowbee-Signature"),
+		p.Secret, key, hex.EncodeToString(hash[:]))
 }

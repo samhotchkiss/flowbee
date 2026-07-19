@@ -19,7 +19,7 @@ func bindBuilderDriver(t *testing.T, st *store.Store, epicID string, now time.Ti
 	st.EnableDriverControlOrigin = true // future-capability fake route
 	b := store.DriverSessionBinding{
 		WorkerIdentity: store.BuilderDriverIdentity(epicID), Role: store.DriverBuilderRole,
-		HostID: "host-builder", StoreID: "store-builder", TmuxServerInstanceID: "server-builder",
+		HostID: "host-builder", StoreID: "store-builder", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-builder", LifecycleOwnership: "driver_managed",
 		LifecycleKey: "builder-" + epicID, TargetEpoch: 1, ProfileID: "codex-builder",
 		WorkspaceRootID: "workspace-root", WorkspaceRelativePath: "repo/" + epicID,
 		SessionID: "session-" + epicID, PaneInstanceID: "pane-" + epicID,

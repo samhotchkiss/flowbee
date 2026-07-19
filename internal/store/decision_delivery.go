@@ -42,24 +42,14 @@ type decisionNotificationPayload struct {
 // commits the immutable action body/hash and route. If the Interactor is absent,
 // the human evidence still commits and a durable visible hold is inserted; the
 // reconciler materializes the exact action as soon as a binding becomes live.
-func ensureDecisionResponseActionTx(ctx context.Context, tx *sql.Tx, projectID, responseID string,
-	now time.Time, controlOriginAvailable bool) (bool, bool, error) {
-	if !controlOriginAvailable {
-		stamp := now.UTC().Format(rfc3339)
-		dedup := "decision_response_interactor_route_unavailable:" + responseID
-		_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO control_alerts
-			(id,project_id,epic_id,kind,dedup_key,payload_json,state,created_at,updated_at)
-			VALUES (?,?,NULL,'decision_response_interactor_route_unavailable',?,
-			json_object('decision_response_id',?,'reason',?),'pending',?,?)`,
-			"decision-route-"+stableID(dedup), projectID, dedup, responseID,
-			ErrDriverControlOriginUnavailable.Error(), stamp, stamp)
-		return false, true, err
-	}
-	created, err := materializeDecisionResponseActionTx(ctx, tx, projectID, responseID, now)
+func (s *Store) ensureDecisionResponseActionTx(ctx context.Context, tx *sql.Tx, projectID, responseID string,
+	now time.Time) (bool, bool, error) {
+	created, err := s.materializeDecisionResponseActionTx(ctx, tx, projectID, responseID, now)
 	if err == nil {
 		return created, false, nil
 	}
-	if !errors.Is(err, ErrDecisionInteractorRouteUnavailable) {
+	if !errors.Is(err, ErrDecisionInteractorRouteUnavailable) &&
+		!errors.Is(err, ErrDriverControlOriginUnavailable) {
 		return false, false, err
 	}
 	stamp := now.UTC().Format(rfc3339)
@@ -100,8 +90,7 @@ func (s *Store) ReconcileDecisionResponseActions(ctx context.Context, now time.T
 			return err
 		}
 		for _, i := range items {
-			created, held, err := ensureDecisionResponseActionTx(ctx, tx, i.projectID, i.responseID,
-				now, s.HasDriverControlOrigin())
+			created, held, err := s.ensureDecisionResponseActionTx(ctx, tx, i.projectID, i.responseID, now)
 			if err != nil {
 				return err
 			}
@@ -117,7 +106,7 @@ func (s *Store) ReconcileDecisionResponseActions(ctx context.Context, now time.T
 	return out, err
 }
 
-func materializeDecisionResponseActionTx(ctx context.Context, tx *sql.Tx, projectID, responseID string, now time.Time) (bool, error) {
+func (s *Store) materializeDecisionResponseActionTx(ctx context.Context, tx *sql.Tx, projectID, responseID string, now time.Time) (bool, error) {
 	var requestID, requestedBy, kind, structured, comment, actorID, authScope string
 	var subjectSHA, deferUntil, deferCondition string
 	var requestVersion, subjectVersion int
@@ -134,6 +123,10 @@ func materializeDecisionResponseActionTx(ctx context.Context, tx *sql.Tx, projec
 	recipient, err := exactProjectInteractorBindingTx(ctx, tx, projectID, requestedBy)
 	if err != nil {
 		return false, err
+	}
+	if !s.HasDriverControlOriginForBinding(recipient) {
+		return false, fmt.Errorf("%w: Interactor endpoint %s/%s/%s is not control-origin ready",
+			ErrDriverControlOriginUnavailable, recipient.HostID, recipient.StoreID, recipient.TmuxServerDomainID)
 	}
 	var baselineSeq, uncertaintyEpoch uint64
 	var instanceState string
@@ -211,8 +204,8 @@ func exactProjectInteractorBindingTx(ctx context.Context, tx *sql.Tx, projectID,
 			return DriverSessionBinding{}, err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT binding_id,project_id,worker_identity,role,
-		binding_epoch,host_id,store_id,tmux_server_instance_id,lifecycle_key,target_epoch,
+	rows, err := tx.QueryContext(ctx, `SELECT binding_id,project_id,worker_identity,role,seat_id,
+		binding_epoch,host_id,store_id,tmux_server_domain_id,tmux_server_instance_id,lifecycle_ownership,external_watch_id,lifecycle_key,target_epoch,
 		profile_id,workspace_root_id,workspace_relative_path,session_id,pane_instance_id,
 		agent_run_id,provider,conversation_id,observed_at
 		FROM driver_session_bindings WHERE project_id=? AND role=? AND state='active'

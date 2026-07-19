@@ -9,6 +9,7 @@ import (
 
 type Runtime struct {
 	Port         DriverPort
+	Resolver     *EndpointResolver
 	Store        SQLActionStore
 	Evidence     StageEvidence
 	Owner        string
@@ -20,7 +21,7 @@ type RuntimeReport struct{ Reclaimed, Verified, Delivered, Retried, DeadLettered
 
 func (r Runtime) Tick(ctx context.Context, now time.Time) (RuntimeReport, error) {
 	var out RuntimeReport
-	if r.Port == nil || r.Store.DB == nil || r.Owner == "" {
+	if (r.Resolver == nil && nilDriverPort(r.Port)) || r.Store.DB == nil || r.Owner == "" {
 		return out, errors.New("driver runtime requires port, store, and owner")
 	}
 	if r.ClaimTTL <= 0 {
@@ -46,7 +47,14 @@ func (r Runtime) Tick(ctx context.Context, now time.Time) (RuntimeReport, error)
 	if err := validateRuntimeRoute(a); err != nil {
 		return r.retryOrDeadLetter(ctx, a, err, now, out)
 	}
-	exec := Executor{Port: r.Port, Store: r.Store, Evidence: r.Evidence}
+	if err := validateSessionOriginEndpoint(a); err != nil {
+		return r.retryOrDeadLetter(ctx, a, err, now, out)
+	}
+	port, err := resolveRuntimeSendPort(r.Resolver, r.Port, a)
+	if err != nil {
+		return r.retryOrDeadLetter(ctx, a, err, now, out)
+	}
+	exec := Executor{Port: port, Store: r.Store, Evidence: r.Evidence}
 	result, err := exec.ExecuteClaimed(ctx, a.SessionTarget(), a.RouteGrant(), a)
 	if err != nil {
 		if result.Uncertain || errors.Is(err, ErrUncertain) {
@@ -73,7 +81,12 @@ func (r Runtime) Tick(ctx context.Context, now time.Time) (RuntimeReport, error)
 }
 
 func (r Runtime) verify(ctx context.Context, a Action, now time.Time, out RuntimeReport) (RuntimeReport, error) {
-	receipt, ok, err := r.Port.ReceiptByAction(ctx, a.ExpectedReceipt())
+	port, err := resolveRuntimePort(r.Resolver, r.Port, a)
+	if err != nil {
+		_ = r.Store.ReleaseVerifying(ctx, a.ActionID, r.Owner, a.Epoch, err.Error(), now)
+		return out, err
+	}
+	receipt, ok, err := port.ReceiptByAction(ctx, a.ExpectedReceipt())
 	if err != nil {
 		_ = r.Store.ReleaseVerifying(ctx, a.ActionID, r.Owner, a.Epoch, err.Error(), now)
 		return out, err
@@ -137,9 +150,8 @@ func (r Runtime) retryOrDeadLetter(ctx context.Context, a Action, cause error, n
 func validateRuntimeRoute(a Action) error {
 	for name, value := range map[string]string{
 		"target_host_id": a.TargetHostID, "target_store_id": a.TargetStoreID,
-		"target_server_id": a.TargetServerID, "lifecycle_key": a.LifecycleKey,
-		"profile_id": a.ProfileID, "workspace_root_id": a.WorkspaceRootID,
-		"workspace_relative_path": a.WorkspaceRelativePath, "lease_id": a.LeaseID,
+		"target_server_domain_id": a.TargetServerDomainID,
+		"target_server_id":        a.TargetServerID, "lease_id": a.LeaseID,
 		"recipient_session_id":       a.RecipientSessionID,
 		"recipient_pane_instance_id": a.RecipientPaneInstanceID, "grant_id": a.GrantID,
 	} {
@@ -157,7 +169,22 @@ func validateRuntimeRoute(a Action) error {
 			return err
 		}
 	}
-	if a.TargetEpoch < 1 || a.LeaseEpoch < 1 || a.Epoch < 1 {
+	managed := a.LifecycleKey != "" || a.TargetEpoch != 0 || a.ProfileID != "" ||
+		a.WorkspaceRootID != "" || a.WorkspaceRelativePath != ""
+	if managed && (a.LifecycleKey == "" || a.TargetEpoch < 1 || a.ProfileID == "") {
+		return errors.New("driver action has incomplete lifecycle target")
+	}
+	if (a.WorkspaceRootID == "") != (a.WorkspaceRelativePath == "") {
+		return errors.New("driver action has incomplete lifecycle workspace")
+	}
+	if a.TargetLifecycleOwnership == "external_observed" {
+		if a.ExternalWatchID == "" || a.WorkspaceRootID != "" {
+			return errors.New("driver action has incomplete external lifecycle target")
+		}
+	} else if managed && a.WorkspaceRootID == "" {
+		return errors.New("driver action has incomplete managed lifecycle target")
+	}
+	if a.LeaseEpoch < 1 || a.Epoch < 1 {
 		return errors.New("driver action has incomplete epochs")
 	}
 	return nil

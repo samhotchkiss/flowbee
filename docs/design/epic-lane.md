@@ -90,7 +90,7 @@ keep: **epoch fencing** (identical `ErrStaleEpoch` semantics to `internal/lease`
 | `launch_failed` | `epic start` rollback path / launching-reaper | 10 | `<epic>:launch_failed` | retry/reassign host or account |
 | `blocked_non_resumable` | watchdog `blockInfra`/`SetNeedsOperator` | 10 | `<epic>:blocked` | diagnose; usually operator, master may unblock |
 | `auth_dead` | auth-death classifier (§12.4) | 10 | `<epic>:auth_dead` | **human-only re-login** — never auto-resume |
-| `master_absent` | reaper: high-pri item unleased > T with no live master | 3 | `master_absent` | operator/push alarm (not master-facing) |
+| `master_absent` | reaper: high-pri item unleased > T with no live master | 3 | `master_absent` | durable exact-project Interactor alert; visible hold if its route is absent |
 | `wedged_ui` | digest: pane in modal/copy-mode > T | 15 | `<epic>:wedged` | author exact escape key (family verb table) |
 | `drift_suspect` | drift detector after advisor says "off" | 15 | `<epic>:drift:<signal>` | correct or `## Amendments` |
 | `usage_critical` | capacity monitor: assigned account critical (non-stale) | 15 | `<epic>:usage:<acct>` | ride/pause/reassign decision |
@@ -165,7 +165,7 @@ between send-verified and pane-moved-on, and a duplicated context-aware instruct
 True exactly-once over a fire-and-forget terminal is impossible; we do not pretend otherwise.
 
 Other actions: `dismiss` (resolve, no send — e.g. `epic_finished`, but audited, §12.8),
-`escalate` (route to operator `NeedsHuman` + optional push), `amend` (a verified send the master
+`escalate` (commit `NeedsHuman` plus an exact-project Interactor obligation), `amend` (a verified send the master
 authors as an `## Amendments` entry — the sanctioned, contract-recognized way to authorize a
 merge-of-main or scope change; INSTRUCTIONS.md line 10 already recognizes `## Amendments`).
 

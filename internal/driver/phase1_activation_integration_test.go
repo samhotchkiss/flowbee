@@ -209,10 +209,22 @@ func seedPhase1BuilderRoute(t *testing.T, st *store.Store, now time.Time) {
 	}, capacityAt); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
+		ProjectID: "default", WorkerIdentity: "phase1-reviewer", Role: store.DriverReviewerRole,
+		SeatID: reviewer.ID, HostID: reviewer.Box, StoreID: "phase1-review-store",
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "phase1-review-server",
+		LifecycleOwnership: "driver_managed", LifecycleKey: "phase1-reviewer",
+		TargetEpoch: 1, ProfileID: "grok-reviewer", WorkspaceRootID: "phase1-workspace",
+		WorkspaceRelativePath: "review", SessionID: "phase1-review-session",
+		PaneInstanceID: "phase1-review-pane", AgentRunID: "phase1-review-run",
+		Provider: "grok", ObservedAt: now,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
 	stamp := now.UTC().Format(time.RFC3339Nano)
 	if _, err := st.DB.ExecContext(ctx, `INSERT INTO driver_instances
-		(instance_ref,host_id,store_id,producer_boot_id,state,created_at,updated_at)
-		VALUES ('phase1-builder-driver',?, 'phase1-builder-store','phase1-boot','live',?,?)`,
+		(instance_ref,host_id,store_id,producer_boot_id,tmux_server_domain_id,tmux_server_ownership,state,created_at,updated_at)
+		VALUES ('phase1-builder-driver',?, 'phase1-builder-store','phase1-boot','flowbee','managed_dedicated','live',?,?)`,
 		seat.Box, stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +236,7 @@ func seedPhase1BuilderRoute(t *testing.T, st *store.Store, now time.Time) {
 	}
 	if err := st.UpsertBuilderDriverTarget(ctx, store.BuilderDriverTarget{
 		ProjectID: "default", SeatID: seat.ID, InstanceRef: "phase1-builder-driver",
-		TmuxServerInstanceID: "phase1-builder-server", ProfileID: "codex-builder",
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "phase1-builder-server", ProfileID: "codex-builder",
 		WorkspaceRootID: "phase1-workspace", WorkspaceRelativeBase: "repos", Enabled: true,
 	}, now); err != nil {
 		t.Fatal(err)

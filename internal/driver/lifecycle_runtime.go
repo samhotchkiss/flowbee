@@ -13,6 +13,7 @@ type LifecycleProjector interface {
 
 type LifecycleRuntime struct {
 	Port         DriverPort
+	Resolver     *EndpointResolver
 	Store        SQLActionStore
 	Projector    LifecycleProjector
 	Gate         LifecycleGate
@@ -25,7 +26,7 @@ type LifecycleRuntimeReport struct{ Reclaimed, Verified, Executed, Held, Retried
 
 func (r LifecycleRuntime) Tick(ctx context.Context, now time.Time) (LifecycleRuntimeReport, error) {
 	var out LifecycleRuntimeReport
-	if r.Port == nil || r.Store.DB == nil || r.Projector == nil || r.Owner == "" {
+	if (r.Resolver == nil && nilDriverPort(r.Port)) || r.Store.DB == nil || r.Projector == nil || r.Owner == "" {
 		return out, errors.New("driver lifecycle runtime requires port, store, projector, and owner")
 	}
 	if r.ClaimTTL <= 0 {
@@ -74,21 +75,27 @@ func (r LifecycleRuntime) Tick(ctx context.Context, now time.Time) (LifecycleRun
 			return out, nil
 		}
 	}
-	receipt, err := r.execute(ctx, action)
+	port, err := resolveRuntimePort(r.Resolver, r.Port, action)
+	if err != nil {
+		return r.retryOrDeadLetter(ctx, action, err, now, out)
+	}
+	receipt, err := r.execute(ctx, port, action)
 	if receipt.LifecycleReceiptID != "" {
 		if persistErr := r.Store.PersistLifecycleReceipt(ctx, receipt); persistErr != nil {
 			return out, persistErr
 		}
 	}
 	if err != nil {
-		if errors.Is(err, ErrUncertain) {
-			if markErr := r.Store.MarkActionVerifying(ctx, action.ActionID, r.Owner,
-				action.Epoch, err.Error(), now); markErr != nil {
-				return out, markErr
-			}
-			return out, nil
+		// Once a lifecycle request reaches Driver, a transport error cannot prove
+		// the terminal was not mutated. Persist uncertainty for every response-loss
+		// shape; recovery must use by-action receipt lookup and exact presence before
+		// the same immutable effect may be resumed. Validation, resolution, and
+		// capacity failures above this call remain ordinary retryable pre-send holds.
+		if markErr := r.Store.MarkActionVerifying(ctx, action.ActionID, r.Owner,
+			action.Epoch, err.Error(), now); markErr != nil {
+			return out, markErr
 		}
-		return r.retryOrDeadLetter(ctx, action, err, now, out)
+		return out, nil
 	}
 	if !receipt.Resolved() {
 		// A terminal Driver receipt proves this exact action has completed. Its
@@ -117,13 +124,13 @@ func (r LifecycleRuntime) Tick(ctx context.Context, now time.Time) (LifecycleRun
 	return out, nil
 }
 
-func (r LifecycleRuntime) execute(ctx context.Context, action Action) (LifecycleReceipt, error) {
+func (r LifecycleRuntime) execute(ctx context.Context, port DriverPort, action Action) (LifecycleReceipt, error) {
 	target := action.SessionTarget()
 	switch action.Kind {
 	case "builder_park":
-		return r.Port.StopSession(ctx, target, action)
+		return port.StopSession(ctx, target, action)
 	case "builder_launch", "builder_rework", "conflict_resolution":
-		return r.Port.EnsureLifecycleSession(ctx, target, action)
+		return port.EnsureLifecycleSession(ctx, target, action)
 	default:
 		return LifecycleReceipt{}, fmt.Errorf("unsupported Driver lifecycle action %s", action.Kind)
 	}
@@ -131,14 +138,19 @@ func (r LifecycleRuntime) execute(ctx context.Context, action Action) (Lifecycle
 
 func (r LifecycleRuntime) verify(ctx context.Context, action Action, now time.Time,
 	out LifecycleRuntimeReport) (LifecycleRuntimeReport, error) {
-	receipt, ok, err := r.Port.LifecycleReceiptByAction(ctx, action.ActionID,
+	port, err := resolveRuntimePort(r.Resolver, r.Port, action)
+	if err != nil {
+		_ = r.Store.ReleaseVerifying(ctx, action.ActionID, r.Owner, action.Epoch, err.Error(), now)
+		return out, err
+	}
+	receipt, ok, err := port.LifecycleReceiptByAction(ctx, action.ActionID,
 		action.LifecycleKey, action.TargetEpoch)
 	if err != nil {
 		_ = r.Store.ReleaseVerifying(ctx, action.ActionID, r.Owner, action.Epoch, err.Error(), now)
 		return out, err
 	}
 	if !ok {
-		presence, presenceErr := r.Port.LifecycleTargetPresence(ctx, action.LifecycleKey, action.TargetEpoch)
+		presence, presenceErr := port.LifecycleTargetPresence(ctx, action.LifecycleKey, action.TargetEpoch)
 		if presenceErr != nil {
 			_ = r.Store.ReleaseVerifying(ctx, action.ActionID, r.Owner, action.Epoch,
 				presenceErr.Error(), now)
@@ -162,7 +174,7 @@ func (r LifecycleRuntime) verify(ctx context.Context, action Action, now time.Ti
 		if err := r.Store.ResumeLifecycleAfterAbsentProof(ctx, action, r.Owner, now, r.ClaimTTL); err != nil {
 			return out, err
 		}
-		recovered, executeErr := r.execute(ctx, action)
+		recovered, executeErr := r.execute(ctx, port, action)
 		if recovered.LifecycleReceiptID != "" {
 			if err := r.Store.PersistLifecycleReceipt(ctx, recovered); err != nil {
 				return out, err
@@ -202,7 +214,7 @@ func (r LifecycleRuntime) verify(ctx context.Context, action Action, now time.Ti
 		if err != nil {
 			return out, err
 		}
-		verified, verifyErr := r.Port.VerifyLifecycleEffect(ctx, receipt.LifecycleReceiptID,
+		verified, verifyErr := port.VerifyLifecycleEffect(ctx, receipt.LifecycleReceiptID,
 			action.SessionTarget(), action)
 		if verified.LifecycleReceiptID != "" {
 			if err := r.Store.PersistLifecycleReceipt(ctx, verified); err != nil {

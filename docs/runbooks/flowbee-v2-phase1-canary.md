@@ -1,21 +1,46 @@
 # Flowbee v2 Phase 1 canary
 
 Use this runbook to activate one project after the fake/contract suites are green.
-The canary does not introduce a second transport: Driver v2.4 is the sole managed-
-session observation and actuation boundary.
+The canary does not introduce a second transport: Driver v2.5, including the v2.4
+control-principal-origin contract, is the sole managed-session observation and
+actuation boundary.
 
 ## Preconditions
 
 - `go test ./... -count=1 -timeout=300s` and `go test ./test/acceptance -count=1` pass.
-- The local Driver lifecycle/control daemon passes its own conformance gates.
+- Both configured Driver endpoints pass metadata, capability, and observation
+  conformance. The managed-dedicated endpoint additionally passes isolated
+  ensure/control-send/stop conformance; the external/default endpoint passes exact
+  non-mutating Interactor adoption and restart recovery. Never run a managed `Ensure`
+  as conformance against the external/default domain.
 - Driver advertises `features.control_principal_origin=true` from `GET /v2/meta`.
   With the configured Flowbee bearer, `GET /v2/control/capabilities` must return
   `format_version=tmux-driver.control-principal-origin-capability/v1`,
   `principal_id=flowbee-control`, `supported=true`, `authorized=true`, and
   `missing_scopes=[]`. Any mismatch keeps messaging in a durable
   `GAP-FD-003` route-unavailable hold.
-- Alert receiver and the independent `flowbee watchdog` are running.
-- Human session, alert, and Driver keys are regular owner-only files (`0600` or stricter).
+- The canary project's exact Interactor binding is active on its configured external
+  Driver endpoint. Alerts use the same exact-project route; there is no Matrix,
+  provider webhook, or global fallback.
+- The endpoint inventory contains both isolated authority domains: the adopted
+  Interactor resolves only to an `external/default` endpoint, while the
+  Flowbee-created Orchestrator and workers resolve only to a
+  `managed_dedicated/non-default` endpoint. Resolution uses the exact
+  host/store/domain tuple with no single-default or cross-domain fallback.
+- The signed control-alert ingress has a durable project-bound Acceptor, and the
+  independent `flowbee watchdog` is running with an explicit matching project ID.
+  If Flowbee is unavailable, the watchdog's local durable outbox retains dead-man
+  incidents. After Flowbee recovers, signed ingress acceptance creates the durable
+  alert obligation and Flowbee projects it to that Interactor.
+- The watchdog emits a signed project/identity/target heartbeat on startup and every
+  pass. Its two-minute Flowbee lease is a dynamic readiness gate, not a human alert.
+  First boot may expose the ingress with readiness degraded only until the first
+  heartbeat arrives; it must then converge green without restarting Flowbee.
+- Readiness is recomputed on every health request. A stale actor incarnation,
+  endpoint-capability revocation, stale capacity generation, unroutable exact seat,
+  or expired watchdog lease closes readiness again while reconcilers keep healing.
+- Human session, dead-man ingress, and Driver keys are regular owner-only files
+  (`0600` or stricter).
 - One Codex build seat and a distinct-family review seat have fresh, identity-bound
   capacity observations and exact Driver targets.
 
@@ -23,8 +48,8 @@ Bind each build seat with `flowbee seat bind-driver`; this records only stable D
 inventory/profile/workspace identities. Session, pane, and agent-run UUIDs arrive in
 Driver lifecycle receipts and are never copied from tmux names.
 
-If the current Flowbee credential lacks `messages:send`, update it with Driver's
-supported operation. Never edit the credential JSON by hand:
+If either endpoint's Flowbee credential lacks `messages:send`, update that daemon with
+Driver's supported operation. Never edit the credential JSON by hand:
 
 ```bash
 td --json auth token-update \
@@ -47,17 +72,36 @@ FLOWBEE_EPIC_REVIEW_HANDOFF_V2=1
 FLOWBEE_PHASE1_DASHBOARD=1
 FLOWBEE_CAPACITY_ROUTING_V2=1
 FLOWBEE_PRIVATE_ADDR=127.0.0.1:7070
-FLOWBEE_DRIVER_SOCKET=<local v2.4 UDS>
-FLOWBEE_DRIVER_TOKEN_FILE=<owner-only control token file>
-FLOWBEE_DRIVER_INSTANCE_REF=<stable inventory ref>
-FLOWBEE_ALERT_WEBHOOK_URL=<push receiver>
-FLOWBEE_ALERT_WEBHOOK_SECRET_FILE=<owner-only HMAC key file>
+FLOWBEE_DRIVER_ENDPOINTS_FILE=<owner-only exact host/store/domain inventory>
 FLOWBEE_EXTERNAL_WATCHDOG_ID=<independent watcher identity>
+FLOWBEE_WATCHDOG_PROJECT_ID=<exact canary project id>
+FLOWBEE_ALERT_WEBHOOK_SECRET_FILE=<owner-only control-alert ingress HMAC key file>
 FLOWBEE_HUMAN_SESSION_KEY_FILE=<owner-only 32+ byte key file>
 FLOWBEE_HUMAN_GRANTS_FILE=<owner-only identity@project=role file>
 FLOWBEE_CAPACITY_LOCAL_HOST_ID=<stable host id>
 FLOWBEE_CAPACITY_COLLECTOR_ID=<enrolled collector identity>
 ```
+
+Configure the independently supervised watchdog separately; these are not
+`flowbee serve` settings:
+
+```text
+FLOWBEE_EXTERNAL_WATCHDOG_ID=<independent watcher identity>
+FLOWBEE_WATCHDOG_PROJECT_ID=<exact canary project id>
+FLOWBEE_WATCHDOG_HEALTH_URL=http://<tailnet-flowbee-host>:7001/healthz
+FLOWBEE_ALERT_WEBHOOK_URL=https://<tailnet-flowbee-host>:7443/v1/control-alerts/ingress
+FLOWBEE_ALERT_WEBHOOK_SECRET_FILE=<owner-only ingress HMAC key file>
+```
+
+The watchdog requires the health and ingress URLs to use the same hostname. Their
+schemes and ports may differ; the ingress path is fixed and admits no query or
+fragment.
+
+`flowbee serve` does not require or emit to an outbound human webhook. Do not copy the
+watchdog target URL into the serve environment and do not install a Matrix or provider
+sink. `flowbee serve` and the watchdog use the same canonical owner-only ingress HMAC
+key file, while only the watchdog needs the ingress URL. Canary evidence must come from
+durable exact-Interactor projection and its Driver grant/receipt or visible route hold.
 
 Keep the private listener on loopback and publish it with Tailscale Serve (for
 example, `https://host.tailnet.ts.net:8443 → 127.0.0.1:7070`). Do not carry the
@@ -71,14 +115,23 @@ all succeed. A raw tmux goal watcher, legacy epic supervisor, `epic start/abando
 master reply/amend pane delivery, and pane-tail capture are automatically fenced while
 v2 is active.
 
-The pinned candidate's live-UDS conformance gate must exercise the same bearer and
-daemon that the canary will use. It must prove: exact metadata feature discovery;
-exact authenticated capability response; strict control-grant and control-receipt
-parsing; an idempotent replay returning the original receipt; changed-body conflict;
-route denial and stale-recipient fencing with zero terminal mutation; and a
-crash-uncertain receipt that is not blindly resent. Keep the old listener running until
-this gate passes. Protocol availability in Driver's own test suite is necessary but is
-not evidence that the Flowbee adapter, configured credential, and live daemon conform.
+Project readiness is a live projection, not a startup certificate. Every `/healthz`
+request rechecks the exact project actor incarnations, per-endpoint control capability,
+builder/reviewer topology, fresh identity-bound capacity generation, and signed
+watchdog lease. A fact that expires or is fenced after startup must make readiness red;
+restored exact evidence must recover without a process restart.
+
+The pinned candidate's live-UDS conformance gate must exercise the same bearers and
+daemons that the canary will use. Both endpoints prove exact metadata discovery,
+authenticated capability, and observation. Only the managed-dedicated endpoint runs
+the isolated ensure/control-origin-send/stop drill; the external/default endpoint
+proves exact non-mutating adoption of the existing Interactor. Together the gates must
+also prove strict control-grant and control-receipt parsing, an idempotent replay
+returning the original receipt, changed-body conflict, route denial and stale-recipient
+fencing with zero terminal mutation, and a crash-uncertain receipt that is not blindly
+resent. Keep the old listener running until these gates pass. Protocol availability in
+Driver's own test suite is necessary but is not evidence that the Flowbee adapter,
+configured credentials, and live daemons conform.
 
 Do not provision a `flowbee-control` `driver_session_bindings` row. Direct origin is
 the authenticated control principal, not a managed agent session. Production startup
@@ -115,32 +168,43 @@ for a Tailnet listener.
 
 ## Acceptance drill
 
-1. From the dashboard, create an ordinary focused project request.
-2. Confirm the durable conversation message and work intent appear before any agent
+1. Start the candidate before a watchdog lease exists. Confirm the private ingress is
+   reachable while `/healthz` reports the exact
+   `external_watchdog_lease_missing_or_stale` project hold. Start the watchdog; confirm
+   its signed heartbeat turns readiness green without restarting Flowbee and creates
+   no `control_alert` or Interactor message.
+2. From the dashboard, create an ordinary focused project request.
+3. Confirm the durable conversation message and work intent appear before any agent
    claims to have accepted it.
-3. If a typed plan/design gate is raised, approve the exact displayed version/hash.
-4. Confirm automatic promotion: `ready_for_orchestrator → orchestrating → submitting
+4. If a typed plan/design gate is raised, approve the exact displayed version/hash.
+5. Confirm automatic promotion: `ready_for_orchestrator → orchestrating → submitting
    → admitted`; do not issue a second “go.”
-5. Confirm Driver records one exact directional grant in strict format
+6. Confirm Driver records one exact directional grant in strict format
    `tmux-driver.control-route-grant/v1`, with
    `sender_principal_id=flowbee-control` and the exact recipient session, recipient
    pane incarnation, epoch, and bounds. Confirm the send omits
    `on_behalf_of_session_id` and returns one
    `tmux-driver.control-delivery-receipt/v1` receipt carrying that same principal.
    A `submitted` receipt alone must not advance the workflow stage.
-6. Kill/restart the Orchestrator after receipt but before processing evidence. Confirm
+7. Kill/restart the Orchestrator after receipt but before processing evidence. Confirm
    Flowbee does not resend blindly and advances only after later exact evidence.
-7. Kill/restart Flowbee after epic admission and before builder launch acknowledgement.
+8. Kill/restart Flowbee after epic admission and before builder launch acknowledgement.
    Confirm one epic, one physical seat lease, and one current lifecycle action.
-8. Let the build reach real CI green. Interrupt between build completion and review
-   dispatch. Confirm the reconciler dispatches exactly one review and pushes an alert.
-9. Complete review/merge/cleanup and confirm the seat, pane, worktree, branch, and
+9. Let the build reach real CI green. Interrupt between build completion and review
+   dispatch. Confirm the reconciler dispatches exactly one review and commits one
+   visible exact-project Interactor alert obligation. If the Interactor route is
+   unavailable, confirm a durable hold; restore it and verify one Driver-routed
+   delivery rather than a provider webhook.
+10. Complete review/merge/cleanup and confirm the seat, pane, worktree, branch, and
    attention projections converge or become an explicit durable hold.
+11. Stop only the watchdog. After two minutes, confirm readiness closes with the exact
+    stale-lease hold. Restart it and confirm its next durable sequence restores
+    readiness without generating a human notification.
 
 ## Stop conditions and rollback
 
 Stop the canary for any duplicate effect, cross-project route, stale-incarnation send,
-green-by-absence, missing pushed alert, or state with neither next action nor visible
+green-by-absence, missing Interactor alert obligation/hold, or state with neither next action nor visible
 hold. Preserve the database and Driver archive for audit. Disable Phase 1 and v2 flags
 only after the current outboxes are acknowledged or explicitly held; never delete
 actions or receipts to make the board look clean. Roll back the session-control boundary

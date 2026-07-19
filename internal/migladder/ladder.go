@@ -54,6 +54,22 @@ type Entry struct {
 	Stem   string // NNNN_slug (the .sql filename without extension)
 }
 
+// BaseSet is the set of migration stems present at the candidate's merge base.
+// Check uses it to distinguish immutable, grandfathered history from migrations
+// introduced by the current candidate. A non-nil set is required; an empty set
+// is valid for a repository whose base has no migrations yet.
+type BaseSet map[string]struct{}
+
+// NewBaseSet constructs a BaseSet from exact migration filename stems
+// (NNNN_slug, without .sql). Check validates their format before use.
+func NewBaseSet(stems ...string) BaseSet {
+	set := make(BaseSet, len(stems))
+	for _, stem := range stems {
+		set[stem] = struct{}{}
+	}
+	return set
+}
+
 // Ladder is the parsed reserved-number block.
 type Ladder struct {
 	Entries []Entry
@@ -138,13 +154,33 @@ func (l *Ladder) numberCounts() map[int]int {
 	return c
 }
 
-// Check compares the migrations directory against the ladder and returns a
-// (possibly empty) list of human-readable violations. It fails a migration whose
-// number is absent from the ladder or whose number is duplicated on disk beyond
-// what the ladder records as a sanctioned double. Reservations with no file yet
-// (a number reserved ahead of writing the .sql) are NOT violations — the check
-// is files ⊆ ladder, not the reverse.
-func Check(migrationsDir, ladderPath string) ([]string, error) {
+// Check compares the migrations directory against the ladder and merge-base
+// history, returning a (possibly empty) list of human-readable violations. It
+// fails a migration whose number is absent from the ladder, a newly introduced
+// duplicate, a backfill at or below max(base), or a candidate whose first new
+// number is not exactly max(base)+1. Historical duplicate numbers are allowed
+// only when every file sharing that number was already present in baseSet.
+//
+// Multiple migrations may land in one candidate. Once the candidate starts at
+// max(base)+1, later numbers may contain intentional ladder reservations without
+// .sql files; this preserves forward-only reserved gaps while preventing two
+// branches from both starting at an already-consumed number.
+func Check(migrationsDir, ladderPath string, baseSet BaseSet) ([]string, error) {
+	if baseSet == nil {
+		return nil, fmt.Errorf("migration base set is required")
+	}
+	baseMax := 0
+	for stem := range baseSet {
+		m := entryRe.FindStringSubmatch(stem)
+		if m == nil {
+			return nil, fmt.Errorf("invalid base migration stem %q (want NNNN_slug)", stem)
+		}
+		n, _ := strconv.Atoi(m[1])
+		if n > baseMax {
+			baseMax = n
+		}
+	}
+
 	l, err := ParseFile(ladderPath)
 	if err != nil {
 		return nil, err
@@ -159,8 +195,11 @@ func Check(migrationsDir, ladderPath string) ([]string, error) {
 	stems := l.stems()
 	ladderNumCount := l.numberCounts()
 
-	var fileStems []string
+	fileStemSet := map[string]bool{}
 	fileNumCount := map[int]int{}
+	fileNumStems := map[int][]string{}
+	newNumStems := map[int][]string{}
+	minNewNumber := -1
 	var violations []string
 	for _, de := range dirEntries {
 		name := de.Name()
@@ -175,13 +214,37 @@ func Check(migrationsDir, ladderPath string) ([]string, error) {
 			continue
 		}
 		n, _ := strconv.Atoi(m[1])
-		fileStems = append(fileStems, stem)
+		fileStemSet[stem] = true
 		fileNumCount[n]++
+		fileNumStems[n] = append(fileNumStems[n], stem)
 		if !stems[stem] {
 			violations = append(violations, fmt.Sprintf(
 				"migration %s is not registered in LADDER.md — reserve it with `flowbee migration reserve %s`",
 				name, m[2]))
 		}
+		if _, existedAtBase := baseSet[stem]; !existedAtBase {
+			newNumStems[n] = append(newNumStems[n], stem)
+			if minNewNumber < 0 || n < minNewNumber {
+				minNewNumber = n
+			}
+			if n <= baseMax {
+				violations = append(violations, fmt.Sprintf(
+					"new migration %s uses %04d at or below max(base) %04d — never backfill; rebase and reserve a fresh number",
+					name, n, baseMax))
+			}
+		}
+	}
+
+	for stem := range baseSet {
+		if !fileStemSet[stem] {
+			violations = append(violations, fmt.Sprintf(
+				"base migration %s.sql was deleted or renamed — applied migration history is immutable", stem))
+		}
+	}
+	if minNewNumber >= 0 && minNewNumber != baseMax+1 {
+		violations = append(violations, fmt.Sprintf(
+			"first new migration is %04d, want exactly %04d (= max(base)+1) — rebase and renumber before merge",
+			minNewNumber, baseMax+1))
 	}
 
 	// duplicate-number guard: a number used by >=2 files is allowed ONLY if the
@@ -199,6 +262,23 @@ func Check(migrationsDir, ladderPath string) ([]string, error) {
 		violations = append(violations, fmt.Sprintf(
 			"migration number %04d is used by %d files but LADDER.md sanctions only %d — a new number collision (never renumber applied migrations; reserve a fresh number)",
 			n, fileNumCount[n], ladderNumCount[n]))
+	}
+
+	// Even when LADDER.md happens to record both colliding names, a duplicate is
+	// not grandfathered unless every file sharing that number existed at the
+	// merge base. This prevents two concurrent schema PRs from making a collision
+	// look legitimate merely by each updating the ladder.
+	newDuplicateNums := make([]int, 0)
+	for n, numberStems := range fileNumStems {
+		if len(numberStems) >= 2 && len(newNumStems[n]) > 0 {
+			newDuplicateNums = append(newDuplicateNums, n)
+		}
+	}
+	sort.Ints(newDuplicateNums)
+	for _, n := range newDuplicateNums {
+		violations = append(violations, fmt.Sprintf(
+			"new migration number %04d is duplicated; only duplicates wholly present at the merge base are grandfathered",
+			n))
 	}
 
 	sort.Strings(violations)

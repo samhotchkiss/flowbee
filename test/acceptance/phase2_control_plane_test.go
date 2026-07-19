@@ -276,7 +276,7 @@ func TestPhase2SessionIncarnationReplacementFencesOldDriverAuthority(t *testing.
 	}
 	control, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		ProjectID: "alpha", WorkerIdentity: store.DriverControlIdentity, Role: store.DriverControlRole,
-		HostID: "host-alpha", StoreID: "store-alpha", TmuxServerInstanceID: "server-alpha",
+		HostID: "host-alpha", StoreID: "store-alpha", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-alpha", LifecycleOwnership: "driver_managed",
 		LifecycleKey: "flowbee-control", TargetEpoch: 1, ProfileID: "flowbee-control",
 		WorkspaceRootID: "root-alpha", WorkspaceRelativePath: "flowbee",
 		SessionID: "control-alpha", PaneInstanceID: "control-pane-alpha", AgentRunID: "control-run-alpha",
@@ -286,7 +286,7 @@ func TestPhase2SessionIncarnationReplacementFencesOldDriverAuthority(t *testing.
 	}
 	old, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		ProjectID: "alpha", WorkerIdentity: "interactor:alpha", Role: store.DriverInteractorRole,
-		HostID: "host-alpha", StoreID: "store-alpha", TmuxServerInstanceID: "server-alpha",
+		HostID: "host-alpha", StoreID: "store-alpha", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-alpha", LifecycleOwnership: "driver_managed",
 		LifecycleKey: "interactor-alpha", TargetEpoch: 1, ProfileID: "interactor",
 		WorkspaceRootID: "root-alpha", WorkspaceRelativePath: "project-alpha",
 		SessionID: "interactor-alpha-v1", PaneInstanceID: "pane-alpha-v1", AgentRunID: "run-alpha-v1",
@@ -314,7 +314,7 @@ func TestPhase2SessionIncarnationReplacementFencesOldDriverAuthority(t *testing.
 	}
 	if _, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		ProjectID: "alpha", WorkerIdentity: "interactor:alpha", Role: store.DriverInteractorRole,
-		HostID: "host-alpha", StoreID: "store-alpha", TmuxServerInstanceID: "server-alpha",
+		HostID: "host-alpha", StoreID: "store-alpha", TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-alpha", LifecycleOwnership: "driver_managed",
 		LifecycleKey: "interactor-alpha", TargetEpoch: 2, ProfileID: "interactor",
 		WorkspaceRootID: "root-alpha", WorkspaceRelativePath: "project-alpha",
 		SessionID: "interactor-alpha-v2", PaneInstanceID: "pane-alpha-v2", AgentRunID: "run-alpha-v2",

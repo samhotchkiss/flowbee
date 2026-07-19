@@ -19,7 +19,7 @@ import (
 
 	"github.com/samhotchkiss/flowbee/internal/advisor"
 	"github.com/samhotchkiss/flowbee/internal/alarm"
-	"github.com/samhotchkiss/flowbee/internal/alerting"
+	"github.com/samhotchkiss/flowbee/internal/alertingress"
 	"github.com/samhotchkiss/flowbee/internal/api"
 	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/clock"
@@ -39,6 +39,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/ulid"
 	"github.com/samhotchkiss/flowbee/internal/watchdog"
 	"github.com/samhotchkiss/flowbee/internal/webhook"
+	"github.com/samhotchkiss/flowbee/internal/worker"
 	actorprotocol "github.com/samhotchkiss/flowbee/protocol/flowbee/v2"
 )
 
@@ -58,6 +59,32 @@ func rejectSyntheticDriverControlBinding(ctx context.Context, db *sql.DB) error 
 		return fmt.Errorf("GAP-FD-003: synthetic flowbee-control session bindings cannot authorize the Driver control principal; remove %d synthetic binding(s)", count)
 	}
 	return nil
+}
+
+// privateHandlerWithControlAlertIngress mounts the independently authenticated
+// dead-man ingress ahead of the worker/dashboard router. The HMAC boundary is
+// deliberately separate from worker and human auth: successful acceptance means
+// the exact project-bound incident is durable, after which normal control-alert
+// projection delivers it to that project's Interactor through Driver.
+func privateHandlerWithControlAlertIngress(base http.Handler, secret, authorizedProjectID string, st *store.Store) (http.Handler, error) {
+	if base == nil {
+		return nil, errors.New("private API handler is required")
+	}
+	if secret == "" {
+		return base, nil
+	}
+	ingress, err := alertingress.New(alertingress.Config{
+		Secret: secret, Acceptor: alertingress.StoreAcceptor{
+			Store: st, AuthorizedProjectID: authorizedProjectID,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure control-alert ingress: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("POST "+alertingress.ControlAlertIngressPath, ingress)
+	mux.Handle("/", base)
+	return mux, nil
 }
 
 func driverControlReadiness(ctx context.Context, v2Enabled bool, port driver.DriverPort) api.DriverControlReadiness {
@@ -81,6 +108,41 @@ func driverControlReadiness(ctx context.Context, v2Enabled bool, port driver.Dri
 		Required: true, Available: true, Status: "ready",
 		Reason: "Tmux Driver authenticated control-principal origin ready for " + capability.PrincipalID + ".",
 	}
+}
+
+// productionWorkerAllowlist projects the operator-owned enrollment policy into
+// the scheduler attestor. The map is deliberately strict even when empty: an
+// enrolled capacity collector may authenticate, but cannot turn a self-asserted
+// role/tool into lease authority. A family bound in enrolled_identities is also
+// injected as the sole permitted model_family capability, so the authentication
+// and attestation trust roots cannot disagree.
+func productionWorkerAllowlist(cfg config.Config) worker.Allowlist {
+	permit := make(map[string][]string, len(cfg.EnrolledIdentities))
+	for _, entry := range cfg.EnrolledIdentities {
+		identity, family, _ := strings.Cut(strings.TrimSpace(entry), ":")
+		if identity == "" {
+			continue
+		}
+		caps := make([]string, 0, len(cfg.WorkerAttestations[identity])+1)
+		for _, capability := range cfg.WorkerAttestations[identity] {
+			caps = append(caps, strings.TrimSpace(capability))
+		}
+		if family != "" {
+			familyCap := "model_family:" + family
+			found := false
+			for _, capability := range caps {
+				if capability == familyCap {
+					found = true
+					break
+				}
+			}
+			if !found {
+				caps = append(caps, familyCap)
+			}
+		}
+		permit[identity] = caps
+	}
+	return worker.Allowlist{Permit: permit}
 }
 
 // selectDurableEpicReviewHandoffV2 makes the session-control boundary a
@@ -208,9 +270,8 @@ func printServeSystemd() {
 	if os.Getenv("FLOWBEE_EPIC_REVIEW_HANDOFF_V2") == "1" {
 		fmt.Printf("FLOWBEE_EPIC_REVIEW_HANDOFF_V2=1\n")
 		for _, key := range []string{
-			"FLOWBEE_ALERT_WEBHOOK_URL", "FLOWBEE_ALERT_WEBHOOK_SECRET_FILE",
-			"FLOWBEE_EXTERNAL_WATCHDOG_ID", "FLOWBEE_DRIVER_SOCKET",
-			"FLOWBEE_DRIVER_TOKEN_FILE", "FLOWBEE_DRIVER_INSTANCE_REF",
+			"FLOWBEE_EXTERNAL_WATCHDOG_ID", "FLOWBEE_WATCHDOG_PROJECT_ID",
+			"FLOWBEE_ALERT_WEBHOOK_SECRET_FILE", config.DriverEndpointsFileEnv,
 		} {
 			if value := os.Getenv(key); value != "" {
 				fmt.Printf("%s=%s\n", key, value)
@@ -255,12 +316,31 @@ WantedBy=multi-user.target
 	fmt.Printf("journalctl -u flowbee-serve -f   # tail logs; the startup line shows the build SHA\n")
 }
 
+func printServeUsage(w io.Writer) {
+	fmt.Fprintln(w, "usage: flowbee serve [--systemd]")
+	fmt.Fprintln(w, "  --systemd  print a hardened systemd unit and environment template")
+}
+
 func runServe(args []string) error {
+	// Serve used to ignore every argument except --systemd. In particular,
+	// `flowbee serve --help` continued into config loading and migration before
+	// eventually failing a readiness check. Parse the closed command surface
+	// before any config, database, listener, or Driver side effect.
+	printSystemd := false
 	for _, a := range args {
-		if a == "--systemd" {
-			printServeSystemd()
+		switch a {
+		case "-h", "--help":
+			printServeUsage(os.Stdout)
 			return nil
+		case "--systemd":
+			printSystemd = true
+		default:
+			return fmt.Errorf("unknown argument %q (try --help)", a)
 		}
+	}
+	if printSystemd {
+		printServeSystemd()
+		return nil
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -309,8 +389,13 @@ func runServe(args []string) error {
 		return err
 	}
 
-	if err := store.MigrateUp(ctx, st.DB); err != nil {
+	preMigrationSnapshot, err := migrateWithRollbackSnapshot(ctx, st.DB,
+		envOr("FLOWBEE_BACKUP_DIR", defaultBackupDir()))
+	if err != nil {
 		return err
+	}
+	if preMigrationSnapshot != "" {
+		logger.Info("pre-migration snapshot verified", "snapshot", preMigrationSnapshot)
 	}
 	logger.Info("migrations applied")
 
@@ -332,11 +417,13 @@ func runServe(args []string) error {
 	phase1Enabled := os.Getenv("FLOWBEE_PHASE1_DASHBOARD") == "1"
 	driverControl := driverControlReadiness(ctx, st.EnableEpicReviewHandoffV2, nil)
 	controlState := newDriverControlState(driverControl)
+	driverControlCurrent := controlState.Snapshot
+	driverControlAvailable := controlState.Available
 	// A database binding is inventory, not authority. Keep every Flowbee-authored
 	// message seam closed until Driver negotiates a real non-session control
 	// origin (GAP-FD-003). Observation and lifecycle control remain available.
 	st.EnableDriverControlOrigin = driverControl.Available
-	st.DriverControlOriginGate = controlState.Available
+	st.DriverControlOriginGate = driverControlAvailable
 	var capacityInterval time.Duration
 	if st.EnableCapacityV2 && !st.EnableEpicReviewHandoffV2 {
 		return fmt.Errorf("capacity routing v2 requires FLOWBEE_EPIC_REVIEW_HANDOFF_V2=1")
@@ -351,49 +438,76 @@ func runServe(args []string) error {
 		return fmt.Errorf("Phase 1 dashboard automation requires FLOWBEE_EPIC_REVIEW_HANDOFF_V2=1")
 	}
 	var v2Reconcilers *durableReconcilerSet
+	var controlAlertIngressSecret, controlAlertIngressProjectID string
+	var phase1ProjectCurrent func() api.Phase1ProjectReadiness
 	if st.EnableEpicReviewHandoffV2 {
 		if err := epicflow.ValidateRegistry(); err != nil {
 			return fmt.Errorf("epic v2 recovery contract: %w", err)
 		}
-		alertURL, alertSecretFile := os.Getenv("FLOWBEE_ALERT_WEBHOOK_URL"), os.Getenv("FLOWBEE_ALERT_WEBHOOK_SECRET_FILE")
-		if alertURL == "" || alertSecretFile == "" {
-			return fmt.Errorf("epic review handoff v2 requires FLOWBEE_ALERT_WEBHOOK_URL and owner-only FLOWBEE_ALERT_WEBHOOK_SECRET_FILE")
-		}
-		alertSecret, alertSecretErr := readOwnerOnlySecret(alertSecretFile)
-		if alertSecretErr != nil {
-			return fmt.Errorf("read alert webhook secret: %w", alertSecretErr)
-		}
-		if os.Getenv("FLOWBEE_EXTERNAL_WATCHDOG_ID") == "" {
+		if strings.TrimSpace(os.Getenv("FLOWBEE_EXTERNAL_WATCHDOG_ID")) == "" {
 			return fmt.Errorf("epic review handoff v2 requires FLOWBEE_EXTERNAL_WATCHDOG_ID")
 		}
-		driverSocket, driverTokenFile := os.Getenv("FLOWBEE_DRIVER_SOCKET"), os.Getenv("FLOWBEE_DRIVER_TOKEN_FILE")
-		if driverSocket == "" || driverTokenFile == "" {
-			return fmt.Errorf("epic review handoff v2 requires FLOWBEE_DRIVER_SOCKET and FLOWBEE_DRIVER_TOKEN_FILE")
+		controlAlertIngressProjectID = os.Getenv("FLOWBEE_WATCHDOG_PROJECT_ID")
+		if controlAlertIngressProjectID == "" {
+			return fmt.Errorf("epic review handoff v2 requires exact FLOWBEE_WATCHDOG_PROJECT_ID")
 		}
-		driverToken, tokenErr := readOwnerOnlySecret(driverTokenFile)
-		if tokenErr != nil {
-			return fmt.Errorf("read Driver control token: %w", tokenErr)
+		watchdogProject, projectErr := st.GetPortfolioProject(ctx, controlAlertIngressProjectID)
+		if projectErr != nil {
+			return fmt.Errorf("epic review handoff v2 watchdog project %q must exist: %w",
+				controlAlertIngressProjectID, projectErr)
 		}
-		driverPort := driver.NewUDSPort(driverSocket, driverToken)
-		if err := driverPort.Check(ctx); err != nil {
-			return fmt.Errorf("tmux-driver readiness: %w", err)
+		if watchdogProject.State != "active" {
+			return fmt.Errorf("epic review handoff v2 watchdog project %q is not active", controlAlertIngressProjectID)
 		}
-		driverControl = probeDriverControlState(ctx, controlState, st.DB, driverPort)
-		st.EnableDriverControlOrigin = driverControl.Available
+		alertSecretFile := os.Getenv("FLOWBEE_ALERT_WEBHOOK_SECRET_FILE")
+		if alertSecretFile == "" {
+			return fmt.Errorf("epic review handoff v2 requires owner-only FLOWBEE_ALERT_WEBHOOK_SECRET_FILE for signed control-alert ingress")
+		}
+		controlAlertIngressSecret, err = readOwnerOnlySecret(alertSecretFile)
+		if err != nil {
+			return fmt.Errorf("read control-alert ingress secret: %w", err)
+		}
+		driverInventory, configured, inventoryErr := config.LoadDriverEndpointInventoryFromEnv()
+		if inventoryErr != nil {
+			return fmt.Errorf("load Driver endpoint inventory: %w", inventoryErr)
+		}
+		if !configured {
+			return fmt.Errorf("epic review handoff v2 requires %s; legacy single-endpoint Driver variables are not a routing fallback", config.DriverEndpointsFileEnv)
+		}
+		driverEndpoints, driverResolver, endpointErr := loadServeDriverEndpoints(ctx, driverInventory)
+		if endpointErr != nil {
+			return endpointErr
+		}
+		endpointControlState := newDriverEndpointControlState(driverEndpoints)
+		driverControlCurrent = endpointControlState.Snapshot
+		// Keep the compatibility/global gate closed. Production materialization and
+		// claims use only the exact endpoint callbacks below; aggregate readiness is
+		// health/display state and never routing authority.
+		driverControlAvailable = func() bool { return false }
+		st.EnableDriverControlOrigin = false
+		st.DriverControlOriginGate = driverControlAvailable
+		st.DriverControlOriginEndpointGate = func(hostID, storeID, tmuxServerDomainID string) bool {
+			return endpointControlState.AvailableFor(driver.EndpointKey{
+				HostID: hostID, StoreID: storeID, TmuxServerDomainID: tmuxServerDomainID,
+			})
+		}
 		reconcilerOwner := fmt.Sprintf("serve-%d", os.Getpid())
 		reconcilerGrace := map[string]time.Duration{
-			"review_handoff":            3 * time.Minute,
-			"review_verdict":            3 * time.Minute,
-			"delivery_backstop":         3 * time.Minute,
-			"alert_drainer":             time.Minute,
-			"driver_observer":           30 * time.Second,
-			"driver_control_capability": 30 * time.Second,
-			"driver_executor":           30 * time.Second,
-			"builder_lifecycle":         30 * time.Second,
-			"builder_launch":            30 * time.Second,
-			"epic_effects":              30 * time.Second,
-			"project_breaker_probe":     time.Minute,
-			"reconciler_watchdog":       time.Minute,
+			"review_handoff":              3 * time.Minute,
+			"review_verdict":              3 * time.Minute,
+			"delivery_backstop":           3 * time.Minute,
+			"alert_interactor_projection": time.Minute,
+			"driver_executor":             30 * time.Second,
+			"builder_lifecycle":           30 * time.Second,
+			"project_actor_lifecycle":     30 * time.Second,
+			"builder_launch":              30 * time.Second,
+			"epic_effects":                30 * time.Second,
+			"project_breaker_probe":       time.Minute,
+			"reconciler_watchdog":         time.Minute,
+		}
+		for _, endpoint := range driverEndpoints {
+			reconcilerGrace[driverEndpointReconcilerName("driver_observer", endpoint.InstanceRef)] = 30 * time.Second
+			reconcilerGrace[driverEndpointReconcilerName("driver_control_capability", endpoint.InstanceRef)] = 30 * time.Second
 		}
 		if phase1Enabled {
 			reconcilerGrace["work_intent_promotion"] = time.Minute
@@ -410,98 +524,101 @@ func runServe(args []string) error {
 			// collector is visible before the scheduler ages out all capacity.
 			reconcilerGrace["capacity_collector"] = capacityInterval + 30*time.Second
 		}
-		v2Reconcilers, tokenErr = beginDurableReconcilers(ctx, st, reconcilerOwner, time.Now(), reconcilerGrace)
-		if tokenErr != nil {
-			return fmt.Errorf("initialize v2 reconciler supervision: %w", tokenErr)
+		v2Reconcilers, endpointErr = beginDurableReconcilers(ctx, st, reconcilerOwner, time.Now(), reconcilerGrace)
+		if endpointErr != nil {
+			return fmt.Errorf("initialize v2 reconciler supervision: %w", endpointErr)
 		}
-		if driverControl.Available {
-			logger.Info("epic review handoff v2 enabled with authenticated Driver control-principal routing",
-				"driver_control_status", driverControl.Status)
-		} else {
-			logger.Warn("epic review handoff v2 enabled with control-plane Driver messaging held",
-				"driver_control_status", driverControl.Status, "contract_gap", driverControl.Gap,
-				"reason", driverControl.Reason)
-			if phase1Enabled {
-				logger.Warn("Phase 1 dashboard enabled; Flowbee-authored Driver automation is not live",
-					"driver_control_status", driverControl.Status, "contract_gap", driverControl.Gap)
+		startupNow := time.Now()
+		for _, configuredEndpoint := range driverEndpoints {
+			endpoint := configuredEndpoint
+			capabilityReconciler := driverEndpointReconcilerName("driver_control_capability", endpoint.InstanceRef)
+			if probeErr := v2Reconcilers.tick(ctx, capabilityReconciler, startupNow, func() error {
+				callCtx, cancel := context.WithTimeout(ctx, driverEndpointCallTimeout)
+				defer cancel()
+				probeDriverEndpointControlState(callCtx, endpointControlState, st.DB, driverResolver, endpoint)
+				return nil
+			}); probeErr != nil {
+				return fmt.Errorf("startup Driver endpoint %q capability supervision: %w", endpoint.InstanceRef, probeErr)
 			}
-		}
-		// Re-prove both the advertised feature and this bearer token's exact
-		// control-principal capability throughout the process lifetime. A failed
-		// probe atomically fences new materialization/claims; a later exact proof
-		// reopens them. The supervised loop itself remains healthy while held so
-		// observation/lifecycle and effect verification continue.
-		go func() {
-			ticker := time.NewTicker(2 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case now := <-ticker.C:
-					before := controlState.Snapshot()
-					var after api.DriverControlReadiness
-					err := v2Reconcilers.tick(ctx, "driver_control_capability", now, func() error {
-						after = probeDriverControlState(ctx, controlState, st.DB, driverPort)
-						return nil
-					})
-					if err != nil {
-						logger.Error("Driver control capability supervision failed", "err", err)
-						continue
-					}
-					if before.Available != after.Available || before.Status != after.Status || before.Reason != after.Reason {
-						if after.Available {
-							logger.Info("Driver control-principal capability restored; pending sends may resume")
-						} else {
-							logger.Warn("Driver control-principal capability lost; new sends held",
-								"status", after.Status, "contract_gap", after.Gap, "reason", after.Reason)
+			observer := driver.ObservationIngestor{InstanceRef: endpoint.InstanceRef, Port: endpoint.Port,
+				Store: driver.ObservationSQLStore{DB: st.DB}}
+			observerReconciler := driverEndpointReconcilerName("driver_observer", endpoint.InstanceRef)
+			var observationRep driver.ObservationFoldResult
+			if observationErr := v2Reconcilers.tick(ctx, observerReconciler, startupNow, func() error {
+				callCtx, cancel := context.WithTimeout(ctx, driverEndpointCallTimeout)
+				defer cancel()
+				var err error
+				observationRep, err = observer.Tick(callCtx)
+				return err
+			}); observationErr != nil {
+				return fmt.Errorf("startup tmux-driver observation reconcile for %q: %w", endpoint.InstanceRef, observationErr)
+			}
+			logger.Info("startup tmux-driver endpoint reconcile complete", "instance_ref", endpoint.InstanceRef,
+				"events", observationRep.Inserted, "deduplicated", observationRep.Deduplicated,
+				"snapshot_replaced", observationRep.SnapshotReplaced, "store_reset", observationRep.StoreReset)
+
+			go func() {
+				ticker := time.NewTicker(2 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case now := <-ticker.C:
+						before := endpointControlState.EndpointSnapshot(endpoint.InstanceRef)
+						var after api.DriverControlReadiness
+						err := v2Reconcilers.tick(ctx, capabilityReconciler, now, func() error {
+							callCtx, cancel := context.WithTimeout(ctx, driverEndpointCallTimeout)
+							defer cancel()
+							after = probeDriverEndpointControlState(callCtx, endpointControlState, st.DB, driverResolver, endpoint)
+							return nil
+						})
+						if err != nil {
+							logger.Error("Driver endpoint capability supervision failed", "instance_ref", endpoint.InstanceRef, "err", err)
+						} else if before.Available != after.Available || before.Status != after.Status || before.Reason != after.Reason {
+							logger.Info("Driver endpoint capability changed", "instance_ref", endpoint.InstanceRef,
+								"available", after.Available, "status", after.Status, "reason", after.Reason)
 						}
 					}
 				}
-			}
-		}()
-		driverInstanceRef := os.Getenv("FLOWBEE_DRIVER_INSTANCE_REF")
-		if driverInstanceRef == "" {
-			driverInstanceRef = "local-driver"
-		}
-		driverObserver := driver.ObservationIngestor{InstanceRef: driverInstanceRef, Port: driverPort,
-			Store: driver.ObservationSQLStore{DB: st.DB}}
-		var observationRep driver.ObservationFoldResult
-		startupNow := time.Now()
-		if oerr := v2Reconcilers.tick(ctx, "driver_observer", startupNow, func() error {
-			var err error
-			observationRep, err = driverObserver.Tick(ctx)
-			return err
-		}); oerr != nil {
-			return fmt.Errorf("startup tmux-driver observation reconcile: %w", oerr)
-		}
-		logger.Info("startup tmux-driver observation reconcile complete",
-			"events", observationRep.Inserted, "deduplicated", observationRep.Deduplicated,
-			"snapshot_replaced", observationRep.SnapshotReplaced, "store_reset", observationRep.StoreReset)
-		go func() {
-			ticker := time.NewTicker(2 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case now := <-ticker.C:
-					var rep driver.ObservationFoldResult
-					err := v2Reconcilers.tick(ctx, "driver_observer", now, func() error {
-						var err error
-						rep, err = driverObserver.Tick(ctx)
-						return err
-					})
-					if err != nil {
-						logger.Error("tmux-driver observation reconcile failed", "err", err)
-					} else if rep.Inserted+rep.Deduplicated > 0 || rep.SnapshotReplaced || rep.StoreReset || rep.CursorGap {
-						logger.Info("tmux-driver observation reconcile complete", "events", rep.Inserted,
-							"deduplicated", rep.Deduplicated, "snapshot_replaced", rep.SnapshotReplaced,
-							"store_reset", rep.StoreReset, "cursor_gap", rep.CursorGap, "caught_up", rep.CaughtUp)
+			}()
+			go func() {
+				ticker := time.NewTicker(2 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case now := <-ticker.C:
+						var rep driver.ObservationFoldResult
+						err := v2Reconcilers.tick(ctx, observerReconciler, now, func() error {
+							callCtx, cancel := context.WithTimeout(ctx, driverEndpointCallTimeout)
+							defer cancel()
+							var err error
+							rep, err = observer.Tick(callCtx)
+							return err
+						})
+						if err != nil {
+							logger.Error("tmux-driver observation reconcile failed", "instance_ref", endpoint.InstanceRef, "err", err)
+						} else if rep.Inserted+rep.Deduplicated > 0 || rep.SnapshotReplaced || rep.StoreReset || rep.CursorGap {
+							logger.Info("tmux-driver observation reconcile complete", "instance_ref", endpoint.InstanceRef,
+								"events", rep.Inserted, "deduplicated", rep.Deduplicated,
+								"snapshot_replaced", rep.SnapshotReplaced, "store_reset", rep.StoreReset,
+								"cursor_gap", rep.CursorGap, "caught_up", rep.CaughtUp)
+						}
 					}
 				}
-			}
-		}()
+			}()
+		}
+		driverControl = driverControlCurrent()
+		if driverControl.Available {
+			logger.Info("epic review handoff v2 enabled with exact endpoint-scoped Driver routing",
+				"driver_control_status", driverControl.Status, "endpoints", len(driverEndpoints))
+		} else {
+			logger.Warn("epic review handoff v2 enabled with one or more exact Driver endpoint routes held",
+				"driver_control_status", driverControl.Status, "contract_gap", driverControl.Gap,
+				"reason", driverControl.Reason)
+		}
 		var rep store.EpicReviewReconcileResult
 		startupNow = time.Now()
 		rerr := v2Reconcilers.tick(ctx, "review_handoff", startupNow, func() error {
@@ -536,21 +653,16 @@ func runServe(args []string) error {
 			return fmt.Errorf("startup epic delivery backstop: %w", rerr)
 		}
 		logger.Info("startup epic delivery backstop complete", "scanned", backstopRep.Scanned, "alerted", backstopRep.Alerted)
-		alertDrainer := alerting.Drainer{
-			Store: st, Sink: alerting.WebhookSink{URL: alertURL, Secret: alertSecret},
-			Owner: fmt.Sprintf("serve-%d", os.Getpid()), ClaimTTL: time.Minute,
-			MaximumTries: 5, Batch: 50,
-		}
-		var alertRep alerting.Report
+		var alertRep store.ControlAlertInteractorProjectionReport
 		startupNow = time.Now()
-		if derr := v2Reconcilers.tick(ctx, "alert_drainer", startupNow, func() error {
+		if derr := v2Reconcilers.tick(ctx, "alert_interactor_projection", startupNow, func() error {
 			var err error
-			alertRep, err = alertDrainer.Tick(ctx, startupNow)
+			alertRep, err = st.ReconcileControlAlertsToInteractors(ctx, startupNow)
 			return err
 		}); derr != nil {
-			logger.Error("startup alert drain failed", "err", derr)
-		} else if alertRep.Published+alertRep.Retried+alertRep.DeadLettered > 0 {
-			logger.Info("startup alert drain complete", "published", alertRep.Published, "retried", alertRep.Retried, "dead_lettered", alertRep.DeadLettered)
+			logger.Error("startup alert-to-Interactor projection failed", "err", derr)
+		} else if alertRep.Projected+alertRep.Held > 0 {
+			logger.Info("startup alert-to-Interactor projection complete", "projected", alertRep.Projected, "held", alertRep.Held)
 		}
 		if st.EnableCapacityV2 {
 			capacityRuntime, capacityErr := newProductionCapacityCollector(st, cfg,
@@ -643,23 +755,24 @@ func runServe(args []string) error {
 				case <-ctx.Done():
 					return
 				case now := <-ticker.C:
-					var rep alerting.Report
-					err := v2Reconcilers.tick(ctx, "alert_drainer", now, func() error {
+					var rep store.ControlAlertInteractorProjectionReport
+					err := v2Reconcilers.tick(ctx, "alert_interactor_projection", now, func() error {
 						var err error
-						rep, err = alertDrainer.Tick(ctx, now)
+						rep, err = st.ReconcileControlAlertsToInteractors(ctx, now)
 						return err
 					})
 					if err != nil {
-						logger.Error("alert drain failed", "err", err)
-					} else if rep.Published+rep.Retried+rep.DeadLettered > 0 {
-						logger.Info("alert drain complete", "published", rep.Published, "retried", rep.Retried, "dead_lettered", rep.DeadLettered)
+						logger.Error("alert-to-Interactor projection failed", "err", err)
+					} else if rep.Projected+rep.Held > 0 {
+						logger.Info("alert-to-Interactor projection complete", "projected", rep.Projected, "held", rep.Held)
 					}
 				}
 			}
 		}()
 		driverRuntime := driver.Runtime{
-			Port: driverPort, Store: driver.SQLActionStore{DB: st.DB,
-				ControlOriginAvailable: driverControl.Available, ControlOriginGate: controlState.Available},
+			Resolver: driverResolver, Store: driver.SQLActionStore{DB: st.DB,
+				ControlOriginAvailable: false, ControlOriginGate: driverControlAvailable,
+				EndpointControlOriginGate: endpointControlState.AvailableFor},
 			Evidence: driver.SQLStageEvidence{DB: st.DB},
 			Owner:    fmt.Sprintf("serve-driver-%d", os.Getpid()), ClaimTTL: time.Minute,
 			MaximumTries: 5,
@@ -688,7 +801,7 @@ func runServe(args []string) error {
 			}
 		}()
 		lifecycleRuntime := driver.LifecycleRuntime{
-			Port: driverPort, Store: driver.SQLActionStore{DB: st.DB}, Projector: driverbridge.Projector{Store: st},
+			Resolver: driverResolver, Store: driver.SQLActionStore{DB: st.DB}, Projector: driverbridge.Projector{Store: st},
 			Owner: fmt.Sprintf("serve-lifecycle-%d", os.Getpid()), ClaimTTL: time.Minute,
 			MaximumTries: 5,
 		}
@@ -713,6 +826,67 @@ func runServe(args []string) error {
 							"verified", rep.Verified, "executed", rep.Executed,
 							"held", rep.Held,
 							"retried", rep.Retried, "dead_lettered", rep.DeadLettered)
+					}
+				}
+			}
+		}()
+		actorLifecycleRuntime := driver.ActorLifecycleRuntime{
+			Resolver: driverResolver, Store: st, Owner: fmt.Sprintf("serve-project-actor-lifecycle-%d", os.Getpid()),
+			ClaimTTL: time.Minute, MaxRecovery: 5,
+		}
+		var startupActorLifecycle driver.ActorLifecycleRuntimeReport
+		startupNow = time.Now()
+		if actorErr := v2Reconcilers.tick(ctx, "project_actor_lifecycle", startupNow, func() error {
+			var err error
+			startupActorLifecycle, err = drainStartupActorLifecycle(ctx, startupNow,
+				actorLifecycleRuntime.Tick, phase1ActorLifecycleStartupBudget)
+			return err
+		}); actorErr != nil {
+			return fmt.Errorf("startup project actor lifecycle reconcile: %w", actorErr)
+		}
+		logger.Info("startup project actor lifecycle reconcile complete",
+			"materialized", startupActorLifecycle.Materialized, "held", startupActorLifecycle.Held,
+			"resumed", startupActorLifecycle.Resumed, "delivery_uncertain", startupActorLifecycle.DeliveryUncertain,
+			"verification_ready", startupActorLifecycle.VerificationReady, "executed", startupActorLifecycle.Executed,
+			"verified", startupActorLifecycle.Verified, "retried", startupActorLifecycle.Retried,
+			"dead_lettered", startupActorLifecycle.DeadLettered)
+		if phase1Enabled {
+			activation, activationErr := requirePhase1ProjectLiveReady(ctx, st,
+				controlAlertIngressProjectID, time.Now())
+			if activationErr != nil {
+				return activationErr
+			}
+			logger.Info("Phase 1 project activation gate passed", "project_id", activation.Project.ID,
+				"actors", len(activation.Actors), "builder_targets", activation.CurrentBuilderTargets,
+				"reviewers", activation.CurrentReviewerBindings,
+				"capacity_generation", activation.ActiveCapacityGeneration)
+			watchdogID := strings.TrimSpace(os.Getenv("FLOWBEE_EXTERNAL_WATCHDOG_ID"))
+			phase1ProjectCurrent = func() api.Phase1ProjectReadiness {
+				return currentPhase1ProjectReadiness(st, controlAlertIngressProjectID, watchdogID, time.Now())
+			}
+		}
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					var rep driver.ActorLifecycleRuntimeReport
+					err := v2Reconcilers.tick(ctx, "project_actor_lifecycle", now, func() error {
+						var err error
+						rep, err = actorLifecycleRuntime.Tick(ctx, now)
+						return err
+					})
+					if err != nil {
+						logger.Error("project actor lifecycle runtime failed", "err", err)
+					} else if rep.Materialized+rep.Held+rep.Resumed+rep.DeliveryUncertain+
+						rep.VerificationReady+rep.Executed+rep.Verified+rep.Retried+rep.DeadLettered > 0 {
+						logger.Info("project actor lifecycle runtime pass", "materialized", rep.Materialized,
+							"held", rep.Held, "resumed", rep.Resumed, "delivery_uncertain", rep.DeliveryUncertain,
+							"verification_ready", rep.VerificationReady, "executed", rep.Executed,
+							"verified", rep.Verified, "retried", rep.Retried, "dead_lettered", rep.DeadLettered)
 					}
 				}
 			}
@@ -757,8 +931,9 @@ func runServe(args []string) error {
 		}()
 		if phase1Enabled {
 			conversationRuntime := driver.ConversationRuntime{
-				Port: driverPort, Store: driver.ConversationSQLStore{DB: st.DB,
-					ControlOriginAvailable: driverControl.Available, ControlOriginGate: controlState.Available},
+				Resolver: driverResolver, Store: driver.ConversationSQLStore{DB: st.DB,
+					ControlOriginAvailable: false, ControlOriginGate: driverControlAvailable,
+					EndpointControlOriginGate: endpointControlState.AvailableFor},
 				Evidence: driver.ConversationStageEvidence{DB: st.DB},
 				Owner:    fmt.Sprintf("serve-conversation-%d", os.Getpid()), ClaimTTL: time.Minute,
 				AcknowledgementTTL: 10 * time.Minute,
@@ -823,8 +998,9 @@ func runServe(args []string) error {
 				}
 			}()
 			decisionRuntime := driver.DecisionResponseRuntime{
-				Port: driverPort, Store: driver.DecisionResponseSQLStore{DB: st.DB,
-					ControlOriginAvailable: driverControl.Available, ControlOriginGate: controlState.Available}, Domain: st,
+				Resolver: driverResolver, Store: driver.DecisionResponseSQLStore{DB: st.DB,
+					ControlOriginAvailable: false, ControlOriginGate: driverControlAvailable,
+					EndpointControlOriginGate: endpointControlState.AvailableFor}, Domain: st,
 				Evidence: driver.DecisionResponseStageEvidence{DB: st.DB},
 				Owner:    fmt.Sprintf("serve-decision-response-%d", os.Getpid()), ClaimTTL: time.Minute,
 				AcknowledgementTTL: 10 * time.Minute,
@@ -883,8 +1059,9 @@ func runServe(args []string) error {
 				"advanced", startupIntentRep.Advanced, "actions_created", startupIntentRep.ActionsCreated,
 				"held", startupIntentRep.Held)
 			intentRuntime := driver.WorkIntentRuntime{
-				Port: driverPort, Store: driver.WorkIntentSQLStore{DB: st.DB,
-					ControlOriginAvailable: driverControl.Available, ControlOriginGate: controlState.Available},
+				Resolver: driverResolver, Store: driver.WorkIntentSQLStore{DB: st.DB,
+					ControlOriginAvailable: false, ControlOriginGate: driverControlAvailable,
+					EndpointControlOriginGate: endpointControlState.AvailableFor},
 				Evidence: driver.SQLStageEvidence{DB: st.DB},
 				Owner:    fmt.Sprintf("serve-work-intent-%d", os.Getpid()), ClaimTTL: time.Minute,
 				AcknowledgementTTL: 10 * time.Minute,
@@ -1048,6 +1225,16 @@ func runServe(args []string) error {
 	if err != nil {
 		return fmt.Errorf("configure dashboard human access: %w", err)
 	}
+	workerAuthPosture := store.WorkerAuthRuntimePosture{
+		Fingerprint: workerAuthRuntimeFingerprint(cfg), PID: os.Getpid(), UpdatedAt: time.Now(),
+	}
+	if err := st.RecordWorkerAuthRuntimePosture(ctx, workerAuthPosture); err != nil {
+		return fmt.Errorf("record worker auth runtime posture: %w", err)
+	}
+	defer func() {
+		workerAuthPosture.UpdatedAt = time.Time{}
+		_ = st.RecordWorkerAuthRuntimePosture(context.Background(), workerAuthPosture)
+	}()
 
 	// F5 per-repo consensus panel: a repo's required_reviewers overrides the global default,
 	// so one repo can run an N-reviewer panel while others stay single-reviewer (keyed by the
@@ -1073,7 +1260,11 @@ func runServe(args []string) error {
 		// FLOWBEE_BUNDLE_PROVISIONING is set. Workers then hold NO GitHub credential
 		// and NO mirror path — they fetch a read-only bundle, return a diff, and
 		// Flowbee performs every git write (apply + push + PR-open, R4/§8).
-		BundleProvisioning:         os.Getenv("FLOWBEE_BUNDLE_PROVISIONING") != "",
+		BundleProvisioning: os.Getenv("FLOWBEE_BUNDLE_PROVISIONING") != "",
+		// Authentication binds the caller identity; this independent strict policy
+		// bounds the roles/families/tools that identity may attest. Never let a
+		// production serve inherit api.New's open dev/test default.
+		Allowlist:                  productionWorkerAllowlist(cfg),
 		Authenticator:              authn,
 		HumanAccess:                humanAccess,
 		DisableLegacyPaneActuation: st.EnableEpicReviewHandoffV2,
@@ -1096,19 +1287,40 @@ func runServe(args []string) error {
 		PauseMarkerPath:      markerPath(cfg.DatabaseURL),
 		RunningConfig:        runningConfigSnapshot(cfg),
 		DriverControl:        driverControl,
-		DriverControlCurrent: controlState.Snapshot,
+		DriverControlCurrent: driverControlCurrent,
+		Phase1ProjectCurrent: phase1ProjectCurrent,
 	}, buildVersion())
 	if cfg.AllowSelfMerge {
 		logger.Info("autonomous merge enabled (Branch B): self_merge eligible jobs merge without a human gate")
 	}
 	healthSrv := &http.Server{Addr: cfg.HealthAddr, Handler: srv.HealthHandler()}
-	privateSrv := &http.Server{Addr: cfg.PrivateAddr, Handler: srv.PrivateHandler()}
+	privateHandler, err := privateHandlerWithControlAlertIngress(srv.PrivateHandler(), controlAlertIngressSecret,
+		controlAlertIngressProjectID, st)
+	if err != nil {
+		return err
+	}
+	privateSrv := &http.Server{Addr: cfg.PrivateAddr, Handler: privateHandler}
 
 	// a bind failure on any listener is fatal — surfaced here so main exits non-zero
 	// rather than running on as a dead process.
 	srvErr := make(chan error, 3)
 	go serveHTTP(logger, "health", healthSrv, srvErr)
 	go serveHTTP(logger, "private", privateSrv, srvErr)
+	go func() {
+		ticker := time.NewTicker(workerAuthRuntimeHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				workerAuthPosture.UpdatedAt = now
+				if err := st.RecordWorkerAuthRuntimePosture(ctx, workerAuthPosture); err != nil {
+					logger.Error("worker auth runtime posture heartbeat failed", "err", err)
+				}
+			}
+		}
+	}()
 
 	// the single durable-timer polling goroutine (project override #2): drives the
 	// no_eligible_worker alarm + the M8 liveness deadlines (Rung-3), epoch-guarded.

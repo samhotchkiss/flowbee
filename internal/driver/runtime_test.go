@@ -37,10 +37,11 @@ func putActionInVerification(t *testing.T, s SQLActionStore, a Action, now time.
 func receiptForAction(a Action, status ReceiptStatus) Receipt {
 	return Receipt{DeliveryID: "delivery-" + a.ActionID, ActionID: a.ActionID,
 		GrantID: a.GrantID, GrantEpoch: a.Epoch,
-		Sender:            Identity{SessionID: a.SenderSessionID, AgentRunID: a.SenderAgentRunID},
-		SenderPrincipalID: a.SenderPrincipalID,
-		Recipient:         Identity{SessionID: a.RecipientSessionID, PaneInstanceID: a.RecipientPaneInstanceID},
-		PayloadSHA256:     a.PayloadSHA256, Status: status}
+		Sender:                      Identity{SessionID: a.SenderSessionID, AgentRunID: a.SenderAgentRunID},
+		SenderPrincipalID:           a.SenderPrincipalID,
+		Recipient:                   Identity{SessionID: a.RecipientSessionID, PaneInstanceID: a.RecipientPaneInstanceID},
+		ExpectedRecipientAgentRunID: a.RecipientAgentRunID,
+		PayloadSHA256:               a.PayloadSHA256, Status: status}
 }
 
 func TestRuntimeLiveControlCapabilityRevocationAndRecovery(t *testing.T) {
@@ -93,7 +94,7 @@ func TestRuntimeLiveControlCapabilityRevocationAndRecovery(t *testing.T) {
 
 func routedAction(a Action) Action {
 	a.TargetRole = "reviewer"
-	a.TargetHostID, a.TargetStoreID, a.TargetServerID = "host-1", "store-1", "server-1"
+	a.TargetHostID, a.TargetStoreID, a.TargetServerDomainID, a.TargetServerID = "host-1", "store-1", "flowbee", "server-1"
 	a.LifecycleKey, a.TargetEpoch = "reviewer-seat-1", 1
 	a.ProfileID, a.WorkspaceRootID, a.WorkspaceRelativePath = "grok_reviewer", "flowbee", "repo"
 	a.LeaseID, a.LeaseEpoch = "lease-1", 1
@@ -221,6 +222,8 @@ func TestRuntimeRejectsRecoveredReceiptIdentityBeforePersistenceOrEvidence(t *te
 			if tc.sessionOrigin {
 				a.SenderPrincipalID = ""
 				a.SenderSessionID, a.SenderAgentRunID = "builder-session", "run-1"
+				a.SenderHostID, a.SenderStoreID = a.TargetHostID, a.TargetStoreID
+				a.SenderServerDomainID, a.SenderServerID = a.TargetServerDomainID, a.TargetServerID
 			}
 			now := time.Date(2026, 7, 19, 10, 45, 0, 0, time.UTC)
 			claimed := putActionInVerification(t, s, a, now)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -13,41 +14,45 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/samhotchkiss/flowbee/internal/config"
 )
 
-// TestPhase1ServeLiveDriverObservationSmoke is the smallest process-level Phase 1
-// v2.4 activation proof. It is opt-in because it talks to the installed tmux-driver
+// TestPhase1ServeLiveDriverObservationSmoke is the process-level live-Driver
+// pre-canary proof. It is opt-in because it talks to the installed tmux-driver
 // daemon, but everything Flowbee owns (database, configuration, keys, listeners,
-// and alert receiver) is isolated under the test directory.
+// and ingress material) is isolated under the test directory. It proves both
+// required endpoint domains and authenticated control-origin capabilities using
+// the exact inventory that production will consume. It deliberately keeps the
+// Phase 1 dashboard off: deterministic ProjectActivation tests provision and
+// prove the exact actor/capacity topology, while a real canary must use its real
+// external Interactor, managed actors, seats, and fresh account observations.
 //
 // The counting UDS proxy is deliberately transparent: Flowbee still executes its
 // production DriverPort wire adapter against the real daemon. The proxy lets this
-// test prove the empty-store posture as well as infer it: startup requires both
-// the global metadata feature and exact authenticated control-origin capability,
+// test prove the empty-store posture as well as infer it: startup requires exact
+// metadata and authenticated control-origin capability for every endpoint,
 // performs Driver readiness/observation reads, and makes zero route-grant or
 // message mutations when there is no durable Flowbee action to execute.
 //
 //	FLOWBEE_DRIVER_LIVE_TEST=1 \
-//	FLOWBEE_DRIVER_SOCKET=/path/to/api.sock \
-//	FLOWBEE_DRIVER_TOKEN_FILE=/path/to/control.token \
+//	FLOWBEE_DRIVER_ENDPOINTS_FILE=/path/to/driver-endpoints.json \
 //	go test ./cmd/flowbee -run TestPhase1ServeLiveDriverObservationSmoke -v
 func TestPhase1ServeLiveDriverObservationSmoke(t *testing.T) {
 	if os.Getenv("FLOWBEE_DRIVER_LIVE_TEST") != "1" {
 		t.Skip("set FLOWBEE_DRIVER_LIVE_TEST=1 to run the Phase 1 serve smoke against an installed Driver daemon")
 	}
-	realSocket := strings.TrimSpace(os.Getenv("FLOWBEE_DRIVER_SOCKET"))
-	tokenFile := strings.TrimSpace(os.Getenv("FLOWBEE_DRIVER_TOKEN_FILE"))
-	if realSocket == "" || tokenFile == "" {
-		t.Fatal("FLOWBEE_DRIVER_SOCKET and FLOWBEE_DRIVER_TOKEN_FILE are required")
+	realInventoryPath := strings.TrimSpace(os.Getenv(config.DriverEndpointsFileEnv))
+	if realInventoryPath == "" {
+		t.Fatalf("%s is required", config.DriverEndpointsFileEnv)
 	}
-	if _, err := os.Stat(realSocket); err != nil {
-		t.Fatalf("stat Driver socket: %v", err)
+	realInventory, err := config.LoadDriverEndpointInventory(realInventoryPath)
+	if err != nil {
+		t.Fatalf("load live Driver endpoint inventory: %v", err)
 	}
-	assertOwnerOnlyRegularFile(t, tokenFile)
 
 	tmp := t.TempDir()
 	// Darwin caps sockaddr_un paths at 104 bytes; testing.T.TempDir can exceed
@@ -58,22 +63,20 @@ func TestPhase1ServeLiveDriverObservationSmoke(t *testing.T) {
 		t.Fatalf("create short Driver proxy directory: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(shortSocketDir) })
-	proxySocket := filepath.Join(shortSocketDir, "driver.sock")
-	proxy, calls := startCountingDriverProxy(t, proxySocket, realSocket)
-	defer proxy.Close()
-
-	var alertCalls atomic.Int64
-	alertReceiver := http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		alertCalls.Add(1)
-		w.WriteHeader(http.StatusNoContent)
-	})}
-	alertListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen alert receiver: %v", err)
+	calls := &countedDriverCalls{calls: map[string]int{}}
+	proxyInventory := realInventory
+	for index := range proxyInventory.Endpoints {
+		proxySocket := filepath.Join(shortSocketDir, fmt.Sprintf("driver-%d.sock", index))
+		proxy := startCountingDriverProxy(t, proxySocket, realInventory.Endpoints[index].UDSPath, calls)
+		defer proxy.Close()
+		proxyInventory.Endpoints[index].UDSPath = proxySocket
 	}
-	defer alertListener.Close()
-	go func() { _ = alertReceiver.Serve(alertListener) }()
-	defer alertReceiver.Close()
+	proxyInventoryPath := filepath.Join(tmp, "driver-endpoints.json")
+	proxyInventoryJSON, err := json.Marshal(proxyInventory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeOwnerOnly(t, proxyInventoryPath, string(proxyInventoryJSON))
 
 	privateAddr := reserveTCPAddr(t)
 	healthAddr := reserveTCPAddr(t)
@@ -87,12 +90,12 @@ heartbeat_interval_s: 10
 long_poll_wait_s: 1
 backup_interval_s: -1
 `, dbPath, privateAddr, healthAddr))
-	alertKey := filepath.Join(tmp, "alert.key")
 	humanKey := filepath.Join(tmp, "human.key")
 	humanGrants := filepath.Join(tmp, "human.grants")
-	writeOwnerOnly(t, alertKey, "phase1-live-smoke-alert-secret\n")
+	alertIngressKey := filepath.Join(tmp, "control-alert-ingress.key")
 	writeOwnerOnly(t, humanKey, "phase1-live-smoke-human-session-key-with-32-bytes\n")
 	writeOwnerOnly(t, humanGrants, "smoke-user@default=admin\n")
+	writeOwnerOnly(t, alertIngressKey, "phase1-live-smoke-control-alert-ingress-key\n")
 
 	logPath := filepath.Join(tmp, "serve.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -107,15 +110,16 @@ backup_interval_s: -1
 		"FLOWBEE_PHASE1_SERVE_TEST_PROCESS": "1",
 		"FLOWBEE_CONFIG":                    configPath,
 		"FLOWBEE_EPIC_REVIEW_HANDOFF_V2":    "1",
-		"FLOWBEE_PHASE1_DASHBOARD":          "1",
+		"FLOWBEE_PHASE1_DASHBOARD":          "",
 		"FLOWBEE_CAPACITY_ROUTING_V2":       "",
 		"FLOWBEE_CAPACITY_V2":               "",
-		"FLOWBEE_ALERT_WEBHOOK_URL":         "http://" + alertListener.Addr().String() + "/alerts",
-		"FLOWBEE_ALERT_WEBHOOK_SECRET_FILE": alertKey,
 		"FLOWBEE_EXTERNAL_WATCHDOG_ID":      "phase1-live-smoke-watchdog",
-		"FLOWBEE_DRIVER_SOCKET":             proxySocket,
-		"FLOWBEE_DRIVER_TOKEN_FILE":         tokenFile,
-		"FLOWBEE_DRIVER_INSTANCE_REF":       "phase1-live-smoke-driver",
+		"FLOWBEE_WATCHDOG_PROJECT_ID":       "default",
+		"FLOWBEE_ALERT_WEBHOOK_SECRET_FILE": alertIngressKey,
+		config.DriverEndpointsFileEnv:       proxyInventoryPath,
+		"FLOWBEE_DRIVER_SOCKET":             "",
+		"FLOWBEE_DRIVER_TOKEN_FILE":         "",
+		"FLOWBEE_DRIVER_INSTANCE_REF":       "",
 		"FLOWBEE_HUMAN_SESSION_KEY_FILE":    humanKey,
 		"FLOWBEE_HUMAN_GRANTS_FILE":         humanGrants,
 		"FLOWBEE_HUMAN_LOOPBACK_DEV":        "",
@@ -167,11 +171,12 @@ backup_interval_s: -1
 	}
 
 	readCounts, mutationCounts := calls.snapshot()
-	if readCounts["GET /v2/meta"] == 0 || readCounts["GET /v2/instance"] == 0 {
+	if readCounts["GET /v2/meta"] < len(realInventory.Endpoints) ||
+		readCounts["GET /v2/instance"] < len(realInventory.Endpoints) {
 		t.Fatalf("serve did not execute Driver readiness checks; calls=%v\n%s", readCounts, readTestLog(logPath))
 	}
-	if readCounts["GET /v2/control/capabilities"] == 0 {
-		t.Fatalf("serve did not authenticate the exact Driver control-origin capability; calls=%v\n%s", readCounts, readTestLog(logPath))
+	if readCounts["GET /v2/control/capabilities"] < len(realInventory.Endpoints) {
+		t.Fatalf("serve did not authenticate every exact Driver control-origin capability; calls=%v\n%s", readCounts, readTestLog(logPath))
 	}
 	if readCounts["GET /v2/sessions"]+readCounts["GET /v2/events"] == 0 {
 		t.Fatalf("serve did not execute Driver observation reads; calls=%v\n%s", readCounts, readTestLog(logPath))
@@ -179,10 +184,7 @@ backup_interval_s: -1
 	if len(mutationCounts) != 0 {
 		t.Fatalf("empty-store startup made Driver route/message mutation calls: %v", mutationCounts)
 	}
-	if got := alertCalls.Load(); got != 0 {
-		t.Fatalf("empty isolated store emitted %d unexpected alerts", got)
-	}
-	t.Logf("Phase 1 v2.4 serve smoke green: control-origin ready, Driver reads=%v, route/message mutations=0", readCounts)
+	t.Logf("Phase 1 live-Driver pre-canary green: all endpoint control origins ready, Driver reads=%v, route/message mutations=0", readCounts)
 }
 
 // TestPhase1ServeLiveDriverProcess is the isolated child entrypoint used above.
@@ -223,7 +225,7 @@ func (c *countedDriverCalls) snapshot() (map[string]int, map[string]int) {
 	return all, mutations
 }
 
-func startCountingDriverProxy(t *testing.T, proxySocket, realSocket string) (*http.Server, *countedDriverCalls) {
+func startCountingDriverProxy(t *testing.T, proxySocket, realSocket string, calls *countedDriverCalls) *http.Server {
 	t.Helper()
 	listener, err := net.Listen("unix", proxySocket)
 	if err != nil {
@@ -235,7 +237,6 @@ func startCountingDriverProxy(t *testing.T, proxySocket, realSocket string) (*ht
 	}}
 	reverse := httputil.NewSingleHostReverseProxy(upstream)
 	reverse.Transport = transport
-	calls := &countedDriverCalls{calls: map[string]int{}}
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.record(r.Method, r.URL.Path)
 		reverse.ServeHTTP(w, r)
@@ -246,7 +247,7 @@ func startCountingDriverProxy(t *testing.T, proxySocket, realSocket string) (*ht
 		transport.CloseIdleConnections()
 		_ = os.Remove(proxySocket)
 	})
-	return server, calls
+	return server
 }
 
 func reserveTCPAddr(t *testing.T) string {

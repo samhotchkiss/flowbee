@@ -38,7 +38,7 @@ func NewUDSPort(socket, token string) *HTTPPort {
 // Check proves the configured daemon endpoint and authenticated control-plane
 // principal are reachable before Flowbee advertises v2 readiness.
 func (p *HTTPPort) Check(ctx context.Context) error {
-	if err := p.call(ctx, http.MethodGet, "/v2/meta", "", nil, nil); err != nil {
+	if _, err := p.Metadata(ctx); err != nil {
 		return fmt.Errorf("driver meta: %w", err)
 	}
 	if err := p.call(ctx, http.MethodGet, "/v2/instance", "", nil, nil); err != nil {
@@ -140,6 +140,8 @@ func (p *HTTPPort) Metadata(ctx context.Context) (DriverMetadata, error) {
 		ReplayFloorCursor      string                     `json:"replay_floor_cursor"`
 		DurableHighWaterCursor string                     `json:"durable_high_water_cursor"`
 		Features               map[string]json.RawMessage `json:"features"`
+		TmuxServer             TmuxServerMetadata         `json:"tmux_server"`
+		Contracts              DriverContractCapabilities `json:"contracts"`
 	}
 	if err := p.call(ctx, http.MethodGet, "/v2/meta", "", nil, &out); err != nil {
 		return DriverMetadata{}, err
@@ -150,16 +152,32 @@ func (p *HTTPPort) Metadata(ctx context.Context) (DriverMetadata, error) {
 	}
 	metadata := DriverMetadata{APIVersion: out.APIVersion, HostID: out.HostID, StoreID: out.StoreID,
 		Instance: out.Instance, ProducerBootID: out.ProducerBootID,
-		ReplayFloorCursor: out.ReplayFloorCursor, DurableHighWaterCursor: out.DurableHighWaterCursor}
+		ReplayFloorCursor: out.ReplayFloorCursor, DurableHighWaterCursor: out.DurableHighWaterCursor,
+		TmuxServer: out.TmuxServer, Contracts: out.Contracts}
 	if raw, present := out.Features["control_principal_origin"]; present {
 		if err := json.Unmarshal(raw, &metadata.ControlPrincipalOrigin); err != nil {
 			return DriverMetadata{}, errors.New("driver metadata: control_principal_origin must be boolean")
 		}
 	}
+	if raw, present := out.Features["lifecycle_control"]; present {
+		if err := json.Unmarshal(raw, &metadata.LifecycleControl); err != nil {
+			return DriverMetadata{}, errors.New("driver metadata: lifecycle_control must be boolean")
+		}
+	}
+	if err := validateDriverMetadata(metadata); err != nil {
+		return DriverMetadata{}, err
+	}
 	return metadata, nil
 }
 
 func (p *HTTPPort) SnapshotSessions(ctx context.Context) (SessionSnapshot, error) {
+	meta, err := p.Metadata(ctx)
+	if err != nil {
+		return SessionSnapshot{}, err
+	}
+	if meta.TmuxServer.InstanceID == "" {
+		return SessionSnapshot{}, errors.New("driver session snapshot: tmux server incarnation is unknown")
+	}
 	type summary struct {
 		SessionID string `json:"session_id"`
 	}
@@ -194,6 +212,11 @@ func (p *HTTPPort) SnapshotSessions(ctx context.Context) (SessionSnapshot, error
 			if err != nil {
 				return SessionSnapshot{}, err
 			}
+			projection.Identity.TmuxServerDomainID = meta.TmuxServer.DomainID
+			if projection.Identity.HostID != meta.HostID || projection.Identity.StoreID != meta.StoreID ||
+				(projection.Lifecycle != "ended" && projection.Identity.TmuxServerInstanceID != meta.TmuxServer.InstanceID) {
+				return SessionSnapshot{}, errors.New("driver session snapshot: metadata identity changed during read")
+			}
 			if snapshot.StoreID == "" {
 				snapshot.HostID, snapshot.StoreID = projection.Identity.HostID, projection.Identity.StoreID
 			} else if projection.Identity.HostID != snapshot.HostID || projection.Identity.StoreID != snapshot.StoreID {
@@ -207,10 +230,6 @@ func (p *HTTPPort) SnapshotSessions(ctx context.Context) (SessionSnapshot, error
 		pageCursor = *page.NextCursor
 	}
 	if snapshot.StoreID == "" {
-		meta, err := p.Metadata(ctx)
-		if err != nil {
-			return SessionSnapshot{}, err
-		}
 		snapshot.HostID, snapshot.StoreID = meta.HostID, meta.StoreID
 	}
 	return snapshot, nil
@@ -231,6 +250,7 @@ func (p *HTTPPort) sessionProjection(ctx context.Context, sessionID string) (Ses
 			EndedAt        *string `json:"ended_at"`
 			EndReason      *string `json:"end_reason"`
 			PaneInstanceID *string `json:"pane_instance_id"`
+			WatchID        *string `json:"watch_id"`
 		} `json:"session"`
 		State json.RawMessage `json:"state"`
 	}
@@ -266,7 +286,8 @@ func (p *HTTPPort) sessionProjection(ctx context.Context, sessionID string) (Ses
 	if state.Lifecycle != "ended" && (identity.PaneInstanceID == "" || identity.AgentRunID == "" || identity.TmuxServerInstanceID == "") {
 		return SessionProjection{}, errors.New("driver session snapshot: active session missing incarnation identity")
 	}
-	return SessionProjection{Identity: identity, Lifecycle: state.Lifecycle, Phase: state.Phase,
+	return SessionProjection{Identity: identity, WatchID: value(out.Session.WatchID),
+		Lifecycle: state.Lifecycle, Phase: state.Phase,
 		BindingStatus: state.BindingStatus, BindingEpoch: state.BindingEpoch,
 		StateRevision: out.StateRevision, AsOfCursor: out.AsOfCursor,
 		StartedAt: value(out.Session.StartedAt), EndedAt: value(out.Session.EndedAt),
@@ -276,7 +297,9 @@ func (p *HTTPPort) sessionProjection(ctx context.Context, sessionID string) (Ses
 type lifecycleIdentityWire struct {
 	HostID               string  `json:"host_id"`
 	StoreID              string  `json:"store_id"`
+	TmuxServerDomainID   string  `json:"tmux_server_domain_id"`
 	TmuxServerInstanceID string  `json:"tmux_server_instance_id"`
+	Ownership            string  `json:"ownership"`
 	LifecycleKey         string  `json:"lifecycle_key"`
 	TargetEpoch          int64   `json:"target_epoch"`
 	SessionID            *string `json:"session_id"`
@@ -295,7 +318,8 @@ func wireIdentity(w lifecycleIdentityWire) Identity {
 		return *p
 	}
 	return Identity{
-		HostID: w.HostID, StoreID: w.StoreID, TmuxServerInstanceID: w.TmuxServerInstanceID,
+		HostID: w.HostID, StoreID: w.StoreID, TmuxServerDomainID: w.TmuxServerDomainID,
+		TmuxServerInstanceID: w.TmuxServerInstanceID, Ownership: w.Ownership,
 		LifecycleKey: w.LifecycleKey, TargetEpoch: w.TargetEpoch, SessionID: value(w.SessionID),
 		PaneInstanceID: value(w.PaneInstanceID), AgentRunID: value(w.AgentRunID),
 		Provider: value(w.Provider), ConversationID: value(w.ConversationID), StateCursor: value(w.StateCursor),
@@ -303,6 +327,7 @@ func wireIdentity(w lifecycleIdentityWire) Identity {
 }
 
 type lifecycleReceiptWire struct {
+	FormatVersion      string                 `json:"format_version"`
 	LifecycleReceiptID string                 `json:"lifecycle_receipt_id"`
 	Operation          string                 `json:"operation"`
 	ActionID           string                 `json:"action_id"`
@@ -310,6 +335,8 @@ type lifecycleReceiptWire struct {
 	LeaseID            string                 `json:"lease_id"`
 	LeaseEpoch         int64                  `json:"lease_epoch"`
 	LifecycleKey       string                 `json:"lifecycle_key"`
+	TmuxServerDomainID string                 `json:"tmux_server_domain_id"`
+	ExternalWatchID    *string                `json:"external_watch_id"`
 	TargetEpoch        int64                  `json:"target_epoch"`
 	Status             string                 `json:"status"`
 	IdentityBefore     *lifecycleIdentityWire `json:"identity_before"`
@@ -319,9 +346,10 @@ type lifecycleReceiptWire struct {
 }
 
 func wireLifecycleReceipt(w lifecycleReceiptWire) LifecycleReceipt {
-	r := LifecycleReceipt{LifecycleReceiptID: w.LifecycleReceiptID, Operation: w.Operation,
+	r := LifecycleReceipt{FormatVersion: w.FormatVersion, LifecycleReceiptID: w.LifecycleReceiptID, Operation: w.Operation,
 		ActionID: w.ActionID, ActionEpoch: w.ActionEpoch, LeaseID: w.LeaseID,
-		LeaseEpoch: w.LeaseEpoch, LifecycleKey: w.LifecycleKey, TargetEpoch: w.TargetEpoch,
+		LeaseEpoch: w.LeaseEpoch, LifecycleKey: w.LifecycleKey,
+		TmuxServerDomainID: w.TmuxServerDomainID, TargetEpoch: w.TargetEpoch,
 		Status: w.Status}
 	if w.IdentityBefore != nil {
 		r.IdentityBefore = wireIdentity(*w.IdentityBefore)
@@ -334,6 +362,9 @@ func wireLifecycleReceipt(w lifecycleReceiptWire) LifecycleReceipt {
 	}
 	if w.DiagnosticCode != nil {
 		r.DiagnosticCode = *w.DiagnosticCode
+	}
+	if w.ExternalWatchID != nil {
+		r.ExternalWatchID = *w.ExternalWatchID
 	}
 	return r
 }
@@ -353,7 +384,7 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 	}
 	if a.ActionID == "" || a.Epoch < 1 || t.LeaseID == "" || t.LeaseEpoch < 1 ||
 		t.LifecycleKey == "" || t.TargetEpoch < 1 || profile == "" ||
-		t.WorkspaceRootID == "" || t.WorkspaceRelativePath == "" ||
+		t.WorkspaceRootID == "" || t.WorkspaceRelativePath == "" || t.Identity.TmuxServerDomainID == "" ||
 		t.Identity.HostID == "" || t.Identity.StoreID == "" || t.Identity.TmuxServerInstanceID == "" {
 		return LifecycleReceipt{}, errors.New("driver lifecycle ensure: incomplete fenced target")
 	}
@@ -368,6 +399,7 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 			TargetEpoch                  int64  `json:"target_epoch"`
 			ExpectedHostID               string `json:"expected_host_id"`
 			ExpectedStoreID              string `json:"expected_store_id"`
+			ExpectedTmuxServerDomainID   string `json:"expected_tmux_server_domain_id"`
 			ExpectedTmuxServerInstanceID string `json:"expected_tmux_server_instance_id"`
 		} `json:"target"`
 		Launch struct {
@@ -378,9 +410,10 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 			} `json:"workspace"`
 		} `json:"launch"`
 	}
-	in := ensureRequest{FormatVersion: "tmux-driver.lifecycle-ensure/v1", ActionID: a.ActionID, ActionEpoch: a.Epoch, LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch}
+	in := ensureRequest{FormatVersion: "tmux-driver.lifecycle-ensure/v2", ActionID: a.ActionID, ActionEpoch: a.Epoch, LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch}
 	in.Target.LifecycleKey, in.Target.TargetEpoch = t.LifecycleKey, t.TargetEpoch
 	in.Target.ExpectedHostID, in.Target.ExpectedStoreID = t.Identity.HostID, t.Identity.StoreID
+	in.Target.ExpectedTmuxServerDomainID = t.Identity.TmuxServerDomainID
 	in.Target.ExpectedTmuxServerInstanceID = t.Identity.TmuxServerInstanceID
 	in.Launch.ProfileID = profile
 	in.Launch.Workspace.RootID, in.Launch.Workspace.RelativePath = t.WorkspaceRootID, t.WorkspaceRelativePath
@@ -391,24 +424,251 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 		return LifecycleReceipt{}, err
 	}
 	r := wireLifecycleReceipt(out.Receipt)
-	if r.ActionID != a.ActionID || r.ActionEpoch != a.Epoch || r.LifecycleKey != t.LifecycleKey || r.TargetEpoch != t.TargetEpoch {
+	if r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" || r.ActionID != a.ActionID ||
+		r.ActionEpoch != a.Epoch || r.LifecycleKey != t.LifecycleKey ||
+		r.TmuxServerDomainID != t.Identity.TmuxServerDomainID || r.TargetEpoch != t.TargetEpoch {
 		return LifecycleReceipt{}, ErrIdentityMismatch
 	}
 	if r.Uncertain() {
 		return r, ErrUncertain
 	}
-	if r.Status != "ensured" || r.IdentityAfter.SessionID == "" ||
+	if r.Status != "ensured" || r.IdentityAfter.HostID != t.Identity.HostID ||
+		r.IdentityAfter.StoreID != t.Identity.StoreID ||
+		r.IdentityAfter.TmuxServerDomainID != t.Identity.TmuxServerDomainID ||
+		r.IdentityAfter.TmuxServerInstanceID != t.Identity.TmuxServerInstanceID ||
+		r.IdentityAfter.Ownership != "driver_managed" || r.IdentityAfter.SessionID == "" ||
 		r.IdentityAfter.PaneInstanceID == "" || r.IdentityAfter.AgentRunID == "" {
 		return r, fmt.Errorf("driver lifecycle ensure: status %q", r.Status)
 	}
 	return r, nil
 }
 
+func (p *HTTPPort) EnsureExternalWatch(ctx context.Context, paneID, provider, profile string) (ExternalWatch, error) {
+	if len(paneID) < 2 || paneID[0] != '%' {
+		return ExternalWatch{}, errors.New("driver watch bootstrap: pane_id must use %N syntax")
+	}
+	if _, err := strconv.Atoi(paneID[1:]); err != nil || provider == "" || profile == "" {
+		return ExternalWatch{}, errors.New("driver watch bootstrap: incomplete watch policy")
+	}
+	in := struct {
+		Target struct {
+			Selector     string `json:"selector"`
+			PaneID       string `json:"pane_id"`
+			FollowPolicy string `json:"follow_policy"`
+		} `json:"target"`
+		ProviderHint string         `json:"provider_hint"`
+		Profile      string         `json:"profile"`
+		Requirements map[string]any `json:"requirements"`
+	}{ProviderHint: provider, Profile: profile, Requirements: map[string]any{}}
+	in.Target.Selector, in.Target.PaneID, in.Target.FollowPolicy = "pane_id", paneID, "exact_incarnation"
+	var out struct {
+		Watch struct {
+			WatchID   string `json:"watch_id"`
+			Enabled   bool   `json:"enabled"`
+			Lifecycle string `json:"lifecycle"`
+			Provider  string `json:"provider_hint"`
+			Profile   string `json:"profile"`
+			Target    struct {
+				Selector     string `json:"selector"`
+				PaneID       string `json:"pane_id"`
+				FollowPolicy string `json:"follow_policy"`
+			} `json:"target"`
+		} `json:"watch"`
+	}
+	if err := p.call(ctx, http.MethodPost, "/v2/watches", "", in, &out); err != nil {
+		return ExternalWatch{}, err
+	}
+	if err := validateCanonicalUUID(out.Watch.WatchID, "watch_id"); err != nil {
+		return ExternalWatch{}, err
+	}
+	if !out.Watch.Enabled || out.Watch.Target.Selector != "pane_id" ||
+		out.Watch.Target.PaneID != paneID || out.Watch.Target.FollowPolicy != "exact_incarnation" ||
+		out.Watch.Provider != provider || out.Watch.Profile != profile {
+		return ExternalWatch{}, ErrIdentityMismatch
+	}
+	return ExternalWatch{WatchID: out.Watch.WatchID, PaneID: paneID, Enabled: true,
+		Lifecycle: out.Watch.Lifecycle, Provider: provider, Profile: profile}, nil
+}
+
+func (p *HTTPPort) AdoptSession(ctx context.Context, t SessionTarget, a Action) (LifecycleReceipt, error) {
+	id := t.Identity
+	if a.ActionID == "" || a.Epoch < 1 || t.LeaseID == "" || t.LeaseEpoch < 1 ||
+		t.LifecycleKey == "" || t.TargetEpoch < 1 || t.ProfileID == "" || t.ExternalWatchID == "" ||
+		id.HostID == "" || id.StoreID == "" || !tmuxServerDomainPattern.MatchString(id.TmuxServerDomainID) ||
+		id.TmuxServerInstanceID == "" || id.SessionID == "" || id.PaneInstanceID == "" ||
+		id.AgentRunID == "" || id.Ownership != "" {
+		return LifecycleReceipt{}, errors.New("driver lifecycle adopt: incomplete external target")
+	}
+	target := lifecycleExternalTarget(t)
+	in := struct {
+		FormatVersion string                      `json:"format_version"`
+		ActionID      string                      `json:"action_id"`
+		ActionEpoch   int64                       `json:"action_epoch"`
+		LeaseID       string                      `json:"lease_id"`
+		LeaseEpoch    int64                       `json:"lease_epoch"`
+		Target        lifecycleExternalTargetWire `json:"target"`
+	}{"tmux-driver.lifecycle-adopt/v1", a.ActionID, a.Epoch, t.LeaseID, t.LeaseEpoch, target}
+	var out struct {
+		Receipt lifecycleReceiptWire `json:"receipt"`
+	}
+	if err := p.call(ctx, http.MethodPost, "/v2/lifecycle/adopt", a.ActionID, in, &out); err != nil {
+		return LifecycleReceipt{}, err
+	}
+	r := wireLifecycleReceipt(out.Receipt)
+	if err := validateExternalLifecycleReceipt(r, t, a, "adopt"); err != nil {
+		return LifecycleReceipt{}, err
+	}
+	if r.Uncertain() {
+		return r, ErrUncertain
+	}
+	expected := id
+	expected.LifecycleKey, expected.TargetEpoch, expected.Ownership = t.LifecycleKey, t.TargetEpoch, "external_observed"
+	if r.Status != "adopted" || r.IdentityBefore != (Identity{}) ||
+		!lifecycleIdentityMatches(r.IdentityAfter, expected) || r.AbsenceObservedAt != "" {
+		return LifecycleReceipt{}, ErrIdentityMismatch
+	}
+	return r, nil
+}
+
+func (p *HTTPPort) ReattachSession(ctx context.Context, t SessionTarget, a Action) (LifecycleReceipt, error) {
+	id := t.Identity
+	if a.ActionID == "" || a.Epoch < 1 || t.LeaseID == "" || t.LeaseEpoch < 1 ||
+		t.LifecycleKey == "" || t.TargetEpoch < 1 || !identityHasExactDriverTuple(id) ||
+		(id.Ownership != "driver_managed" && id.Ownership != "external_observed") ||
+		(id.Ownership == "external_observed" && t.ExternalWatchID == "") ||
+		id.LifecycleKey != t.LifecycleKey || id.TargetEpoch != t.TargetEpoch {
+		return LifecycleReceipt{}, errors.New("driver lifecycle reattach: incomplete exact target")
+	}
+	type reattachRequest struct {
+		FormatVersion string `json:"format_version"`
+		ActionID      string `json:"action_id"`
+		ActionEpoch   int64  `json:"action_epoch"`
+		LeaseID       string `json:"lease_id"`
+		LeaseEpoch    int64  `json:"lease_epoch"`
+		Target        struct {
+			LifecycleKey                 string `json:"lifecycle_key"`
+			TargetEpoch                  int64  `json:"target_epoch"`
+			ExpectedHostID               string `json:"expected_host_id"`
+			ExpectedStoreID              string `json:"expected_store_id"`
+			ExpectedTmuxServerDomainID   string `json:"expected_tmux_server_domain_id"`
+			ExpectedTmuxServerInstanceID string `json:"expected_tmux_server_instance_id"`
+			ExpectedSessionID            string `json:"expected_session_id"`
+			ExpectedPaneInstanceID       string `json:"expected_pane_instance_id"`
+			ExpectedAgentRunID           string `json:"expected_agent_run_id"`
+		} `json:"target"`
+	}
+	in := reattachRequest{FormatVersion: "tmux-driver.lifecycle-reattach/v2", ActionID: a.ActionID,
+		ActionEpoch: a.Epoch, LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch}
+	in.Target.LifecycleKey, in.Target.TargetEpoch = t.LifecycleKey, t.TargetEpoch
+	in.Target.ExpectedHostID, in.Target.ExpectedStoreID = id.HostID, id.StoreID
+	in.Target.ExpectedTmuxServerDomainID, in.Target.ExpectedTmuxServerInstanceID = id.TmuxServerDomainID, id.TmuxServerInstanceID
+	in.Target.ExpectedSessionID, in.Target.ExpectedPaneInstanceID, in.Target.ExpectedAgentRunID = id.SessionID, id.PaneInstanceID, id.AgentRunID
+	var out struct {
+		Receipt lifecycleReceiptWire `json:"receipt"`
+	}
+	if err := p.call(ctx, http.MethodPost, "/v2/lifecycle/reattach", a.ActionID, in, &out); err != nil {
+		return LifecycleReceipt{}, err
+	}
+	r := wireLifecycleReceipt(out.Receipt)
+	if r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" || r.Operation != "reattach" ||
+		r.ActionID != a.ActionID || r.ActionEpoch != a.Epoch || r.LeaseID != t.LeaseID ||
+		r.LeaseEpoch != t.LeaseEpoch || r.LifecycleKey != t.LifecycleKey || r.TargetEpoch != t.TargetEpoch ||
+		r.TmuxServerDomainID != id.TmuxServerDomainID || r.ExternalWatchID != t.ExternalWatchID {
+		return LifecycleReceipt{}, ErrIdentityMismatch
+	}
+	if r.Uncertain() {
+		return r, ErrUncertain
+	}
+	if r.Status != "reattached" || !lifecycleIdentityMatches(r.IdentityBefore, id) ||
+		!lifecycleIdentityMatches(r.IdentityAfter, id) || r.AbsenceObservedAt != "" {
+		return LifecycleReceipt{}, ErrIdentityMismatch
+	}
+	return r, nil
+}
+
+func (p *HTTPPort) ReleaseSession(ctx context.Context, t SessionTarget, a Action) (LifecycleReceipt, error) {
+	if t.Identity.Ownership != "external_observed" || t.ExternalWatchID == "" {
+		return LifecycleReceipt{}, errors.New("driver lifecycle release: target is not externally adopted")
+	}
+	target := lifecycleExternalTarget(t)
+	target.ProfileID = ""
+	in := struct {
+		FormatVersion string                      `json:"format_version"`
+		ActionID      string                      `json:"action_id"`
+		ActionEpoch   int64                       `json:"action_epoch"`
+		LeaseID       string                      `json:"lease_id"`
+		LeaseEpoch    int64                       `json:"lease_epoch"`
+		Target        lifecycleExternalTargetWire `json:"target"`
+	}{"tmux-driver.lifecycle-release/v1", a.ActionID, a.Epoch, t.LeaseID, t.LeaseEpoch, target}
+	var out struct {
+		Receipt lifecycleReceiptWire `json:"receipt"`
+	}
+	if err := p.call(ctx, http.MethodPost, "/v2/lifecycle/release", a.ActionID, in, &out); err != nil {
+		return LifecycleReceipt{}, err
+	}
+	r := wireLifecycleReceipt(out.Receipt)
+	if err := validateExternalLifecycleReceipt(r, t, a, "release"); err != nil {
+		return LifecycleReceipt{}, err
+	}
+	if r.Uncertain() {
+		return r, ErrUncertain
+	}
+	if r.Status != "released" || !lifecycleIdentityMatches(r.IdentityBefore, t.Identity) ||
+		r.IdentityAfter != (Identity{}) || r.AbsenceObservedAt != "" {
+		return LifecycleReceipt{}, ErrIdentityMismatch
+	}
+	return r, nil
+}
+
+func lifecycleIdentityMatches(got, expected Identity) bool {
+	return got.HostID == expected.HostID && got.StoreID == expected.StoreID &&
+		got.TmuxServerDomainID == expected.TmuxServerDomainID &&
+		got.TmuxServerInstanceID == expected.TmuxServerInstanceID && got.Ownership == expected.Ownership &&
+		got.LifecycleKey == expected.LifecycleKey && got.TargetEpoch == expected.TargetEpoch &&
+		got.SessionID == expected.SessionID && got.PaneInstanceID == expected.PaneInstanceID &&
+		got.AgentRunID == expected.AgentRunID
+}
+
+type lifecycleExternalTargetWire struct {
+	LifecycleKey                 string `json:"lifecycle_key"`
+	TargetEpoch                  int64  `json:"target_epoch"`
+	ExpectedHostID               string `json:"expected_host_id"`
+	ExpectedStoreID              string `json:"expected_store_id"`
+	ExpectedTmuxServerDomainID   string `json:"expected_tmux_server_domain_id"`
+	ExpectedTmuxServerInstanceID string `json:"expected_tmux_server_instance_id"`
+	ExpectedSessionID            string `json:"expected_session_id"`
+	ExpectedPaneInstanceID       string `json:"expected_pane_instance_id"`
+	ExpectedAgentRunID           string `json:"expected_agent_run_id"`
+	ProfileID                    string `json:"profile_id,omitempty"`
+	ExternalWatchID              string `json:"external_watch_id"`
+}
+
+func lifecycleExternalTarget(t SessionTarget) lifecycleExternalTargetWire {
+	id := t.Identity
+	return lifecycleExternalTargetWire{LifecycleKey: t.LifecycleKey, TargetEpoch: t.TargetEpoch,
+		ExpectedHostID: id.HostID, ExpectedStoreID: id.StoreID,
+		ExpectedTmuxServerDomainID:   id.TmuxServerDomainID,
+		ExpectedTmuxServerInstanceID: id.TmuxServerInstanceID,
+		ExpectedSessionID:            id.SessionID, ExpectedPaneInstanceID: id.PaneInstanceID,
+		ExpectedAgentRunID: id.AgentRunID, ProfileID: t.ProfileID, ExternalWatchID: t.ExternalWatchID}
+}
+
+func validateExternalLifecycleReceipt(r LifecycleReceipt, t SessionTarget, a Action, operation string) error {
+	if r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" || r.Operation != operation ||
+		r.Status == "" || r.ActionID != a.ActionID || r.ActionEpoch != a.Epoch ||
+		r.LeaseID != t.LeaseID || r.LeaseEpoch != t.LeaseEpoch ||
+		r.LifecycleKey != t.LifecycleKey || r.TargetEpoch != t.TargetEpoch ||
+		r.TmuxServerDomainID != t.Identity.TmuxServerDomainID || r.ExternalWatchID != t.ExternalWatchID {
+		return ErrIdentityMismatch
+	}
+	return nil
+}
+
 func (p *HTTPPort) StopSession(ctx context.Context, t SessionTarget, a Action) (LifecycleReceipt, error) {
 	id := t.Identity
 	if a.ActionID == "" || a.Epoch < 1 || t.LeaseID == "" || t.LeaseEpoch < 1 ||
 		t.LifecycleKey == "" || t.TargetEpoch < 1 || id.HostID == "" || id.StoreID == "" ||
-		id.TmuxServerInstanceID == "" || id.SessionID == "" || id.PaneInstanceID == "" || id.AgentRunID == "" {
+		id.TmuxServerDomainID == "" || id.TmuxServerInstanceID == "" || id.SessionID == "" || id.PaneInstanceID == "" || id.AgentRunID == "" {
 		return LifecycleReceipt{}, errors.New("driver lifecycle stop: incomplete fenced target")
 	}
 	type stopRequest struct {
@@ -422,16 +682,18 @@ func (p *HTTPPort) StopSession(ctx context.Context, t SessionTarget, a Action) (
 			TargetEpoch                  int64  `json:"target_epoch"`
 			ExpectedHostID               string `json:"expected_host_id"`
 			ExpectedStoreID              string `json:"expected_store_id"`
+			ExpectedTmuxServerDomainID   string `json:"expected_tmux_server_domain_id"`
 			ExpectedTmuxServerInstanceID string `json:"expected_tmux_server_instance_id"`
 			ExpectedSessionID            string `json:"expected_session_id"`
 			ExpectedPaneInstanceID       string `json:"expected_pane_instance_id"`
 			ExpectedAgentRunID           string `json:"expected_agent_run_id"`
 		} `json:"target"`
 	}
-	in := stopRequest{FormatVersion: "tmux-driver.lifecycle-stop/v1", ActionID: a.ActionID,
+	in := stopRequest{FormatVersion: "tmux-driver.lifecycle-stop/v2", ActionID: a.ActionID,
 		ActionEpoch: a.Epoch, LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch}
 	in.Target.LifecycleKey, in.Target.TargetEpoch = t.LifecycleKey, t.TargetEpoch
 	in.Target.ExpectedHostID, in.Target.ExpectedStoreID = id.HostID, id.StoreID
+	in.Target.ExpectedTmuxServerDomainID = id.TmuxServerDomainID
 	in.Target.ExpectedTmuxServerInstanceID = id.TmuxServerInstanceID
 	in.Target.ExpectedSessionID, in.Target.ExpectedPaneInstanceID = id.SessionID, id.PaneInstanceID
 	in.Target.ExpectedAgentRunID = id.AgentRunID
@@ -442,7 +704,9 @@ func (p *HTTPPort) StopSession(ctx context.Context, t SessionTarget, a Action) (
 		return LifecycleReceipt{}, err
 	}
 	r := wireLifecycleReceipt(out.Receipt)
-	if r.ActionID != a.ActionID || r.ActionEpoch != a.Epoch || r.LifecycleKey != t.LifecycleKey || r.TargetEpoch != t.TargetEpoch {
+	if r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" || r.ActionID != a.ActionID ||
+		r.ActionEpoch != a.Epoch || r.LifecycleKey != t.LifecycleKey ||
+		r.TmuxServerDomainID != id.TmuxServerDomainID || r.TargetEpoch != t.TargetEpoch {
 		return LifecycleReceipt{}, ErrIdentityMismatch
 	}
 	if r.Uncertain() {
@@ -470,7 +734,9 @@ func (p *HTTPPort) VerifyLifecycleEffect(ctx context.Context, receiptID string, 
 		return LifecycleReceipt{}, err
 	}
 	r := wireLifecycleReceipt(out.Receipt)
-	if r.LifecycleReceiptID != receiptID || r.ActionID != a.ActionID ||
+	if r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" ||
+		r.TmuxServerDomainID != t.Identity.TmuxServerDomainID ||
+		r.LifecycleReceiptID != receiptID || r.ActionID != a.ActionID ||
 		r.ActionEpoch != a.Epoch || r.LeaseID != t.LeaseID || r.LeaseEpoch != t.LeaseEpoch ||
 		r.LifecycleKey != t.LifecycleKey || r.TargetEpoch != t.TargetEpoch {
 		return LifecycleReceipt{}, ErrIdentityMismatch
@@ -531,7 +797,8 @@ func (p *HTTPPort) LifecycleReceiptByAction(ctx context.Context, actionID, lifec
 		return LifecycleReceipt{}, false, err
 	}
 	r := wireLifecycleReceipt(out.Receipt)
-	if r.ActionID != actionID || r.LifecycleKey != lifecycleKey || r.TargetEpoch != targetEpoch {
+	if r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" || r.TmuxServerDomainID == "" ||
+		r.ActionID != actionID || r.LifecycleKey != lifecycleKey || r.TargetEpoch != targetEpoch {
 		return LifecycleReceipt{}, false, ErrIdentityMismatch
 	}
 	return r, true, nil
@@ -551,19 +818,23 @@ func (p *HTTPPort) Grant(ctx context.Context, g Grant) error {
 		return validateProjectedGrant(existing, g, false)
 	}
 	common := struct {
-		GrantID                 string `json:"grant_id,omitempty"`
-		SenderPrincipalID       string `json:"sender_principal_id,omitempty"`
-		SenderSessionID         string `json:"sender_session_id,omitempty"`
-		SenderAgentRunID        string `json:"sender_agent_run_id,omitempty"`
-		RecipientSessionID      string `json:"recipient_session_id"`
-		RecipientPaneInstanceID string `json:"recipient_pane_instance_id"`
-		Epoch                   int64  `json:"epoch"`
-		MaximumPayloadBytes     int    `json:"maximum_payload_bytes,omitempty"`
-		AllowDraftStash         bool   `json:"allow_draft_stash,omitempty"`
-		ExpiresAt               string `json:"expires_at,omitempty"`
-	}{g.GrantID, g.SenderPrincipalID, g.SenderSessionID, g.SenderAgentRunID,
-		g.RecipientSessionID, g.RecipientPaneInstanceID, g.Epoch,
-		g.MaximumPayloadBytes, g.AllowDraftStash, g.ExpiresAt}
+		GrantID                     string `json:"grant_id,omitempty"`
+		SenderPrincipalID           string `json:"sender_principal_id,omitempty"`
+		SenderSessionID             string `json:"sender_session_id,omitempty"`
+		SenderAgentRunID            string `json:"sender_agent_run_id,omitempty"`
+		RecipientSessionID          string `json:"recipient_session_id"`
+		RecipientPaneInstanceID     string `json:"recipient_pane_instance_id"`
+		ExpectedRecipientAgentRunID string `json:"expected_recipient_agent_run_id,omitempty"`
+		Epoch                       int64  `json:"epoch"`
+		MaximumPayloadBytes         int    `json:"maximum_payload_bytes,omitempty"`
+		AllowDraftStash             bool   `json:"allow_draft_stash,omitempty"`
+		ExpiresAt                   string `json:"expires_at,omitempty"`
+	}{GrantID: g.GrantID, SenderPrincipalID: g.SenderPrincipalID,
+		SenderSessionID: g.SenderSessionID, SenderAgentRunID: g.SenderAgentRunID,
+		RecipientSessionID: g.RecipientSessionID, RecipientPaneInstanceID: g.RecipientPaneInstanceID,
+		ExpectedRecipientAgentRunID: g.ExpectedRecipientAgentRunID, Epoch: g.Epoch,
+		MaximumPayloadBytes: g.MaximumPayloadBytes, AllowDraftStash: g.AllowDraftStash,
+		ExpiresAt: g.ExpiresAt}
 	var out struct {
 		Grant routeGrantWire `json:"grant"`
 	}
@@ -617,29 +888,30 @@ func (p *HTTPPort) RevokeGrant(ctx context.Context, id string, epoch int64) erro
 }
 
 type deliveryReceiptWire struct {
-	FormatVersion           string        `json:"format_version"`
-	DeliveryID              string        `json:"delivery_id"`
-	ActionID                string        `json:"action_id"`
-	GrantID                 string        `json:"grant_id"`
-	GrantEpoch              int64         `json:"grant_epoch"`
-	SenderPrincipalID       string        `json:"sender_principal_id,omitempty"`
-	SenderSessionID         string        `json:"sender_session_id"`
-	SenderAgentRunID        string        `json:"sender_agent_run_id"`
-	RecipientSessionID      string        `json:"recipient_session_id"`
-	RecipientPaneInstanceID string        `json:"recipient_pane_instance_id"`
-	PayloadSHA256           string        `json:"payload_sha256"`
-	PayloadBytes            int           `json:"payload_bytes"`
-	PayloadMediaType        string        `json:"payload_media_type"`
-	RequestFingerprint      string        `json:"request_fingerprint"`
-	Status                  ReceiptStatus `json:"status"`
-	CompatibilityCode       *int          `json:"compatibility_code"`
-	Verification            *string       `json:"verification"`
-	PaneHashBefore          *string       `json:"pane_hash_before"`
-	PaneHashAfter           *string       `json:"pane_hash_after"`
-	EnterAttempts           int           `json:"enter_attempts"`
-	AcceptedAt              string        `json:"accepted_at"`
-	CompletedAt             *string       `json:"completed_at"`
-	DiagnosticCode          *string       `json:"diagnostic_code"`
+	FormatVersion               string        `json:"format_version"`
+	DeliveryID                  string        `json:"delivery_id"`
+	ActionID                    string        `json:"action_id"`
+	GrantID                     string        `json:"grant_id"`
+	GrantEpoch                  int64         `json:"grant_epoch"`
+	SenderPrincipalID           string        `json:"sender_principal_id,omitempty"`
+	SenderSessionID             string        `json:"sender_session_id"`
+	SenderAgentRunID            string        `json:"sender_agent_run_id"`
+	RecipientSessionID          string        `json:"recipient_session_id"`
+	RecipientPaneInstanceID     string        `json:"recipient_pane_instance_id"`
+	ExpectedRecipientAgentRunID string        `json:"expected_recipient_agent_run_id,omitempty"`
+	PayloadSHA256               string        `json:"payload_sha256"`
+	PayloadBytes                int           `json:"payload_bytes"`
+	PayloadMediaType            string        `json:"payload_media_type"`
+	RequestFingerprint          string        `json:"request_fingerprint"`
+	Status                      ReceiptStatus `json:"status"`
+	CompatibilityCode           *int          `json:"compatibility_code"`
+	Verification                *string       `json:"verification"`
+	PaneHashBefore              *string       `json:"pane_hash_before"`
+	PaneHashAfter               *string       `json:"pane_hash_after"`
+	EnterAttempts               int           `json:"enter_attempts"`
+	AcceptedAt                  string        `json:"accepted_at"`
+	CompletedAt                 *string       `json:"completed_at"`
+	DiagnosticCode              *string       `json:"diagnostic_code"`
 }
 
 func (w *deliveryReceiptWire) UnmarshalJSON(data []byte) error {
@@ -695,31 +967,32 @@ func (w *deliveryReceiptWire) UnmarshalJSON(data []byte) error {
 			EnterAttempts: value.EnterAttempts, AcceptedAt: value.AcceptedAt,
 			CompletedAt: value.CompletedAt, DiagnosticCode: value.DiagnosticCode}
 	case controlDeliveryReceiptFormat:
-		if err := requireExactWireKeys(data, deliveryReceiptRequiredKeys("sender_principal_id")); err != nil {
+		if err := requireExactWireKeys(data, deliveryReceiptRequiredKeys("sender_principal_id", "expected_recipient_agent_run_id")); err != nil {
 			return err
 		}
 		var value struct {
-			FormatVersion           string        `json:"format_version"`
-			DeliveryID              string        `json:"delivery_id"`
-			ActionID                string        `json:"action_id"`
-			GrantID                 string        `json:"grant_id"`
-			GrantEpoch              int64         `json:"grant_epoch"`
-			SenderPrincipalID       string        `json:"sender_principal_id"`
-			RecipientSessionID      string        `json:"recipient_session_id"`
-			RecipientPaneInstanceID string        `json:"recipient_pane_instance_id"`
-			PayloadSHA256           string        `json:"payload_sha256"`
-			PayloadBytes            int           `json:"payload_bytes"`
-			PayloadMediaType        string        `json:"payload_media_type"`
-			RequestFingerprint      string        `json:"request_fingerprint"`
-			Status                  ReceiptStatus `json:"status"`
-			CompatibilityCode       *int          `json:"compatibility_code"`
-			Verification            *string       `json:"verification"`
-			PaneHashBefore          *string       `json:"pane_hash_before"`
-			PaneHashAfter           *string       `json:"pane_hash_after"`
-			EnterAttempts           int           `json:"enter_attempts"`
-			AcceptedAt              string        `json:"accepted_at"`
-			CompletedAt             *string       `json:"completed_at"`
-			DiagnosticCode          *string       `json:"diagnostic_code"`
+			FormatVersion               string        `json:"format_version"`
+			DeliveryID                  string        `json:"delivery_id"`
+			ActionID                    string        `json:"action_id"`
+			GrantID                     string        `json:"grant_id"`
+			GrantEpoch                  int64         `json:"grant_epoch"`
+			SenderPrincipalID           string        `json:"sender_principal_id"`
+			RecipientSessionID          string        `json:"recipient_session_id"`
+			RecipientPaneInstanceID     string        `json:"recipient_pane_instance_id"`
+			ExpectedRecipientAgentRunID string        `json:"expected_recipient_agent_run_id"`
+			PayloadSHA256               string        `json:"payload_sha256"`
+			PayloadBytes                int           `json:"payload_bytes"`
+			PayloadMediaType            string        `json:"payload_media_type"`
+			RequestFingerprint          string        `json:"request_fingerprint"`
+			Status                      ReceiptStatus `json:"status"`
+			CompatibilityCode           *int          `json:"compatibility_code"`
+			Verification                *string       `json:"verification"`
+			PaneHashBefore              *string       `json:"pane_hash_before"`
+			PaneHashAfter               *string       `json:"pane_hash_after"`
+			EnterAttempts               int           `json:"enter_attempts"`
+			AcceptedAt                  string        `json:"accepted_at"`
+			CompletedAt                 *string       `json:"completed_at"`
+			DiagnosticCode              *string       `json:"diagnostic_code"`
 		}
 		if err := decodeStrictWire(data, &value); err != nil {
 			return err
@@ -727,8 +1000,10 @@ func (w *deliveryReceiptWire) UnmarshalJSON(data []byte) error {
 		decoded = deliveryReceiptWire{FormatVersion: value.FormatVersion, DeliveryID: value.DeliveryID,
 			ActionID: value.ActionID, GrantID: value.GrantID, GrantEpoch: value.GrantEpoch,
 			SenderPrincipalID: value.SenderPrincipalID, RecipientSessionID: value.RecipientSessionID,
-			RecipientPaneInstanceID: value.RecipientPaneInstanceID, PayloadSHA256: value.PayloadSHA256,
-			PayloadBytes: value.PayloadBytes, PayloadMediaType: value.PayloadMediaType,
+			RecipientPaneInstanceID:     value.RecipientPaneInstanceID,
+			ExpectedRecipientAgentRunID: value.ExpectedRecipientAgentRunID,
+			PayloadSHA256:               value.PayloadSHA256,
+			PayloadBytes:                value.PayloadBytes, PayloadMediaType: value.PayloadMediaType,
 			RequestFingerprint: value.RequestFingerprint, Status: value.Status,
 			CompatibilityCode: value.CompatibilityCode, Verification: value.Verification,
 			PaneHashBefore: value.PaneHashBefore, PaneHashAfter: value.PaneHashAfter,
@@ -760,10 +1035,11 @@ func wireReceipt(w deliveryReceiptWire) Receipt {
 		diagnostic = *w.DiagnosticCode
 	}
 	return Receipt{DeliveryID: w.DeliveryID, ActionID: w.ActionID, GrantID: w.GrantID, GrantEpoch: w.GrantEpoch,
-		Sender:            Identity{SessionID: w.SenderSessionID, AgentRunID: w.SenderAgentRunID},
-		SenderPrincipalID: w.SenderPrincipalID,
-		Recipient:         Identity{SessionID: w.RecipientSessionID, PaneInstanceID: w.RecipientPaneInstanceID},
-		PayloadSHA256:     w.PayloadSHA256, Status: w.Status, CompatibilityCode: compat, DiagnosticCode: diagnostic}
+		Sender:                      Identity{SessionID: w.SenderSessionID, AgentRunID: w.SenderAgentRunID},
+		SenderPrincipalID:           w.SenderPrincipalID,
+		Recipient:                   Identity{SessionID: w.RecipientSessionID, PaneInstanceID: w.RecipientPaneInstanceID},
+		ExpectedRecipientAgentRunID: w.ExpectedRecipientAgentRunID,
+		PayloadSHA256:               w.PayloadSHA256, Status: w.Status, CompatibilityCode: compat, DiagnosticCode: diagnostic}
 }
 
 func (p *HTTPPort) Send(ctx context.Context, r SendRequest) (Receipt, error) {
@@ -771,9 +1047,17 @@ func (p *HTTPPort) Send(ctx context.Context, r SendRequest) (Receipt, error) {
 		return Receipt{}, errors.New("driver message: mixed control origin")
 	}
 	if r.SenderPrincipalID != "" {
+		if r.ExpectedRecipientAgentRunID == "" {
+			return Receipt{}, errors.New("driver message: missing recipient agent-run fence")
+		}
 		if err := validatePrincipalID(r.SenderPrincipalID, "sender_principal_id"); err != nil {
 			return Receipt{}, err
 		}
+		if err := validateCanonicalUUID(r.ExpectedRecipientAgentRunID, "expected_recipient_agent_run_id"); err != nil {
+			return Receipt{}, err
+		}
+	} else if r.ExpectedRecipientAgentRunID != "" {
+		return Receipt{}, errors.New("driver message: session origin carries control run fence")
 	}
 	in := struct {
 		GrantID            string `json:"grant_id"`
@@ -784,9 +1068,13 @@ func (p *HTTPPort) Send(ctx context.Context, r SendRequest) (Receipt, error) {
 			MediaType string `json:"media_type"`
 			Text      string `json:"text"`
 		} `json:"payload"`
-		PayloadSHA256       string `json:"payload_sha256"`
-		OnBehalfOfSessionID string `json:"on_behalf_of_session_id,omitempty"`
-	}{GrantID: r.GrantID, RecipientSessionID: r.RecipientSessionID, GrantEpoch: r.GrantEpoch, ActionID: r.ActionID, PayloadSHA256: r.PayloadSHA256, OnBehalfOfSessionID: r.OnBehalfOfSessionID}
+		PayloadSHA256               string `json:"payload_sha256"`
+		OnBehalfOfSessionID         string `json:"on_behalf_of_session_id,omitempty"`
+		ExpectedRecipientAgentRunID string `json:"expected_recipient_agent_run_id,omitempty"`
+	}{GrantID: r.GrantID, RecipientSessionID: r.RecipientSessionID, GrantEpoch: r.GrantEpoch,
+		ActionID: r.ActionID, PayloadSHA256: r.PayloadSHA256,
+		OnBehalfOfSessionID:         r.OnBehalfOfSessionID,
+		ExpectedRecipientAgentRunID: r.ExpectedRecipientAgentRunID}
 	in.Payload.MediaType, in.Payload.Text = "text/plain; charset=utf-8", r.Payload
 	var out struct {
 		Receipt deliveryReceiptWire `json:"receipt"`
@@ -803,6 +1091,7 @@ func (p *HTTPPort) Send(ctx context.Context, r SendRequest) (Receipt, error) {
 		out.Receipt.PayloadBytes != len([]byte(r.Payload)) ||
 		receipt.Recipient.SessionID != r.RecipientSessionID ||
 		receipt.Recipient.PaneInstanceID != r.RecipientPaneInstanceID ||
+		receipt.ExpectedRecipientAgentRunID != r.ExpectedRecipientAgentRunID ||
 		r.SenderPrincipalID != receipt.SenderPrincipalID ||
 		r.SenderPrincipalID == "" && r.SenderSessionID != "" && receipt.Sender.SessionID != r.SenderSessionID ||
 		r.OnBehalfOfSessionID != "" && receipt.Sender.SessionID != r.OnBehalfOfSessionID ||
@@ -815,10 +1104,11 @@ func (p *HTTPPort) Send(ctx context.Context, r SendRequest) (Receipt, error) {
 func (p *HTTPPort) ReceiptByAction(ctx context.Context, expected ReceiptExpectation) (Receipt, bool, error) {
 	if err := expected.Validate(Receipt{DeliveryID: "expectation-probe", ActionID: expected.ActionID,
 		GrantID: expected.GrantID, GrantEpoch: expected.GrantEpoch,
-		Sender:            Identity{SessionID: expected.SenderSessionID, AgentRunID: expected.SenderAgentRunID},
-		SenderPrincipalID: expected.SenderPrincipalID,
-		Recipient:         Identity{SessionID: expected.RecipientSessionID, PaneInstanceID: expected.RecipientPaneInstanceID},
-		PayloadSHA256:     expected.PayloadSHA256}); err != nil {
+		Sender:                      Identity{SessionID: expected.SenderSessionID, AgentRunID: expected.SenderAgentRunID},
+		SenderPrincipalID:           expected.SenderPrincipalID,
+		Recipient:                   Identity{SessionID: expected.RecipientSessionID, PaneInstanceID: expected.RecipientPaneInstanceID},
+		ExpectedRecipientAgentRunID: expected.ExpectedRecipientAgentRunID,
+		PayloadSHA256:               expected.PayloadSHA256}); err != nil {
 		return Receipt{}, false, err
 	}
 	q := url.Values{"grant_epoch": []string{strconv.FormatInt(expected.GrantEpoch, 10)}}

@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -150,7 +151,7 @@ func TestWorkIntentContractRejectsChangedReplayAndSupersededOrchestrator(t *test
 	other, old := seedOrchestratingWorkIntent(t, st, "contract-old-binding", "old-orchestrator", now.Add(3*time.Minute))
 	if _, err := st.UpsertDriverSessionBinding(ctx, store.DriverSessionBinding{
 		WorkerIdentity: "old-orchestrator", Role: store.DriverOrchestratorRole,
-		HostID: old.HostID, StoreID: old.StoreID, TmuxServerInstanceID: old.TmuxServerInstanceID,
+		HostID: old.HostID, StoreID: old.StoreID, TmuxServerDomainID: "flowbee", TmuxServerInstanceID: old.TmuxServerInstanceID, LifecycleOwnership: "driver_managed",
 		LifecycleKey: old.LifecycleKey, TargetEpoch: old.TargetEpoch + 1, ProfileID: old.ProfileID,
 		WorkspaceRootID: old.WorkspaceRootID, WorkspaceRelativePath: old.WorkspaceRelativePath,
 		SessionID: old.SessionID + "-new", PaneInstanceID: old.PaneInstanceID + "-new",
@@ -169,5 +170,133 @@ func TestWorkIntentContractRejectsChangedReplayAndSupersededOrchestrator(t *test
 	}, now.Add(5*time.Minute))
 	if !errors.Is(err, store.ErrWorkIntentContractFenced) {
 		t.Fatalf("superseded binding err=%v", err)
+	}
+}
+
+func TestPreparedWorkIntentAdmissionHonorsPauseAcrossRestartAndRecoversOnResume(t *testing.T) {
+	ctx := context.Background()
+	dsn := filepath.Join(t.TempDir(), "paused-admission.db")
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
+		_ = st.Close()
+		t.Fatal(err)
+	}
+	st.EnableEpicReviewHandoffV2 = true
+	now := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	intent, binding := seedOrchestratingWorkIntent(t, st, "paused-contract", "paused-orchestrator", now)
+	contract := validPreparedContract("paused-contract")
+	hash, err := store.WorkIntentEpicContractSHA256(contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := workintent.AdmissionKey(workintent.Intent{
+		ID: intent.ID, ProjectID: intent.ProjectID, Version: intent.IntentVersion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.RecordWorkIntentEpicContract(ctx, store.RecordWorkIntentEpicContractInput{
+		ProjectID: intent.ProjectID, WorkIntentID: intent.ID, IntentVersion: intent.IntentVersion,
+		ExpectedStateVersion: intent.StateVersion, SourceArtifactSHA256: intent.ArtifactSHA256,
+		ContractVersion: 1, ContractRef: "artifact://contract/paused", ContractSHA256: hash,
+		Contract: contract, OrchestratorBindingID: binding.BindingID, SubmissionKey: key,
+	}, now.Add(4*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err = st.GetWorkIntent(ctx, intent.ProjectID, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PauseWorkIntent(ctx, intent.ProjectID, intent.ID, intent.StateVersion,
+		"human:sam", "hold before admission", now.Add(5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the control-plane dying after contract preparation and pause, then
+	// running its startup admission reconciliation against only durable state.
+	restarted, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	restarted.EnableEpicReviewHandoffV2 = true
+	report, err := restarted.ReconcileWorkIntentAdmissions(ctx, now.Add(6*time.Minute))
+	if err != nil || report.Scanned != 0 || report.Admitted != 0 {
+		t.Fatalf("paused startup admission=%+v err=%v", report, err)
+	}
+	var epics int
+	if err := restarted.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM epics
+		WHERE work_intent_id=?`, intent.ID).Scan(&epics); err != nil {
+		t.Fatal(err)
+	}
+	if epics != 0 {
+		t.Fatalf("paused intent admitted %d epics after restart", epics)
+	}
+
+	intent, err = restarted.GetWorkIntent(ctx, intent.ProjectID, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ResumeWorkIntent(ctx, intent.ProjectID, intent.ID, intent.StateVersion,
+		"human:sam", now.Add(7*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	report, err = restarted.ReconcileWorkIntentAdmissions(ctx, now.Add(8*time.Minute))
+	if err != nil || report.Scanned != 1 || report.Admitted != 1 {
+		t.Fatalf("resumed admission=%+v err=%v", report, err)
+	}
+	intent, err = restarted.GetWorkIntent(ctx, intent.ProjectID, intent.ID)
+	if err != nil || intent.State != workintent.StateAdmitted || intent.AdmittedEpicID == "" {
+		t.Fatalf("resumed intent=%+v err=%v", intent, err)
+	}
+}
+
+func TestCancellingPreparedWorkIntentTerminalizesAdmissionObligation(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	now := time.Date(2026, 7, 20, 1, 0, 0, 0, time.UTC)
+	intent, binding := seedOrchestratingWorkIntent(t, st, "cancelled-contract", "cancelled-orchestrator", now)
+	contract := validPreparedContract("cancelled-contract")
+	hash, err := store.WorkIntentEpicContractSHA256(contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := workintent.AdmissionKey(workintent.Intent{
+		ID: intent.ID, ProjectID: intent.ProjectID, Version: intent.IntentVersion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.RecordWorkIntentEpicContract(ctx, store.RecordWorkIntentEpicContractInput{
+		ProjectID: intent.ProjectID, WorkIntentID: intent.ID, IntentVersion: intent.IntentVersion,
+		ExpectedStateVersion: intent.StateVersion, SourceArtifactSHA256: intent.ArtifactSHA256,
+		ContractVersion: 1, ContractRef: "artifact://contract/cancelled", ContractSHA256: hash,
+		Contract: contract, OrchestratorBindingID: binding.BindingID, SubmissionKey: key,
+	}, now.Add(4*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err = st.GetWorkIntent(ctx, intent.ProjectID, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CancelWorkIntent(ctx, intent.ProjectID, intent.ID, intent.StateVersion,
+		"human:sam", "withdraw before admission", now.Add(5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := st.GetPreparedWorkIntentEpicContract(ctx, intent.ProjectID, intent.ID, intent.IntentVersion)
+	if err != nil || prepared.State != "cancelled" || prepared.AdmittedEpicID != "" {
+		t.Fatalf("cancelled contract=%+v err=%v", prepared, err)
+	}
+	report, err := st.ReconcileWorkIntentAdmissions(ctx, now.Add(6*time.Minute))
+	if err != nil || report.Scanned != 0 || report.Admitted != 0 {
+		t.Fatalf("cancelled admission reconcile=%+v err=%v", report, err)
 	}
 }

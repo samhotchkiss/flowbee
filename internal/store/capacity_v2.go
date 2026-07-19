@@ -47,10 +47,23 @@ type CapacitySeatIdentity struct {
 // while the build runs, so dispatch still re-evaluates and leases atomically.
 // The admission invariant is narrower: never create work when the presently
 // configured, fresh fleet has no viable independent-review path at all.
-func distinctReviewerCapacityTx(ctx context.Context, tx *sql.Tx, builderFamily string,
+func distinctReviewerCapacityTx(ctx context.Context, tx *sql.Tx, projectID, builderFamily string,
 	now time.Time, freshFor time.Duration) (capacity.RouteDecision, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id,agent_family FROM seats
-		WHERE enabled=1 AND agent_family<>? ORDER BY agent_family,id`, builderFamily)
+	// Capacity is useful only when the project has an active reviewer route to
+	// the exact seat. A healthy seat elsewhere in the fleet is inventory, not an
+	// admission proof for this project. Keep the binding/seat authority checks in
+	// this transaction so a concurrent rebind cannot false-green admission.
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT s.id,s.agent_family
+		FROM driver_session_bindings b
+		JOIN seats s ON s.id=b.seat_id
+		WHERE b.project_id=? AND b.role=? AND b.state='active' AND b.seat_id<>''
+		  AND b.lifecycle_ownership='driver_managed'
+		  AND b.tmux_server_domain_id<>'' AND b.tmux_server_instance_id<>''
+		  AND s.enabled=1 AND s.agent_family<>?
+		  AND s.expected_host_id<>'' AND s.expected_host_id=b.host_id
+		  AND s.expected_account_key<>'' AND s.expected_credential_lineage<>''
+		  AND b.provider=s.agent_family
+		ORDER BY s.agent_family,s.id`, projectID, DriverReviewerRole, builderFamily)
 	if err != nil {
 		return capacity.RouteDecision{}, err
 	}
@@ -68,7 +81,9 @@ func distinctReviewerCapacityTx(ctx context.Context, tx *sql.Tx, builderFamily s
 		return capacity.RouteDecision{}, err
 	}
 	if len(candidates) == 0 {
-		return capacity.RouteDecision{Reasons: []string{"no configured review seat from a distinct family"}}, nil
+		return capacity.RouteDecision{Reasons: []string{
+			"no active project-bound review seat from a distinct family",
+		}}, nil
 	}
 	var reasons []string
 	for _, candidate := range candidates {
@@ -457,13 +472,18 @@ func capacityRouteForSeatQueryExcludingEpic(ctx context.Context, q capacityQuery
 	var seatHealth, seatFetched, accountFetched, seatWindows, accountWindows string
 	var reserve float64
 	err := q.QueryRowContext(ctx, `SELECT sp.provider,sp.account_key,sp.seat_id,sp.host_id,
-		se.enabled,se.health,sp.source,sp.trust_state,sp.identity_match,sp.lineage_match,
+		se.enabled,se.health,sp.source,sp.trust_state,
+		(sp.identity_match=1 AND sp.host_id=se.expected_host_id
+		 AND sp.account_key=se.expected_account_key AND sp.provider=se.agent_family),
+		(sp.lineage_match=1 AND obs.credential_lineage=se.expected_credential_lineage),
 		sp.fetched_at,ap.fetched_at,ap.trust_state,sp.rate_limited,ap.rate_limited,
 		sp.billing_period_active,se.max_concurrent,se.account_max_concurrent,se.capacity_reserve_pct,
 		sp.windows_json,ap.windows_json
 		FROM capacity_active_generation ag
 		JOIN capacity_seat_projection sp ON sp.seat_id=? AND sp.generation_id=ag.generation_id
 		JOIN seats se ON se.id=sp.seat_id
+		JOIN account_usage_observations obs ON obs.observation_id=sp.observation_id
+		 AND obs.generation_id=sp.generation_id AND obs.seat_id=sp.seat_id
 		JOIN capacity_account_projection ap ON ap.provider=sp.provider AND ap.account_key=sp.account_key
 		 AND ap.generation_id=ag.generation_id WHERE ag.singleton=1`, seatID).
 		Scan(&o.Provider, &o.AccountKey, &o.SeatID, &o.HostID, &enabled, &seatHealth,
