@@ -29,7 +29,7 @@ func GeneratedFiles(c Contract) (map[string][]byte, error) {
 		writeList(&b, "Autonomous recovery", role.Recovery)
 		writeList(&b, "Escalates to", role.EscalatesTo)
 		writeList(&b, "Forbidden", role.Forbidden)
-		files[filepath.Join("docs/runbooks/actors", role.ID+".md")] = []byte(b.String())
+		files[filepath.Join("docs/runbooks/actors", role.ID+".md")] = []byte(strings.TrimRight(b.String(), "\n") + "\n")
 	}
 
 	labels := map[string]map[string]string{}
