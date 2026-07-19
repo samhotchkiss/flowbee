@@ -41,35 +41,41 @@ func (s *Store) ListEpicRunsForRepo(ctx context.Context, repo string, now time.T
 		 ORDER BY id`, repo, cutoff)
 }
 
-// EpicForRepoBranch is the epic-lane Phase 3 Epic-PR detection helper's DIRECT form
-// (task brief point 1: "a PR whose head branch matches branch epic/<slug> where an
-// epics row exists for that slug+repo"), for any caller that already knows the PR's
-// actual head branch name. ok=false (not an error) covers both the overwhelmingly
-// common case — an ordinary, non-epic branch — and a near-miss branch name
-// (SlugFromBranch) or a slug registered for a DIFFERENT repo (same slug, two repos,
-// never the same epic).
-//
-// Nothing in this control plane currently calls this with a real branch name: GitHub
-// gives Flowbee no fact naming a PR's head branch (BoardSweep/PullRequest fetch only
-// headRefOid, the SHA — see EpicForHeadSHA's doc for the practical runtime substitute
-// this repo actually wires up). This direct form is kept as the literal, narrowly
-// testable realization of the task brief's own wording, and is what a FUTURE caller
-// that does have a branch name (e.g. a webhook payload, which DOES carry
-// pull_request.head.ref) should reach for first.
+// EpicForRepoBranch resolves the exact persisted repo/branch identity. The epic id
+// is intentionally opaque in v2, so deriving it from an `epic/<slug>` string would
+// bind the wrong row after admission moved to stable ids. Ambiguous persisted
+// identities fail closed rather than selecting an arbitrary delivery.
 func (s *Store) EpicForRepoBranch(ctx context.Context, repo, branch string) (EpicRun, bool, error) {
-	slug, ok := epicspec.SlugFromBranch(branch)
-	if !ok {
+	if branch == "" {
 		return EpicRun{}, false, nil
 	}
-	e, err := s.GetEpicRun(ctx, slug)
-	if errors.Is(err, ErrEpicRunNotFound) {
-		return EpicRun{}, false, nil
-	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT id FROM epics
+		WHERE repo=? AND branch=? AND state<>'abandoned'
+		ORDER BY id LIMIT 2`, repo, branch)
 	if err != nil {
 		return EpicRun{}, false, err
 	}
-	if e.Repo != repo {
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return EpicRun{}, false, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return EpicRun{}, false, err
+	}
+	if len(ids) == 0 {
 		return EpicRun{}, false, nil
+	}
+	if len(ids) > 1 {
+		return EpicRun{}, false, fmt.Errorf("%w: repo=%q branch=%q", ErrEpicArtifactOwnershipAmbiguous, repo, branch)
+	}
+	e, err := s.GetEpicRun(ctx, ids[0])
+	if err != nil {
+		return EpicRun{}, false, err
 	}
 	return e, true, nil
 }

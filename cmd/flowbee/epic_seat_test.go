@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/acctprobe"
+	"github.com/samhotchkiss/flowbee/internal/capacity"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
@@ -264,6 +265,44 @@ func TestEpicSelectSeat(t *testing.T) {
 		}
 		if !gate.refuse || !gate.hardNoSeat {
 			t.Fatalf("all boxes at cap must hard-refuse (--force-quota must not conjure a slot), got %+v", gate)
+		}
+	})
+
+	t.Run("v2 builder selector fails closed then uses the active generation", func(t *testing.T) {
+		st := testutil.NewStore(t)
+		st.EnableCapacityV2 = true
+		addCapSeat(st, "codex-v2@localhost", "account-v2", "codex", 2)
+		seats, err := st.ListSeats(ctx)
+		if err != nil || len(seats) != 1 {
+			t.Fatalf("seats=%+v err=%v", seats, err)
+		}
+		seat := seats[0]
+		if err := st.BindCapacitySeatIdentity(ctx, store.CapacitySeatIdentity{
+			SeatID: seat.ID, HostID: seat.Box, AccountKey: seat.AccountKey,
+			CredentialLineage: "lineage-v2", ReservePct: 10, AccountMaximum: 3,
+		}, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, gate, err := epicSelectSeat(ctx, st, "codex", "", nil); err != nil || !gate.refuse {
+			t.Fatalf("missing active generation must refuse: gate=%+v err=%v", gate, err)
+		}
+		observed := time.Now().UTC()
+		if err := st.CommitCapacityGeneration(ctx, store.CapacityGeneration{
+			ID: "builder-generation", StartedAt: observed,
+			ExpectedSeatIDs: []string{seat.ID},
+			Observations: []store.CapacitySeatObservation{{
+				ObservationID: "builder-observation", SeatID: seat.ID, HostID: seat.Box,
+				Provider: "codex", AccountKey: seat.AccountKey, CredentialLineage: "lineage-v2",
+				CollectorID: "collector-v2", Source: "live_app_server", TrustState: "verified",
+				IntegrityState: "verified", FetchedAt: observed, AdapterVersion: "codex-live/v1",
+				Windows: []capacity.RouteWindow{{Kind: "weekly", Applicable: true, Known: true, Percent: 20}},
+			}},
+		}, observed); err != nil {
+			t.Fatal(err)
+		}
+		got, gate, err := epicSelectSeat(ctx, st, "codex", "", nil)
+		if err != nil || gate.refuse || got.ID != seat.ID {
+			t.Fatalf("active generation selection seat=%+v gate=%+v err=%v", got, gate, err)
 		}
 	})
 }

@@ -60,8 +60,8 @@ func TestCodexLiveWindowsBucketing(t *testing.T) {
 				spark = &ws[i]
 			}
 		}
-		if spark == nil || spark.Scope != "Spark" || spark.Percent != 3 {
-			t.Errorf("scoped window=%+v want Spark 3%% (trailing codename)", spark)
+		if spark == nil || spark.Scope != "codex_bengalfox" || spark.Display != "Spark" || spark.Percent != 3 {
+			t.Errorf("scoped window=%+v want stable id codex_bengalfox + display Spark + 3%%", spark)
 		}
 	})
 

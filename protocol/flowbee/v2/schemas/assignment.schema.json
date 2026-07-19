@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flowbee.assignment/v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version", "schema_id", "schema_sha256", "assignment_id",
+    "action_id", "lease_id", "lease_epoch", "project_id", "role",
+    "target", "desired_outcome", "allowed_result_kinds", "idempotency_key"
+  ],
+  "properties": {
+    "protocol_version": {"type": "string", "const": "2.0"},
+    "schema_id": {"type": "string", "const": "flowbee.assignment/v2"},
+    "schema_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "assignment_id": {"type": "string", "minLength": 1},
+    "action_id": {"type": "string", "minLength": 1},
+    "action_epoch": {"type": "integer", "minimum": 1},
+    "lease_id": {"type": "string", "minLength": 1},
+    "lease_epoch": {"type": "integer", "minimum": 1},
+    "project_id": {"type": "string", "minLength": 1},
+    "epic_id": {"type": "string"},
+    "role": {"type": "string", "enum": ["interactor", "orchestrator", "operational_agent", "builder", "reviewer"]},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_id", "store_id", "session_id", "pane_instance_id", "agent_run_id"],
+      "properties": {
+        "host_id": {"type": "string", "minLength": 1},
+        "store_id": {"type": "string", "minLength": 1},
+        "session_id": {"type": "string", "minLength": 1},
+        "pane_instance_id": {"type": "string", "minLength": 1},
+        "agent_run_id": {"type": "string", "minLength": 1},
+        "provider": {"type": "string"},
+        "conversation_id": {"type": "string"}
+      }
+    },
+    "desired_outcome": {"type": "string", "minLength": 1},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "content_sha256", "head_sha", "base_sha"],
+      "properties": {
+        "version": {"type": "integer", "minimum": 1},
+        "content_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "head_sha": {"type": "string", "minLength": 7},
+        "base_sha": {"type": "string", "minLength": 7}
+      }
+    },
+    "allowed_result_kinds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "ack_deadline": {"type": "string", "format": "date-time"},
+    "lease_deadline": {"type": "string", "format": "date-time"},
+    "recovery_code": {"type": "string"},
+    "recovery_endpoint": {"type": "string"},
+    "escalation_route": {"type": "string"},
+    "idempotency_key": {"type": "string", "minLength": 1}
+  }
+}

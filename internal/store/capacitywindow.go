@@ -23,6 +23,8 @@ import (
 // absent window is never a real 0% — acctprobe's own "absent ≠ zero" invariant).
 const unknownPct = -1.0
 
+var ErrLegacyCapacityWriterDisabled = errors.New("legacy account capacity writer disabled under capacity routing v2")
+
 // AccountWindow is one account_windows row (a read model). Percentages carry -1 for
 // UNKNOWN; ProbeStale is the §12.14 flag (true = the reading is old/untrustworthy for
 // gating). It joins 1:1 to worker_accounts on AccountKey == account_id.
@@ -78,6 +80,9 @@ func (a AccountWindow) CriticalNonStale() bool {
 //
 // Both writes commit in ONE serialized tx. now is the fold instant (passed in).
 func (s *Store) UpsertAccountLimits(ctx context.Context, res acctprobe.Result, now time.Time) error {
+	if s.EnableCapacityV2 {
+		return ErrLegacyCapacityWriterDisabled
+	}
 	key := res.Identity.AccountKey
 	if key == "" {
 		return errors.New("acctprobe result has no account key (cannot key account_windows)")

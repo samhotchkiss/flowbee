@@ -18,6 +18,7 @@ import (
 	"embed"
 	"html/template"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/clock"
@@ -25,7 +26,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
-//go:embed assets/*.css assets/*.js
+//go:embed assets/*.css assets/*.js assets/*.json
 var assetsFS embed.FS
 
 //go:embed templates/*.html
@@ -51,6 +52,8 @@ type Data interface {
 	ListSupervisors(ctx context.Context) ([]store.Supervisor, error)
 	ListAccountWindows(ctx context.Context) ([]store.AccountWindow, error)
 	ListOpenAttention(ctx context.Context, state string, kinds []string, repo string) ([]store.AttentionItem, error)
+	ListDecisionInboxAllProjects(ctx context.Context, resolvedLimit int) ([]store.DecisionInboxRow, error)
+	ProjectDashboard(ctx context.Context) ([]store.ProjectDashboardRow, error)
 }
 
 // UI serves the F12 dashboards. It holds the parsed templates + the data source +
@@ -64,13 +67,35 @@ type UI struct {
 	// to red, red beyond). Operator-tunable; sensible defaults if zero.
 	amber time.Duration
 	red   time.Duration
+	// Driver control messaging is separate from observation/SSE liveness. The
+	// workspace uses this read-only capability to avoid presenting a live send
+	// path while Flowbee-authored routes are held fail-closed.
+	driverControlRequired  bool
+	driverControlAvailable bool
+	driverControlGap       string
+	driverControlReason    string
+	driverControlCurrent   func() DriverControlState
+}
+
+// DriverControlState is the UI's non-secret view of the live Driver
+// authorization fence. It intentionally carries no transport handle.
+type DriverControlState struct {
+	Required  bool
+	Available bool
+	Gap       string
+	Reason    string
 }
 
 // Config carries the UI knobs.
 type Config struct {
-	StaleHB    time.Duration // the roster stale-heartbeat threshold (mirrors api).
-	StageAmber time.Duration // a card turns amber after this long in a stage.
-	StageRed   time.Duration // a card turns red after this long in a stage.
+	StaleHB                time.Duration // the roster stale-heartbeat threshold (mirrors api).
+	StageAmber             time.Duration // a card turns amber after this long in a stage.
+	StageRed               time.Duration // a card turns red after this long in a stage.
+	DriverControlRequired  bool
+	DriverControlAvailable bool
+	DriverControlGap       string
+	DriverControlReason    string
+	DriverControlCurrent   func() DriverControlState
 }
 
 // New builds the UI, parsing the embedded templates with the helper funcs.
@@ -86,7 +111,13 @@ func New(data Data, clk clock.Clock, cfg Config) *UI {
 	if stale <= 0 {
 		stale = 90 * time.Second
 	}
-	u := &UI{data: data, clock: clk, staleHB: stale, amber: amber, red: red}
+	u := &UI{data: data, clock: clk, staleHB: stale, amber: amber, red: red,
+		driverControlRequired:  cfg.DriverControlRequired,
+		driverControlAvailable: cfg.DriverControlAvailable,
+		driverControlGap:       cfg.DriverControlGap,
+		driverControlReason:    cfg.DriverControlReason,
+		driverControlCurrent:   cfg.DriverControlCurrent,
+	}
 	u.tmpl = template.Must(template.New("web").Funcs(u.funcs()).ParseFS(tmplFS, "templates/*.html"))
 	return u
 }
@@ -100,6 +131,7 @@ func (u *UI) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /", u.epics)
 	mux.HandleFunc("GET /epics", u.epics)
 	mux.HandleFunc("GET /dashboard", u.epics)
+	mux.HandleFunc("GET /workspace", u.workspace)
 	mux.HandleFunc("GET /board", u.board)
 	mux.HandleFunc("GET /board/detail", u.detail)
 	mux.HandleFunc("GET /fleet", u.fleet)
@@ -131,6 +163,7 @@ func (u *UI) funcs() template.FuncMap {
 		"pips":       pips,
 		"ratio":      ratioPct,
 		"sub":        func(a, b int) int { return a - b },
+		"lower":      strings.ToLower,
 	}
 }
 

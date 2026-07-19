@@ -1,0 +1,126 @@
+protocol:
+  id: flowbee.actor-protocol/v2
+  major: 2
+  minor: 0
+  maximum_kernel_words: 180
+  maximum_role_card_words: 420
+
+common_kernel:
+  - The Flowbee database is workflow truth; transcripts, panes, and agent prose are observations only.
+  - Act only under a current project-scoped assignment, capability, incarnation, lease, and epoch.
+  - Bind every judgment and external effect to the supplied artifact version, content hash, head SHA, and base SHA.
+  - Retry with the existing idempotency key and verify uncertain effects before retrying; never invent a replacement identity.
+  - Recovery completes or verifies existing durable intent and never broadens authority.
+  - On ambiguity persist a visible hold or typed escalation instead of guessing or failing open.
+  - A transport receipt proves insertion only and never proves build, review, merge, or cleanup completion.
+
+roles:
+  - id: human
+    authority: States product intent, answers typed questions, approves exact artifacts, and grants exceptional authority.
+    outputs: [typed response, version-bound approval, work intent]
+    capabilities: [decision.respond, work_intent.amend, work_intent.cancel]
+    recovery: [retry the same idempotent dashboard response]
+    escalates_to: [interactor]
+    forbidden: [dispatch reviews, mutate workflow state, provide an extra go after configured gates pass]
+  - id: dashboard
+    authority: Renders durable read models and submits authenticated version-bound human commands.
+    outputs: [idempotent command, durable message, typed decision response]
+    capabilities: [read.project, read.portfolio, decision.submit, conversation.send]
+    recovery: [refetch after cursor gaps, retry the same request key]
+    escalates_to: [human]
+    forbidden: [compute workflow truth locally, convert prose to authorization, report unacknowledged work complete]
+  - id: interactor
+    authority: Owns one project conversation, persists work intent, frames typed decisions, and routes ready intent to its paired Orchestrator.
+    outputs: [work intent, decision request, orchestrator route action]
+    capabilities: [conversation.frame, work_intent.persist, decision.request, orchestrator.route]
+    recovery: [rehydrate durable threads and acknowledgements, replay the same durable route]
+    escalates_to: [human, orchestrator]
+    forbidden: [dispatch build or review or merge work, infer approval from prose, retain work only in transcript, ask human to push ready intent]
+  - id: orchestrator
+    authority: Owns project priorities, dependencies, definition quality, issue grouping, and epic contract materialization.
+    outputs: [versioned epic contract, admission request]
+    capabilities: [work_intent.claim, epic_contract.write, epic.admit]
+    recovery: [drain ready intents, query admission by original idempotency key before retry]
+    escalates_to: [interactor, flowbee]
+    forbidden: [own post-admission continuity, manually dispatch review, adopt arbitrary artifacts, bypass a human gate]
+  - id: flowbee
+    authority: Deterministically owns durable state, legal transitions, leases, gates, scheduling, reconciliation, alerts, and effect outboxes.
+    outputs: [fenced assignment, durable action, transition, attention, alert]
+    capabilities: [workflow.transition, lease.issue, action.commit, reconcile, alert]
+    recovery: [reap stale leases, reconcile facts, repair missing actions, verify uncertain effects, resume on startup]
+    escalates_to: [operational_agent, orchestrator, interactor]
+    forbidden: [depend on session memory, accept agent prose as GitHub truth, expose generic set-state, fail open silently]
+  - id: operational_agent
+    authority: Performs bounded operational supervision under one durable action and reports mechanical evidence.
+    outputs: [structured evidence, bounded repair result]
+    capabilities: [action.claim, evidence.report, repair.minor]
+    recovery: [resume a live fenced action, verify receipts, relinquish stale work]
+    escalates_to: [orchestrator, interactor, flowbee]
+    forbidden: [direct database transition, product decision, artifact adoption, blind resend, review without separate reviewer lease]
+  - id: builder
+    authority: Implements one bounded epic on its registered branch and worktree and reports structured evidence.
+    outputs: [artifact, progress fact, build result]
+    capabilities: [build, test, artifact.report]
+    recovery: [relaunch the same affinity under a new incarnation, resume rework after capacity reacquisition]
+    escalates_to: [orchestrator, flowbee]
+    forbidden: [choose pipeline state, merge, self-review, touch another epic workspace, call GitHub with worker credentials]
+  - id: reviewer
+    authority: Independently judges the exact assigned artifact and returns a structured SHA-bound verdict.
+    outputs: [SHA-bound verdict, review evidence]
+    capabilities: [review, verdict.submit]
+    recovery: [resume only while lease epoch artifact and SHAs remain current]
+    escalates_to: [orchestrator, flowbee]
+    forbidden: [review another head, same-family fallback, modify delivery, merge, submit after fencing]
+  - id: driver
+    authority: Owns exact terminal identities, lifecycle, observation archive, routed grants, verified insertion receipts, and control APIs.
+    outputs: [stable identity, observation event, route receipt, transport receipt]
+    capabilities: [session.ensure, route.grant, message.insert, observe]
+    recovery: [reconcile transport uncertainty from stable identities receipts and observation evidence]
+    escalates_to: [flowbee]
+    forbidden: [choose product routes, decide workflow transitions, assert GitHub facts, treat insertion as stage completion]
+  - id: capacity_collector
+    authority: Performs read-only on-host provider probes and reports sanitized identity-bound capacity observations.
+    outputs: [signed usage observation, identity lineage evidence]
+    capabilities: [capacity.observe]
+    recovery: [honor durable backoff, retry live collection, preserve last-good history]
+    escalates_to: [flowbee]
+    forbidden: [choose routes, export credentials, promote cache data to routable, relabel windows, infer reset]
+
+# Every entry is closed, fenced, bounded, and has a named proof. attention_kind is
+# optional for protocol-only failures; delivery attention kinds are exhaustive.
+recovery_codes:
+  - {code: builder_launch_stalled, attention_kind: launch_failed, invariant: admitted work has one fenced launch action, predicate: admitted delivery is past state_due_at without a live launch action or visible hold, owner: flowbee, automatic: true, repair_action: ensure_builder_launch, fence: delivery_state_version+action_epoch+target_incarnation, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/builder_launch_stalled, test_id: recovery_builder_launch_stalled}
+  - {code: builder_progress_stalled, attention_kind: build_stalled, invariant: a building delivery produces durable progress, predicate: building delivery is past fact_progress_at without a newer builder fact, owner: flowbee, automatic: true, repair_action: verify_or_relaunch_builder, fence: delivery_state_version+lease_epoch+agent_run_id, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/builder_progress_stalled, test_id: recovery_builder_progress_stalled}
+  - {code: artifact_never_produced, attention_kind: artifact_overdue, invariant: a completed build binds one owned artifact, predicate: awaiting_artifact is past state_due_at without an owned current artifact, owner: flowbee, automatic: true, repair_action: reconcile_owned_artifact, fence: delivery_state_version+artifact_version, maximum_attempts: 3, escalation_target: orchestrator, severity: critical, help_path: /help/recovery/artifact_never_produced, test_id: recovery_artifact_never_produced}
+  - {code: ci_never_green, attention_kind: ci_pending_overdue, invariant: review requires real CI success at current head, predicate: awaiting_ci is past state_due_at without complete required checks, owner: flowbee, automatic: true, repair_action: refresh_ci_facts, fence: artifact_version+head_sha+base_sha, maximum_attempts: 6, escalation_target: operational_agent, severity: warning, help_path: /help/recovery/ci_never_green, test_id: recovery_ci_never_green}
+  - {code: review_dispatch_missing, attention_kind: review_dispatch_stalled, invariant: each eligible current artifact has one native review obligation, predicate: current CI-green artifact has no verdict live reviewer or native review job past dispatch_due_at, owner: flowbee, automatic: true, repair_action: ensure_native_review, fence: delivery_state_version+head_sha+base_sha, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/review_dispatch_missing, test_id: production_drop_4950_4951}
+  - {code: review_capacity_unavailable, attention_kind: review_capacity_exhausted, invariant: queued review has an eligible distinct-family route or visible hold, predicate: review_queued is past state_due_at with zero routable distinct-family seats, owner: flowbee, automatic: true, repair_action: reconcile_review_capacity, fence: delivery_state_version+capacity_generation, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/review_capacity_unavailable, test_id: recovery_review_capacity_unavailable}
+  - {code: review_verdict_overdue, attention_kind: review_verdict_overdue, invariant: a live reviewer lease produces durable progress or is fenced, predicate: in_review is past last_reviewer_fact_at without a current verdict, owner: flowbee, automatic: true, repair_action: fence_and_requeue_reviewer, fence: delivery_state_version+review_lease_epoch+head_sha, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/review_verdict_overdue, test_id: hung_reviewer_fenced}
+  - {code: rework_dispatch_stalled, attention_kind: builder_rework_stalled, invariant: rejected work receives one fenced rework action, predicate: changes_requested or rebuild_in_flight is overdue without current builder evidence, owner: flowbee, automatic: true, repair_action: ensure_builder_rework, fence: delivery_state_version+head_sha+action_epoch, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/rework_dispatch_stalled, test_id: recovery_rework_dispatch_stalled}
+  - {code: merge_dispatch_stalled, attention_kind: merge_dispatch_stalled, invariant: approved current head has one exact-head merge effect, predicate: merge_queued or merging is overdue without a current merge fact, owner: flowbee, automatic: true, repair_action: verify_or_dispatch_exact_head_merge, fence: delivery_state_version+verdict_head_sha+action_epoch, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/merge_dispatch_stalled, test_id: recovery_merge_dispatch_stalled}
+  - {code: conflict_resolution_stalled, attention_kind: conflict_resolution_stalled, invariant: a conflict resolution returns through CI and independent review, predicate: conflict_resolution is past fact_progress_at without a newer resolved head, owner: flowbee, automatic: true, repair_action: verify_or_relaunch_conflict_resolution, fence: delivery_state_version+head_sha+action_epoch, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/conflict_resolution_stalled, test_id: recovery_conflict_resolution_stalled}
+  - {code: cleanup_overdue, attention_kind: cleanup_overdue, invariant: merged delivery resources are proven absent, predicate: merged or cleanup_pending is overdue without remote absence evidence, owner: flowbee, automatic: true, repair_action: verify_or_dispatch_cleanup, fence: delivery_state_version+target_incarnation+action_epoch, maximum_attempts: 3, escalation_target: operational_agent, severity: warning, help_path: /help/recovery/cleanup_overdue, test_id: recovery_cleanup_overdue}
+  - {code: hold_overdue, attention_kind: hold_overdue, invariant: visible holds have a typed owner and disposition, predicate: paused or needs_human is past state_due_at without a response, owner: flowbee, automatic: false, repair_action: request_typed_disposition, fence: delivery_state_version+decision_subject_hash, maximum_attempts: 0, escalation_target: interactor, severity: warning, help_path: /help/recovery/hold_overdue, test_id: recovery_hold_overdue}
+  - {code: action_delivery_uncertain, invariant: uncertain effects are verified before retry, predicate: action is verifying without conclusive receipt or mechanical evidence, owner: flowbee, automatic: true, repair_action: verify_existing_action, fence: action_id+action_epoch+payload_sha256+target_incarnation, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/action_delivery_uncertain, test_id: driver_crash_uncertain_no_resend}
+  - {code: action_ack_overdue, invariant: transport and stage acknowledgement remain distinct, predicate: submitted action has no independent stage evidence before its due clock, owner: flowbee, automatic: true, repair_action: reconcile_stage_evidence, fence: action_id+action_epoch+artifact_version, maximum_attempts: 3, escalation_target: operational_agent, severity: warning, help_path: /help/recovery/action_ack_overdue, test_id: transport_is_not_stage_success}
+  - {code: lease_expired, invariant: stale actors cannot report after their lease epoch, predicate: a lease deadline passed without renewal or completion, owner: flowbee, automatic: true, repair_action: fence_and_requeue_lease, fence: lease_id+lease_epoch+agent_run_id, maximum_attempts: 3, escalation_target: operational_agent, severity: warning, help_path: /help/recovery/lease_expired, test_id: stale_lease_result_fenced}
+  - {code: artifact_advanced, invariant: old-head actions and verdicts never affect a new head, predicate: observed head or base differs from bound action and verdict SHAs, owner: flowbee, automatic: true, repair_action: cancel_superseded_and_return_to_ci, fence: artifact_version+head_sha+base_sha, maximum_attempts: 1, escalation_target: operational_agent, severity: info, help_path: /help/recovery/artifact_advanced, test_id: head_advance_cancels_stale_effects}
+  - {code: reconciler_dead, invariant: every enabled reconciler advances a durable heartbeat, predicate: reconciler heartbeat is stale past its declared SLO, owner: flowbee, automatic: true, repair_action: restart_control_plane_and_reconcile, fence: process_incarnation+reconciler_generation, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/reconciler_dead, test_id: stale_reconciler_heartbeat_alerts}
+  - {code: capacity_live_unavailable, invariant: cache and stale observations are visible but never routable, predicate: a required seat has no fresh verified live observation, owner: flowbee, automatic: true, repair_action: retry_live_capacity_collection, fence: seat_id+lineage_version+collector_epoch, maximum_attempts: 5, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/capacity_live_unavailable, test_id: cache_never_routes}
+  - {code: capacity_identity_mismatch, invariant: observed provider identity and credential lineage match registration, predicate: expected and observed account or lineage differ, owner: flowbee, automatic: false, repair_action: hold_seat_for_explicit_rebind, fence: seat_id+expected_lineage_version, maximum_attempts: 0, escalation_target: human, severity: critical, help_path: /help/recovery/capacity_identity_mismatch, test_id: identity_swap_fences_seat}
+  - {code: capacity_pool_exhausted, invariant: eligible work with zero routable seats is durably visible and pushed, predicate: a required build review or operations pool has queued work and zero routes past threshold, owner: flowbee, automatic: true, repair_action: reconcile_capacity_pool, fence: project_id+pool+capacity_generation, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/capacity_pool_exhausted, test_id: zero_pool_pushes_alert}
+  - {code: protocol_incompatible, invariant: incompatible actors receive no new lease, predicate: protocol major schema hash or role bundle is unsupported, owner: flowbee, automatic: false, repair_action: hold_actor_until_compatible, fence: actor_run_id+bundle_hash+schema_hash, maximum_attempts: 0, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/protocol_incompatible, test_id: incompatible_actor_gets_no_lease}
+  - {code: work_intent_capture_unacked, invariant: ordinary human requests are durable before acceptance is reported, predicate: conversation message has no work-intent persistence acknowledgement, owner: interactor, automatic: true, repair_action: persist_same_work_intent, fence: project_id+source_message_id+intent_version, maximum_attempts: 3, escalation_target: flowbee, severity: critical, help_path: /help/recovery/work_intent_capture_unacked, test_id: interactor_restart_recovers_intent}
+  - {code: work_intent_promotion_stalled, invariant: a ready intent automatically reaches the paired Orchestrator, predicate: ready work intent lacks a current route action or acknowledgement, owner: flowbee, automatic: true, repair_action: ensure_orchestrator_route, fence: project_id+work_intent_id+intent_version, maximum_attempts: 3, escalation_target: interactor, severity: critical, help_path: /help/recovery/work_intent_promotion_stalled, test_id: ready_intent_auto_promotes}
+  - {code: orchestrator_claim_expired, invariant: ready intent is claimed by exactly its paired Orchestrator, predicate: orchestrator route lease expired without an epic contract, owner: flowbee, automatic: true, repair_action: fence_and_requeue_orchestrator_claim, fence: route_action_id+lease_epoch+agent_run_id, maximum_attempts: 3, escalation_target: interactor, severity: critical, help_path: /help/recovery/orchestrator_claim_expired, test_id: orchestrator_claim_restart}
+  - {code: epic_admission_outcome_uncertain, invariant: admission retry queries the original idempotency key first, predicate: an admission action outcome is unknown, owner: orchestrator, automatic: true, repair_action: query_then_retry_same_admission, fence: project_id+work_intent_id+intent_version+contract_hash, maximum_attempts: 3, escalation_target: flowbee, severity: critical, help_path: /help/recovery/epic_admission_outcome_uncertain, test_id: admission_lost_ack_one_epic}
+  - {code: epic_admission_ack_stalled, invariant: admitted epic identity is acknowledged upstream exactly once, predicate: admitted epic has no acknowledged upstream admission response, owner: flowbee, automatic: true, repair_action: ensure_admission_ack, fence: project_id+epic_id+admission_key, maximum_attempts: 3, escalation_target: interactor, severity: warning, help_path: /help/recovery/epic_admission_ack_stalled, test_id: admission_ack_restart}
+  - {code: decision_ack_overdue, invariant: an immutable typed response reaches every required actor, predicate: a current response is unacknowledged past its due clock, owner: flowbee, automatic: true, repair_action: ensure_decision_ack_chain, fence: request_id+subject_hash+response_version, maximum_attempts: 3, escalation_target: interactor, severity: warning, help_path: /help/recovery/decision_ack_overdue, test_id: decision_ack_restart}
+  - {code: orchestrator_route_absent, invariant: each project has exactly one current Interactor-to-Orchestrator route, predicate: ready project work has no compatible paired Orchestrator route, owner: flowbee, automatic: true, repair_action: reconcile_project_actor_route, fence: project_id+registration_version, maximum_attempts: 3, escalation_target: interactor, severity: critical, help_path: /help/recovery/orchestrator_route_absent, test_id: project_route_absent_alert}
+  - {code: operational_supervisor_absent, invariant: bounded operational work has a routable supervisor, predicate: operational actions are queued with no compatible operations seat, owner: flowbee, automatic: true, repair_action: reconcile_operations_route, fence: project_id+capacity_generation, maximum_attempts: 3, escalation_target: human, severity: critical, help_path: /help/recovery/operational_supervisor_absent, test_id: operations_pool_absent_alert}
+  - {code: builder_host_unreachable, invariant: a builder target is observed from its exact registered host and store, predicate: expected host or Driver store is unreachable beyond threshold, owner: flowbee, automatic: true, repair_action: verify_host_then_hold_or_rehome, fence: host_id+store_id+target_epoch, maximum_attempts: 3, escalation_target: operational_agent, severity: critical, help_path: /help/recovery/builder_host_unreachable, test_id: host_failure_isolated}
+
+required_schemas:
+  - {id: flowbee.assignment/v2, sha256: "sha256:ca62045fc2078085d95c3bd2e2bd389707c352e9a2a0f0eb415ed09c310bdcaa"}
+  - {id: flowbee.result/v2, sha256: "sha256:9f660d289c8859ff251b9e4712f0462fb1baf8d1b4620dee7478590e423a5f9c"}
+  - {id: flowbee.recovery/v2, sha256: "sha256:6201f58ea03b794513bd444c8d28cdaf024790ba97f0a037b82487b5b8bbfddc"}

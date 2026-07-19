@@ -22,7 +22,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
-// runSeat is the `flowbee seat <add|list|probe|discover>` CLI: the SEAT registry (plan
+// runSeat is the `flowbee seat <add|list|probe|discover|bind-capacity|bind-driver>` CLI: the SEAT registry (plan
 // §15.13, 0028_epic_capacity.sql) — where each account is already logged-in-and-usable
 // on a box. Store-direct like `flowbee host` (pure registry CRUD, no serve round-trip).
 // Flowbee NEVER logs in; discovery only READS what a human already authenticated, and
@@ -30,7 +30,7 @@ import (
 // non-secret identity + server percentages).
 func runSeat(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: flowbee seat <add|list|probe|discover> ...")
+		return fmt.Errorf("usage: flowbee seat <add|list|probe|discover|bind-capacity|bind-driver> ...")
 	}
 	sub, rest := args[0], args[1:]
 
@@ -56,9 +56,100 @@ func runSeat(args []string) error {
 		return runSeatDiscover(ctx, st, rest)
 	case "set-max-concurrent":
 		return runSeatSetMaxConcurrent(ctx, st, rest)
+	case "bind-capacity":
+		return runSeatBindCapacity(ctx, st, rest)
+	case "bind-driver":
+		return runSeatBindDriver(ctx, st, rest)
 	default:
-		return fmt.Errorf("unknown `flowbee seat` subcommand %q (want add|list|probe|discover|set-max-concurrent)", sub)
+		return fmt.Errorf("unknown `flowbee seat` subcommand %q (want add|list|probe|discover|set-max-concurrent|bind-capacity|bind-driver)", sub)
 	}
+}
+
+// runSeatBindDriver explicitly joins a capacity seat to a configured Driver
+// instance/profile/workspace. Driver-generated session identities are never
+// accepted here: the launch reconciler obtains and persists those only from an
+// exact lifecycle Ensure receipt.
+func runSeatBindDriver(ctx context.Context, st *store.Store, args []string) error {
+	fs := flag.NewFlagSet("seat bind-driver", flag.ContinueOnError)
+	projectID := fs.String("project-id", "default", "Flowbee project identity")
+	box := fs.String("box", "", "registered stable host identity")
+	family := fs.String("family", "", "agent family: claude|codex|grok (required)")
+	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR / GROK_HOME")
+	codexHome := fs.String("codex-home", "", "CODEX_HOME for a codex seat")
+	instanceRef := fs.String("instance-ref", "", "Flowbee Driver inventory key (required)")
+	serverID := fs.String("tmux-server-instance-id", "", "Driver tmux server incarnation (required)")
+	profileID := fs.String("profile-id", "", "Driver launch profile identity (required)")
+	workspaceRootID := fs.String("workspace-root-id", "", "Driver workspace root identity (required)")
+	workspaceBase := fs.String("workspace-relative-base", "", "clean relative base for per-epic workspaces (required)")
+	disabled := fs.Bool("disabled", false, "record the binding disabled")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *family == "" || *instanceRef == "" || *serverID == "" ||
+		*profileID == "" || *workspaceRootID == "" || *workspaceBase == "" {
+		return errors.New("usage: flowbee seat bind-driver --box <stable-host-id> --family <claude|codex|grok> [--config-dir D | --codex-home D] --instance-ref <ref> --tmux-server-instance-id <id> --profile-id <id> --workspace-root-id <id> --workspace-relative-base <path> [--project-id P]")
+	}
+	seat := store.Seat{Box: *box, AgentFamily: *family, ConfigDir: *configDir, CodexHome: *codexHome}
+	id := seat.ComposeID()
+	if _, err := st.GetSeat(ctx, id); err != nil {
+		if errors.Is(err, store.ErrSeatNotFound) {
+			return fmt.Errorf("no such seat (box %q, family %q, dir %q) — see `flowbee seat list`",
+				boxLabel(*box), *family, seatDirOf(seat))
+		}
+		return err
+	}
+	if err := st.UpsertBuilderDriverTarget(ctx, store.BuilderDriverTarget{
+		ProjectID: *projectID, SeatID: id, InstanceRef: *instanceRef,
+		TmuxServerInstanceID: *serverID, ProfileID: *profileID,
+		WorkspaceRootID: *workspaceRootID, WorkspaceRelativeBase: *workspaceBase,
+		Enabled: !*disabled,
+	}, time.Now()); err != nil {
+		return err
+	}
+	fmt.Printf("✓ bound %s seat on host %q to Driver instance %q profile %q workspace %s/%s\n",
+		*family, *box, *instanceRef, *profileID, *workspaceRootID, *workspaceBase)
+	return nil
+}
+
+// runSeatBindCapacity records the immutable operator expectation that the v2
+// collector checks against its live provider response. This is deliberately a
+// separate, explicit registry operation: a collector may observe an account or
+// credential lineage, but it may never enroll or silently rewrite either one.
+func runSeatBindCapacity(ctx context.Context, st *store.Store, args []string) error {
+	fs := flag.NewFlagSet("seat bind-capacity", flag.ContinueOnError)
+	box := fs.String("box", "", "registered host / ssh destination ('' = control-plane box)")
+	family := fs.String("family", "", "agent family: claude|codex|grok (required)")
+	configDir := fs.String("config-dir", "", "CLAUDE_CONFIG_DIR (claude seats) / GROK_HOME (grok seats)")
+	codexHome := fs.String("codex-home", "", "CODEX_HOME (codex seats)")
+	hostID := fs.String("host-id", "", "authenticated capacity-collector host identity (required)")
+	accountKey := fs.String("account-key", "", "expected provider-global account identity (required)")
+	lineage := fs.String("credential-lineage", "", "expected non-secret credential-lineage digest (required)")
+	reserve := fs.Float64("reserve-pct", 10, "capacity reserved from routing, 0..100 (default 10)")
+	accountMaximum := fs.Int("account-max-concurrent", 0, "provider-account concurrency limit; 0 means no explicit account cap")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *family == "" || *hostID == "" || *accountKey == "" || *lineage == "" {
+		return errors.New("usage: flowbee seat bind-capacity --box <b> --family <claude|codex|grok> [--config-dir D | --codex-home D] --host-id <id> --account-key <key> --credential-lineage <digest> [--reserve-pct N] [--account-max-concurrent N]")
+	}
+	seat := store.Seat{Box: *box, AgentFamily: *family, ConfigDir: *configDir, CodexHome: *codexHome}
+	id := seat.ComposeID()
+	if _, err := st.GetSeat(ctx, id); err != nil {
+		if errors.Is(err, store.ErrSeatNotFound) {
+			return fmt.Errorf("no such seat (box %q, family %q, dir %q) — see `flowbee seat list`", boxLabel(*box), *family, seatDirOf(seat))
+		}
+		return err
+	}
+	if err := st.BindCapacitySeatIdentity(ctx, store.CapacitySeatIdentity{
+		SeatID: id, HostID: *hostID, AccountKey: *accountKey,
+		CredentialLineage: *lineage, ReservePct: *reserve,
+		AccountMaximum: *accountMaximum,
+	}, time.Now()); err != nil {
+		return err
+	}
+	fmt.Printf("✓ bound %s seat on box %q to capacity host %q and account %q\n",
+		*family, boxLabel(*box), *hostID, *accountKey)
+	return nil
 }
 
 // envFlag collects repeatable --env KEY=VAL flags into a map.

@@ -29,7 +29,10 @@ func (s *Store) EpicDigestSeq(ctx context.Context) (int64, error) {
 		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM supervisors
 		UNION ALL SELECT COALESCE(MAX(reported_at),'') FROM account_windows
 		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM seats
-		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM wip_markers`)
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM wip_markers
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM epic_deliveries
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM epic_artifacts
+		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM epic_actions`)
 	if err != nil {
 		return 0, err
 	}
@@ -51,7 +54,20 @@ func (s *Store) EpicDigestSeq(ctx context.Context) (int64, error) {
 			best = ms
 		}
 	}
-	return best, rows.Err()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	var controlSeq int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM control_events`).Scan(&controlSeq); err != nil {
+		return 0, err
+	}
+	if controlSeq > best {
+		best = controlSeq
+	}
+	return best, nil
 }
 
 // ParseTimeOrZero parses an RFC3339Nano store timestamp, returning the zero time on any

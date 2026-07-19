@@ -90,6 +90,7 @@ type ClaimSpecAuthorParams struct {
 	Attested    []string
 	TTL         time.Duration
 	Now         time.Time
+	Fair        *ProjectFairClaim
 }
 
 // ClaimSpecAuthor runs the atomic claim for the spec_authoring stage. It binds the
@@ -99,6 +100,9 @@ func (s *Store) ClaimSpecAuthor(ctx context.Context, p ClaimSpecAuthorParams) (*
 	deadline := p.Now.Add(p.TTL)
 	var result *lease.Lease
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := projectConcurrencyGateTx(ctx, tx, p.JobID); err != nil {
+			return err
+		}
 		var reqJSON, curState string
 		if err := tx.QueryRowContext(ctx,
 			`SELECT required_capabilities, state FROM jobs WHERE id = ?`, p.JobID).Scan(&reqJSON, &curState); err != nil {
@@ -162,6 +166,9 @@ func (s *Store) ClaimSpecAuthor(ctx context.Context, p ClaimSpecAuthorParams) (*
 			int(p.TTL/time.Second), deadline.Format(rfc3339)); err != nil {
 			return fmt.Errorf("insert spec author lease audit: %w", err)
 		}
+		if err := commitProjectFairClaimTx(ctx, tx, p.LeaseID, p.Fair); err != nil {
+			return fmt.Errorf("commit project fair turn: %w", err)
+		}
 		result = &lease.Lease{
 			LeaseID: p.LeaseID, JobID: p.JobID, Epoch: newEpoch,
 			Identity: p.Identity, ModelFamily: p.ModelFamily, TTL: p.TTL,
@@ -178,8 +185,11 @@ func (s *Store) ClaimSpecAuthor(ctx context.Context, p ClaimSpecAuthorParams) (*
 // candidatesInState returns every job in the given state as a Candidate.
 func (s *Store) candidatesInState(ctx context.Context, state job.State) ([]scheduler.Candidate, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, priority, enqueued_at, required_capabilities
-		  FROM jobs WHERE state = ?`, string(state))
+		SELECT id, project_id, priority, enqueued_at, required_capabilities
+		  FROM jobs j WHERE state = ?
+		   AND NOT EXISTS (SELECT 1 FROM project_circuit_breakers b
+		     WHERE b.project_id=j.project_id AND b.state<>'closed'
+		       AND (b.repo_id='' OR b.repo_id=j.repo))`, string(state))
 	if err != nil {
 		return nil, err
 	}
@@ -188,8 +198,14 @@ func (s *Store) candidatesInState(ctx context.Context, state job.State) ([]sched
 	for rows.Next() {
 		var c scheduler.Candidate
 		var enqueued, reqJSON string
-		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON); err != nil {
+		if err := rows.Scan(&c.JobID, &c.ProjectID, &c.Priority, &enqueued, &reqJSON); err != nil {
 			return nil, err
+		}
+		switch state {
+		case job.StateSpecAuthoring:
+			c.Pool = scheduler.PoolSpecAuthor
+		case job.StateSpecReview:
+			c.Pool = scheduler.PoolSpecReview
 		}
 		if ts, perr := time.Parse(rfc3339, enqueued); perr == nil {
 			c.EnqueuedAt = ts
@@ -392,6 +408,7 @@ type ClaimSpecReviewParams struct {
 	Attested    []string
 	TTL         time.Duration
 	Now         time.Time
+	Fair        *ProjectFairClaim
 }
 
 // ClaimSpecReview runs the atomic claim for the spec_review gate stage. The §5.5
@@ -403,6 +420,9 @@ func (s *Store) ClaimSpecReview(ctx context.Context, p ClaimSpecReviewParams) (*
 	deadline := p.Now.Add(p.TTL)
 	var result *lease.Lease
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := projectConcurrencyGateTx(ctx, tx, p.JobID); err != nil {
+			return err
+		}
 		var reqJSON, curState, authorLens string
 		if err := tx.QueryRowContext(ctx,
 			`SELECT required_capabilities, state, COALESCE(author_lens,'') FROM jobs WHERE id = ?`, p.JobID).
@@ -468,6 +488,9 @@ func (s *Store) ClaimSpecReview(ctx context.Context, p ClaimSpecReviewParams) (*
 			p.LeaseID, p.JobID, newEpoch, p.Identity, p.ModelFamily,
 			int(p.TTL/time.Second), deadline.Format(rfc3339)); err != nil {
 			return fmt.Errorf("insert spec review lease audit: %w", err)
+		}
+		if err := commitProjectFairClaimTx(ctx, tx, p.LeaseID, p.Fair); err != nil {
+			return fmt.Errorf("commit project fair turn: %w", err)
 		}
 		result = &lease.Lease{
 			LeaseID: p.LeaseID, JobID: p.JobID, Epoch: newEpoch,

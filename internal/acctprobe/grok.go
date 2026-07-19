@@ -279,8 +279,12 @@ func grokUsageFromConfig(cfg grokBillingConfig) Usage {
 	if pct >= 100 {
 		sev = SeverityCritical
 	}
+	kind := KindWeeklyAll
+	if strings.EqualFold(strings.TrimSpace(cfg.CurrentPeriod.Type), "USAGE_PERIOD_TYPE_MONTHLY") {
+		kind = KindMonthly
+	}
 	usage.Windows = append(usage.Windows, LimitWindow{
-		Kind:          KindWeeklyAll,
+		Kind:          kind,
 		Percent:       pct,
 		Severity:      sev,
 		ResetsAt:      parseRFC3339(firstNonEmptyStr(cfg.CurrentPeriod.End, cfg.BillingPeriodEnd)),
@@ -306,8 +310,8 @@ func grokConfigPresent(cfg grokBillingConfig) bool {
 }
 
 // grokPeriodMinutes maps grok's billing period type to a window duration (weekly=7d,
-// monthly≈30d), or 0 when unknown. Both map onto the single account-wide KindWeeklyAll
-// window (grok has no shorter window); the minutes are recorded for the dashboard.
+// monthly≈30d), or 0 when unknown. The caller preserves the corresponding weekly or
+// monthly kind; the duration is additional evidence, not a reason to relabel it.
 func grokPeriodMinutes(periodType string) int {
 	switch strings.ToUpper(strings.TrimSpace(periodType)) {
 	case "USAGE_PERIOD_TYPE_WEEKLY":

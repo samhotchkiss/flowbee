@@ -27,6 +27,7 @@ const rfc3339 = time.RFC3339Nano
 // attest to win the lease (§6.6).
 type SeedParams struct {
 	ID                   string
+	ProjectID            string
 	Kind                 job.Kind
 	Flow                 string
 	Stage                string
@@ -78,6 +79,16 @@ func (s *Store) SeedJob(ctx context.Context, p SeedParams) (job.Job, error) {
 // otherwise race two concurrent sweep goroutines between the check and the insert) can
 // run the whole check-then-seed inside ONE transaction.
 func (s *Store) seedJobTx(ctx context.Context, tx *sql.Tx, p SeedParams) error {
+	if p.ProjectID == "" {
+		p.ProjectID = "default"
+	}
+	var projectActive int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE id=? AND state='active'`, p.ProjectID).Scan(&projectActive); err != nil {
+		return err
+	}
+	if projectActive != 1 {
+		return fmt.Errorf("seed job project %q is missing or inactive", p.ProjectID)
+	}
 	blocked, err := hasUnsatisfiedDeps(ctx, tx, p.BlockedBy)
 	if err != nil {
 		return err
@@ -101,13 +112,13 @@ func (s *Store) seedJobTx(ctx context.Context, tx *sql.Tx, p SeedParams) error {
 		issueNum = *p.IssueNumber
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO jobs (id, kind, flow, stage, state, role, base_sha, priority,
+		INSERT INTO jobs (id, project_id, kind, flow, stage, state, role, base_sha, priority,
 		                  blocked_by, required_capabilities, enqueued_at,
 		                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 		                  cost_ceiling_micro_usd, flow_id,
 		                  task_text, spec_text, acceptance_criteria, repo, issue_number)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 4, 0, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ID, string(p.Kind), p.Flow, p.Stage, string(state), string(p.Role), p.BaseSHA, p.Priority,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 5, 0, 4, 0, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.ProjectID, string(p.Kind), p.Flow, p.Stage, string(state), string(p.Role), p.BaseSHA, p.Priority,
 		blockedJSON, reqJSON, p.Now.Format(rfc3339), ceiling, flowID,
 		p.TaskText, p.SpecText, p.AcceptanceCriteria, p.Repo, issueNum)
 	if err != nil {
@@ -182,6 +193,7 @@ type ClaimParams struct {
 	Attested []string
 	TTL      time.Duration
 	Now      time.Time
+	Fair     *ProjectFairClaim
 }
 
 // ClaimReadyJob runs the §6.3.1 atomic claim against the named job: a single
@@ -195,6 +207,9 @@ func (s *Store) ClaimReadyJob(ctx context.Context, p ClaimParams) (*lease.Lease,
 	var result *lease.Lease
 
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := projectConcurrencyGateTx(ctx, tx, p.JobID); err != nil {
+			return err
+		}
 		// §6.6 capability match: a worker lacking a required attested capability
 		// must NOT win the row. Read the candidate's required set and check it
 		// against the attested set; on mismatch return ErrLostRace (the job stays
@@ -306,6 +321,9 @@ func (s *Store) ClaimReadyJob(ctx context.Context, p ClaimParams) (*lease.Lease,
 			int(p.TTL/time.Second), deadline.Format(rfc3339))
 		if err != nil {
 			return fmt.Errorf("insert lease audit: %w", err)
+		}
+		if err := commitProjectFairClaimTx(ctx, tx, p.LeaseID, p.Fair); err != nil {
+			return fmt.Errorf("commit project fair turn: %w", err)
 		}
 
 		result = &lease.Lease{
@@ -680,7 +698,17 @@ func (s *Store) Release(ctx context.Context, p ReleaseParams) error {
 				string(job.EscalationAttempts), p.JobID); err != nil {
 				return fmt.Errorf("escalate exhausted release: %w", err)
 			}
+			if j.State == job.StateCodeReview {
+				if err := projectEpicReviewLeaseEndTx(ctx, tx, p.JobID, job.StateNeedsHuman, string(job.EscalationAttempts), p.Now); err != nil {
+					return fmt.Errorf("project epic review release escalation: %w", err)
+				}
+			}
 			return setJobSeq(ctx, tx, p.JobID, escSeq)
+		}
+		if j.State == job.StateCodeReview {
+			if err := projectEpicReviewLeaseEndTx(ctx, tx, p.JobID, toState, "released", p.Now); err != nil {
+				return fmt.Errorf("project epic review release: %w", err)
+			}
 		}
 		return setJobSeq(ctx, tx, p.JobID, nextSeq)
 	})
@@ -692,8 +720,11 @@ func (s *Store) Release(ctx context.Context, p ReleaseParams) error {
 // candidate selection only.
 func (s *Store) ReadyCandidates(ctx context.Context) ([]scheduler.Candidate, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, priority, enqueued_at, required_capabilities
-		  FROM jobs WHERE state='ready'`)
+		SELECT id, project_id, priority, enqueued_at, required_capabilities
+		  FROM jobs j WHERE state='ready'
+		   AND NOT EXISTS (SELECT 1 FROM project_circuit_breakers b
+		     WHERE b.project_id=j.project_id AND b.state<>'closed'
+		       AND (b.repo_id='' OR b.repo_id=j.repo))`)
 	if err != nil {
 		return nil, err
 	}
@@ -702,9 +733,10 @@ func (s *Store) ReadyCandidates(ctx context.Context) ([]scheduler.Candidate, err
 	for rows.Next() {
 		var c scheduler.Candidate
 		var enqueued, reqJSON string
-		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON); err != nil {
+		if err := rows.Scan(&c.JobID, &c.ProjectID, &c.Priority, &enqueued, &reqJSON); err != nil {
 			return nil, err
 		}
+		c.Pool = scheduler.PoolBuild
 		if ts, perr := time.Parse(rfc3339, enqueued); perr == nil {
 			c.EnqueuedAt = ts
 		}
@@ -719,14 +751,24 @@ func (s *Store) ReadyCandidates(ctx context.Context) ([]scheduler.Candidate, err
 // review claim's WHERE state='review_pending' remains the correctness guarantee.
 func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candidate, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT j.id, j.priority, j.enqueued_at, j.required_capabilities,
+		SELECT j.id, j.project_id, j.priority, j.enqueued_at, j.required_capabilities,
 		       COALESCE(f.pr_exists,0), COALESCE(f.ci_green,0), COALESCE(f.merged,0),
 		       COALESCE(j.adopted,0), COALESCE(j.patch_diff,''), COALESCE(j.diff_empty,0),
 		       COALESCE(j.head_sha,''), COALESCE(j.base_sha,''),
 		       COALESCE(f.head_sha,''), COALESCE(f.base_sha,'')
 		  FROM jobs j
 		  LEFT JOIN domain_b_facts f ON f.job_id = j.id
-		 WHERE j.state='review_pending'`)
+		 WHERE j.state='review_pending'
+		   AND NOT EXISTS (SELECT 1 FROM project_circuit_breakers b
+		     WHERE b.project_id=j.project_id AND b.state<>'closed'
+		       AND (b.repo_id='' OR b.repo_id=j.repo))
+		   AND (COALESCE(j.workflow_domain,'legacy') <> 'epic_v2'
+		        OR EXISTS (
+		            SELECT 1 FROM epic_deliveries d
+		             WHERE d.epic_id=j.epic_delivery_id
+		               AND d.review_job_id=j.id
+		               AND d.state='review_queued'
+		               AND d.hold_reason=''))`)
 	if err != nil {
 		return nil, err
 	}
@@ -736,10 +778,11 @@ func (s *Store) ReviewPendingCandidates(ctx context.Context) ([]scheduler.Candid
 		var c scheduler.Candidate
 		var enqueued, reqJSON, patchDiff, jobHead, jobBase, factHead, factBase string
 		var prExists, ciGreen, merged, adopted, diffEmpty int
-		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON, &prExists, &ciGreen, &merged,
+		if err := rows.Scan(&c.JobID, &c.ProjectID, &c.Priority, &enqueued, &reqJSON, &prExists, &ciGreen, &merged,
 			&adopted, &patchDiff, &diffEmpty, &jobHead, &jobBase, &factHead, &factBase); err != nil {
 			return nil, err
 		}
+		c.Pool = scheduler.PoolReview
 		if ts, perr := time.Parse(rfc3339, enqueued); perr == nil {
 			c.EnqueuedAt = ts
 		}
@@ -961,9 +1004,9 @@ func appendEvent(ctx context.Context, tx *sql.Tx, e ledger.Event) error {
 	to := sql.NullString{String: string(e.ToState), Valid: e.ToState != ""}
 	epoch := sql.NullInt64{Int64: int64(e.LeaseEpoch), Valid: e.Kind != ledger.KindJobCreated}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO job_events (job_id, job_seq, kind, from_state, to_state, lease_epoch, actor, payload, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.JobID, e.JobSeq, string(e.Kind), from, to, epoch, e.Actor, string(blob), e.CreatedAt.Format(rfc3339))
+		INSERT INTO job_events (job_id, project_id, job_seq, kind, from_state, to_state, lease_epoch, actor, payload, created_at)
+		VALUES (?, COALESCE((SELECT project_id FROM jobs WHERE id=?),'default'), ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.JobID, e.JobID, e.JobSeq, string(e.Kind), from, to, epoch, e.Actor, string(blob), e.CreatedAt.Format(rfc3339))
 	if err != nil {
 		return fmt.Errorf("append event %s: %w", e.Kind, err)
 	}
@@ -986,7 +1029,7 @@ func loadJobTx(ctx context.Context, tx *sql.Tx, id string) (job.Job, int, error)
 }
 
 const jobSelect = `
-	SELECT id, kind, flow, stage, state, role,
+	SELECT id, project_id, kind, flow, stage, state, role,
 	       COALESCE(base_sha,''), COALESCE(head_sha,''),
 	       priority, blocked_by, required_capabilities, enqueued_at,
 	       COALESCE(lease_id,''), lease_epoch,
@@ -1015,7 +1058,7 @@ func scanJob(row rowScanner) (job.Job, error) {
 	var kind, role, blockedJSON, reqJSON, enqueued, verdictJSON, specSignoffJSON string
 	var overBudget, isEpic, epicReviewed, diffEmpty int
 	var ceiling sql.NullInt64
-	err := row.Scan(&j.ID, &kind, &j.Flow, &j.Stage, (*string)(&j.State), &role,
+	err := row.Scan(&j.ID, &j.ProjectID, &kind, &j.Flow, &j.Stage, (*string)(&j.State), &role,
 		&j.BaseSHA, &j.HeadSHA, &j.Priority, &blockedJSON, &reqJSON, &enqueued,
 		&j.LeaseID, &j.LeaseEpoch,
 		&j.BoundIdentity, &j.BoundModelFamily, &j.BoundLens,

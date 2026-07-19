@@ -52,9 +52,14 @@ type PullRequest struct {
 	IsDraft     bool
 	Merged      bool
 	MergedAt    time.Time
-	HeadRefOid  string // Domain-B: head SHA
-	BaseRefOid  string // Domain-B: base SHA
-	MergeCommit string // Domain-B: merge commit SHA (terminal fact)
+	HeadRefName string // Domain-B: exact head branch name
+	// IsCrossRepository distinguishes an owned same-repository branch from a
+	// lookalike branch name submitted from a fork. A fork head is never proof of
+	// ownership for a v2 epic delivery.
+	IsCrossRepository bool
+	HeadRefOid        string // Domain-B: head SHA
+	BaseRefOid        string // Domain-B: base SHA
+	MergeCommit       string // Domain-B: merge commit SHA (terminal fact)
 	// MergeableState is GitHub's computed mergeability status (GraphQL
 	// mergeStateStatus, e.g. CLEAN/UNKNOWN). UNKNOWN is not mergeable.
 	MergeableState string
@@ -141,6 +146,13 @@ type PRDiffer interface {
 // "main not red" (bounce as before).
 type BranchCIReader interface {
 	BranchCIState(ctx context.Context, branch string) (CIState, error)
+}
+
+// BranchExistenceReader is the mechanical verification surface for crash-safe
+// cleanup. An uncertain ref deletion is observed before Flowbee decides whether
+// the original action may be re-armed; it is never blindly repeated.
+type BranchExistenceReader interface {
+	BranchExists(ctx context.Context, branch string) (bool, error)
 }
 
 // MergeUnsticker is the OPTIONAL GitHub surface for the merge_handoff un-stick driver (#214):
@@ -455,7 +467,7 @@ func NewRealClient(owner, repo string, token func(ctx context.Context) (string, 
 const boardSweepQuery = `
 fragment prFields on PullRequest {
   number updatedAt isDraft merged mergedAt
-  headRefOid baseRefOid mergeStateStatus
+  headRefName isCrossRepository headRefOid baseRefOid mergeStateStatus
   mergeCommit { oid }
   commits(last:1) { nodes { commit { statusCheckRollup { state
     contexts(first:100) { pageInfo { hasNextPage } nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
@@ -547,15 +559,17 @@ type pageInfo struct {
 // prNode is one pullRequests connection node (shared by the OPEN and MERGED selections
 // via the prFields fragment).
 type prNode struct {
-	Number         int       `json:"number"`
-	UpdatedAt      time.Time `json:"updatedAt"`
-	IsDraft        bool      `json:"isDraft"`
-	Merged         bool      `json:"merged"`
-	MergedAt       time.Time `json:"mergedAt"`
-	HeadRefOid     string    `json:"headRefOid"`
-	BaseRefOid     string    `json:"baseRefOid"`
-	MergeableState string    `json:"mergeStateStatus"`
-	MergeCommit    *struct {
+	Number            int       `json:"number"`
+	UpdatedAt         time.Time `json:"updatedAt"`
+	IsDraft           bool      `json:"isDraft"`
+	Merged            bool      `json:"merged"`
+	MergedAt          time.Time `json:"mergedAt"`
+	HeadRefName       string    `json:"headRefName"`
+	IsCrossRepository bool      `json:"isCrossRepository"`
+	HeadRefOid        string    `json:"headRefOid"`
+	BaseRefOid        string    `json:"baseRefOid"`
+	MergeableState    string    `json:"mergeStateStatus"`
+	MergeCommit       *struct {
 		Oid string `json:"oid"`
 	} `json:"mergeCommit"`
 	Commits struct {
@@ -626,6 +640,7 @@ func prFromNode(n prNode) PullRequest {
 	pr := PullRequest{
 		Number: n.Number, UpdatedAt: n.UpdatedAt, IsDraft: n.IsDraft,
 		Merged: n.Merged, MergedAt: n.MergedAt,
+		HeadRefName: n.HeadRefName, IsCrossRepository: n.IsCrossRepository,
 		HeadRefOid: n.HeadRefOid, BaseRefOid: n.BaseRefOid,
 		MergeableState: n.MergeableState,
 	}
@@ -818,7 +833,7 @@ query PR($owner:String!, $repo:String!, $number:Int!) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
       number updatedAt isDraft merged mergedAt
-      headRefOid baseRefOid mergeStateStatus
+      headRefName isCrossRepository headRefOid baseRefOid mergeStateStatus
       mergeCommit { oid }
       commits(last:1) { nodes { commit { statusCheckRollup { state
     contexts(first:100) { pageInfo { hasNextPage } nodes { __typename ... on CheckRun { name conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
@@ -832,15 +847,17 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 	var data struct {
 		Repository struct {
 			PullRequest *struct {
-				Number         int       `json:"number"`
-				UpdatedAt      time.Time `json:"updatedAt"`
-				IsDraft        bool      `json:"isDraft"`
-				Merged         bool      `json:"merged"`
-				MergedAt       time.Time `json:"mergedAt"`
-				HeadRefOid     string    `json:"headRefOid"`
-				BaseRefOid     string    `json:"baseRefOid"`
-				MergeableState string    `json:"mergeStateStatus"`
-				MergeCommit    *struct {
+				Number            int       `json:"number"`
+				UpdatedAt         time.Time `json:"updatedAt"`
+				IsDraft           bool      `json:"isDraft"`
+				Merged            bool      `json:"merged"`
+				MergedAt          time.Time `json:"mergedAt"`
+				HeadRefName       string    `json:"headRefName"`
+				IsCrossRepository bool      `json:"isCrossRepository"`
+				HeadRefOid        string    `json:"headRefOid"`
+				BaseRefOid        string    `json:"baseRefOid"`
+				MergeableState    string    `json:"mergeStateStatus"`
+				MergeCommit       *struct {
 					Oid string `json:"oid"`
 				} `json:"mergeCommit"`
 				Commits struct {
@@ -884,6 +901,7 @@ func (c *RealClient) PullRequest(ctx context.Context, number int) (PullRequest, 
 	pr := PullRequest{
 		Number: n.Number, UpdatedAt: n.UpdatedAt, IsDraft: n.IsDraft,
 		Merged: n.Merged, MergedAt: n.MergedAt,
+		HeadRefName: n.HeadRefName, IsCrossRepository: n.IsCrossRepository,
 		HeadRefOid: n.HeadRefOid, BaseRefOid: n.BaseRefOid,
 		MergeableState: n.MergeableState,
 	}
@@ -1330,6 +1348,20 @@ func (c *RealClient) DeleteBranch(ctx context.Context, branch string) error {
 		}
 	}
 	return err
+}
+
+// BranchExists verifies the exact registered ref. A 404 is the desired absent
+// fact; other failures remain visible to the cleanup verifier.
+func (c *RealClient) BranchExists(ctx context.Context, branch string) (bool, error) {
+	err := c.rest(ctx, http.MethodGet, "/git/ref/heads/"+branch, nil, nil)
+	if err == nil {
+		return true, nil
+	}
+	var ghErr *ErrGitHub
+	if errors.As(err, &ghErr) && ghErr.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	return false, err
 }
 
 func (c *RealClient) PutFile(ctx context.Context, path string, content []byte, message, branch string) error {

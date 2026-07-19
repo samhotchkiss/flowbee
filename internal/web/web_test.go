@@ -2,6 +2,7 @@ package web_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 	"github.com/samhotchkiss/flowbee/internal/web"
 	"github.com/samhotchkiss/flowbee/internal/worker"
+	"github.com/samhotchkiss/flowbee/internal/workintent"
 )
 
 // fixedClock feeds the UI a deterministic instant so the per-card stage timer +
@@ -219,6 +221,120 @@ func TestProductionDashboardRoutes(t *testing.T) {
 	}
 }
 
+func TestPhase1ProjectWorkspaceCarriesExactProjectAndConversationContract(t *testing.T) {
+	st := testutil.NewStore(t)
+	h := mountUI(t, st, fixedClock{t: time.Date(2026, 7, 19, 19, 30, 0, 0, time.UTC)})
+
+	code, body := getBody(t, h, "/workspace?project=russ-prod")
+	if code != http.StatusOK {
+		t.Fatalf("workspace status=%d\n%s", code, body)
+	}
+	for _, want := range []string{
+		`data-conversation-workspace`, `data-project-id="russ-prod"`, `name="project" value="russ-prod"`,
+		"Talk to your Interactor", "Durable project conversation", "Loading exact Interactor route",
+		`data-workspace-messages`, `data-workspace-composer`, `data-workspace-connection`,
+		"Messages persist before delivery", `href="/workspace" class="active"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("workspace missing %q\n%s", want, body)
+		}
+	}
+
+	code, _ = getBody(t, h, "/workspace?project=../../not-a-project")
+	if code != http.StatusBadRequest {
+		t.Fatalf("unsafe project scope status=%d want %d", code, http.StatusBadRequest)
+	}
+	code, body = getBody(t, h, "/workspace")
+	if code != http.StatusOK || !strings.Contains(body, `data-project-id="default"`) {
+		t.Fatalf("workspace default project status=%d\n%s", code, body)
+	}
+}
+
+func TestPhase1WorkspaceShowsDriverControlHoldAndDisablesLiveSendClaim(t *testing.T) {
+	st := testutil.NewStore(t)
+	ui := web.New(st, fixedClock{t: time.Date(2026, 7, 19, 19, 30, 0, 0, time.UTC)}, web.Config{
+		DriverControlRequired:  true,
+		DriverControlAvailable: false,
+		DriverControlGap:       "GAP-FD-003",
+		DriverControlReason:    "Authenticated Flowbee control origin is unsupported; actions remain durably held.",
+	})
+	mux := http.NewServeMux()
+	ui.Mount(mux)
+
+	code, body := getBody(t, mux, "/workspace?project=russ-prod")
+	if code != http.StatusOK {
+		t.Fatalf("workspace status=%d\n%s", code, body)
+	}
+	for _, want := range []string{
+		`data-driver-control-available="false"`, `data-driver-control-hold`,
+		"Driver control route unavailable", "GAP-FD-003", "actions remain durably held",
+		"Messages are held until Driver supports an authenticated Flowbee control origin",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("workspace missing fail-closed indicator %q\n%s", want, body)
+		}
+	}
+	_, js := getBody(t, mux, "/assets/board.js")
+	for _, want := range []string{
+		`root.dataset.driverControlAvailable !== "false"`,
+		`History live · control held`,
+		`Flowbee will not use a direct tmux fallback`,
+	} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("workspace client missing fail-closed behavior %q", want)
+		}
+	}
+}
+
+func TestPhase1WorkspaceReadsLiveDriverControlState(t *testing.T) {
+	st := testutil.NewStore(t)
+	current := web.DriverControlState{Required: true, Available: true}
+	ui := web.New(st, fixedClock{t: time.Date(2026, 7, 19, 19, 30, 0, 0, time.UTC)}, web.Config{
+		DriverControlRequired: true, DriverControlAvailable: true,
+		DriverControlCurrent: func() web.DriverControlState { return current },
+	})
+	mux := http.NewServeMux()
+	ui.Mount(mux)
+	_, body := getBody(t, mux, "/workspace")
+	if !strings.Contains(body, `data-driver-control-available="true"`) || strings.Contains(body, "data-driver-control-hold") {
+		t.Fatalf("ready workspace advertised wrong state:\n%s", body)
+	}
+	current = web.DriverControlState{Required: true, Gap: "GAP-FD-003", Reason: "scope revoked"}
+	_, body = getBody(t, mux, "/workspace")
+	if !strings.Contains(body, `data-driver-control-available="false"`) ||
+		!strings.Contains(body, "data-driver-control-hold") || !strings.Contains(body, "scope revoked") {
+		t.Fatalf("revoked workspace advertised wrong state:\n%s", body)
+	}
+	current = web.DriverControlState{Required: true, Available: true}
+	_, body = getBody(t, mux, "/workspace")
+	if !strings.Contains(body, `data-driver-control-available="true"`) || strings.Contains(body, "data-driver-control-hold") {
+		t.Fatalf("restored workspace advertised wrong state:\n%s", body)
+	}
+}
+
+func TestPhase1ProjectWorkspaceClientResumesDurableDriverRoutedConversation(t *testing.T) {
+	st := testutil.NewStore(t)
+	h := mountUI(t, st, fixedClock{t: time.Now()})
+	code, js := getBody(t, h, "/assets/board.js")
+	if code != http.StatusOK {
+		t.Fatalf("board.js status=%d", code)
+	}
+	for _, want := range []string{
+		"wireConversationWorkspace",
+		`/v1/projects/`, `/conversations`, `/messages`, `/events?after=`, "new EventSource",
+		"flowbee-workspace-thread:", "flowbee-conversation-draft:", "Idempotency-Key",
+		"X-Flowbee-CSRF", "Driver delivery uncertain · not resent", "awaiting Interactor evidence",
+		"workspaceLoadMessages(runtime)", "setInterval", "credentials = \"same-origin\"",
+	} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("workspace client missing %q", want)
+		}
+	}
+	if strings.Contains(js, "flowbee_human_session") || strings.Contains(js, "tmux-send") || strings.Contains(js, "send-keys") {
+		t.Fatal("workspace must not expose the HttpOnly session or implement a terminal messaging path")
+	}
+}
+
 // TestDashboardJSHasPeriodicRefreshFallback ensures a dashboard still converges
 // when an SSE nudge is dropped or a producer mutates a live read-model without
 // publishing. SSE remains the fast path; this interval is the correctness floor.
@@ -250,6 +366,139 @@ func TestEpicDashboardDerivesStaleMasterFromHeartbeat(t *testing.T) {
 	_, body := getBody(t, mountUI(t, st, fixedClock{t: now}), "/dashboard")
 	if !strings.Contains(body, "ops-master-kpi critical") || !strings.Contains(body, ">stale</") {
 		t.Fatalf("master older than StaleHB must render stale/critical, not active:\n%s", body)
+	}
+}
+
+func TestDashboardShowsBuiltAwaitingReviewDispatchAsDistinctState(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 19, 3, 30, 0, 0, time.UTC)
+	addRunningEpic(t, st, "awaiting-review", now)
+	e, err := st.GetEpicRun(ctx, "awaiting-review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ObserveEpicArtifactFact(ctx, store.EpicArtifactFact{
+		EpicID: e.ID, Repo: e.Repo, Branch: e.Branch, PRNumber: 4950, PROpen: true,
+		HeadSHA: "head", BaseSHA: "base", CIState: "green", CIHasRealSuccess: true,
+		RequiredChecksPresentPassed: true,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	_, body := getBody(t, mountUI(t, st, fixedClock{t: now}), "/dashboard")
+	card := articleFor(t, body, `data-epic="awaiting-review"`)
+	if !strings.Contains(card, "built · awaiting review dispatch") || !strings.Contains(card, "ops-card-state critical") {
+		t.Fatalf("missing visible review-dispatch stall state:\n%s", card)
+	}
+}
+
+func TestPhase1NeedsYouInboxRendersTypedDurablePriorityAndStaleState(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	hash := "sha256:" + strings.Repeat("a", 64)
+
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "blocked-epic", Repo: "russ", Title: "Blocked epic",
+		Branch: "epic/blocked", TmuxName: "epic-blocked"}, 1, now.Add(-5*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	create := func(in store.CreateDecisionRequestInput, at time.Time) store.DecisionRequest {
+		t.Helper()
+		in.ProjectID = "default"
+		in.RequestedBy = "interactor:default"
+		in.RouteTo = "human:sam"
+		in.SubjectArtifactRef = "/artifacts/" + in.ID
+		in.SubjectVersion = 3
+		in.SubjectSHA256 = hash
+		row, err := st.CreateDecisionRequest(ctx, in, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return row
+	}
+
+	create(store.CreateDecisionRequestInput{
+		ID: "urgent-auth", Kind: workintent.DecisionAuthorization, Title: "Authorize production cutover",
+		Prompt: "Authorize the exact canary cutover scope?", Priority: 1,
+		ExpectedResponseKinds: []workintent.ResponseKind{workintent.ResponseApprove, workintent.ResponseDeny},
+		EvidenceRefs:          json.RawMessage(`[{"kind":"runbook","ref":"/evidence/cutover","title":"Cutover evidence"}]`),
+	}, now.Add(-30*time.Minute))
+	create(store.CreateDecisionRequestInput{
+		ID: "blocking-plan", EpicID: "blocked-epic", Kind: workintent.DecisionPlanReview,
+		Title: "Review blocked epic plan", Prompt: "Approve the plan bound to this epic?", Priority: 2,
+		ExpectedResponseKinds: []workintent.ResponseKind{workintent.ResponseApprove, workintent.ResponseRequestChanges, workintent.ResponseDefer},
+	}, now.Add(-4*time.Hour))
+	create(store.CreateDecisionRequestInput{
+		ID: "due-question", Kind: workintent.DecisionQuestion, Title: "Choose release window",
+		Prompt: "Which release window should the Orchestrator use?", Priority: 2, DueAt: now.Add(-time.Minute),
+		ExpectedResponseKinds: []workintent.ResponseKind{workintent.ResponseAnswer, workintent.ResponseDefer},
+		Options:               json.RawMessage(`[{"id":"tonight","label":"Tonight","description":"Use the current headroom.","recommended":true},{"id":"tomorrow","label":"Tomorrow"}]`),
+	}, now.Add(-2*time.Hour))
+	deferred := create(store.CreateDecisionRequestInput{
+		ID: "deferred-design", Kind: workintent.DecisionDesignReview, Title: "Review dashboard design",
+		Prompt: "Approve the exact rendered design?", Priority: 3,
+		ExpectedResponseKinds: []workintent.ResponseKind{workintent.ResponseApprove, workintent.ResponseDefer},
+	}, now.Add(-3*time.Hour))
+	if _, err := st.RespondDecision(ctx, "default", store.DecisionResponseInput{
+		RequestID: deferred.ID, RequestVersion: deferred.RequestVersion, SubjectVersion: deferred.SubjectVersion,
+		SubjectSHA256: deferred.SubjectSHA256, Kind: workintent.ResponseDefer, ActorID: "human:sam",
+		IdempotencyKey: "defer-design", DeferUntil: now.Add(2 * time.Hour), DeferCondition: "new render is ready",
+	}, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	stale := create(store.CreateDecisionRequestInput{
+		ID: "old-plan", Kind: workintent.DecisionPlanReview, Title: "Old plan",
+		Prompt: "Approve the old plan?", Priority: 4,
+		ExpectedResponseKinds: []workintent.ResponseKind{workintent.ResponseApprove},
+	}, now.Add(-6*time.Hour))
+	replacement := create(store.CreateDecisionRequestInput{
+		ID: "new-plan", Kind: workintent.DecisionPlanReview, Title: "Current plan",
+		Prompt: "Approve the current plan?", Priority: 5,
+		ExpectedResponseKinds: []workintent.ResponseKind{workintent.ResponseApprove},
+	}, now.Add(-time.Hour))
+	if err := st.SupersedeDecisionRequest(ctx, "default", stale.ID, stale.RequestVersion,
+		replacement.ID, "interactor:default", "artifact advanced", now.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	h := mountUI(t, st, fixedClock{t: now})
+	code, body := getBody(t, h, "/dashboard")
+	if code != http.StatusOK {
+		t.Fatalf("dashboard status=%d\n%s", code, body)
+	}
+	urgentAt := strings.Index(body, `data-decision-id="urgent-auth"`)
+	blockingAt := strings.Index(body, `data-decision-id="blocking-plan"`)
+	dueAt := strings.Index(body, `data-decision-id="due-question"`)
+	if urgentAt < 0 || blockingAt < 0 || dueAt < 0 || !(urgentAt < blockingAt && blockingAt < dueAt) {
+		t.Fatalf("deterministic severity/blocking order missing: urgent=%d blocking=%d due=%d\n%s", urgentAt, blockingAt, dueAt, body)
+	}
+	for _, want := range []string{
+		`data-decision-inbox`, `<strong>4</strong>`, `>1</dd>`, "Plan review", "Design review", "Authorization",
+		"Exact authorization scope", "I confirm this exact scope", "Cutover evidence", hash,
+		"Tonight", "recommended", `data-decision-action="answer"`, `data-decision-action="request-changes"`,
+		"Deferred <span>1</span>", "Recent decisions and stale requests",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("Needs You dashboard missing %q\n%s", want, body)
+		}
+	}
+	authCard := articleFor(t, body, `data-decision-id="urgent-auth"`)
+	if strings.Contains(authCard, `data-decision-action="answer"`) || !strings.Contains(authCard, `data-decision-action="deny"`) {
+		t.Fatalf("authorization must expose only its typed actions:\n%s", authCard)
+	}
+	staleCard := articleFor(t, body, `data-decision-id="old-plan"`)
+	if !strings.Contains(staleCard, "stale and cannot be acted on") || strings.Contains(staleCard, "data-decision-action") {
+		t.Fatalf("superseded request must be visibly stale and inert:\n%s", staleCard)
+	}
+
+	_, js := getBody(t, h, "/assets/board.js")
+	for _, want := range []string{"wireDecisionInbox", "Idempotency-Key", "subject_sha256", "request-changes", "Delivery is uncertain", "flowbee_csrf=", "X-Flowbee-CSRF"} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("decision client missing %q", want)
+		}
+	}
+	if strings.Contains(js, "flowbee_human_session") {
+		t.Fatal("dashboard JavaScript must never read or expose the HttpOnly human session cookie")
 	}
 }
 
@@ -614,6 +863,10 @@ func TestF12DashboardsRenderOffRealStore(t *testing.T) {
 	code, js := getBody(t, h, "/assets/board.js")
 	if code != http.StatusOK || !strings.Contains(js, "EventSource") {
 		t.Fatalf("/assets/board.js not served (code=%d)", code)
+	}
+	code, labels := getBody(t, h, "/assets/recovery-labels.generated.json")
+	if code != http.StatusOK || !strings.Contains(labels, "review_dispatch_missing") {
+		t.Fatalf("generated recovery labels not served (code=%d)", code)
 	}
 }
 

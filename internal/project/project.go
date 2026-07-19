@@ -107,6 +107,10 @@ func contentDenyReason(actualDiff string, allowOwnSource bool) string {
 // error) — a PR that provably belongs to epic <slug> but can't be contract-verified
 // must reach a human, not retry forever.
 func (s *Sender) epicDenyReason(ctx context.Context, repo, baseSHA, headSHA, actualDiff string) (string, error) {
+	return s.epicDenyReasonFor(ctx, "", repo, baseSHA, headSHA, actualDiff)
+}
+
+func (s *Sender) epicDenyReasonFor(ctx context.Context, expectedEpicID, repo, baseSHA, headSHA, actualDiff string) (string, error) {
 	if s.history == nil || headSHA == "" {
 		return "", nil
 	}
@@ -116,6 +120,9 @@ func (s *Sender) epicDenyReason(ctx context.Context, repo, baseSHA, headSHA, act
 	}
 	if !ok {
 		return "", nil // clean non-match across every epic in the window: an ordinary PR
+	}
+	if expectedEpicID != "" && e.ID != expectedEpicID {
+		return fmt.Sprintf("expected epic %q but head resolves to epic %q", expectedEpicID, e.ID), nil
 	}
 	// review m4: an epic-detected PR with NO base SHA cannot be contract-verified (no
 	// diff to scope-check, no launch-pinned ref to read). Fail CLOSED to a human rather
@@ -179,6 +186,84 @@ func (s *Sender) epicDenyReason(ctx context.Context, repo, baseSHA, headSHA, act
 	return strings.Join(reasons, "; "), nil
 }
 
+// MergeAuthorizationDeniedError is a deterministic product-safety denial. The
+// v2 executor must park it for a human rather than retrying the same immutable
+// artifact. Transport/mirror errors remain ordinary retryable errors.
+type MergeAuthorizationDeniedError struct{ Reason string }
+
+func (e *MergeAuthorizationDeniedError) Error() string { return e.Reason }
+
+// AuthorizeEpicV2Merge reuses the production autonomous-merge safety boundary
+// for a v2 delivery. It binds the action to the registered epic, verifies the
+// mirror's exact branch tip, evaluates the real base..head diff and launch-pinned
+// contract, then performs a final authoritative PR/required-CI refetch. No
+// GitHub mutation occurs here; the caller immediately follows a nil result with
+// an expected-head merge request.
+func (s *Sender) AuthorizeEpicV2Merge(ctx context.Context, epicID, projectID, repo string, prNumber int, branch, baseSHA, headSHA string) error {
+	deny := func(format string, args ...any) error {
+		return &MergeAuthorizationDeniedError{Reason: fmt.Sprintf(format, args...)}
+	}
+	if s.repo != repo {
+		return deny("merge repository %q is not owned by sender %q", repo, s.repo)
+	}
+	if s.history == nil {
+		return deny("v2 autonomous merge requires a repository mirror")
+	}
+	if epicID == "" || prNumber <= 0 || branch == "" || baseSHA == "" || headSHA == "" {
+		return deny("v2 merge action lacks exact epic, PR, branch, base, or head identity")
+	}
+	e, err := s.store.GetEpicRun(ctx, epicID)
+	if err != nil {
+		return deny("registered epic %q is unavailable: %v", epicID, err)
+	}
+	if e.ProjectID != projectID || e.Repo != repo || e.Branch != branch {
+		return deny("merge action does not match registered epic identity")
+	}
+	if err := s.history.FetchBranch(branch); err != nil {
+		return fmt.Errorf("authorize v2 merge: fetch %s: %w", branch, err)
+	}
+	tip, err := s.history.HeadSHA("refs/heads/" + branch)
+	if err != nil {
+		return fmt.Errorf("authorize v2 merge: resolve %s: %w", branch, err)
+	}
+	if tip != headSHA {
+		return fmt.Errorf("%w: mirror branch moved from %s to %s", gh.ErrMergeHeadModified, headSHA, tip)
+	}
+	actualDiff, err := s.history.DiffBetween(baseSHA, headSHA)
+	if err != nil {
+		return fmt.Errorf("authorize v2 merge: diff %s..%s: %w", baseSHA, headSHA, err)
+	}
+	if reason := contentDenyReason(actualDiff, s.allowOwnSource); reason != "" {
+		return deny("%s", reason)
+	}
+	if reason, err := s.epicDenyReasonFor(ctx, epicID, repo, baseSHA, headSHA, actualDiff); err != nil {
+		return fmt.Errorf("authorize v2 merge: %w", err)
+	} else if reason != "" {
+		return deny("%s", reason)
+	}
+
+	// This is deliberately last: it is the immediate authoritative PR/base/head/
+	// required-check read before the expected-head mutation.
+	ci, err := s.liveMergeCI(ctx, prNumber, baseSHA, headSHA)
+	if err != nil {
+		var stale *staleMergeAuthorizationError
+		if errors.As(err, &stale) {
+			if stale.observedBase != baseSHA {
+				return fmt.Errorf("%w: PR base moved from %s to %s", gh.ErrMergeBaseModified, baseSHA, stale.observedBase)
+			}
+			return fmt.Errorf("%w: PR head moved from %s", gh.ErrMergeHeadModified, headSHA)
+		}
+		return err
+	}
+	if ci.failed {
+		return deny("authoritative CI failed: %s", strings.Join(ci.failingChecks, ", "))
+	}
+	if !ci.green {
+		return errMergeCINotReady
+	}
+	return nil
+}
+
 // epicExplainerPath derives an epic's human-facing explainer path from its spec path:
 // epics/<slug>.md -> epics/<slug>-explainer.html (contract §Explainer / plan §15.14). It
 // is implicitly in scope alongside the spec so maintaining it never trips the gate.
@@ -231,6 +316,9 @@ func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedBase, ex
 		return liveMergeCIResult{}, err
 	}
 	if !ok {
+		return liveMergeCIResult{}, errMergeCINotReady
+	}
+	if pr.IsDraft || pr.ClosedUnmerged || pr.Merged || pr.IsCrossRepository || pr.CheckContextsTruncated {
 		return liveMergeCIResult{}, errMergeCINotReady
 	}
 	if pr.BaseRefOid != expectedBase || pr.HeadRefOid != expectedHead {

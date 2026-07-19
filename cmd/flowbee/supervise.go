@@ -16,6 +16,14 @@ import (
 // box must never blind the fold for every OTHER seat), and identical to `flowbee seat probe`
 // minus the tabular output.
 func foldSeatCapacity(ctx context.Context, logger *slog.Logger, st *store.Store, now time.Time) {
+	// v2 has exactly one projection writer: the authenticated live collector builds
+	// a complete generation and CommitCapacityGeneration advances its pointer. The
+	// legacy seat-by-seat UpsertAccountLimits fold is order-dependent and must remain
+	// read-only/off while fail-closed routing is enabled.
+	if st.EnableCapacityV2 {
+		logger.Debug("legacy capacity fold disabled under capacity routing v2")
+		return
+	}
 	seats, err := st.ListSeats(ctx)
 	if err != nil {
 		logger.Warn("capacity fold: list seats", "err", err)

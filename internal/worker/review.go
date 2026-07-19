@@ -57,6 +57,7 @@ func RunOnceReviewHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	c.Model = cfg.ModelLabel
+	c.SeatID = cfg.SeatID
 	reg := client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,

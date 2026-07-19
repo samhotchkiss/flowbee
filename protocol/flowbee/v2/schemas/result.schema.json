@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flowbee.result/v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version", "schema_id", "schema_sha256", "assignment_id",
+    "action_id", "action_epoch", "lease_id", "lease_epoch", "project_id",
+    "actor_run_id", "kind", "idempotency_key", "evidence_refs"
+  ],
+  "properties": {
+    "protocol_version": {"type": "string", "const": "2.0"},
+    "schema_id": {"type": "string", "const": "flowbee.result/v2"},
+    "schema_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "assignment_id": {"type": "string", "minLength": 1},
+    "action_id": {"type": "string", "minLength": 1},
+    "action_epoch": {"type": "integer", "minimum": 1},
+    "lease_id": {"type": "string", "minLength": 1},
+    "lease_epoch": {"type": "integer", "minimum": 1},
+    "project_id": {"type": "string", "minLength": 1},
+    "epic_id": {"type": "string"},
+    "actor_run_id": {"type": "string", "minLength": 1},
+    "kind": {"type": "string", "minLength": 1},
+    "artifact_version": {"type": "integer", "minimum": 1},
+    "artifact_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "head_sha": {"type": "string"},
+    "base_sha": {"type": "string"},
+    "verdict": {"type": "string", "enum": ["approved", "changes_requested", "needs_human"]},
+    "summary": {"type": "string"},
+    "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "idempotency_key": {"type": "string", "minLength": 1}
+  }
+}

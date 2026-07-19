@@ -45,6 +45,32 @@ func TestServeSystemdCarriesAuthChoice(t *testing.T) {
 	}
 }
 
+func TestServeSystemdCarriesV2FileBackedTrustConfiguration(t *testing.T) {
+	t.Setenv("FLOWBEE_EPIC_REVIEW_HANDOFF_V2", "1")
+	t.Setenv("FLOWBEE_PHASE1_DASHBOARD", "1")
+	t.Setenv("FLOWBEE_ALERT_WEBHOOK_SECRET", "inline-secret-must-never-print")
+	t.Setenv("FLOWBEE_ALERT_WEBHOOK_SECRET_FILE", "/etc/flowbee/alert.key")
+	t.Setenv("FLOWBEE_DRIVER_TOKEN_FILE", "/etc/flowbee/driver.token")
+	t.Setenv("FLOWBEE_DRIVER_SOCKET", "/var/run/tmux-driver.sock")
+	t.Setenv("FLOWBEE_HUMAN_SESSION_KEY_FILE", "/etc/flowbee/human.key")
+	t.Setenv("FLOWBEE_HUMAN_GRANTS_FILE", "/etc/flowbee/human.grants")
+	out := captureStdout(t, printServeSystemd)
+	for _, want := range []string{
+		"FLOWBEE_EPIC_REVIEW_HANDOFF_V2=1",
+		"FLOWBEE_PHASE1_DASHBOARD=1",
+		"FLOWBEE_ALERT_WEBHOOK_SECRET_FILE=/etc/flowbee/alert.key",
+		"FLOWBEE_DRIVER_TOKEN_FILE=/etc/flowbee/driver.token",
+		"FLOWBEE_HUMAN_SESSION_KEY_FILE=/etc/flowbee/human.key",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("v2 template missing %q\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "inline-secret-must-never-print") || strings.Contains(out, "FLOWBEE_ALERT_WEBHOOK_SECRET=") {
+		t.Fatalf("v2 template leaked or encouraged an inline alert secret\n%s", out)
+	}
+}
+
 // TestRepoTokenWarning covers the multi-repo token footgun classifier: a repo with
 // no token at all (no-op), a declared token_env that's unset (silent shared fallback),
 // and the healthy cases (per-repo token present, or shared token with no token_env).

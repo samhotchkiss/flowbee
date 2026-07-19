@@ -157,6 +157,21 @@ func (r *Reconciler) Sweep(ctx context.Context) ([]store.ReconcileOutcome, error
 		if pr.IsDraft || pr.Merged || pr.ClosedUnmerged || !hasAdoptLabel(pr.Labels) {
 			continue
 		}
+		if r.store.EnableEpicReviewHandoffV2 {
+			// Same-repository ownership cannot be disproved without the exact head
+			// branch. A partial GraphQL response must never fall through to generic
+			// adoption; retry when GitHub returns the identity fact.
+			if !pr.IsCrossRepository && pr.HeadRefName == "" {
+				continue
+			}
+			// Ownership comes only from the admitted repo/branch pair. Fail closed
+			// on a lookup error or ambiguity: a transient store problem must never
+			// fall through and manufacture a second legacy review job.
+			_, owned, oerr := r.ownedEpicForPR(ctx, pr)
+			if oerr != nil || owned {
+				continue
+			}
+		}
 		// API-storm gate: AdoptPR spends TWO GitHub round-trips (PullRequest +
 		// PullRequestDiff) BEFORE it reaches the store's idempotency check, and adopt
 		// labels never come off — so without this local pre-flight every already-adopted
@@ -267,6 +282,20 @@ func (r *Reconciler) AdoptPR(ctx context.Context, prNumber int) (string, bool, e
 	if pr.ClosedUnmerged {
 		return "", false, fmt.Errorf("pr #%d is closed unmerged", prNumber)
 	}
+	if r.store.EnableEpicReviewHandoffV2 {
+		if !pr.IsCrossRepository && pr.HeadRefName == "" {
+			return "", false, fmt.Errorf("pr #%d cannot be adopted: same-repository head branch is unknown", prNumber)
+		}
+		owned, err := r.ingestOwnedEpicPR(ctx, pr, r.clock.Now())
+		if err != nil {
+			return "", false, err
+		}
+		if owned {
+			// This PR is already owned by its admission-created delivery. Never
+			// route it through the generic adoption domain or fetch a second diff.
+			return "", false, nil
+		}
+	}
 	ciGreen := pr.CIRollup == gh.CISuccess && pr.CIHasRealSuccess
 	differ, ok := r.gh.(gh.PRDiffer)
 	if !ok {
@@ -277,9 +306,17 @@ func (r *Reconciler) AdoptPR(ctx context.Context, prNumber int) (string, bool, e
 		return "", false, fmt.Errorf("fetch adopted pr diff repo=%q pr=%d base=%s head=%s: %w",
 			r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid, err)
 	}
-	id, rearmed, err := r.store.AdoptPRForReview(ctx, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid,
-		diff, diff == "",
-		pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
+	var id string
+	var rearmed bool
+	if pr.IsCrossRepository {
+		// A fork ref cannot own a delivery in this repository, so there is no
+		// same-repository ownership identity to fence.
+		id, rearmed, err = r.store.AdoptPRForReview(ctx, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid,
+			diff, diff == "", pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
+	} else {
+		id, rearmed, err = r.store.AdoptPRForReviewWithHeadRef(ctx, r.repo, prNumber, pr.HeadRefName, pr.BaseRefOid, pr.HeadRefOid,
+			diff, diff == "", pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
+	}
 	if err != nil {
 		return "", false, err
 	}
@@ -305,6 +342,15 @@ func (r *Reconciler) IntakeSweep(ctx context.Context) bool {
 // ingest maps one PR's Domain-B facts to its bound job and applies them under the
 // I-3 guards. An un-bound PR (no job for that number) is a no-op (applied=false).
 func (r *Reconciler) ingest(ctx context.Context, pr gh.PullRequest, now time.Time, mainCIRed bool) (store.ReconcileOutcome, bool, error) {
+	if r.store.EnableEpicReviewHandoffV2 {
+		owned, err := r.ingestOwnedEpicPR(ctx, pr, now)
+		if err != nil {
+			return store.ReconcileOutcome{}, false, err
+		}
+		if owned {
+			return store.ReconcileOutcome{Applied: true}, true, nil
+		}
+	}
 	jobID, ok, err := r.store.JobIDForPRInRepo(ctx, r.repo, pr.Number)
 	if err != nil {
 		return store.ReconcileOutcome{}, false, err
@@ -329,6 +375,75 @@ func (r *Reconciler) ingest(ctx context.Context, pr gh.PullRequest, now time.Tim
 		}
 	}
 	return out, true, nil
+}
+
+func (r *Reconciler) ownedEpicForPR(ctx context.Context, pr gh.PullRequest) (store.EpicDeliveryOwner, bool, error) {
+	if pr.HeadRefName == "" || pr.IsCrossRepository {
+		return store.EpicDeliveryOwner{}, false, nil
+	}
+	return r.store.EpicDeliveryForRepoBranch(ctx, r.repo, pr.HeadRefName)
+}
+
+// ingestOwnedEpicPR maps an exact same-repository branch match into the v2 fact
+// store. It deliberately does not call AdoptPRForReview: the review obligation
+// already exists from admission.
+func (r *Reconciler) ingestOwnedEpicPR(ctx context.Context, pr gh.PullRequest, now time.Time) (bool, error) {
+	owner, owned, err := r.ownedEpicForPR(ctx, pr)
+	if err != nil || !owned {
+		return false, err
+	}
+	requiredPassed := r.requiredFetched && allRequiredChecksPresent(pr, r.requiredChecks)
+	ciState := epicArtifactCIState(pr, requiredPassed)
+	fact := store.EpicArtifactFact{
+		EpicID: owner.EpicID, Repo: owner.Repo, Branch: owner.Branch,
+		PRNumber: pr.Number, PROpen: !pr.Merged && !pr.ClosedUnmerged,
+		Draft: pr.IsDraft, Merged: pr.Merged, HeadSHA: pr.HeadRefOid,
+		BaseSHA: pr.BaseRefOid, CIState: ciState,
+		CIHasRealSuccess:            pr.CIHasRealSuccess,
+		RequiredChecksPresentPassed: requiredPassed,
+		CheckContextsTruncated:      pr.CheckContextsTruncated,
+		RequiredChecks:              append([]string(nil), r.requiredChecks...),
+		MergeableState:              pr.MergeableState, MergeCommitSHA: pr.MergeCommit,
+		SourceWatermark: now.UTC().UnixNano(), SourceUpdatedAt: pr.UpdatedAt,
+	}
+	if err := r.store.ObserveEpicArtifactFact(ctx, fact, now); err != nil {
+		return false, err
+	}
+	if r.pub != nil {
+		r.pub.PublishReconcile(owner.EpicID, "epic_artifact_reconciled")
+	}
+	return true, nil
+}
+
+func allRequiredChecksPresent(pr gh.PullRequest, required []string) bool {
+	if pr.CheckContextsTruncated {
+		return false
+	}
+	passed := make(map[string]bool, len(pr.PassedChecks))
+	for _, name := range pr.PassedChecks {
+		passed[name] = true
+	}
+	for _, name := range required {
+		if !passed[name] {
+			return false
+		}
+	}
+	return true
+}
+
+func epicArtifactCIState(pr gh.PullRequest, requiredPassed bool) string {
+	if pr.CIRollup == gh.CISuccess && pr.CIHasRealSuccess &&
+		requiredPassed && !pr.CheckContextsTruncated {
+		return "green"
+	}
+	switch pr.CIRollup {
+	case gh.CIFailure, gh.CIError:
+		return "red"
+	case gh.CINone:
+		return "none"
+	default:
+		return "pending"
+	}
 }
 
 // toReconciled maps a github.PullRequest to the store's Domain-B fact-set. CI is
@@ -375,9 +490,9 @@ func (r *Reconciler) ensureRequiredChecks(ctx context.Context) {
 		if err != nil {
 			return // transient: leave unfetched so a later sweep retries
 		}
-		r.requiredFetched = true
-		r.requiredChecks = checks
 		if len(checks) > 0 {
+			r.requiredFetched = true
+			r.requiredChecks = checks
 			return
 		}
 		// empty from rules — fall through to classic protection (belt-and-suspenders).
@@ -385,7 +500,7 @@ func (r *Reconciler) ensureRequiredChecks(ctx context.Context) {
 	if br, ok := r.gh.(gh.BranchProtectionReader); ok {
 		prot, ok, err := br.BranchProtection(ctx, branch)
 		if err != nil {
-			return
+			return // transient: empty rules plus an unreadable fallback is unknown, not "none"
 		}
 		r.requiredFetched = true
 		if ok && len(prot.RequiredChecks) > 0 {

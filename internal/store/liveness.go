@@ -331,6 +331,11 @@ func applyRevokeTx(ctx context.Context, tx *sql.Tx, j *job.Job, seq int,
 		j.ID, j.LeaseEpoch); err != nil {
 		return fmt.Errorf("cancel old-epoch timers: %w", err)
 	}
+	if j.State == job.StateCodeReview {
+		if err := projectEpicReviewLeaseEndTx(ctx, tx, j.ID, t.To, t.RevokeReason, now); err != nil {
+			return fmt.Errorf("project epic review revoke: %w", err)
+		}
+	}
 	return nil
 }
 

@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/ulid"
 	"github.com/samhotchkiss/flowbee/internal/web"
 	"github.com/samhotchkiss/flowbee/internal/worker"
+	"github.com/samhotchkiss/flowbee/internal/workintent"
 )
 
 type Server struct {
@@ -138,6 +140,14 @@ type Server struct {
 	// authn is the worker-transport authenticator (§7.6). Nil = loopback-only dev
 	// (no mutual auth); set for a non-loopback listener (bearer token / mTLS).
 	authn auth.Authenticator
+	// human is a separate trust boundary for dashboard decisions and work-intent
+	// control. Worker enrollment never implies human authority.
+	human *auth.HumanAccess
+	// disableLegacyPaneActuation fences the pre-v2 tmuxio send seam. In v2 every
+	// managed-session message is an immutable Driver action projected through an
+	// exact directional grant and receipt; the legacy master endpoint may still
+	// resolve non-send actions but can never type into a pane.
+	disableLegacyPaneActuation bool
 	// ui is the F12 web UI (internal/web): the productionized Fleet/Board/Dashboard
 	// panes served off the same live store read-models, embedded via go:embed.
 	ui *web.UI
@@ -145,42 +155,88 @@ type Server struct {
 	// exposed read-only for operators who need to reproduce or audit the running
 	// process without `ps eww` archaeology.
 	runningConfig RunningConfig
+	// driverControl is the runtime capability for messages authored by the
+	// deterministic Flowbee control plane. It is deliberately distinct from
+	// Driver daemon/read readiness: Driver observation can be healthy while the
+	// shipped authorization contract has no supported non-session sender.
+	driverControl DriverControlReadiness
+	// driverControlCurrent replaces the startup snapshot when serve negotiates
+	// a live capability. Health/config therefore reflect revocation and recovery
+	// without restarting the API server.
+	driverControlCurrent func() DriverControlReadiness
+
+	// projectFairMu serializes the read-pick-claim scheduling turn. The lease
+	// claim commits the selected turn in its own SQLite transaction, so this
+	// process lock only prevents two HTTP pollers from choosing from the same
+	// durable deficit snapshot. The process writer lock prevents a second server.
+	projectFairMu sync.Mutex
 }
 
 // RunningConfig is the control plane's redacted effective runtime snapshot. It is
 // deliberately limited to non-secret values and boolean "present" bits for secrets.
 type RunningConfig struct {
-	Version               string              `json:"version"`
-	PID                   int                 `json:"pid"`
-	SourceCommit          string              `json:"source_commit,omitempty"`
-	TreeDirty             bool                `json:"tree_dirty"`
-	TreeDirtyKnown        bool                `json:"tree_dirty_known"`
-	OriginMainSHA         string              `json:"origin_main_sha,omitempty"`
-	BehindOriginMainBy    int                 `json:"behind_origin_main_by,omitempty"`
-	BehindOriginMainKnown bool                `json:"behind_origin_main_known"`
-	SourceWarning         string              `json:"source_warning,omitempty"`
-	ConfigPath            string              `json:"config_path,omitempty"`
-	DatabaseURL           string              `json:"database_url"`
-	PrivateAddr           string              `json:"private_addr"`
-	HealthAddr            string              `json:"health_addr"`
-	WebhookAddr           string              `json:"webhook_addr"`
-	AllowSelfMerge        bool                `json:"allow_self_merge"`
-	RequiredReviewers     int                 `json:"required_reviewers"`
-	MirrorPath            string              `json:"mirror_path,omitempty"`
-	GitRemote             string              `json:"git_remote,omitempty"`
-	WorkerGitSSH          bool                `json:"worker_git_ssh"`
-	BundleProvisioning    bool                `json:"bundle_provisioning"`
-	GitHubTokenPresent    bool                `json:"github_token_present"`
-	WebhookSecretPresent  bool                `json:"webhook_secret_present"`
-	WorkerAuthConfigured  bool                `json:"worker_auth_configured"`
-	InsecureWorkerAPI     bool                `json:"insecure_worker_api"`
-	AuthLoopbackBypass    bool                `json:"auth_loopback_bypass"`
-	Repos                 []RunningConfigRepo `json:"repos,omitempty"`
-	LogPath               string              `json:"log_path,omitempty"`
-	BackupDir             string              `json:"backup_dir,omitempty"`
-	ReconcileIntervalEnv  string              `json:"reconcile_interval_s,omitempty"`
-	UnstickIntervalEnv    string              `json:"unstick_interval_s,omitempty"`
-	FlowbeeURL            string              `json:"flowbee_url,omitempty"`
+	Version               string                 `json:"version"`
+	PID                   int                    `json:"pid"`
+	SourceCommit          string                 `json:"source_commit,omitempty"`
+	TreeDirty             bool                   `json:"tree_dirty"`
+	TreeDirtyKnown        bool                   `json:"tree_dirty_known"`
+	OriginMainSHA         string                 `json:"origin_main_sha,omitempty"`
+	BehindOriginMainBy    int                    `json:"behind_origin_main_by,omitempty"`
+	BehindOriginMainKnown bool                   `json:"behind_origin_main_known"`
+	SourceWarning         string                 `json:"source_warning,omitempty"`
+	ConfigPath            string                 `json:"config_path,omitempty"`
+	DatabaseURL           string                 `json:"database_url"`
+	PrivateAddr           string                 `json:"private_addr"`
+	HealthAddr            string                 `json:"health_addr"`
+	WebhookAddr           string                 `json:"webhook_addr"`
+	AllowSelfMerge        bool                   `json:"allow_self_merge"`
+	RequiredReviewers     int                    `json:"required_reviewers"`
+	MirrorPath            string                 `json:"mirror_path,omitempty"`
+	GitRemote             string                 `json:"git_remote,omitempty"`
+	WorkerGitSSH          bool                   `json:"worker_git_ssh"`
+	BundleProvisioning    bool                   `json:"bundle_provisioning"`
+	GitHubTokenPresent    bool                   `json:"github_token_present"`
+	WebhookSecretPresent  bool                   `json:"webhook_secret_present"`
+	WorkerAuthConfigured  bool                   `json:"worker_auth_configured"`
+	InsecureWorkerAPI     bool                   `json:"insecure_worker_api"`
+	AuthLoopbackBypass    bool                   `json:"auth_loopback_bypass"`
+	Repos                 []RunningConfigRepo    `json:"repos,omitempty"`
+	LogPath               string                 `json:"log_path,omitempty"`
+	BackupDir             string                 `json:"backup_dir,omitempty"`
+	ReconcileIntervalEnv  string                 `json:"reconcile_interval_s,omitempty"`
+	UnstickIntervalEnv    string                 `json:"unstick_interval_s,omitempty"`
+	FlowbeeURL            string                 `json:"flowbee_url,omitempty"`
+	DriverControl         DriverControlReadiness `json:"driver_control"`
+}
+
+// DriverControlReadiness is the operator-facing, non-secret projection of the
+// control-plane-authored Driver messaging boundary. Required+unavailable is a
+// fail-closed route hold, not a reason to fabricate a session identity or fall
+// back to raw tmux.
+type DriverControlReadiness struct {
+	Required  bool   `json:"required"`
+	Available bool   `json:"available"`
+	Status    string `json:"status"`
+	Gap       string `json:"gap,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+func (r DriverControlReadiness) normalized() DriverControlReadiness {
+	if !r.Required {
+		r.Available = false
+		if r.Status == "" {
+			r.Status = "disabled"
+		}
+		return r
+	}
+	if r.Available {
+		r.Status, r.Gap, r.Reason = "ready", "", ""
+		return r
+	}
+	if r.Status == "" {
+		r.Status = "route_unavailable"
+	}
+	return r
 }
 
 type RunningConfigRepo struct {
@@ -235,6 +291,14 @@ type Config struct {
 	// a non-loopback listener MUST set it (bearer token or mTLS). The bound,
 	// unforgeable identity it returns overrides any self-asserted query param.
 	Authenticator auth.Authenticator
+	// HumanAccess authenticates expiring dashboard sessions, applies the
+	// project-scoped role/action matrix, and validates CSRF on browser writes.
+	// Nil keeps only the explicit loopback development posture; non-loopback
+	// Phase-1 API access fails closed.
+	HumanAccess *auth.HumanAccess
+	// DisableLegacyPaneActuation is mandatory for the v2 control plane. It keeps
+	// old master reply/amend routes from bypassing DriverPort.
+	DisableLegacyPaneActuation bool
 	// ContentPolicy is the operator-configured content-integrity posture (F2): the
 	// size ceilings + an EXTRA denylist that AUGMENT the shipped protected set the
 	// content gate (§9.2, I-11) runs over a worker's untrusted diff. The zero value
@@ -254,6 +318,10 @@ type Config struct {
 	// the check (dev/test with no DB-backed file path).
 	PauseMarkerPath string
 	RunningConfig   RunningConfig
+	// DriverControl carries the exact runtime messaging capability into health,
+	// config, and dashboard read models. It never enables a transport path.
+	DriverControl        DriverControlReadiness
+	DriverControlCurrent func() DriverControlReadiness
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -280,39 +348,63 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 	// F2: install the operator content-integrity Policy on the store so the gate
 	// (ReviewResult / DispatchMerge) runs the configured ceilings + extra denylist.
 	st.ContentPolicy = cfg.ContentPolicy
-	ui := web.New(st, clk, web.Config{StaleHB: staleHB})
+	driverControl := cfg.DriverControl.normalized()
+	var webDriverControlCurrent func() web.DriverControlState
+	if cfg.DriverControlCurrent != nil {
+		webDriverControlCurrent = func() web.DriverControlState {
+			current := cfg.DriverControlCurrent().normalized()
+			return web.DriverControlState{Required: current.Required, Available: current.Available,
+				Gap: current.Gap, Reason: current.Reason}
+		}
+	}
+	ui := web.New(st, clk, web.Config{StaleHB: staleHB,
+		DriverControlRequired:  driverControl.Required,
+		DriverControlAvailable: driverControl.Available,
+		DriverControlGap:       driverControl.Gap,
+		DriverControlReason:    driverControl.Reason,
+		DriverControlCurrent:   webDriverControlCurrent,
+	})
 	runningConfig := cfg.RunningConfig
 	runningConfig.Version = version
+	runningConfig.DriverControl = driverControl
 	if runningConfig.PID == 0 {
 		runningConfig.PID = os.Getpid()
 	}
+	humanAccess := cfg.HumanAccess
+	if humanAccess == nil {
+		humanAccess = auth.NewHumanAccess(nil, nil, nil, true)
+	}
 	srv := &Server{
-		store:              st,
-		clock:              clk,
-		reviewersByRepo:    cfg.RepoReviewers,
-		minter:             minter,
-		registry:           worker.NewRegistry(st, cfg.LeaseTTLS, cfg.HeartbeatIntervalS, allow),
-		broker:             NewBroker(),
-		version:            version,
-		facts:              facts,
-		policy:             cfg.Policy,
-		leaseTTL:           cfg.LeaseTTL,
-		longPollWait:       cfg.LongPollWait,
-		pollInterval:       poll,
-		mirrorPath:         cfg.MirrorPath,
-		bundleProvisioning: cfg.BundleProvisioning,
-		pushRemoteURL:      cfg.PushRemoteURL,
-		workerGitSSH:       cfg.WorkerGitSSH,
-		staleHB:            staleHB,
-		authn:              cfg.Authenticator,
-		ui:                 ui,
-		pauseMarkerPath:    cfg.PauseMarkerPath,
-		hbIntervalS:        cfg.HeartbeatIntervalS,
-		reviewAccounts:     parseReviewAccounts(os.Getenv("FLOWBEE_REVIEW_ACCOUNTS")),
-		buildAccounts:      parseReviewAccounts(os.Getenv("FLOWBEE_BUILD_ACCOUNTS")),
-		resolverAccounts:   parseReviewAccounts(os.Getenv("FLOWBEE_RESOLVER_ACCOUNTS")),
-		dispatchAccounts:   parseReviewAccounts(os.Getenv("FLOWBEE_DISPATCH_ACCOUNTS")),
-		runningConfig:      runningConfig,
+		store:                      st,
+		clock:                      clk,
+		reviewersByRepo:            cfg.RepoReviewers,
+		minter:                     minter,
+		registry:                   worker.NewRegistry(st, cfg.LeaseTTLS, cfg.HeartbeatIntervalS, allow),
+		broker:                     NewBroker(),
+		version:                    version,
+		facts:                      facts,
+		policy:                     cfg.Policy,
+		leaseTTL:                   cfg.LeaseTTL,
+		longPollWait:               cfg.LongPollWait,
+		pollInterval:               poll,
+		mirrorPath:                 cfg.MirrorPath,
+		bundleProvisioning:         cfg.BundleProvisioning,
+		pushRemoteURL:              cfg.PushRemoteURL,
+		workerGitSSH:               cfg.WorkerGitSSH,
+		staleHB:                    staleHB,
+		authn:                      cfg.Authenticator,
+		human:                      humanAccess,
+		disableLegacyPaneActuation: cfg.DisableLegacyPaneActuation,
+		ui:                         ui,
+		pauseMarkerPath:            cfg.PauseMarkerPath,
+		hbIntervalS:                cfg.HeartbeatIntervalS,
+		reviewAccounts:             parseReviewAccounts(os.Getenv("FLOWBEE_REVIEW_ACCOUNTS")),
+		buildAccounts:              parseReviewAccounts(os.Getenv("FLOWBEE_BUILD_ACCOUNTS")),
+		resolverAccounts:           parseReviewAccounts(os.Getenv("FLOWBEE_RESOLVER_ACCOUNTS")),
+		dispatchAccounts:           parseReviewAccounts(os.Getenv("FLOWBEE_DISPATCH_ACCOUNTS")),
+		runningConfig:              runningConfig,
+		driverControl:              driverControl,
+		driverControlCurrent:       cfg.DriverControlCurrent,
 	}
 	// seed GitHub health to "just succeeded" so the age metric starts ~0, not at the
 	// unix epoch, before the first sweep runs.
@@ -432,6 +524,23 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.HandleFunc("GET /v1/backlog", s.backlogJSON)
 	mux.HandleFunc("GET /v1/fleet", s.fleetJSON)
 	mux.HandleFunc("GET /v1/sessions", s.sessionsJSON)
+	// One-time dashboard authentication bootstrap. The bearer is carried only in
+	// the browser fragment and exchanged once for an HttpOnly signed session.
+	mux.HandleFunc("GET /login", s.humanLoginPage)
+	mux.HandleFunc("POST /v1/human/session", s.humanSessionCreate)
+	human := func(h http.HandlerFunc) http.Handler { return auth.HumanMiddleware(s.human, h) }
+	s.MountProjectCircuitBreakerRoutes(mux)
+	mux.Handle("GET /v1/decisions/audit", s.HumanDecisionAuditHandler())
+	mux.Handle("GET /v1/projects", human(s.projectsList))
+	mux.Handle("GET /v1/projects/{project_id}", human(s.projectOne))
+	mux.Handle("GET /v1/decisions", human(s.decisionsList))
+	mux.Handle("GET /v1/decisions/{id}", human(s.decisionOne))
+	mux.Handle("GET /v1/projects/{project_id}/work-intents", human(s.workIntentsList))
+	mux.Handle("GET /v1/work-intents/{id}", human(s.workIntentOne))
+	mux.Handle("GET /v1/projects/{project_id}/conversations", human(s.conversationThreadsList))
+	mux.Handle("GET /v1/conversations/{thread_id}", human(s.conversationOne))
+	mux.Handle("GET /v1/conversations/{thread_id}/messages", human(s.conversationMessagesList))
+	mux.Handle("GET /v1/conversations/{thread_id}/events", human(s.conversationEvents))
 	// epic-lane read-models (Phase 6b, plan §2.1 + §15.16). These join the OPEN loopback
 	// read tier /v1/sessions uses: they expose no Domain-A write, are a PUBLIC versioned
 	// contract external consumers (the elgato Stream Deck plugin) poll, and carry ETag/304.
@@ -457,7 +566,33 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.Handle("POST /v1/jobs/{job}/cancel", op(s.cancel))
 	mux.Handle("POST /v1/specs", op(s.specCreate))
 	mux.Handle("POST /v1/epics", op(s.epicCreate))
+	mux.Handle("POST /v1/epics/{id}/effect-recovery", op(s.epicEffectRecovery))
+	mux.Handle("POST /v1/work-intents/{id}/epic-contract", op(s.workIntentEpicContract))
 	mux.Handle("POST /v1/adopt", op(s.adoptPR))
+	mux.Handle("POST /v1/decisions", human(s.decisionCreate))
+	mux.Handle("POST /v1/human/login-links", human(s.humanLoginLinkCreate))
+	mux.Handle("POST /v1/projects", human(s.projectCreate))
+	mux.Handle("POST /v1/projects/{project_id}/state", human(s.projectState))
+	mux.Handle("POST /v1/projects/{project_id}/repos", human(s.projectRepoAdd))
+	mux.Handle("POST /v1/projects/{project_id}/actors", human(s.projectActorRegister))
+	mux.Handle("POST /v1/decisions/{id}/view", human(s.decisionView))
+	mux.Handle("POST /v1/decisions/{id}/answer", human(s.decisionRespond(workintent.ResponseAnswer)))
+	mux.Handle("POST /v1/decisions/{id}/approve", human(s.decisionRespond(workintent.ResponseApprove)))
+	mux.Handle("POST /v1/decisions/{id}/request-changes", human(s.decisionRespond(workintent.ResponseRequestChanges)))
+	mux.Handle("POST /v1/decisions/{id}/defer", human(s.decisionRespond(workintent.ResponseDefer)))
+	mux.Handle("POST /v1/decisions/{id}/deny", human(s.decisionRespond(workintent.ResponseDeny)))
+	mux.Handle("POST /v1/projects/{project_id}/work-intents", human(s.workIntentCreate))
+	mux.Handle("POST /v1/work-intents/{id}/definition", human(s.workIntentDefinition))
+	mux.Handle("POST /v1/work-intents/{id}/orchestrator", human(s.workIntentRegisterOrchestrator))
+	mux.Handle("POST /v1/work-intents/{id}/pause", human(s.workIntentPause))
+	mux.Handle("POST /v1/work-intents/{id}/resume", human(s.workIntentResume))
+	mux.Handle("POST /v1/work-intents/{id}/cancel", human(s.workIntentCancel))
+	mux.Handle("POST /v1/projects/{project_id}/conversations", human(s.conversationCreate))
+	mux.Handle("POST /v1/conversations/{thread_id}/focus", human(s.conversationFocus))
+	mux.Handle("POST /v1/conversations/{thread_id}/messages", human(s.conversationMessageAppend))
+	// Delivery is advanced only by the authenticated Flowbee transport projector;
+	// dashboard humans cannot forge Driver receipts or acknowledgement state.
+	mux.Handle("POST /v1/conversations/{thread_id}/messages/{message_id}/delivery", op(s.conversationMessageDelivery))
 	// epic-lane master WRITE surface (Phase 6b, plan §1): register / heartbeat / lease
 	// (the poll one-call) / resolve (the fenced exactly-once-in-practice state machine).
 	// These MUTATE supervision state + type into a live pane, so they carry the worker-
@@ -485,7 +620,16 @@ func (s *Server) configJSON(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "running config is available only from loopback unless worker auth is configured", http.StatusForbidden)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.runningConfig)
+	cfg := s.runningConfig
+	cfg.DriverControl = s.currentDriverControl()
+	writeJSON(w, http.StatusOK, cfg)
+}
+
+func (s *Server) currentDriverControl() DriverControlReadiness {
+	if s.driverControlCurrent != nil {
+		return s.driverControlCurrent().normalized()
+	}
+	return s.driverControl
 }
 
 func requestFromLoopback(r *http.Request) bool {
@@ -723,12 +867,34 @@ func (s *Server) fleetHealthJSON(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	dbOK := s.store.Ping(r.Context()) == nil
+	driverControl := s.currentDriverControl()
 	status, code := "ok", http.StatusOK
 	if !dbOK {
 		status, code = "unavailable", http.StatusServiceUnavailable
 	}
 	resp := map[string]any{"status": status, "db": dbOK, "version": s.version,
-		"github_last_success_age_seconds": s.clock.Now().Unix() - s.ghLastSuccess.Load()}
+		"github_last_success_age_seconds": s.clock.Now().Unix() - s.ghLastSuccess.Load(),
+		"driver_control":                  driverControl}
+	if dbOK && driverControl.Required && !driverControl.Available {
+		status, code = "degraded", http.StatusServiceUnavailable
+		resp["status"] = status
+	}
+	if dbOK {
+		reconcilers, err := s.store.ReconcilerSummary(r.Context(), s.clock.Now())
+		if err != nil {
+			status, code = "unavailable", http.StatusServiceUnavailable
+			resp["status"] = status
+			resp["reconciler_health_error"] = err.Error()
+		} else {
+			resp["reconciler_total"] = reconcilers.Total
+			resp["reconciler_overdue"] = reconcilers.Overdue
+			resp["reconciler_overdue_names"] = reconcilers.OverdueNames
+			if reconcilers.Overdue > 0 {
+				status, code = "degraded", http.StatusServiceUnavailable
+				resp["status"] = status
+			}
+		}
+	}
 	if e := s.ghLastErr.Load(); e != nil {
 		resp["github_last_error"] = *e
 	}
@@ -755,6 +921,17 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "# HELP flowbee_github_last_success_age_seconds Seconds since the last successful GitHub reconcile sweep.\n")
 	fmt.Fprintf(&b, "# TYPE flowbee_github_last_success_age_seconds gauge\n")
 	fmt.Fprintf(&b, "flowbee_github_last_success_age_seconds %d\n", s.clock.Now().Unix()-s.ghLastSuccess.Load())
+
+	// Reconciler liveness is computed from due clocks at scrape time. This includes
+	// the in-process watchdog itself, giving an external monitor a true dead-man
+	// signal even when no internal goroutine remains able to update projections.
+	fmt.Fprintf(&b, "# HELP flowbee_reconciler_overdue Number of enabled reconcilers past their durable heartbeat deadline.\n")
+	fmt.Fprintf(&b, "# TYPE flowbee_reconciler_overdue gauge\n")
+	if summary, err := s.store.ReconcilerSummary(ctx, s.clock.Now()); err == nil {
+		fmt.Fprintf(&b, "flowbee_reconciler_overdue %d\n", summary.Overdue)
+	} else {
+		fmt.Fprintf(&b, "flowbee_reconciler_overdue -1\n")
+	}
 
 	// DB on-disk size: the ledger (job_events) is append-only, so this grows with
 	// throughput over months. Litestream-backed + SQLite handles multi-GB, but surface
@@ -1069,6 +1246,7 @@ func (s *Server) sessionsJSON(w http.ResponseWriter, r *http.Request) {
 // LeaseGrant is the §7.2 lease envelope returned to a worker on GET /v1/lease.
 type LeaseGrant struct {
 	JobID      string `json:"job_id"`
+	ProjectID  string `json:"project_id"`
 	Kind       string `json:"kind"`
 	Role       string `json:"role"`
 	BaseSHA    string `json:"base_sha"`
@@ -1355,8 +1533,54 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 			}
 			cands = kept
 		}
-		for _, cand := range scheduler.Order(cands, attested, s.clock.Now()) {
+		// Project/repository circuit breakers are a scheduling hold, not a global
+		// pause. Filter every role's candidate union at this single choke point so
+		// a broken project cannot repeatedly win the fair turn and starve healthy
+		// projects. The claim transaction repeats the same fence to close the
+		// read→pick→claim race.
+		blockedByBreaker, breakerErr := s.store.ProjectBreakerBlockedJobIDs(r.Context())
+		if breakerErr != nil {
+			http.Error(w, "lease breaker gate error", http.StatusInternalServerError)
+			return
+		}
+		if len(blockedByBreaker) > 0 {
+			kept := cands[:0]
+			for _, c := range cands {
+				if _, blocked := blockedByBreaker[c.JobID]; !blocked {
+					kept = append(kept, c)
+				}
+			}
+			cands = kept
+		}
+		pool := scheduler.PoolBuild
+		switch {
+		case reviewing:
+			pool = scheduler.PoolReview
+		case specAuthoring:
+			pool = scheduler.PoolSpecAuthor
+		case specReviewing:
+			pool = scheduler.PoolSpecReview
+		}
+
+		// One process-wide scheduling turn: load durable credit/occupancy, pick one
+		// project, then atomically commit that exact turn with the lease. A stale
+		// candidate can still lose the job claim; in that case no fair state moves.
+		s.projectFairMu.Lock()
+		snapshot, snapErr := s.store.LoadProjectFairSnapshot(r.Context(), pool)
+		if snapErr != nil {
+			s.projectFairMu.Unlock()
+			http.Error(w, "lease scheduler error", http.StatusInternalServerError)
+			return
+		}
+		turn := scheduler.PickProjectFair(cands, snapshot.Policies, snapshot.Active, snapshot.FairState,
+			scheduler.FairConfig{Pool: pool, Attested: attested, Now: s.clock.Now(), StarvationBound: 15 * time.Minute})
+		if turn.OK {
+			cand := turn.Selected
+			fairClaim := &store.ProjectFairClaim{Pool: pool, ProjectID: turn.WinningProject,
+				JobID: cand.JobID, ForcedByAge: turn.ForcedByAge, NextState: turn.NextState,
+				Decisions: turn.Decisions, Now: s.clock.Now()}
 			if dryRun {
+				s.projectFairMu.Unlock()
 				j, gerr := s.store.GetJob(r.Context(), cand.JobID)
 				if gerr != nil {
 					http.Error(w, "lease error", http.StatusInternalServerError)
@@ -1372,29 +1596,31 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 			case reviewing:
 				ls, err = s.store.ClaimReviewJob(r.Context(), store.ClaimReviewParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
-					ModelFamily: family, Model: model, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+					SeatID: r.URL.Query().Get("seat_id"), ModelFamily: family, Model: model,
+					Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(), Fair: fairClaim,
 				})
 			case specAuthoring:
 				ls, err = s.store.ClaimSpecAuthor(r.Context(), store.ClaimSpecAuthorParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
-					ModelFamily: family, Model: model, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+					ModelFamily: family, Model: model, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(), Fair: fairClaim,
 				})
 			case specReviewing:
 				ls, err = s.store.ClaimSpecReview(r.Context(), store.ClaimSpecReviewParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
-					ModelFamily: family, Model: model, Lens: lens, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+					ModelFamily: family, Model: model, Lens: lens, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(), Fair: fairClaim,
 				})
 			case resolvingConflict:
 				ls, err = s.store.ClaimConflictJob(r.Context(), store.ClaimConflictParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
-					ModelFamily: family, Model: model, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+					ModelFamily: family, Model: model, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(), Fair: fairClaim,
 				})
 			default:
 				ls, err = s.store.ClaimReadyJob(r.Context(), store.ClaimParams{
 					JobID: cand.JobID, LeaseID: s.minter.New(), Identity: identity,
-					ModelFamily: family, Model: model, Role: role, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(),
+					ModelFamily: family, Model: model, Role: role, Attested: attested, TTL: s.leaseTTL, Now: s.clock.Now(), Fair: fairClaim,
 				})
 			}
+			s.projectFairMu.Unlock()
 			if err == nil {
 				// Arm the Rung-3 deadlines (soft phase budget + absolute cap) for this lease
 				// so the §10.2 ladder + durable deadline timers run in production — the claim
@@ -1417,7 +1643,10 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "claim error", http.StatusInternalServerError)
 				return
 			}
-			// lost race / lost on capability: try the next candidate.
+			// Lost race / final concurrency slot: no scheduler state committed.
+			// The normal long-poll cadence reloads candidates and durable credit.
+		} else {
+			s.projectFairMu.Unlock()
 		}
 		if time.Now().After(deadline) {
 			w.WriteHeader(http.StatusNoContent)
@@ -1460,7 +1689,7 @@ func truthyQuery(v string) bool {
 
 func (s *Server) leaseGrantForJob(ctx context.Context, jobID string, j job.Job, identity, family, lens string, role job.Role, reviewing, resolvingConflict bool, leaseID string, leaseEpoch int, leaseDeadline time.Time, dryRun bool) LeaseGrant {
 	grant := LeaseGrant{
-		JobID: jobID, Kind: string(j.Kind), Role: string(j.Role),
+		JobID: jobID, ProjectID: j.ProjectID, Kind: string(j.Kind), Role: string(j.Role),
 		BaseSHA: j.BaseSHA, LeaseID: leaseID, LeaseEpoch: leaseEpoch,
 		LeaseTTLS: int(s.leaseTTL / time.Second), Deadline: leaseDeadline.Format(time.RFC3339Nano),
 		DryRun: dryRun, SpecContentHash: j.SpecContentHash, SpecVersion: j.SpecVersion,

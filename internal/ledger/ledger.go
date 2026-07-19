@@ -38,10 +38,11 @@ const (
 	KindMergeHandoff    EventKind = "merge_handoff"    // mergeable -> merge_handoff
 	KindMergeStarted    EventKind = "merge_started"    // mergeable -> merging (self_merge)
 	// M6 reconcile-IN event kinds (Domain-B-driven transitions; actor='reconcile').
-	KindFactsReconciled EventKind = "facts_reconciled" // a sweep/refetch wrote Domain-B facts (audit)
-	KindSuperseded      EventKind = "superseded"       // SHA move re-armed the job to ready (I-5, §6.2.4)
-	KindAdoptRearmed    EventKind = "adopt_rearmed"    // targeted adopt observed a new PR SHA and re-armed review
-	KindBaseRefreshed   EventKind = "base_refreshed"   // a ready job's base_sha advanced to the new main after a sibling merge
+	KindFactsReconciled   EventKind = "facts_reconciled"    // a sweep/refetch wrote Domain-B facts (audit)
+	KindSuperseded        EventKind = "superseded"          // SHA move re-armed the job to ready (I-5, §6.2.4)
+	KindAdoptRearmed      EventKind = "adopt_rearmed"       // targeted adopt observed a new PR SHA and re-armed review
+	KindEpicAdoptAbsorbed EventKind = "epic_adopt_absorbed" // an admitted epic superseded a legacy adopted review execution
+	KindBaseRefreshed     EventKind = "base_refreshed"      // a ready job's base_sha advanced to the new main after a sibling merge
 	// M7 spec-flow + project-OUT event kinds.
 	KindSpecAuthored      EventKind = "spec_authored"       // Flowbee committed spec.md, opened spec_review (§11.6)
 	KindSpecClaim         EventKind = "spec_claim"          // the spec reviewer's CLAIM (untrusted, I-9)
@@ -480,6 +481,20 @@ func Fold(events []Event) (job.Job, error) {
 			j.BaseSHA = e.Payload.BaseSHA
 			j.HeadSHA = e.Payload.HeadSHA
 			j.EnqueuedAt = e.CreatedAt
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+			j.BoundLens = ""
+
+		case KindEpicAdoptAbsorbed:
+			// Admission owns this PR's review obligation. The pre-existing
+			// generic adopted execution becomes inert history: fence its epoch,
+			// revoke any lease, and clear any stale verdict authorization. A
+			// separate deterministic epic_v2 job is materialized only after the
+			// delivery's durable review handoff is eligible.
+			j.State = e.ToState
+			j.LeaseEpoch = e.LeaseEpoch
+			j.Verdict = nil
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"html/template"
@@ -17,14 +18,72 @@ import (
 // page is the shared template payload: the active nav tab + the view-specific
 // body data. The base template renders the nav + the live SSE hook around it.
 type page struct {
-	Active  string // "epics" | "board" | "fleet" | "audit" | "roster"
-	Title   string
-	Partial bool // true => render only the live body fragment (SSE refresh)
-	Epics   *epicsView
-	Board   *boardView
-	Fleet   *fleetView
-	Dash    *dashView
-	Roster  []store.RosterWorker
+	Active    string // "epics" | "workspace" | "board" | "fleet" | "audit" | "roster"
+	Title     string
+	Partial   bool // true => render only the live body fragment (SSE refresh)
+	Epics     *epicsView
+	Workspace *workspaceView
+	Board     *boardView
+	Fleet     *fleetView
+	Dash      *dashView
+	Roster    []store.RosterWorker
+}
+
+// workspaceView carries only the exact project scope into the HTML shell. The
+// durable thread, message, delivery, and route state is always read from the
+// authenticated conversation API by the browser; server-rendered placeholders
+// never become a second conversation projection.
+type workspaceView struct {
+	ProjectID              string
+	DriverControlRequired  bool
+	DriverControlAvailable bool
+	DriverControlGap       string
+	DriverControlReason    string
+}
+
+func (u *UI) workspace(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/workspace" {
+		http.NotFound(w, r)
+		return
+	}
+	projectID := strings.TrimSpace(r.URL.Query().Get("project"))
+	if projectID == "" {
+		projectID = "default"
+	}
+	if !validWorkspaceProjectID(projectID) {
+		http.Error(w, "invalid project", http.StatusBadRequest)
+		return
+	}
+	driverControl := u.currentDriverControl()
+	u.renderPage(w, r, page{Active: "workspace", Title: "Project workspace", Workspace: &workspaceView{
+		ProjectID:              projectID,
+		DriverControlRequired:  driverControl.Required,
+		DriverControlAvailable: !driverControl.Required || driverControl.Available,
+		DriverControlGap:       driverControl.Gap,
+		DriverControlReason:    driverControl.Reason,
+	}})
+}
+
+func (u *UI) currentDriverControl() DriverControlState {
+	if u.driverControlCurrent != nil {
+		return u.driverControlCurrent()
+	}
+	return DriverControlState{Required: u.driverControlRequired, Available: u.driverControlAvailable,
+		Gap: u.driverControlGap, Reason: u.driverControlReason}
+}
+
+func validWorkspaceProjectID(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' || r == ':' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // ── BOARD ──
@@ -374,11 +433,76 @@ type epicStatsView struct {
 	NeedsYou                  int
 }
 
+type needsYouCount struct {
+	Label string
+	Count int
+}
+
+type needsYouOption struct {
+	ID, Label, Description, Consequence, ValueJSON string
+	Recommended                                    bool
+}
+
+type needsYouEvidence struct {
+	Label, Kind, Ref, Hash, Version string
+	URL                             template.URL
+}
+
+type needsYouAction struct {
+	Kind, Label, Class string
+}
+
+type needsYouCard struct {
+	ID, ProjectID, EpicID, DeliveryID string
+	Kind, KindLabel, KindClass        string
+	Title, Prompt, Summary            string
+	State, StateLabel, StateClass     string
+	Priority, RequestVersion          int
+	PriorityLabel, UrgencyClass       string
+	Blocking                          bool
+	Impact, AgeLabel, DueLabel        string
+	DueClass                          string
+	RequestedBy, RouteTo              string
+	SubjectArtifactRef                string
+	SubjectArtifactURL                template.URL
+	SubjectVersion                    int
+	SubjectSHA256, SubjectShortHash   string
+	ResponseSchemaJSON                string
+	Options                           []needsYouOption
+	Evidence                          []needsYouEvidence
+	Actions                           []needsYouAction
+	AllowAnswer                       bool
+	AllowFreeAnswer                   bool
+	AllowDefer                        bool
+	RequiresAuthorizationScope        bool
+	Actionable                        bool
+	DeferredUntilLabel                string
+	DeferCondition                    string
+	SupersededBy                      string
+	CancellationReason                string
+	CurrentResponseID                 string
+	ResponseKind, ResponseActor       string
+	ResponseAckState                  string
+	CreatedLabel, ViewedLabel         string
+	ResponseCreatedLabel              string
+	SortCreated, SortUpdated, SortDue time.Time
+}
+
+type needsYouView struct {
+	Actionable, Deferred, Recent     []needsYouCard
+	OpenCount, UrgentCount           int
+	OverdueCount                     int
+	OldestLabel                      string
+	Urgencies, Projects, Types, Ages []needsYouCount
+}
+
 type epicsView struct {
 	SnapshotAt, SnapshotAge string
 	Stats                   epicStatsView
 	Master                  epicMasterView
 	Alert                   *epicCapacityAlert
+	NeedsYou                needsYouView
+	Projects                []projectPortfolioCard
 	Attention               []epicAttentionRow
 	Accounts                []epicAccountRow
 	Seats                   []epicSeatRow
@@ -387,6 +511,14 @@ type epicsView struct {
 	Completed               []epicCard
 	Archived                []epicCard
 	CompletedHidden         int
+}
+
+type projectPortfolioCard struct {
+	ID, Name, State, StateClass       string
+	PauseReason, Blocker, BlockerKind string
+	Priority, Weight, Cap             int
+	Active, Parked, NeedsYou          int
+	BlockerAge                        string
 }
 
 const dashboardCompletedLimit = 24
@@ -424,9 +556,400 @@ func (u *UI) epics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "epics error", http.StatusInternalServerError)
 		return
 	}
+	decisions, err := u.data.ListDecisionInboxAllProjects(ctx, 24)
+	if err != nil {
+		http.Error(w, "decision inbox error", http.StatusInternalServerError)
+		return
+	}
+	projects, err := u.data.ProjectDashboard(ctx)
+	if err != nil {
+		http.Error(w, "project portfolio error", http.StatusInternalServerError)
+		return
+	}
 
 	view := u.buildEpics(epics, seats, supervisors, windows, attention, u.clock.Now())
+	view.NeedsYou = buildNeedsYou(decisions, u.clock.Now())
+	view.Projects = buildProjectPortfolio(projects, u.clock.Now())
+	view.Stats.NeedsYou += view.NeedsYou.OpenCount
 	u.renderPage(w, r, page{Active: "epics", Title: "Fleet", Epics: &view})
+}
+
+func buildProjectPortfolio(rows []store.ProjectDashboardRow, now time.Time) []projectPortfolioCard {
+	out := make([]projectPortfolioCard, 0, len(rows))
+	for _, row := range rows {
+		card := projectPortfolioCard{
+			ID: row.Project.ID, Name: row.Project.Name, State: row.Project.State,
+			StateClass: strings.ToLower(row.Project.State), PauseReason: row.Project.PauseReason,
+			Priority: row.Project.Priority, Weight: row.Project.SchedulerWeight,
+			Cap: row.Project.ConcurrencyCap, Active: row.ActiveEpics, Parked: row.ParkedEpics,
+			NeedsYou: row.NeedsYou, Blocker: row.OldestBlocker, BlockerKind: humanizeToken(row.BlockerKind),
+		}
+		if !row.BlockedSince.IsZero() {
+			card.BlockerAge = humanAgo(row.BlockedSince, now)
+		}
+		out = append(out, card)
+	}
+	return out
+}
+
+func buildNeedsYou(rows []store.DecisionInboxRow, now time.Time) needsYouView {
+	view := needsYouView{}
+	projectCounts := map[string]int{}
+	typeCounts := map[string]int{}
+	urgencyCounts := map[string]int{}
+	ageCounts := map[string]int{"under 1h": 0, "1-24h": 0, "1-3d": 0, "3d+": 0}
+	oldest := time.Duration(0)
+	for _, row := range rows {
+		card := buildNeedsYouCard(row, now)
+		switch card.State {
+		case "open", "viewed":
+			view.Actionable = append(view.Actionable, card)
+			view.OpenCount++
+			projectCounts[card.ProjectID]++
+			typeCounts[card.KindLabel]++
+			urgencyCounts[card.PriorityLabel]++
+			age := now.Sub(card.SortCreated)
+			if age < 0 {
+				age = 0
+			}
+			if age > oldest {
+				oldest = age
+			}
+			switch {
+			case age < time.Hour:
+				ageCounts["under 1h"]++
+			case age < 24*time.Hour:
+				ageCounts["1-24h"]++
+			case age < 72*time.Hour:
+				ageCounts["1-3d"]++
+			default:
+				ageCounts["3d+"]++
+			}
+			if card.UrgencyClass == "critical" {
+				view.UrgentCount++
+			}
+			if card.DueClass == "overdue" {
+				view.OverdueCount++
+			}
+		case "deferred":
+			view.Deferred = append(view.Deferred, card)
+		default:
+			view.Recent = append(view.Recent, card)
+		}
+	}
+	sort.SliceStable(view.Actionable, func(i, j int) bool {
+		a, b := view.Actionable[i], view.Actionable[j]
+		if a.Priority != b.Priority {
+			return a.Priority < b.Priority
+		}
+		if a.Blocking != b.Blocking {
+			return a.Blocking
+		}
+		if a.SortDue.IsZero() != b.SortDue.IsZero() {
+			return !a.SortDue.IsZero()
+		}
+		if !a.SortDue.Equal(b.SortDue) {
+			return a.SortDue.Before(b.SortDue)
+		}
+		if !a.SortCreated.Equal(b.SortCreated) {
+			return a.SortCreated.Before(b.SortCreated)
+		}
+		return a.ID < b.ID
+	})
+	sort.SliceStable(view.Deferred, func(i, j int) bool {
+		a, b := view.Deferred[i], view.Deferred[j]
+		if !a.SortDue.Equal(b.SortDue) {
+			if a.SortDue.IsZero() != b.SortDue.IsZero() {
+				return !a.SortDue.IsZero()
+			}
+			return a.SortDue.Before(b.SortDue)
+		}
+		return a.ID < b.ID
+	})
+	sort.SliceStable(view.Recent, func(i, j int) bool {
+		if !view.Recent[i].SortUpdated.Equal(view.Recent[j].SortUpdated) {
+			return view.Recent[i].SortUpdated.After(view.Recent[j].SortUpdated)
+		}
+		return view.Recent[i].ID < view.Recent[j].ID
+	})
+	view.OldestLabel = durationAge(oldest)
+	view.Urgencies = orderedDecisionCounts(urgencyCounts, []string{"urgent", "high", "normal", "low"})
+	view.Projects = orderedDecisionCounts(projectCounts, nil)
+	view.Types = orderedDecisionCounts(typeCounts, []string{"Question", "Plan review", "Design review", "Authorization", "Exception"})
+	view.Ages = orderedDecisionCounts(ageCounts, []string{"under 1h", "1-24h", "1-3d", "3d+"})
+	return view
+}
+
+func buildNeedsYouCard(row store.DecisionInboxRow, now time.Time) needsYouCard {
+	r := row.Request
+	kindLabel, kindClass := decisionKindPresentation(string(r.Kind))
+	priorityLabel, urgencyClass := decisionPriorityPresentation(r.Priority)
+	dueLabel, dueClass := "no deadline", ""
+	if !r.DueAt.IsZero() {
+		dueLabel = "due " + humanRelative(r.DueAt, now)
+		if !r.DueAt.After(now) {
+			dueClass, urgencyClass = "overdue", "critical"
+		} else if r.DueAt.Sub(now) <= time.Hour {
+			dueClass = "soon"
+		}
+	}
+	stateLabel, stateClass := decisionStatePresentation(string(r.State))
+	actionable := r.State == "open" || r.State == "viewed"
+	card := needsYouCard{
+		ID: r.ID, ProjectID: r.ProjectID, EpicID: r.EpicID, DeliveryID: r.DeliveryID,
+		Kind: string(r.Kind), KindLabel: kindLabel, KindClass: kindClass,
+		Title: r.Title, Prompt: r.Prompt, Summary: r.Summary,
+		State: string(r.State), StateLabel: stateLabel, StateClass: stateClass,
+		Priority: r.Priority, PriorityLabel: priorityLabel, UrgencyClass: urgencyClass,
+		Blocking: row.Blocking, AgeLabel: humanAgo(r.CreatedAt, now), DueLabel: dueLabel, DueClass: dueClass,
+		RequestedBy: r.RequestedBy, RouteTo: r.RouteTo,
+		SubjectArtifactRef: r.SubjectArtifactRef, SubjectArtifactURL: safeEvidenceURL(r.SubjectArtifactRef),
+		SubjectVersion: r.SubjectVersion, SubjectSHA256: r.SubjectSHA256,
+		SubjectShortHash: shortDecisionHash(r.SubjectSHA256), RequestVersion: r.RequestVersion,
+		ResponseSchemaJSON: r.ResponseSchemaJSON, Options: parseDecisionOptions(r.OptionsJSON),
+		Evidence: parseDecisionEvidence(r.EvidenceRefsJSON), Actionable: actionable,
+		DeferCondition: r.DeferCondition, SupersededBy: r.SupersededBy,
+		CancellationReason: r.CancellationReason, CurrentResponseID: r.CurrentResponseID,
+		ResponseKind: humanizeToken(string(row.ResponseKind)), ResponseActor: row.ResponseActorID,
+		ResponseAckState: humanizeToken(row.DownstreamAckState),
+		CreatedLabel:     r.CreatedAt.Format("Jan 02, 03:04 PM"),
+		SortCreated:      r.CreatedAt, SortUpdated: r.UpdatedAt, SortDue: r.DueAt,
+	}
+	if !row.ViewedAt.IsZero() {
+		card.ViewedLabel = row.ViewedAt.Format("Jan 02, 03:04 PM")
+	}
+	if !row.ResponseCreatedAt.IsZero() {
+		card.ResponseCreatedLabel = row.ResponseCreatedAt.Format("Jan 02, 03:04 PM")
+	}
+	card.RequiresAuthorizationScope = (r.Kind == "authorization" || r.Kind == "exception") && actionable
+	if !r.DeferredUntil.IsZero() {
+		card.DeferredUntilLabel = humanRelative(r.DeferredUntil, now)
+		card.SortDue = r.DeferredUntil
+	}
+	if dueClass == "overdue" {
+		card.Impact = "The deadline passed. Waiting work remains held until this is resolved."
+	} else if row.Blocking {
+		card.Impact = "Waiting work cannot continue until this decision is recorded."
+	} else {
+		card.Impact = "Flowbee will keep this request visible until it is resolved."
+	}
+	if actionable {
+		for _, kind := range r.ExpectedResponseKinds {
+			switch string(kind) {
+			case "answer":
+				card.AllowAnswer = true
+				card.AllowFreeAnswer = r.Kind == "question" && len(card.Options) == 0
+			case "approve":
+				card.Actions = append(card.Actions, needsYouAction{Kind: "approve", Label: "Approve", Class: "primary"})
+			case "request_changes":
+				card.Actions = append(card.Actions, needsYouAction{Kind: "request-changes", Label: "Request changes", Class: "secondary"})
+			case "defer":
+				card.AllowDefer = true
+			case "deny":
+				card.Actions = append(card.Actions, needsYouAction{Kind: "deny", Label: "Deny", Class: "danger"})
+			}
+		}
+	}
+	return card
+}
+
+func decisionKindPresentation(kind string) (string, string) {
+	switch kind {
+	case "question":
+		return "Question", "question"
+	case "plan_review":
+		return "Plan review", "plan"
+	case "design_review":
+		return "Design review", "design"
+	case "authorization":
+		return "Authorization", "authorization"
+	case "exception":
+		return "Exception", "exception"
+	default:
+		return "Decision", "question"
+	}
+}
+
+func decisionPriorityPresentation(priority int) (string, string) {
+	switch priority {
+	case 1:
+		return "urgent", "critical"
+	case 2:
+		return "high", "high"
+	case 3:
+		return "normal", "normal"
+	default:
+		return "low", "low"
+	}
+}
+
+func decisionStatePresentation(state string) (string, string) {
+	switch state {
+	case "open":
+		return "new", "open"
+	case "viewed":
+		return "viewed", "viewed"
+	case "deferred":
+		return "deferred", "deferred"
+	case "superseded":
+		return "superseded", "stale"
+	case "cancelled":
+		return "cancelled", "stale"
+	case "changes_requested":
+		return "changes requested", "resolved"
+	default:
+		return humanizeToken(state), "resolved"
+	}
+}
+
+func orderedDecisionCounts(counts map[string]int, order []string) []needsYouCount {
+	seen := map[string]bool{}
+	out := []needsYouCount{}
+	for _, label := range order {
+		seen[label] = true
+		if counts[label] > 0 {
+			out = append(out, needsYouCount{Label: label, Count: counts[label]})
+		}
+	}
+	labels := make([]string, 0, len(counts))
+	for label, count := range counts {
+		if count > 0 && !seen[label] {
+			labels = append(labels, label)
+		}
+	}
+	sort.Strings(labels)
+	for _, label := range labels {
+		out = append(out, needsYouCount{Label: label, Count: counts[label]})
+	}
+	return out
+}
+
+func parseDecisionOptions(raw string) []needsYouOption {
+	var values []any
+	if json.Unmarshal([]byte(raw), &values) != nil {
+		return nil
+	}
+	out := make([]needsYouOption, 0, len(values))
+	for i, value := range values {
+		option := needsYouOption{ID: fmt.Sprintf("option-%d", i+1)}
+		choice := value
+		switch typed := value.(type) {
+		case string:
+			option.ID, option.Label = typed, typed
+		case map[string]any:
+			option.ID = firstJSONText(typed, "id", "value", "key")
+			option.Label = firstJSONText(typed, "label", "title", "name", "id", "value")
+			option.Description = firstJSONText(typed, "description", "detail", "summary")
+			option.Consequence = firstJSONText(typed, "consequence", "impact")
+			option.Recommended, _ = typed["recommended"].(bool)
+			if rawValue, ok := typed["value"]; ok {
+				choice = rawValue
+			} else if id, ok := typed["id"]; ok {
+				choice = id
+			}
+		}
+		if option.ID == "" {
+			option.ID = fmt.Sprintf("option-%d", i+1)
+		}
+		if option.Label == "" {
+			option.Label = option.ID
+		}
+		blob, err := json.Marshal(choice)
+		if err != nil {
+			continue
+		}
+		option.ValueJSON = string(blob)
+		out = append(out, option)
+	}
+	return out
+}
+
+func parseDecisionEvidence(raw string) []needsYouEvidence {
+	var values []any
+	if json.Unmarshal([]byte(raw), &values) != nil {
+		return nil
+	}
+	out := make([]needsYouEvidence, 0, len(values))
+	for _, value := range values {
+		evidence := needsYouEvidence{}
+		switch typed := value.(type) {
+		case string:
+			evidence.Label, evidence.Ref = typed, typed
+		case map[string]any:
+			evidence.Label = firstJSONText(typed, "label", "title", "name", "kind", "ref", "url")
+			evidence.Kind = firstJSONText(typed, "kind", "type")
+			evidence.Ref = firstJSONText(typed, "ref", "artifact_ref", "url")
+			evidence.Hash = firstJSONText(typed, "sha256", "hash")
+			evidence.Version = firstJSONText(typed, "version", "artifact_version")
+		}
+		if evidence.Ref == "" {
+			continue
+		}
+		if evidence.Label == "" {
+			evidence.Label = evidence.Ref
+		}
+		evidence.URL = safeEvidenceURL(evidence.Ref)
+		out = append(out, evidence)
+	}
+	return out
+}
+
+func firstJSONText(value map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if text, ok := value[key].(string); ok && strings.TrimSpace(text) != "" {
+			return strings.TrimSpace(text)
+		}
+	}
+	return ""
+}
+
+func safeEvidenceURL(value string) template.URL {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "/") && !strings.HasPrefix(value, "//") {
+		return template.URL(value)
+	}
+	if strings.HasPrefix(value, "https://") || strings.HasPrefix(value, "http://") {
+		return template.URL(value)
+	}
+	return ""
+}
+
+func shortDecisionHash(value string) string {
+	value = strings.TrimPrefix(value, "sha256:")
+	if len(value) > 12 {
+		return value[:12]
+	}
+	return value
+}
+
+func durationAge(age time.Duration) string {
+	if age <= 0 {
+		return "0m"
+	}
+	if age >= 24*time.Hour {
+		return fmt.Sprintf("%dd %dh", int(age/(24*time.Hour)), int(age%(24*time.Hour)/time.Hour))
+	}
+	if age >= time.Hour {
+		return fmt.Sprintf("%dh %dm", int(age/time.Hour), int(age%time.Hour/time.Minute))
+	}
+	return fmt.Sprintf("%dm", maxInt(1, int(age/time.Minute)))
+}
+
+func humanRelative(target, now time.Time) string {
+	if target.IsZero() {
+		return ""
+	}
+	if target.Before(now) {
+		return durationAge(now.Sub(target)) + " ago"
+	}
+	return "in " + durationAge(target.Sub(now))
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors []store.Supervisor, windows []store.AccountWindow, attention []store.AttentionItem, now time.Time) epicsView {
@@ -575,7 +1098,7 @@ func (u *UI) buildEpics(epics []store.EpicRun, seats []store.Seat, supervisors [
 			v.Completed = append(v.Completed, card)
 		case e.State == "abandoned":
 			v.Archived = append(v.Archived, card)
-		case len(items) > 0 || e.State == "blocked" || strings.Contains(strings.ToLower(e.StatusStateDetail), "review"):
+		case len(items) > 0 || e.State == "blocked" || deliveryIsReviewLane(e.DeliveryState) || strings.Contains(strings.ToLower(e.StatusStateDetail), "review"):
 			v.Review = append(v.Review, card)
 		default:
 			v.Active = append(v.Active, card)
@@ -867,6 +1390,18 @@ func epicStatus(e store.EpicRun, items []store.AttentionItem) (string, string) {
 	case "abandoned":
 		return "abandoned", "muted"
 	}
+	switch e.DeliveryState {
+	case "awaiting_review_dispatch":
+		return "built · awaiting review dispatch", "critical"
+	case "review_queued":
+		return "review queued", "review"
+	case "in_review":
+		return "in review", "review"
+	case "changes_requested", "rebuild_in_flight":
+		return humanizeToken(e.DeliveryState), "warning"
+	case "merge_queued", "merging", "conflict_resolution", "cleanup_pending":
+		return humanizeToken(e.DeliveryState), "review"
+	}
 	for _, item := range items {
 		if strings.Contains(strings.ToLower(item.Kind), "ci_red") {
 			return "CI red", "critical"
@@ -882,6 +1417,16 @@ func epicStatus(e store.EpicRun, items []store.AttentionItem) (string, string) {
 		return e.State, "warning"
 	default:
 		return firstNonEmpty(e.StatusStateDetail, e.State), "active"
+	}
+}
+
+func deliveryIsReviewLane(state string) bool {
+	switch state {
+	case "awaiting_review_dispatch", "review_queued", "in_review", "changes_requested",
+		"rebuild_in_flight", "merge_queued", "merging", "conflict_resolution", "cleanup_pending":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -976,9 +1521,9 @@ func epicDisplayText(e store.EpicRun) (string, string) {
 	if heading, description, ok := strings.Cut(raw, " — "); ok {
 		heading = strings.TrimPrefix(strings.TrimSpace(heading), "epic/")
 		heading = strings.TrimPrefix(heading, "mail-")
-		return firstNonEmpty(heading, shortEpicSlug(e.ID)), strings.TrimSpace(description)
+		return firstNonEmpty(heading, shortEpicSlug(firstNonEmpty(e.Slug, e.ID))), strings.TrimSpace(description)
 	}
-	return firstNonEmpty(raw, shortEpicSlug(e.ID), e.ID), epicSubtitle(e)
+	return firstNonEmpty(raw, shortEpicSlug(firstNonEmpty(e.Slug, e.ID)), e.ID), epicSubtitle(e)
 }
 
 func shortEpicSlug(id string) string {

@@ -29,22 +29,35 @@ import (
 type Kind string
 
 const (
-	KindScopeViolation      Kind = "scope_violation"       // prio 5  — epic diff out of scope, or a main-merge into a reserved tree
-	KindLaunchFailed        Kind = "launch_failed"         // prio 10 — epic start rollback / launching-reaper
-	KindBlockedNonResumable Kind = "blocked_non_resumable" // prio 10 — watchdog blockInfra/SetNeedsOperator
-	KindAuthDead            Kind = "auth_dead"             // prio 10 — auth-death classifier; HUMAN-ONLY re-login
-	KindMasterAbsent        Kind = "master_absent"         // prio 3  — reaper: high-pri item unleased with no live master
-	KindWedgedUI            Kind = "wedged_ui"             // prio 15 — pane stuck in modal/copy-mode
-	KindDriftSuspect        Kind = "drift_suspect"         // prio 15 — drift detector after advisor says "off"
-	KindUsageCritical       Kind = "usage_critical"        // prio 15 — capacity monitor: assigned account critical
-	KindStalled             Kind = "stalled"               // prio 15 — session stalled (plan §15.4)
-	KindNeedsInput          Kind = "needs_input"           // prio 20 — pane AWAITING_INPUT (blocking vs non-blocking, plan §15.4)
-	KindCIRedOnEpicPR       Kind = "ci_red_on_epic_pr"     // prio 20 — CI red on epic head (real, not flake)
-	KindCIInfraIncident     Kind = "ci_infra_incident"     // prio 25 — suspected infra flake; fleet banner, never pages
-	KindMergeMainSuggested  Kind = "merge_main_suggested"  // prio 35 — main moved adjacent to active scope
-	KindEpicFinished        Kind = "epic_finished"         // prio 40 — ingestion saw State: done/achieved
-	KindSendUnverified      Kind = "send_unverified"       // delivery-failed / send-unverified: fast master retry (plan §15.4)
-	KindDepFailed           Kind = "dep_failed"            // prio 15 — a queued epic's blocker terminated unsuccessfully (plan §15.12)
+	KindScopeViolation            Kind = "scope_violation"         // prio 5  — epic diff out of scope, or a main-merge into a reserved tree
+	KindLaunchFailed              Kind = "launch_failed"           // prio 10 — epic start rollback / launching-reaper
+	KindBlockedNonResumable       Kind = "blocked_non_resumable"   // prio 10 — watchdog blockInfra/SetNeedsOperator
+	KindAuthDead                  Kind = "auth_dead"               // prio 10 — auth-death classifier; HUMAN-ONLY re-login
+	KindMasterAbsent              Kind = "master_absent"           // prio 3  — reaper: high-pri item unleased with no live master
+	KindWedgedUI                  Kind = "wedged_ui"               // prio 15 — pane stuck in modal/copy-mode
+	KindDriftSuspect              Kind = "drift_suspect"           // prio 15 — drift detector after advisor says "off"
+	KindUsageCritical             Kind = "usage_critical"          // prio 15 — capacity monitor: assigned account critical
+	KindStalled                   Kind = "stalled"                 // prio 15 — session stalled (plan §15.4)
+	KindNeedsInput                Kind = "needs_input"             // prio 20 — pane AWAITING_INPUT (blocking vs non-blocking, plan §15.4)
+	KindCIRedOnEpicPR             Kind = "ci_red_on_epic_pr"       // prio 20 — CI red on epic head (real, not flake)
+	KindCIInfraIncident           Kind = "ci_infra_incident"       // prio 25 — suspected infra flake; fleet banner, never pages
+	KindMergeMainSuggested        Kind = "merge_main_suggested"    // prio 35 — main moved adjacent to active scope
+	KindEpicFinished              Kind = "epic_finished"           // prio 40 — ingestion saw State: done/achieved
+	KindSendUnverified            Kind = "send_unverified"         // delivery-failed / send-unverified: fast master retry (plan §15.4)
+	KindDepFailed                 Kind = "dep_failed"              // prio 15 — a queued epic's blocker terminated unsuccessfully (plan §15.12)
+	KindReviewDispatchStalled     Kind = "review_dispatch_stalled" // prio 10 — CI-green delivery lost its review handoff
+	KindReviewClaimStalled        Kind = "review_claim_stalled"    // prio 10 — eligible review lacks an exact Driver route binding
+	KindReviewVerdictOverdue      Kind = "review_verdict_overdue"  // prio 10 — live reviewer lease made no durable verdict progress
+	KindBuildStalled              Kind = "build_stalled"
+	KindArtifactOverdue           Kind = "artifact_overdue"
+	KindCIPendingOverdue          Kind = "ci_pending_overdue"
+	KindReviewCapacityExhausted   Kind = "review_capacity_exhausted"
+	KindCapacityPoolExhausted     Kind = "capacity_pool_exhausted"
+	KindBuilderReworkStalled      Kind = "builder_rework_stalled"
+	KindMergeDispatchStalled      Kind = "merge_dispatch_stalled"
+	KindConflictResolutionStalled Kind = "conflict_resolution_stalled"
+	KindCleanupOverdue            Kind = "cleanup_overdue"
+	KindHoldOverdue               Kind = "hold_overdue"
 )
 
 // knownKinds is the CLOSED attention-kind enum. ValidKind gates any place a kind
@@ -55,7 +68,12 @@ var knownKinds = map[Kind]bool{
 	KindAuthDead: true, KindMasterAbsent: true, KindWedgedUI: true, KindDriftSuspect: true,
 	KindUsageCritical: true, KindStalled: true, KindNeedsInput: true, KindCIRedOnEpicPR: true,
 	KindCIInfraIncident: true, KindMergeMainSuggested: true, KindEpicFinished: true,
-	KindSendUnverified: true, KindDepFailed: true,
+	KindSendUnverified: true, KindDepFailed: true, KindReviewDispatchStalled: true,
+	KindReviewClaimStalled: true, KindReviewVerdictOverdue: true,
+	KindBuildStalled: true, KindArtifactOverdue: true, KindCIPendingOverdue: true,
+	KindReviewCapacityExhausted: true, KindCapacityPoolExhausted: true, KindBuilderReworkStalled: true,
+	KindMergeDispatchStalled: true, KindConflictResolutionStalled: true,
+	KindCleanupOverdue: true, KindHoldOverdue: true,
 }
 
 // ValidKind reports whether k is a member of the closed attention-kind enum.
@@ -216,7 +234,9 @@ const (
 // TierFor maps a kind to its escalation tier (plan §15.4).
 func TierFor(kind Kind) Tier {
 	switch kind {
-	case KindAuthDead, KindWedgedUI, KindMasterAbsent, KindLaunchFailed:
+	case KindAuthDead, KindWedgedUI, KindMasterAbsent, KindLaunchFailed, KindReviewDispatchStalled,
+		KindReviewClaimStalled,
+		KindReviewVerdictOverdue, KindMergeDispatchStalled, KindCleanupOverdue, KindHoldOverdue:
 		return TierHumanImmediate
 	case KindSendUnverified:
 		return TierFastRetry

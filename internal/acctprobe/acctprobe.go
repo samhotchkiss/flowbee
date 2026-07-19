@@ -173,6 +173,10 @@ const (
 	// KindWeeklyScoped is a per-model weekly sub-limit (Claude weekly_scoped /
 	// a Codex model-scoped bucket), keyed by Scope.
 	KindWeeklyScoped WindowKind = "weekly_scoped"
+	// KindMonthly is an account-wide calendar/billing-period month. It must not be
+	// relabeled weekly: reserve policy and reset explanations depend on the real
+	// provider period.
+	KindMonthly WindowKind = "monthly"
 )
 
 // Severity mirrors the server's own severity flag. Critical means the server is
@@ -193,6 +197,7 @@ type LimitWindow struct {
 	Severity      Severity  // server severity flag (derived for codex)
 	ResetsAt      time.Time // window reset instant; zero if unknown
 	Scope         string    // model display name for scoped windows; "" otherwise
+	Display       string    // optional friendly label; Scope remains the stable upstream key
 	WindowMinutes int       // real window duration in minutes (300, 10080, …); 0 if unknown
 	Active        bool      // server is_active flag (claude); true for live codex windows
 }

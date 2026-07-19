@@ -147,12 +147,13 @@ func codexLiveWindows(main *codexLiveBucket, scoped map[string]codexLiveBucket) 
 	if !seen[KindWeeklyAll] {
 		return nil, held(ReasonUnrecognizedPayload, errors.New("codex app-server returned no weekly capacity window"))
 	}
-	for _, b := range scoped {
+	for limitID, b := range scoped {
 		name := strings.TrimSpace(b.LimitName)
 		if name == "" {
 			continue
 		}
-		// Show only the trailing model codename ("Spark" from "GPT-5.3-Codex-Spark").
+		// Keep the provider's stable limit id as routing/dedup scope. The friendly
+		// trailing codename is display metadata and never uniqueness authority.
 		label := name
 		if i := strings.LastIndex(name, "-"); i >= 0 && i+1 < len(name) {
 			label = name[i+1:]
@@ -170,7 +171,7 @@ func codexLiveWindows(main *codexLiveBucket, scoped map[string]codexLiveBucket) 
 			}
 			ws = append(ws, LimitWindow{
 				Kind: KindWeeklyScoped, Percent: *w.UsedPercent, Severity: sev,
-				ResetsAt: parseResetsAt(w.ResetsAt), Scope: label,
+				ResetsAt: parseResetsAt(w.ResetsAt), Scope: limitID, Display: label,
 				WindowMinutes: 10080, Active: true,
 			})
 			break
@@ -292,6 +293,31 @@ func (a *execAppServer) Read(ctx context.Context, codexHome string) (AppServerRe
 	if err := send(rpc(1, "initialize", map[string]any{"clientInfo": map[string]string{"name": "flowbee-acctprobe", "version": "1"}})); err != nil {
 		return AppServerResult{}, held(ReasonAppServerUnavailable, err)
 	}
+	// The app-server protocol requires the initialize RESPONSE before the client
+	// sends initialized or any account reads. Sending the whole batch optimistically
+	// races startup on a cold/updated Codex binary and can silently lose the live
+	// capacity read.
+	for {
+		select {
+		case <-runCtx.Done():
+			return AppServerResult{}, held(ReasonAppServerUnavailable, errors.New("codex app-server initialize timeout"))
+		case msg, ok := <-responses:
+			if !ok {
+				return AppServerResult{}, held(ReasonAppServerUnavailable, errors.New("codex app-server closed before initialize response"))
+			}
+			id, idErr := rpcID(msg["id"])
+			if idErr != nil || id != 1 {
+				continue
+			}
+			if raw, hasError := msg["error"]; hasError && len(raw) > 0 && string(raw) != "null" {
+				reason := classifyAppServerError(raw)
+				return AppServerResult{}, held(reason, fmt.Errorf("codex app-server initialize error classified as %s", reason))
+			}
+			goto initialized
+		}
+	}
+
+initialized:
 	if err := send(map[string]any{"jsonrpc": "2.0", "method": "initialized", "params": map[string]any{}}); err != nil {
 		return AppServerResult{}, held(ReasonAppServerUnavailable, err)
 	}

@@ -291,6 +291,10 @@ func (s *Server) mastersResolve(w http.ResponseWriter, r *http.Request) {
 // resolveWithSend runs the reply/amend delivery path (plan §1.5 steps 2–5).
 func (s *Server) resolveWithSend(w http.ResponseWriter, r *http.Request, id string, req resolveRequest, now time.Time) {
 	ctx := r.Context()
+	if s.disableLegacyPaneActuation {
+		http.Error(w, "legacy pane delivery is disabled; v2 messages require a durable Driver grant and receipt", http.StatusGone)
+		return
+	}
 	if err := validatePayload(req.Payload); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -680,6 +684,12 @@ func (s *Server) countOpenAttention(ctx context.Context) (int, error) {
 // returns "" (no tail) when no deliverer is a capturer or capture fails — the tail is
 // best-effort evidence, never load-bearing.
 func (s *Server) paneTail(ctx context.Context, e store.EpicRun) (string, error) {
+	if s.disableLegacyPaneActuation {
+		// V2 observation is read from Driver's stable-identity archive. Falling
+		// back to a raw tmux name here would reintroduce pane-reuse ambiguity and
+		// a second control-plane boundary, even though capture itself is read-only.
+		return "", nil
+	}
 	c := tmuxio.New()
 	capt, err := c.Capture(ctx, e.TmuxName, 0)
 	if err != nil {

@@ -684,8 +684,11 @@ func (s *Store) ResolveConflictResult(ctx context.Context, p ResolveConflictPara
 // scheduler Candidate, for a conflict_resolver's long-poll loop to rank and claim.
 func (s *Store) ResolvingConflictCandidates(ctx context.Context) ([]scheduler.Candidate, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, priority, enqueued_at, required_capabilities
-		  FROM jobs WHERE state='resolving_conflict' AND lease_id IS NULL`)
+		SELECT id, project_id, priority, enqueued_at, required_capabilities
+		  FROM jobs j WHERE state='resolving_conflict' AND lease_id IS NULL
+		   AND NOT EXISTS (SELECT 1 FROM project_circuit_breakers b
+		     WHERE b.project_id=j.project_id AND b.state<>'closed'
+		       AND (b.repo_id='' OR b.repo_id=j.repo))`)
 	if err != nil {
 		return nil, err
 	}
@@ -694,9 +697,10 @@ func (s *Store) ResolvingConflictCandidates(ctx context.Context) ([]scheduler.Ca
 	for rows.Next() {
 		var c scheduler.Candidate
 		var enqueued, reqJSON string
-		if err := rows.Scan(&c.JobID, &c.Priority, &enqueued, &reqJSON); err != nil {
+		if err := rows.Scan(&c.JobID, &c.ProjectID, &c.Priority, &enqueued, &reqJSON); err != nil {
 			return nil, err
 		}
+		c.Pool = scheduler.PoolBuild
 		if ts, perr := time.Parse(rfc3339, enqueued); perr == nil {
 			c.EnqueuedAt = ts
 		}
@@ -716,6 +720,7 @@ type ClaimConflictParams struct {
 	Attested    []string
 	TTL         time.Duration
 	Now         time.Time
+	Fair        *ProjectFairClaim
 }
 
 // ClaimConflictJob runs the atomic claim for the resolve_conflict stage: it binds a
@@ -729,6 +734,9 @@ func (s *Store) ClaimConflictJob(ctx context.Context, p ClaimConflictParams) (*l
 	deadline := p.Now.Add(p.TTL)
 	var result *lease.Lease
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if err := projectConcurrencyGateTx(ctx, tx, p.JobID); err != nil {
+			return err
+		}
 		var reqJSON, curState string
 		var leaseID sql.NullString
 		if err := tx.QueryRowContext(ctx,
@@ -801,6 +809,9 @@ func (s *Store) ClaimConflictJob(ctx context.Context, p ClaimConflictParams) (*l
 			p.LeaseID, p.JobID, newEpoch, p.Identity, p.ModelFamily,
 			int(p.TTL/time.Second), deadline.Format(rfc3339)); err != nil {
 			return fmt.Errorf("insert conflict lease audit: %w", err)
+		}
+		if err := commitProjectFairClaimTx(ctx, tx, p.LeaseID, p.Fair); err != nil {
+			return fmt.Errorf("commit project fair turn: %w", err)
 		}
 		result = &lease.Lease{
 			LeaseID: p.LeaseID, JobID: p.JobID, Epoch: newEpoch,

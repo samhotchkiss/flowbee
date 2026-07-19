@@ -26,6 +26,10 @@ type Client struct {
 	// every lease so the server can record it on the bound event for the §F card. Display
 	// only; empty omits the param (older/unlabeled workers just show no model on the card).
 	Model string
+	// SeatID is the operator-bound physical provider seat used by the v2
+	// fail-closed capacity gate. It is never inferred from an account label, host,
+	// CWD, or worker identity.
+	SeatID string
 }
 
 func New(baseURL string) *Client {
@@ -109,6 +113,7 @@ func (c *Client) Register(ctx context.Context, reg Registration) (RegisterRespon
 // LeaseGrant is the §7.2 lease envelope.
 type LeaseGrant struct {
 	JobID        string `json:"job_id"`
+	ProjectID    string `json:"project_id"`
 	Kind         string `json:"kind"`
 	Role         string `json:"role"`
 	BaseSHA      string `json:"base_sha"`
@@ -231,6 +236,9 @@ func (c *Client) leaseWithLens(ctx context.Context, identity, family, role, lens
 	q.Set("model_family", family)
 	if c.Model != "" {
 		q.Set("model", c.Model)
+	}
+	if c.SeatID != "" {
+		q.Set("seat_id", c.SeatID)
 	}
 	// F6 capacity: declare this worker's agent login so dispatch can gate it OUT when the
 	// account is rate-limited (the per-account ceiling). Empty/unset => never gated.

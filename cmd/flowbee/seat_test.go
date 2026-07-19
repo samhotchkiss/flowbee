@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/acctprobe"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/store"
+	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
 
 // ── an in-memory acctprobe.FS so discoverSeats is exercised without real ssh ──
@@ -161,6 +163,73 @@ func TestEnvFlagParsing(t *testing.T) {
 	}
 	if err := e.Set("noeq"); err == nil {
 		t.Fatal("expected an error for a non KEY=VALUE flag")
+	}
+}
+
+func TestSeatBindCapacityPersistsOperatorExpectation(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	seat := store.Seat{AgentFamily: "codex", CodexHome: "/opt/codex-a"}
+	if err := st.AddSeat(ctx, seat, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := runSeatBindCapacity(ctx, st, []string{
+		"--family", "codex", "--codex-home", "/opt/codex-a",
+		"--host-id", "control-host", "--account-key", "account-a",
+		"--credential-lineage", "sha256:lineage-a", "--reserve-pct", "12.5",
+		"--account-max-concurrent", "3",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var host, account, lineage string
+	var reserve float64
+	var maximum int
+	if err := st.DB.QueryRowContext(ctx, `SELECT expected_host_id,expected_account_key,
+		expected_credential_lineage,capacity_reserve_pct,account_max_concurrent
+		FROM seats WHERE id=?`, seat.ComposeID()).Scan(&host, &account, &lineage, &reserve, &maximum); err != nil {
+		t.Fatal(err)
+	}
+	if host != "control-host" || account != "account-a" || lineage != "sha256:lineage-a" || reserve != 12.5 || maximum != 3 {
+		t.Fatalf("binding host=%q account=%q lineage=%q reserve=%v maximum=%d", host, account, lineage, reserve, maximum)
+	}
+}
+
+func TestSeatBindDriverPersistsOnlyInventoryTargetNotSessionIdentity(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 19, 12, 30, 0, 0, time.UTC)
+	seat := store.Seat{Box: "stable-host", AgentFamily: "codex", CodexHome: "/opt/codex-a"}
+	if err := st.AddSeat(ctx, seat, now); err != nil {
+		t.Fatal(err)
+	}
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	if _, err := st.DB.ExecContext(ctx, `INSERT INTO driver_instances
+		(instance_ref,host_id,store_id,producer_boot_id,state,created_at,updated_at)
+		VALUES ('driver-a','stable-host','store-a','boot-a','live',?,?)`, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if err := runSeatBindDriver(ctx, st, []string{"--box", "stable-host", "--family", "codex",
+		"--codex-home", "/opt/codex-a", "--instance-ref", "driver-a",
+		"--tmux-server-instance-id", "server-a", "--profile-id", "codex-builder",
+		"--workspace-root-id", "repos", "--workspace-relative-base", "worktrees"}); err != nil {
+		t.Fatal(err)
+	}
+	var instance, server, profile, root, base string
+	if err := st.DB.QueryRowContext(ctx, `SELECT instance_ref,tmux_server_instance_id,
+		profile_id,workspace_root_id,workspace_relative_base FROM builder_driver_targets
+		WHERE project_id='default' AND seat_id=?`, seat.ComposeID()).Scan(&instance, &server,
+		&profile, &root, &base); err != nil {
+		t.Fatal(err)
+	}
+	if instance != "driver-a" || server != "server-a" || profile != "codex-builder" ||
+		root != "repos" || base != "worktrees" {
+		t.Fatalf("target=%q/%q/%q/%q/%q", instance, server, profile, root, base)
+	}
+	var sessions int
+	_ = st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM driver_session_bindings`).Scan(&sessions)
+	if sessions != 0 {
+		t.Fatalf("operator target registration injected %d session identities", sessions)
 	}
 }
 

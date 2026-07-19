@@ -148,6 +148,10 @@ func main() {
 		err = runMaster(args)
 	case "attention":
 		err = runAttention(args)
+	case "human":
+		err = runHuman(args)
+	case "watchdog":
+		err = runWatchdog(args)
 	case "version", "-v", "--version":
 		err = runVersion(args)
 	default:
@@ -162,5 +166,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|list|status|spec|repo|card|up|fleet|serve|token|migrate|migration|work|lease|submit|requeue|adopt|cancel|retry-outbox|backup|build|restore|pause|resume|session|host|seat|epic|master|attention|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|list|status|spec|repo|card|up|fleet|serve|watchdog|token|human|migrate|migration|work|lease|submit|requeue|adopt|cancel|retry-outbox|backup|build|restore|pause|resume|session|host|seat|epic|master|attention|seed|version>")
 }

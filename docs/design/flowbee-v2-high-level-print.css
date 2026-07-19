@@ -1,0 +1,216 @@
+@page {
+  size: 468pt 624pt;
+  margin: 12.35mm 11.75mm 12.95mm;
+}
+
+:root {
+  --ink: #181b1e;
+  --muted: #5c646b;
+  --line: #c7cdd1;
+  --soft: #f1f3f4;
+  --accent: #2c6950;
+}
+
+* { box-sizing: border-box; }
+
+html {
+  background: white;
+  color: var(--ink);
+  font-family: "Avenir Next", Avenir, "Helvetica Neue", Arial, sans-serif;
+  font-size: 11.35pt;
+  line-height: 1.34;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+body { margin: 0; }
+
+h1, h2, h3, table, .callout, .status { break-inside: avoid; }
+h1, h2, h3 { break-after: avoid; }
+
+h1 {
+  margin: 0 0 3.8mm;
+  font-size: 24.7pt;
+  line-height: 1.02;
+  letter-spacing: -0.045em;
+  font-weight: 720;
+}
+
+h2 {
+  margin: 3.6mm 0 1.3mm;
+  font-size: 13.75pt;
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+  font-weight: 700;
+}
+
+p { margin: 0 0 2.45mm; }
+
+ul, ol { margin: 1.1mm 0 2.6mm; padding-left: 5.1mm; }
+li { margin: 0 0 1.15mm; padding-left: 0.5mm; }
+
+strong { font-weight: 720; }
+
+.page-break { break-after: page; }
+
+.cover {
+  min-height: 158mm;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  padding-top: 3mm;
+}
+
+.cover .eyebrow {
+  font-size: 10pt;
+  font-weight: 750;
+  letter-spacing: 0.16em;
+  color: var(--accent);
+  margin-bottom: 25mm;
+}
+
+.cover h1 {
+  font-size: 41pt;
+  margin: 0 0 2.5mm;
+}
+
+.cover h2 {
+  font-size: 20pt;
+  font-weight: 500;
+  margin: 0 0 9mm;
+  max-width: 95mm;
+}
+
+.cover > p {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 14.6pt;
+  line-height: 1.4;
+  max-width: 110mm;
+}
+
+.cover-note {
+  border-top: 1.2pt solid var(--ink);
+  margin-top: 8mm;
+  padding-top: 3.5mm;
+  color: var(--muted);
+  font-size: 11.2pt;
+}
+
+.cover-note p { margin: 0; }
+.cover-note p + p { margin-top: 3mm; }
+
+.version {
+  margin-top: auto;
+  font-size: 9.4pt;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+
+.callout {
+  margin: 3.4mm 0 0;
+  padding: 3.2mm 4mm;
+  border-left: 2.2pt solid var(--accent);
+  background: var(--soft);
+}
+
+.callout p { margin: 0; }
+.callout.soft { border-left-color: #6e777e; }
+
+.profile {
+  margin-top: 3mm;
+  padding: 2.7mm 3.5mm;
+  border-top: 0.8pt solid var(--line);
+  border-bottom: 0.8pt solid var(--line);
+  font-size: 9.8pt;
+  line-height: 1.3;
+}
+
+.profile p { margin: 0; }
+.profile p + p { margin-top: 1.4mm; }
+
+.topology {
+  margin: 1.3mm auto 3.5mm;
+  max-width: 100mm;
+  text-align: center;
+  font-weight: 720;
+}
+
+.node, .pair {
+  border: 1.15pt solid var(--ink);
+  padding: 2.3mm 3.5mm;
+  letter-spacing: 0.04em;
+  background: white;
+}
+
+.node.dashboard, .node.flowbee {
+  background: var(--ink);
+  color: white;
+}
+
+.pair {
+  display: flex;
+  justify-content: space-between;
+  gap: 5mm;
+  text-align: left;
+}
+
+.pair span:last-child {
+  color: var(--muted);
+  font-size: 10.2pt;
+  font-weight: 550;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.arrow { height: 5.4mm; line-height: 5.4mm; font-size: 14.7pt; }
+.fork { display: flex; justify-content: space-between; padding: 2mm 3.5mm 0; font-size: 10.35pt; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.8mm 0 2.8mm;
+  font-size: 9.1pt;
+  line-height: 1.22;
+}
+
+th, td {
+  text-align: left;
+  vertical-align: top;
+  padding: 1.7mm 1.5mm;
+  border-bottom: 0.7pt solid var(--line);
+}
+
+th { font-weight: 720; border-bottom-color: var(--ink); }
+
+.status {
+  margin: 3.5mm 0;
+  padding: 3.2mm;
+  border: 1.2pt solid var(--ink);
+  text-align: center;
+  font-size: 13.9pt;
+  font-weight: 760;
+  letter-spacing: 0.08em;
+}
+
+.checks p {
+  margin: 0;
+  padding: 1.65mm 0;
+  border-bottom: 0.6pt solid var(--line);
+  font-size: 10.4pt;
+  line-height: 1.22;
+}
+
+.notes {
+  height: 125mm;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 8mm,
+    var(--line) 8.15mm,
+    transparent 8.3mm
+  );
+}
+
+@media print {
+  a { color: inherit; text-decoration: none; }
+}

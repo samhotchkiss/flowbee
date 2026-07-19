@@ -155,6 +155,8 @@ func TestTierFor(t *testing.T) {
 		{KindWedgedUI, TierHumanImmediate},
 		{KindMasterAbsent, TierHumanImmediate},
 		{KindLaunchFailed, TierHumanImmediate},
+		{KindReviewDispatchStalled, TierHumanImmediate},
+		{KindReviewVerdictOverdue, TierHumanImmediate},
 		{KindSendUnverified, TierFastRetry},
 		{KindEpicFinished, TierNeverPage},
 		{KindMergeMainSuggested, TierNeverPage},

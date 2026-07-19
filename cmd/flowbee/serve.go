@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,21 +19,131 @@ import (
 
 	"github.com/samhotchkiss/flowbee/internal/advisor"
 	"github.com/samhotchkiss/flowbee/internal/alarm"
+	"github.com/samhotchkiss/flowbee/internal/alerting"
 	"github.com/samhotchkiss/flowbee/internal/api"
 	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/config"
+	"github.com/samhotchkiss/flowbee/internal/driver"
+	"github.com/samhotchkiss/flowbee/internal/driverbridge"
+	"github.com/samhotchkiss/flowbee/internal/epicexec"
+	"github.com/samhotchkiss/flowbee/internal/epicflow"
 	"github.com/samhotchkiss/flowbee/internal/epicsupervisor"
 	"github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/multirepo"
 	"github.com/samhotchkiss/flowbee/internal/project"
+	"github.com/samhotchkiss/flowbee/internal/projectbreaker"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/ulid"
 	"github.com/samhotchkiss/flowbee/internal/watchdog"
 	"github.com/samhotchkiss/flowbee/internal/webhook"
+	actorprotocol "github.com/samhotchkiss/flowbee/protocol/flowbee/v2"
 )
+
+// rejectSyntheticDriverControlBinding prevents a deprecated session-shaped
+// flowbee-control identity from coexisting with Driver's authenticated v2.4
+// control-principal origin. Flowbee-authored messages are owned by the exact
+// token-bound principal, never by a fabricated agent session.
+func rejectSyntheticDriverControlBinding(ctx context.Context, db *sql.DB) error {
+	var count int
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM driver_session_bindings
+		WHERE worker_identity=? AND role=? AND state='active'`,
+		store.DriverControlIdentity, store.DriverControlRole).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("inspect Driver control bindings: %w", err)
+	}
+	if count != 0 {
+		return fmt.Errorf("GAP-FD-003: synthetic flowbee-control session bindings cannot authorize the Driver control principal; remove %d synthetic binding(s)", count)
+	}
+	return nil
+}
+
+func driverControlReadiness(ctx context.Context, v2Enabled bool, port driver.DriverPort) api.DriverControlReadiness {
+	if !v2Enabled {
+		return api.DriverControlReadiness{Status: "disabled"}
+	}
+	if port == nil {
+		return api.DriverControlReadiness{
+			Required: true, Status: "route_unavailable", Gap: "GAP-FD-003",
+			Reason: "Tmux Driver control-principal capability was not initialized; actions remain durably held.",
+		}
+	}
+	capability, err := port.ControlOriginCapability(ctx)
+	if err != nil {
+		return api.DriverControlReadiness{
+			Required: true, Status: "route_unavailable", Gap: "GAP-FD-003",
+			Reason: "Tmux Driver control-principal capability is unavailable or unauthorized: " + err.Error(),
+		}
+	}
+	return api.DriverControlReadiness{
+		Required: true, Available: true, Status: "ready",
+		Reason: "Tmux Driver authenticated control-principal origin ready for " + capability.PrincipalID + ".",
+	}
+}
+
+// selectDurableEpicReviewHandoffV2 makes the session-control boundary a
+// writer-owned database fact instead of process-local environment memory. An
+// absent environment variable reuses the last selected mode; 1 and 0 are
+// explicit activation/rollback requests and are persisted while serve holds the
+// exclusive writer lock. Offline mutating CLIs consult the same fact before
+// they can reach any legacy raw-tmux implementation.
+func selectDurableEpicReviewHandoffV2(ctx context.Context, st *store.Store) (bool, error) {
+	persisted, err := st.DurableEpicReviewHandoffV2(ctx)
+	if err != nil {
+		return true, fmt.Errorf("read durable epic-review-handoff v2 activation: %w", err)
+	}
+	raw, explicit := os.LookupEnv("FLOWBEE_EPIC_REVIEW_HANDOFF_V2")
+	if !explicit {
+		return persisted, nil
+	}
+	var selected bool
+	switch strings.TrimSpace(raw) {
+	case "1":
+		selected = true
+	case "", "0":
+		selected = false
+	default:
+		return true, fmt.Errorf("FLOWBEE_EPIC_REVIEW_HANDOFF_V2 must be 0 or 1")
+	}
+	if err := st.SetDurableEpicReviewHandoffV2(ctx, selected); err != nil {
+		return true, fmt.Errorf("persist epic-review-handoff v2 activation: %w", err)
+	}
+	return selected, nil
+}
+
+func readOwnerOnlySecret(path string) (string, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = syscall.Close(fd)
+		return "", errors.New("open secret file")
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("secret file must be regular and owner-only (mode 0600 or stricter)")
+	}
+	if info.Size() <= 0 || info.Size() > 8192 {
+		return "", fmt.Errorf("secret file has invalid size %d", info.Size())
+	}
+	b, err := io.ReadAll(io.LimitReader(f, 8193))
+	if err != nil {
+		return "", err
+	}
+	secret := strings.TrimSpace(string(b))
+	if secret == "" {
+		return "", errors.New("secret file is empty")
+	}
+	return secret, nil
+}
 
 // runServe boots the control plane: load config -> open store -> migrate ->
 // open health + private listeners -> block until signal -> graceful shutdown.
@@ -93,6 +205,34 @@ func printServeSystemd() {
 		fmt.Printf("# FLOWBEE_ENROLLED_IDENTITIES (run `flowbee token --identity <name>` per worker):\n")
 		fmt.Printf("FLOWBEE_INSECURE=1\n")
 	}
+	if os.Getenv("FLOWBEE_EPIC_REVIEW_HANDOFF_V2") == "1" {
+		fmt.Printf("FLOWBEE_EPIC_REVIEW_HANDOFF_V2=1\n")
+		for _, key := range []string{
+			"FLOWBEE_ALERT_WEBHOOK_URL", "FLOWBEE_ALERT_WEBHOOK_SECRET_FILE",
+			"FLOWBEE_EXTERNAL_WATCHDOG_ID", "FLOWBEE_DRIVER_SOCKET",
+			"FLOWBEE_DRIVER_TOKEN_FILE", "FLOWBEE_DRIVER_INSTANCE_REF",
+		} {
+			if value := os.Getenv(key); value != "" {
+				fmt.Printf("%s=%s\n", key, value)
+			}
+		}
+	}
+	if os.Getenv("FLOWBEE_CAPACITY_ROUTING_V2") == "1" || os.Getenv("FLOWBEE_CAPACITY_V2") == "1" {
+		fmt.Printf("FLOWBEE_CAPACITY_ROUTING_V2=1\n")
+		for _, key := range []string{"FLOWBEE_CAPACITY_LOCAL_HOST_ID", "FLOWBEE_CAPACITY_COLLECTOR_ID", "FLOWBEE_CAPACITY_COLLECT_INTERVAL"} {
+			if value := os.Getenv(key); value != "" {
+				fmt.Printf("%s=%s\n", key, value)
+			}
+		}
+	}
+	if os.Getenv("FLOWBEE_PHASE1_DASHBOARD") == "1" {
+		fmt.Printf("FLOWBEE_PHASE1_DASHBOARD=1\n")
+		for _, key := range []string{"FLOWBEE_HUMAN_SESSION_KEY_FILE", "FLOWBEE_HUMAN_GRANTS_FILE"} {
+			if value := os.Getenv(key); value != "" {
+				fmt.Printf("%s=%s\n", key, value)
+			}
+		}
+	}
 	fmt.Printf("\n# 2. Write /etc/systemd/system/flowbee-serve.service:\n")
 	fmt.Printf(`[Unit]
 Description=Flowbee control plane
@@ -127,6 +267,16 @@ func runServe(args []string) error {
 		return err
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	contract, err := actorprotocol.Load()
+	if err != nil {
+		return fmt.Errorf("validate embedded actor protocol: %w", err)
+	}
+	contractHash, err := actorprotocol.BundleHash()
+	if err != nil {
+		return fmt.Errorf("hash embedded actor protocol: %w", err)
+	}
+	logger.Info("actor protocol validated", "protocol", contract.Protocol.ID,
+		"version", contract.Version(), "bundle_hash", contractHash)
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -155,6 +305,9 @@ func runServe(args []string) error {
 		return err
 	}
 	defer st.Close()
+	if err := st.AcquireWriterLock(); err != nil {
+		return err
+	}
 
 	if err := store.MigrateUp(ctx, st.DB); err != nil {
 		return err
@@ -167,6 +320,699 @@ func runServe(args []string) error {
 	ensureControlMirror(logger, cfg)
 
 	st.NoEligibleWorkerDelay = cfg.NoEligibleWorker()
+	// V2 activation is durable: after the first explicit 1, an omitted environment
+	// variable cannot silently reopen legacy raw-tmux control. An explicit 0 while
+	// holding the writer lock is the rollback operation.
+	st.EnableEpicReviewHandoffV2, err = selectDurableEpicReviewHandoffV2(ctx, st)
+	if err != nil {
+		return err
+	}
+	st.EnableCapacityV2 = os.Getenv("FLOWBEE_CAPACITY_ROUTING_V2") == "1" ||
+		os.Getenv("FLOWBEE_CAPACITY_V2") == "1"
+	phase1Enabled := os.Getenv("FLOWBEE_PHASE1_DASHBOARD") == "1"
+	driverControl := driverControlReadiness(ctx, st.EnableEpicReviewHandoffV2, nil)
+	controlState := newDriverControlState(driverControl)
+	// A database binding is inventory, not authority. Keep every Flowbee-authored
+	// message seam closed until Driver negotiates a real non-session control
+	// origin (GAP-FD-003). Observation and lifecycle control remain available.
+	st.EnableDriverControlOrigin = driverControl.Available
+	st.DriverControlOriginGate = controlState.Available
+	var capacityInterval time.Duration
+	if st.EnableCapacityV2 && !st.EnableEpicReviewHandoffV2 {
+		return fmt.Errorf("capacity routing v2 requires FLOWBEE_EPIC_REVIEW_HANDOFF_V2=1")
+	}
+	if st.EnableCapacityV2 {
+		capacityInterval, err = capacityCollectorInterval()
+		if err != nil {
+			return err
+		}
+	}
+	if phase1Enabled && !st.EnableEpicReviewHandoffV2 {
+		return fmt.Errorf("Phase 1 dashboard automation requires FLOWBEE_EPIC_REVIEW_HANDOFF_V2=1")
+	}
+	var v2Reconcilers *durableReconcilerSet
+	if st.EnableEpicReviewHandoffV2 {
+		if err := epicflow.ValidateRegistry(); err != nil {
+			return fmt.Errorf("epic v2 recovery contract: %w", err)
+		}
+		alertURL, alertSecretFile := os.Getenv("FLOWBEE_ALERT_WEBHOOK_URL"), os.Getenv("FLOWBEE_ALERT_WEBHOOK_SECRET_FILE")
+		if alertURL == "" || alertSecretFile == "" {
+			return fmt.Errorf("epic review handoff v2 requires FLOWBEE_ALERT_WEBHOOK_URL and owner-only FLOWBEE_ALERT_WEBHOOK_SECRET_FILE")
+		}
+		alertSecret, alertSecretErr := readOwnerOnlySecret(alertSecretFile)
+		if alertSecretErr != nil {
+			return fmt.Errorf("read alert webhook secret: %w", alertSecretErr)
+		}
+		if os.Getenv("FLOWBEE_EXTERNAL_WATCHDOG_ID") == "" {
+			return fmt.Errorf("epic review handoff v2 requires FLOWBEE_EXTERNAL_WATCHDOG_ID")
+		}
+		driverSocket, driverTokenFile := os.Getenv("FLOWBEE_DRIVER_SOCKET"), os.Getenv("FLOWBEE_DRIVER_TOKEN_FILE")
+		if driverSocket == "" || driverTokenFile == "" {
+			return fmt.Errorf("epic review handoff v2 requires FLOWBEE_DRIVER_SOCKET and FLOWBEE_DRIVER_TOKEN_FILE")
+		}
+		driverToken, tokenErr := readOwnerOnlySecret(driverTokenFile)
+		if tokenErr != nil {
+			return fmt.Errorf("read Driver control token: %w", tokenErr)
+		}
+		driverPort := driver.NewUDSPort(driverSocket, driverToken)
+		if err := driverPort.Check(ctx); err != nil {
+			return fmt.Errorf("tmux-driver readiness: %w", err)
+		}
+		driverControl = probeDriverControlState(ctx, controlState, st.DB, driverPort)
+		st.EnableDriverControlOrigin = driverControl.Available
+		reconcilerOwner := fmt.Sprintf("serve-%d", os.Getpid())
+		reconcilerGrace := map[string]time.Duration{
+			"review_handoff":            3 * time.Minute,
+			"review_verdict":            3 * time.Minute,
+			"delivery_backstop":         3 * time.Minute,
+			"alert_drainer":             time.Minute,
+			"driver_observer":           30 * time.Second,
+			"driver_control_capability": 30 * time.Second,
+			"driver_executor":           30 * time.Second,
+			"builder_lifecycle":         30 * time.Second,
+			"builder_launch":            30 * time.Second,
+			"epic_effects":              30 * time.Second,
+			"project_breaker_probe":     time.Minute,
+			"reconciler_watchdog":       time.Minute,
+		}
+		if phase1Enabled {
+			reconcilerGrace["work_intent_promotion"] = time.Minute
+			reconcilerGrace["work_intent_driver"] = 30 * time.Second
+			reconcilerGrace["work_intent_admission"] = time.Minute
+			reconcilerGrace["decision_response_driver"] = 30 * time.Second
+			reconcilerGrace["conversation_driver"] = 30 * time.Second
+		}
+		if st.EnableCapacityV2 {
+			reconcilerGrace["capacity_pools"] = time.Minute
+			// The external watchdog must not call a healthy non-default cadence
+			// overdue. Conversely, this grace remains below the five-minute
+			// route-freshness window for every accepted cadence, so a dead
+			// collector is visible before the scheduler ages out all capacity.
+			reconcilerGrace["capacity_collector"] = capacityInterval + 30*time.Second
+		}
+		v2Reconcilers, tokenErr = beginDurableReconcilers(ctx, st, reconcilerOwner, time.Now(), reconcilerGrace)
+		if tokenErr != nil {
+			return fmt.Errorf("initialize v2 reconciler supervision: %w", tokenErr)
+		}
+		if driverControl.Available {
+			logger.Info("epic review handoff v2 enabled with authenticated Driver control-principal routing",
+				"driver_control_status", driverControl.Status)
+		} else {
+			logger.Warn("epic review handoff v2 enabled with control-plane Driver messaging held",
+				"driver_control_status", driverControl.Status, "contract_gap", driverControl.Gap,
+				"reason", driverControl.Reason)
+			if phase1Enabled {
+				logger.Warn("Phase 1 dashboard enabled; Flowbee-authored Driver automation is not live",
+					"driver_control_status", driverControl.Status, "contract_gap", driverControl.Gap)
+			}
+		}
+		// Re-prove both the advertised feature and this bearer token's exact
+		// control-principal capability throughout the process lifetime. A failed
+		// probe atomically fences new materialization/claims; a later exact proof
+		// reopens them. The supervised loop itself remains healthy while held so
+		// observation/lifecycle and effect verification continue.
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					before := controlState.Snapshot()
+					var after api.DriverControlReadiness
+					err := v2Reconcilers.tick(ctx, "driver_control_capability", now, func() error {
+						after = probeDriverControlState(ctx, controlState, st.DB, driverPort)
+						return nil
+					})
+					if err != nil {
+						logger.Error("Driver control capability supervision failed", "err", err)
+						continue
+					}
+					if before.Available != after.Available || before.Status != after.Status || before.Reason != after.Reason {
+						if after.Available {
+							logger.Info("Driver control-principal capability restored; pending sends may resume")
+						} else {
+							logger.Warn("Driver control-principal capability lost; new sends held",
+								"status", after.Status, "contract_gap", after.Gap, "reason", after.Reason)
+						}
+					}
+				}
+			}
+		}()
+		driverInstanceRef := os.Getenv("FLOWBEE_DRIVER_INSTANCE_REF")
+		if driverInstanceRef == "" {
+			driverInstanceRef = "local-driver"
+		}
+		driverObserver := driver.ObservationIngestor{InstanceRef: driverInstanceRef, Port: driverPort,
+			Store: driver.ObservationSQLStore{DB: st.DB}}
+		var observationRep driver.ObservationFoldResult
+		startupNow := time.Now()
+		if oerr := v2Reconcilers.tick(ctx, "driver_observer", startupNow, func() error {
+			var err error
+			observationRep, err = driverObserver.Tick(ctx)
+			return err
+		}); oerr != nil {
+			return fmt.Errorf("startup tmux-driver observation reconcile: %w", oerr)
+		}
+		logger.Info("startup tmux-driver observation reconcile complete",
+			"events", observationRep.Inserted, "deduplicated", observationRep.Deduplicated,
+			"snapshot_replaced", observationRep.SnapshotReplaced, "store_reset", observationRep.StoreReset)
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					var rep driver.ObservationFoldResult
+					err := v2Reconcilers.tick(ctx, "driver_observer", now, func() error {
+						var err error
+						rep, err = driverObserver.Tick(ctx)
+						return err
+					})
+					if err != nil {
+						logger.Error("tmux-driver observation reconcile failed", "err", err)
+					} else if rep.Inserted+rep.Deduplicated > 0 || rep.SnapshotReplaced || rep.StoreReset || rep.CursorGap {
+						logger.Info("tmux-driver observation reconcile complete", "events", rep.Inserted,
+							"deduplicated", rep.Deduplicated, "snapshot_replaced", rep.SnapshotReplaced,
+							"store_reset", rep.StoreReset, "cursor_gap", rep.CursorGap, "caught_up", rep.CaughtUp)
+					}
+				}
+			}
+		}()
+		var rep store.EpicReviewReconcileResult
+		startupNow = time.Now()
+		rerr := v2Reconcilers.tick(ctx, "review_handoff", startupNow, func() error {
+			var err error
+			rep, err = st.ReconcileEpicReviewHandoffs(ctx, startupNow, 5*time.Minute)
+			return err
+		})
+		if rerr != nil {
+			return fmt.Errorf("startup epic review handoff reconcile: %w", rerr)
+		}
+		logger.Info("startup epic review handoff reconcile complete", "scanned", rep.Scanned, "dispatched", rep.Dispatched)
+		var verdictRep store.EpicReviewVerdictStallResult
+		startupNow = time.Now()
+		rerr = v2Reconcilers.tick(ctx, "review_verdict", startupNow, func() error {
+			var err error
+			verdictRep, err = st.ReconcileEpicReviewVerdictStalls(ctx, startupNow, 20*time.Minute, 3)
+			return err
+		})
+		if rerr != nil {
+			return fmt.Errorf("startup epic review verdict reconcile: %w", rerr)
+		}
+		logger.Info("startup epic review verdict reconcile complete", "scanned", verdictRep.Scanned,
+			"requeued", verdictRep.Requeued, "escalated", verdictRep.Escalated)
+		var backstopRep store.EpicDeliveryBackstopResult
+		startupNow = time.Now()
+		rerr = v2Reconcilers.tick(ctx, "delivery_backstop", startupNow, func() error {
+			var err error
+			backstopRep, err = st.ReconcileEpicDeliveryBackstops(ctx, startupNow)
+			return err
+		})
+		if rerr != nil {
+			return fmt.Errorf("startup epic delivery backstop: %w", rerr)
+		}
+		logger.Info("startup epic delivery backstop complete", "scanned", backstopRep.Scanned, "alerted", backstopRep.Alerted)
+		alertDrainer := alerting.Drainer{
+			Store: st, Sink: alerting.WebhookSink{URL: alertURL, Secret: alertSecret},
+			Owner: fmt.Sprintf("serve-%d", os.Getpid()), ClaimTTL: time.Minute,
+			MaximumTries: 5, Batch: 50,
+		}
+		var alertRep alerting.Report
+		startupNow = time.Now()
+		if derr := v2Reconcilers.tick(ctx, "alert_drainer", startupNow, func() error {
+			var err error
+			alertRep, err = alertDrainer.Tick(ctx, startupNow)
+			return err
+		}); derr != nil {
+			logger.Error("startup alert drain failed", "err", derr)
+		} else if alertRep.Published+alertRep.Retried+alertRep.DeadLettered > 0 {
+			logger.Info("startup alert drain complete", "published", alertRep.Published, "retried", alertRep.Retried, "dead_lettered", alertRep.DeadLettered)
+		}
+		if st.EnableCapacityV2 {
+			capacityRuntime, capacityErr := newProductionCapacityCollector(st, cfg,
+				os.Getenv("FLOWBEE_CAPACITY_LOCAL_HOST_ID"), os.Getenv("FLOWBEE_CAPACITY_COLLECTOR_ID"))
+			if capacityErr != nil {
+				return fmt.Errorf("initialize capacity collector: %w", capacityErr)
+			}
+			startupNow = time.Now()
+			var startupGeneration store.CapacityGeneration
+			if capacityErr := v2Reconcilers.tick(ctx, "capacity_collector", startupNow, func() error {
+				var err error
+				startupGeneration, err = capacityRuntime.collect(ctx, startupNow)
+				return err
+			}); capacityErr != nil {
+				return fmt.Errorf("startup live capacity collection: %w", capacityErr)
+			}
+			logger.Info("startup live capacity generation committed", "generation", startupGeneration.ID,
+				"seats", len(startupGeneration.ExpectedSeatIDs), "observations", len(startupGeneration.Observations),
+				"interval", capacityInterval.String())
+			go func() {
+				ticker := time.NewTicker(capacityInterval)
+				defer ticker.Stop()
+				runCapacityCollectorLoop(ctx, ticker.C, func(now time.Time) {
+					var generation store.CapacityGeneration
+					err := v2Reconcilers.tick(ctx, "capacity_collector", now, func() error {
+						var err error
+						generation, err = capacityRuntime.collect(ctx, now)
+						return err
+					})
+					if err != nil {
+						logger.Error("live capacity collection failed; active generation will age out fail-closed", "err", err)
+					} else {
+						logger.Info("live capacity generation committed", "generation", generation.ID,
+							"seats", len(generation.ExpectedSeatIDs), "observations", len(generation.Observations))
+					}
+				})
+			}()
+
+			buildProvider := envOr("FLOWBEE_BUILD_PROVIDER", "codex")
+			reviewProvider := envOr("FLOWBEE_REVIEW_PROVIDER", "grok")
+			operationsProvider := envOr("FLOWBEE_OPERATIONS_PROVIDER", "grok")
+			reconcilePools := func(now time.Time) (store.CapacityPoolReconcileResult, error) {
+				requirements, err := st.CapacityPoolDemand(ctx, buildProvider, reviewProvider, operationsProvider)
+				if err != nil {
+					return store.CapacityPoolReconcileResult{}, err
+				}
+				return st.ReconcileCapacityPools(ctx, requirements, now, 5*time.Minute, 15*time.Minute)
+			}
+			startupNow = time.Now()
+			var startupPoolRep store.CapacityPoolReconcileResult
+			if perr := v2Reconcilers.tick(ctx, "capacity_pools", startupNow, func() error {
+				var err error
+				startupPoolRep, err = reconcilePools(startupNow)
+				return err
+			}); perr != nil {
+				return fmt.Errorf("startup capacity-pool reconcile: %w", perr)
+			}
+			logger.Info("startup capacity-pool reconcile complete", "checked", startupPoolRep.Checked,
+				"pending", startupPoolRep.Pending, "alerted", startupPoolRep.Alerted,
+				"resolved", startupPoolRep.Resolved)
+			go func() {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case now := <-ticker.C:
+						var rep store.CapacityPoolReconcileResult
+						err := v2Reconcilers.tick(ctx, "capacity_pools", now, func() error {
+							var err error
+							rep, err = reconcilePools(now)
+							return err
+						})
+						if err != nil {
+							logger.Error("capacity-pool reconcile failed", "err", err)
+						} else if rep.Pending+rep.Alerted+rep.Resolved > 0 {
+							logger.Info("capacity-pool reconcile pass", "checked", rep.Checked,
+								"pending", rep.Pending, "alerted", rep.Alerted, "resolved", rep.Resolved)
+						}
+					}
+				}
+			}()
+		}
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					var rep alerting.Report
+					err := v2Reconcilers.tick(ctx, "alert_drainer", now, func() error {
+						var err error
+						rep, err = alertDrainer.Tick(ctx, now)
+						return err
+					})
+					if err != nil {
+						logger.Error("alert drain failed", "err", err)
+					} else if rep.Published+rep.Retried+rep.DeadLettered > 0 {
+						logger.Info("alert drain complete", "published", rep.Published, "retried", rep.Retried, "dead_lettered", rep.DeadLettered)
+					}
+				}
+			}
+		}()
+		driverRuntime := driver.Runtime{
+			Port: driverPort, Store: driver.SQLActionStore{DB: st.DB,
+				ControlOriginAvailable: driverControl.Available, ControlOriginGate: controlState.Available},
+			Evidence: driver.SQLStageEvidence{DB: st.DB},
+			Owner:    fmt.Sprintf("serve-driver-%d", os.Getpid()), ClaimTTL: time.Minute,
+			MaximumTries: 5,
+		}
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					var rep driver.RuntimeReport
+					err := v2Reconcilers.tick(ctx, "driver_executor", now, func() error {
+						var err error
+						rep, err = driverRuntime.Tick(ctx, now)
+						return err
+					})
+					if err != nil {
+						logger.Error("Driver action runtime failed", "err", err)
+					} else if rep.Delivered+rep.Verified+rep.Retried+rep.DeadLettered > 0 {
+						logger.Info("Driver action runtime pass", "delivered", rep.Delivered,
+							"verified", rep.Verified, "retried", rep.Retried, "dead_lettered", rep.DeadLettered)
+					}
+				}
+			}
+		}()
+		lifecycleRuntime := driver.LifecycleRuntime{
+			Port: driverPort, Store: driver.SQLActionStore{DB: st.DB}, Projector: driverbridge.Projector{Store: st},
+			Owner: fmt.Sprintf("serve-lifecycle-%d", os.Getpid()), ClaimTTL: time.Minute,
+			MaximumTries: 5,
+		}
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					var rep driver.LifecycleRuntimeReport
+					err := v2Reconcilers.tick(ctx, "builder_lifecycle", now, func() error {
+						var err error
+						rep, err = lifecycleRuntime.Tick(ctx, now)
+						return err
+					})
+					if err != nil {
+						logger.Error("builder lifecycle runtime failed", "err", err)
+					} else if rep.Reclaimed+rep.Verified+rep.Executed+rep.Held+rep.Retried+rep.DeadLettered > 0 {
+						logger.Info("builder lifecycle runtime pass", "reclaimed", rep.Reclaimed,
+							"verified", rep.Verified, "executed", rep.Executed,
+							"held", rep.Held,
+							"retried", rep.Retried, "dead_lettered", rep.DeadLettered)
+					}
+				}
+			}
+		}()
+		launchProvider := envOr("FLOWBEE_BUILD_PROVIDER", "codex")
+		var startupLaunchRep store.BuilderLaunchReconcileResult
+		startupNow = time.Now()
+		if launchErr := v2Reconcilers.tick(ctx, "builder_launch", startupNow, func() error {
+			var err error
+			startupLaunchRep, err = st.ReconcileBuilderLaunches(ctx, startupNow,
+				5*time.Minute, launchProvider, 5)
+			return err
+		}); launchErr != nil {
+			return fmt.Errorf("startup builder-launch reconcile: %w", launchErr)
+		}
+		logger.Info("startup builder-launch reconcile complete", "scanned", startupLaunchRep.Scanned,
+			"actions_created", startupLaunchRep.ActionsCreated, "acknowledged", startupLaunchRep.Acknowledged,
+			"capacity_held", startupLaunchRep.CapacityHeld, "stalled", startupLaunchRep.Stalled)
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					var rep store.BuilderLaunchReconcileResult
+					err := v2Reconcilers.tick(ctx, "builder_launch", now, func() error {
+						var err error
+						rep, err = st.ReconcileBuilderLaunches(ctx, now, 5*time.Minute, launchProvider, 5)
+						return err
+					})
+					if err != nil {
+						logger.Error("builder-launch reconcile failed", "err", err)
+					} else if rep.ActionsCreated+rep.Acknowledged+rep.CapacityHeld+rep.Stalled > 0 {
+						logger.Info("builder-launch reconcile pass", "scanned", rep.Scanned,
+							"actions_created", rep.ActionsCreated, "acknowledged", rep.Acknowledged,
+							"capacity_held", rep.CapacityHeld, "stalled", rep.Stalled)
+					}
+				}
+			}
+		}()
+		if phase1Enabled {
+			conversationRuntime := driver.ConversationRuntime{
+				Port: driverPort, Store: driver.ConversationSQLStore{DB: st.DB,
+					ControlOriginAvailable: driverControl.Available, ControlOriginGate: controlState.Available},
+				Evidence: driver.ConversationStageEvidence{DB: st.DB},
+				Owner:    fmt.Sprintf("serve-conversation-%d", os.Getpid()), ClaimTTL: time.Minute,
+				AcknowledgementTTL: 10 * time.Minute,
+				MaximumTries:       5,
+			}
+			var startupConversationProjection store.ConversationDeliveryReconcileReport
+			var startupConversationRuntime driver.ConversationRuntimeReport
+			startupNow = time.Now()
+			if cerr := v2Reconcilers.tick(ctx, "conversation_driver", startupNow, func() error {
+				var err error
+				startupConversationProjection, err = st.ReconcileConversationMessageActions(ctx, startupNow)
+				if err != nil {
+					return err
+				}
+				startupConversationRuntime, err = conversationRuntime.Tick(ctx, startupNow)
+				return err
+			}); cerr != nil {
+				return fmt.Errorf("startup conversation Driver reconcile: %w", cerr)
+			}
+			logger.Info("startup conversation Driver reconcile complete",
+				"materialized", startupConversationProjection.ActionsCreated,
+				"route_holds", startupConversationProjection.RoutesHeld,
+				"fenced", startupConversationRuntime.Fenced,
+				"reclaimed", startupConversationRuntime.Reclaimed,
+				"held", startupConversationRuntime.Held,
+				"delivered", startupConversationRuntime.Delivered,
+				"verified", startupConversationRuntime.Verified,
+				"retried", startupConversationRuntime.Retried,
+				"dead_lettered", startupConversationRuntime.DeadLettered)
+			go func() {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case now := <-ticker.C:
+						var projection store.ConversationDeliveryReconcileReport
+						var transport driver.ConversationRuntimeReport
+						err := v2Reconcilers.tick(ctx, "conversation_driver", now, func() error {
+							var err error
+							projection, err = st.ReconcileConversationMessageActions(ctx, now)
+							if err != nil {
+								return err
+							}
+							transport, err = conversationRuntime.Tick(ctx, now)
+							return err
+						})
+						if err != nil {
+							logger.Error("conversation Driver reconcile failed", "err", err)
+						} else if projection.ActionsCreated+projection.RoutesHeld+transport.Fenced+
+							transport.Reclaimed+transport.Held+transport.Delivered+transport.Verified+
+							transport.Retried+transport.DeadLettered > 0 {
+							logger.Info("conversation Driver reconcile pass",
+								"materialized", projection.ActionsCreated, "route_holds", projection.RoutesHeld,
+								"fenced", transport.Fenced, "reclaimed", transport.Reclaimed,
+								"held", transport.Held, "delivered", transport.Delivered,
+								"verified", transport.Verified, "retried", transport.Retried,
+								"dead_lettered", transport.DeadLettered)
+						}
+					}
+				}
+			}()
+			decisionRuntime := driver.DecisionResponseRuntime{
+				Port: driverPort, Store: driver.DecisionResponseSQLStore{DB: st.DB,
+					ControlOriginAvailable: driverControl.Available, ControlOriginGate: controlState.Available}, Domain: st,
+				Evidence: driver.DecisionResponseStageEvidence{DB: st.DB},
+				Owner:    fmt.Sprintf("serve-decision-response-%d", os.Getpid()), ClaimTTL: time.Minute,
+				AcknowledgementTTL: 10 * time.Minute,
+				MaximumTries:       5,
+			}
+			var startupDecisionRep driver.DecisionResponseRuntimeReport
+			startupNow = time.Now()
+			if derr := v2Reconcilers.tick(ctx, "decision_response_driver", startupNow, func() error {
+				var err error
+				startupDecisionRep, err = decisionRuntime.Tick(ctx, startupNow)
+				return err
+			}); derr != nil {
+				return fmt.Errorf("startup decision-response Driver reconcile: %w", derr)
+			}
+			logger.Info("startup decision-response Driver reconcile complete",
+				"materialized", startupDecisionRep.Materialized, "fenced", startupDecisionRep.Fenced,
+				"reclaimed", startupDecisionRep.Reclaimed, "held", startupDecisionRep.Held,
+				"delivered", startupDecisionRep.Delivered, "verified", startupDecisionRep.Verified,
+				"retried", startupDecisionRep.Retried, "dead_lettered", startupDecisionRep.DeadLettered)
+			go func() {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case now := <-ticker.C:
+						var rep driver.DecisionResponseRuntimeReport
+						err := v2Reconcilers.tick(ctx, "decision_response_driver", now, func() error {
+							var err error
+							rep, err = decisionRuntime.Tick(ctx, now)
+							return err
+						})
+						if err != nil {
+							logger.Error("decision-response Driver reconcile failed", "err", err)
+						} else if rep.Materialized+rep.Fenced+rep.Reclaimed+rep.Held+rep.Delivered+
+							rep.Verified+rep.Retried+rep.DeadLettered > 0 {
+							logger.Info("decision-response Driver reconcile pass", "materialized", rep.Materialized,
+								"fenced", rep.Fenced, "reclaimed", rep.Reclaimed, "held", rep.Held,
+								"delivered", rep.Delivered, "verified", rep.Verified,
+								"retried", rep.Retried, "dead_lettered", rep.DeadLettered)
+						}
+					}
+				}
+			}()
+			var startupIntentRep store.WorkIntentReconcileResult
+			startupNow = time.Now()
+			if ierr := v2Reconcilers.tick(ctx, "work_intent_promotion", startupNow, func() error {
+				var err error
+				startupIntentRep, err = st.ReconcileWorkIntents(ctx, startupNow, 10*time.Minute)
+				return err
+			}); ierr != nil {
+				return fmt.Errorf("startup work-intent promotion reconcile: %w", ierr)
+			}
+			logger.Info("startup work-intent promotion complete", "scanned", startupIntentRep.Scanned,
+				"advanced", startupIntentRep.Advanced, "actions_created", startupIntentRep.ActionsCreated,
+				"held", startupIntentRep.Held)
+			intentRuntime := driver.WorkIntentRuntime{
+				Port: driverPort, Store: driver.WorkIntentSQLStore{DB: st.DB,
+					ControlOriginAvailable: driverControl.Available, ControlOriginGate: controlState.Available},
+				Evidence: driver.SQLStageEvidence{DB: st.DB},
+				Owner:    fmt.Sprintf("serve-work-intent-%d", os.Getpid()), ClaimTTL: time.Minute,
+				AcknowledgementTTL: 10 * time.Minute,
+				MaximumTries:       5,
+			}
+			var startupDriverRep driver.WorkIntentRuntimeReport
+			startupNow = time.Now()
+			if ierr := v2Reconcilers.tick(ctx, "work_intent_driver", startupNow, func() error {
+				var err error
+				startupDriverRep, err = intentRuntime.Tick(ctx, startupNow)
+				return err
+			}); ierr != nil {
+				return fmt.Errorf("startup work-intent Driver reconcile: %w", ierr)
+			}
+			logger.Info("startup work-intent Driver reconcile complete",
+				"fenced", startupDriverRep.Fenced, "reclaimed", startupDriverRep.Reclaimed,
+				"held", startupDriverRep.Held,
+				"delivered", startupDriverRep.Delivered, "verified", startupDriverRep.Verified,
+				"retried", startupDriverRep.Retried, "dead_lettered", startupDriverRep.DeadLettered)
+			var startupAdmissionRep store.WorkIntentAdmissionReconcileResult
+			startupNow = time.Now()
+			if ierr := v2Reconcilers.tick(ctx, "work_intent_admission", startupNow, func() error {
+				var err error
+				startupAdmissionRep, err = st.ReconcileWorkIntentAdmissions(ctx, startupNow)
+				return err
+			}); ierr != nil {
+				return fmt.Errorf("startup work-intent admission reconcile: %w", ierr)
+			}
+			logger.Info("startup work-intent admission reconcile complete",
+				"scanned", startupAdmissionRep.Scanned, "admitted", startupAdmissionRep.Admitted,
+				"held", startupAdmissionRep.Held)
+			go func() {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case now := <-ticker.C:
+						var transportRep driver.WorkIntentRuntimeReport
+						err := v2Reconcilers.tick(ctx, "work_intent_driver", now, func() error {
+							var err error
+							transportRep, err = intentRuntime.Tick(ctx, now)
+							return err
+						})
+						if err != nil {
+							logger.Error("work-intent Driver reconcile failed", "err", err)
+						} else if transportRep.Fenced+transportRep.Reclaimed+transportRep.Held+transportRep.Delivered+
+							transportRep.Verified+transportRep.Retried+transportRep.DeadLettered > 0 {
+							logger.Info("work-intent Driver reconcile pass", "fenced", transportRep.Fenced,
+								"reclaimed", transportRep.Reclaimed, "held", transportRep.Held,
+								"delivered", transportRep.Delivered,
+								"verified", transportRep.Verified, "retried", transportRep.Retried,
+								"dead_lettered", transportRep.DeadLettered)
+						}
+					}
+				}
+			}()
+			go func() {
+				ticker := time.NewTicker(15 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case now := <-ticker.C:
+						var rep store.WorkIntentReconcileResult
+						err := v2Reconcilers.tick(ctx, "work_intent_promotion", now, func() error {
+							var err error
+							rep, err = st.ReconcileWorkIntents(ctx, now, 10*time.Minute)
+							return err
+						})
+						if err != nil {
+							logger.Error("work-intent promotion failed", "err", err)
+						} else if rep.Advanced+rep.ActionsCreated+rep.Held > 0 {
+							logger.Info("work-intent promotion pass", "scanned", rep.Scanned,
+								"advanced", rep.Advanced, "actions_created", rep.ActionsCreated, "held", rep.Held)
+						}
+					}
+				}
+			}()
+			go func() {
+				ticker := time.NewTicker(15 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case now := <-ticker.C:
+						var rep store.WorkIntentAdmissionReconcileResult
+						err := v2Reconcilers.tick(ctx, "work_intent_admission", now, func() error {
+							var err error
+							rep, err = st.ReconcileWorkIntentAdmissions(ctx, now)
+							return err
+						})
+						if err != nil {
+							logger.Error("work-intent admission failed", "err", err)
+						} else if rep.Admitted+rep.Held > 0 {
+							logger.Info("work-intent admission pass", "scanned", rep.Scanned,
+								"admitted", rep.Admitted, "held", rep.Held)
+						}
+					}
+				}
+			}()
+		}
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					var rep store.ReconcilerWatchdogResult
+					err := v2Reconcilers.tick(ctx, "reconciler_watchdog", now, func() error {
+						var err error
+						rep, err = st.ReconcileStaleReconcilers(ctx, now)
+						return err
+					})
+					if err != nil {
+						logger.Error("v2 reconciler watchdog failed", "err", err)
+					} else if rep.Alerted > 0 {
+						logger.Error("v2 reconcilers declared stale", "scanned", rep.Scanned, "alerted", rep.Alerted)
+					}
+				}
+			}
+		}()
+	}
 	// §6.7 per-job cost circuit-breaker: 0 (default) keeps the shipped posture
 	// (metered, never spend-capped); FLOWBEE_COST_CEILING_USD > 0 arms it fleet-wide.
 	st.DefaultCostCeilingMicroUSD = cfg.CostCeilingMicroUSD()
@@ -198,6 +1044,10 @@ func runServe(args []string) error {
 		logger.Warn("⚠️  worker API is OPEN (no auth) on a non-loopback bind — relying on the network (e.g. Tailscale) as the only trust boundary",
 			"addr", cfg.PrivateAddr, "self_merge", cfg.AllowSelfMerge)
 	}
+	humanAccess, err := configuredHumanAccess(cfg.PrivateAddr, authn, phase1Enabled)
+	if err != nil {
+		return fmt.Errorf("configure dashboard human access: %w", err)
+	}
 
 	// F5 per-repo consensus panel: a repo's required_reviewers overrides the global default,
 	// so one repo can run an N-reviewer panel while others stay single-reviewer (keyed by the
@@ -223,8 +1073,10 @@ func runServe(args []string) error {
 		// FLOWBEE_BUNDLE_PROVISIONING is set. Workers then hold NO GitHub credential
 		// and NO mirror path — they fetch a read-only bundle, return a diff, and
 		// Flowbee performs every git write (apply + push + PR-open, R4/§8).
-		BundleProvisioning: os.Getenv("FLOWBEE_BUNDLE_PROVISIONING") != "",
-		Authenticator:      authn,
+		BundleProvisioning:         os.Getenv("FLOWBEE_BUNDLE_PROVISIONING") != "",
+		Authenticator:              authn,
+		HumanAccess:                humanAccess,
+		DisableLegacyPaneActuation: st.EnableEpicReviewHandoffV2,
 		// THE ONE DECISION (§14, F2): Branch B (autonomous merge) when
 		// FLOWBEE_ALLOW_SELF_MERGE is set; default false = Branch A (handoff).
 		Policy:        job.Policy{AllowSelfMerge: cfg.AllowSelfMerge, RequiredReviewers: cfg.RequiredReviewers},
@@ -241,8 +1093,10 @@ func runServe(args []string) error {
 		WorkerGitSSH: strings.EqualFold(os.Getenv("FLOWBEE_GIT_REMOTE"), "ssh"),
 		// PauseMarkerPath: a file beside the live DB whose presence stops new leases.
 		// `flowbee pause` creates it; `flowbee resume` removes it; no server restart needed.
-		PauseMarkerPath: markerPath(cfg.DatabaseURL),
-		RunningConfig:   runningConfigSnapshot(cfg),
+		PauseMarkerPath:      markerPath(cfg.DatabaseURL),
+		RunningConfig:        runningConfigSnapshot(cfg),
+		DriverControl:        driverControl,
+		DriverControlCurrent: controlState.Snapshot,
 	}, buildVersion())
 	if cfg.AllowSelfMerge {
 		logger.Info("autonomous merge enabled (Branch B): self_merge eligible jobs merge without a human gate")
@@ -467,7 +1321,7 @@ func runServe(args []string) error {
 	// ticker (mirrors the mirror-refresh/advisor cadence style above) — a wedged
 	// tmux/ssh capture must never stall the fast forward-progress watchdog. Kill-switch:
 	// FLOWBEE_SESSION_WATCH=off (mirrors FLOWBEE_SELF_UNBLOCK exactly).
-	if !cfg.SessionWatchDisabled {
+	if legacyPaneRuntimeEnabled(st.EnableEpicReviewHandoffV2, cfg.SessionWatchDisabled) {
 		watcher := watchdog.New(st, watchdog.NewShellRunner(), logger)
 		go func() {
 			t := time.NewTicker(2 * time.Minute)
@@ -482,6 +1336,8 @@ func runServe(args []string) error {
 			}
 		}()
 		logger.Info("👁️  goal-session watchdog enabled (2m tick)")
+	} else if st.EnableEpicReviewHandoffV2 && !cfg.SessionWatchDisabled {
+		logger.Info("goal-session raw pane watcher fenced by v2; Driver observation/actions are authoritative")
 	}
 
 	// Keep every epics-topic nudge on the same digest-sequence contract as the master
@@ -503,9 +1359,11 @@ func runServe(args []string) error {
 	// (it is the Phase 2 status fold); only the supervision half honors the switch.
 	{
 		var supv *epicsupervisor.Supervisor
-		if !cfg.EpicSupervisionDisabled {
+		if legacyPaneRuntimeEnabled(st.EnableEpicReviewHandoffV2, cfg.EpicSupervisionDisabled) {
 			supv = epicsupervisor.New(st, epicsupervisor.TmuxPane{}, nil, epicsupervisor.Config{}, logger)
 			logger.Info("🛰️  epic-supervision ticker enabled (2m tick — one consolidated pass)")
+		} else if st.EnableEpicReviewHandoffV2 && !cfg.EpicSupervisionDisabled {
+			logger.Info("legacy tmux epic supervisor fenced by v2; Driver observation/actions are authoritative")
 		}
 		go func() {
 			t := time.NewTicker(2 * time.Minute)
@@ -530,6 +1388,38 @@ func runServe(args []string) error {
 						}()
 						now := time.Now()
 						ingestEpicStatuses(ctx, logger, st, now)
+						if st.EnableEpicReviewHandoffV2 {
+							var handoffRep store.EpicReviewReconcileResult
+							if err := v2Reconcilers.tick(ctx, "review_handoff", now, func() error {
+								var err error
+								handoffRep, err = st.ReconcileEpicReviewHandoffs(ctx, now, 5*time.Minute)
+								return err
+							}); err != nil {
+								logger.Error("epic review handoff reconcile failed", "err", err)
+							} else if handoffRep.Dispatched > 0 {
+								logger.Info("epic review handoffs repaired", "scanned", handoffRep.Scanned, "dispatched", handoffRep.Dispatched)
+							}
+							var verdictRep store.EpicReviewVerdictStallResult
+							if err := v2Reconcilers.tick(ctx, "review_verdict", now, func() error {
+								var err error
+								verdictRep, err = st.ReconcileEpicReviewVerdictStalls(ctx, now, 20*time.Minute, 3)
+								return err
+							}); err != nil {
+								logger.Error("epic review verdict reconcile failed", "err", err)
+							} else if verdictRep.Requeued > 0 {
+								logger.Warn("hung epic reviewers fenced", "scanned", verdictRep.Scanned, "requeued", verdictRep.Requeued, "escalated", verdictRep.Escalated)
+							}
+							var backstopRep store.EpicDeliveryBackstopResult
+							if err := v2Reconcilers.tick(ctx, "delivery_backstop", now, func() error {
+								var err error
+								backstopRep, err = st.ReconcileEpicDeliveryBackstops(ctx, now)
+								return err
+							}); err != nil {
+								logger.Error("epic delivery backstop failed", "err", err)
+							} else if backstopRep.Alerted > 0 {
+								logger.Warn("overdue epic delivery states surfaced", "scanned", backstopRep.Scanned, "alerted", backstopRep.Alerted)
+							}
+						}
 						if supv != nil {
 							supv.Pass(ctx, now)
 						}
@@ -673,6 +1563,87 @@ func runServe(args []string) error {
 	// compatibility, the single-repo FLOWBEE_GITHUB_OWNER/REPO env path. There are no
 	// creds in dev/CI, so this stays dormant when nothing is configured.
 	if mgr := wireMultiRepo(ctx, logger, cfg, st, srv); mgr != nil {
+		if st.EnableEpicReviewHandoffV2 {
+			breakerRunner := newProductionProjectBreakerRunner(st, mgr,
+				fmt.Sprintf("serve-project-breaker-%d", os.Getpid()))
+			startupNow := time.Now()
+			var startupBreakerRep projectbreaker.Report
+			if err := v2Reconcilers.tick(ctx, "project_breaker_probe", startupNow, func() error {
+				var err error
+				startupBreakerRep, err = breakerRunner.RunOnce(ctx)
+				return err
+			}); err != nil {
+				// The periodic supervised loop remains live even if the startup claim
+				// encounters a transient store error. Existing open breakers remain a
+				// visible, fail-closed hold and the reconciler watchdog tracks health.
+				logger.Error("startup project breaker probe failed", "err", err)
+			} else {
+				logProjectBreakerReport(logger, "startup project breaker probe complete", startupBreakerRep)
+			}
+			go func() {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case now := <-ticker.C:
+						var rep projectbreaker.Report
+						err := v2Reconcilers.tick(ctx, "project_breaker_probe", now, func() error {
+							var err error
+							rep, err = breakerRunner.RunOnce(ctx)
+							return err
+						})
+						if err != nil {
+							logger.Error("project breaker probe failed", "err", err)
+						} else if rep.Claimed > 0 {
+							logProjectBreakerReport(logger, "project breaker probe pass", rep)
+						}
+					}
+				}
+			}()
+
+			startupNow = time.Now()
+			var startupEffectRep store.EpicEffectReconcileResult
+			if err := v2Reconcilers.tick(ctx, "epic_effects", startupNow, func() error {
+				var err error
+				startupEffectRep, err = st.ReconcileEpicEffectActions(ctx, startupNow, 2)
+				return err
+			}); err != nil {
+				return fmt.Errorf("startup epic merge/cleanup reconcile: %w", err)
+			}
+			logger.Info("startup epic merge/cleanup reconcile complete", "scanned", startupEffectRep.Scanned,
+				"ensured", startupEffectRep.Ensured, "rearmed", startupEffectRep.Rearmed)
+			effectRunner := epicexec.Runner{Store: st, Resolver: mgr, Authorizer: mgr,
+				Owner: fmt.Sprintf("serve-effects-%d", os.Getpid()), ClaimTTL: time.Minute}
+			go func() {
+				ticker := time.NewTicker(2 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case now := <-ticker.C:
+						err := v2Reconcilers.tick(ctx, "epic_effects", now, func() error {
+							if _, err := st.ReconcileEpicEffectActions(ctx, now, 2); err != nil {
+								return err
+							}
+							if _, err := st.ReclaimExpiredEpicDomainActions(ctx, now); err != nil {
+								return err
+							}
+							if _, err := effectRunner.VerifyNext(ctx); err != nil {
+								return err
+							}
+							_, err := effectRunner.ExecuteNext(ctx)
+							return err
+						})
+						if err != nil {
+							logger.Error("epic merge/cleanup runtime failed", "err", err)
+						}
+					}
+				}
+			}()
+		}
 		// let POST /v1/adopt (flowbee adopt <pr>) reach the per-repo GitHub loops.
 		srv.SetAdopter(mgr)
 		// boot sweep + periodic floor sweep PER repo (every 2-5 min; default 3 min),
@@ -826,6 +1797,14 @@ func runServe(args []string) error {
 	default:
 	}
 	return bindErr
+}
+
+// legacyPaneRuntimeEnabled is the single activation predicate for background
+// loops that observe or actuate sessions through raw tmux. V2 owns those
+// operations through DriverPort, so an operator cannot accidentally re-enable a
+// legacy loop merely by leaving its old kill-switch unset.
+func legacyPaneRuntimeEnabled(v2Enabled, explicitlyDisabled bool) bool {
+	return !v2Enabled && !explicitlyDisabled
 }
 
 func runningConfigSnapshot(cfg config.Config) api.RunningConfig {
@@ -1308,6 +2287,32 @@ func firstRepo(mgr *multirepo.Manager) string {
 		return rs[0]
 	}
 	return ""
+}
+
+// logProjectBreakerReport keeps per-scope failures visible without turning one
+// poison repository into a pass-level error that could suppress healthy scopes.
+func logProjectBreakerReport(logger *slog.Logger, message string, report projectbreaker.Report) {
+	logger.Info(message, "claimed", report.Claimed, "recovered", report.Recovered,
+		"reopened", report.Reopened, "poisoned", report.Poisoned)
+	for _, outcome := range report.Outcomes {
+		if outcome.Err != nil {
+			logger.Warn("project breaker scope remained open", "project_id", outcome.ProjectID,
+				"repo_id", outcome.RepoID, "probe_epoch", outcome.Epoch,
+				"poisoned", outcome.Poisoned, "err", outcome.Err)
+		}
+	}
+}
+
+func newProductionProjectBreakerRunner(st *store.Store, mgr *multirepo.Manager, owner string) projectbreaker.Runner {
+	return projectbreaker.Runner{
+		Store: st,
+		Probe: projectbreaker.MechanicalDependencyProbe{
+			Projects: st, Repositories: mgr, RetryAfter: time.Minute,
+		},
+		Config: projectbreaker.Config{
+			Owner: owner, ClaimTTL: time.Minute, FailureRetryAfter: time.Minute, Budget: 25,
+		},
+	}
 }
 
 func serveHTTP(logger *slog.Logger, name string, srv *http.Server, errc chan<- error) {

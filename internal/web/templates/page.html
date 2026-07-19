@@ -22,6 +22,7 @@
 <nav class="fb-nav">
   <span class="brand">🐝 Flowbee</span>
   <a href="/dashboard" {{if eq .Active "epics"}}class="active"{{end}}>Dashboard</a>
+  <a href="/workspace" {{if eq .Active "workspace"}}class="active"{{end}}>Workspace</a>
   <a href="/board" {{if eq .Active "board"}}class="active"{{end}}>Board</a>
   <a href="/fleet" {{if eq .Active "fleet"}}class="active"{{end}}>Fleet</a>
   <a href="/audit" {{if eq .Active "audit"}}class="active"{{end}}>Audit</a>
@@ -32,6 +33,7 @@
 
 {{define "body.html"}}
 {{if .Epics}}{{template "epics.html" .Epics}}{{end}}
+{{if .Workspace}}{{template "workspace.html" .Workspace}}{{end}}
 {{if .Board}}{{template "board.html" .Board}}{{end}}
 {{if .Fleet}}{{template "fleet.html" .Fleet}}{{end}}
 {{if .Dash}}{{template "dashboard.html" .Dash}}{{end}}

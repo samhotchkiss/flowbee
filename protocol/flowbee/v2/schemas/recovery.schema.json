@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flowbee.recovery/v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version", "schema_id", "schema_sha256", "recovery_code",
+    "project_id", "subject_id", "expected_state_version", "expected_epoch",
+    "idempotency_key", "command"
+  ],
+  "properties": {
+    "protocol_version": {"type": "string", "const": "2.0"},
+    "schema_id": {"type": "string", "const": "flowbee.recovery/v2"},
+    "schema_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "recovery_code": {"type": "string", "minLength": 1},
+    "project_id": {"type": "string", "minLength": 1},
+    "subject_id": {"type": "string", "minLength": 1},
+    "expected_state_version": {"type": "integer", "minimum": 0},
+    "expected_epoch": {"type": "integer", "minimum": 0},
+    "artifact_version": {"type": "integer", "minimum": 0},
+    "artifact_sha256": {"type": "string", "pattern": "^(|sha256:[0-9a-f]{64})$"},
+    "idempotency_key": {"type": "string", "minLength": 1},
+    "command": {"type": "string", "enum": ["verify_existing_action", "retry_existing_action", "rearm_expired_lease", "acknowledge_current_intent", "clear_typed_hold"]},
+    "authorization_id": {"type": "string"}
+  }
+}

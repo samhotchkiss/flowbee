@@ -244,6 +244,20 @@ func TestEpicForRepoBranchNearMissAndRepoMismatch(t *testing.T) {
 	}
 }
 
+func TestEpicForRepoBranchUsesPersistedIdentityWithOpaqueID(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	mustAddEpicRun(t, st, ctx, store.EpicRun{
+		ID: "01JOPAQUECONTROLID", Slug: "human-readable", Repo: "russ",
+		FilePath: "epics/human-readable.md", Branch: "epic/human-readable",
+	}, now)
+	e, ok, err := st.EpicForRepoBranch(ctx, "russ", "epic/human-readable")
+	if err != nil || !ok || e.ID != "01JOPAQUECONTROLID" {
+		t.Fatalf("opaque branch owner ok=%v err=%v epic=%+v", ok, err, e)
+	}
+}
+
 func TestEpicContractAtRefReadsAndParses(t *testing.T) {
 	st := testutil.NewStore(t)
 

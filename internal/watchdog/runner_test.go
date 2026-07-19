@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+func TestNewLaunchRunnerKeepsLargeCloneBudget(t *testing.T) {
+	if got := NewLaunchRunner().Timeout; got != 15*time.Minute {
+		t.Fatalf("launch timeout = %s, want 15m", got)
+	}
+}
+
 func installFakeGH(t *testing.T, root string) string {
 	t.Helper()
 	bin := filepath.Join(root, "bin")

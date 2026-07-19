@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
-	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/lease"
+	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
 
 // seedLeasedCost seeds a build job (optional $ ceiling + flow_id) and claims it,
@@ -257,10 +257,10 @@ func TestFlowCostRollupSumsAcrossJobs(t *testing.T) {
 
 func TestNeedsHumanViewClassifiesTriggers(t *testing.T) {
 	tests := []struct {
-		reason string
-		over   int
+		reason                      string
+		over                        int
 		att, maxA, bnc, maxB, stall int
-		want   string
+		want                        string
 	}{
 		{"cost", 1, 0, 5, 0, 3, 0, "cost"},
 		{"", 0, 5, 5, 0, 3, 0, "attempts"},

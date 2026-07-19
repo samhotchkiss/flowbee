@@ -24,6 +24,59 @@ func mustAddEpicRun(t *testing.T, st *store.Store, ctx context.Context, e store.
 	}
 }
 
+func TestAddEpicRunV2AdmissionIsIdempotentAndCreatesReviewObligation(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	if _, err := st.DB.Exec(`INSERT INTO projects(id,name) VALUES ('proj-a','Project A')`); err != nil {
+		t.Fatal(err)
+	}
+	e := store.EpicRun{ID: "epic-ulid-1", ProjectID: "proj-a", AdmissionKey: "intent-1:v1", ContractHash: "sha256:contract", Repo: "r", Branch: "dev/russ", Scope: []string{"pkg/**"}}
+	if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	// Lost-ack retry may choose a different local slug, but the stable key returns
+	// success and must not create another delivery obligation.
+	e.ID = "different-retry-slug"
+	if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
+		t.Fatalf("idempotent retry: %v", err)
+	}
+	var epics, deliveries int
+	if err := st.DB.QueryRow(`SELECT COUNT(*) FROM epics WHERE project_id=? AND admission_key=?`, e.ProjectID, e.AdmissionKey).Scan(&epics); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DB.QueryRow(`SELECT COUNT(*) FROM epic_deliveries WHERE project_id=?`, e.ProjectID).Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if epics != 1 || deliveries != 1 {
+		t.Fatalf("duplicate admission: epics=%d deliveries=%d", epics, deliveries)
+	}
+	var required int
+	if err := st.DB.QueryRow(`SELECT review_required FROM epic_deliveries WHERE epic_id=?`, "epic-ulid-1").Scan(&required); err != nil {
+		t.Fatal(err)
+	}
+	if required != 1 {
+		t.Fatalf("review obligation not durable: %d", required)
+	}
+}
+
+func TestAddEpicRunV2AdmissionConflictsOnChangedContract(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := st.DB.Exec(`INSERT INTO projects(id,name) VALUES ('proj-a','Project A')`); err != nil {
+		t.Fatal(err)
+	}
+	e := store.EpicRun{ID: "epic-contract", ProjectID: "proj-a", AdmissionKey: "intent-2:v1", ContractHash: "hash-a", Repo: "r", Scope: []string{"a/**"}}
+	if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	e.ID, e.ContractHash = "epic-contract-retry", "hash-b"
+	if err := st.AddEpicRun(ctx, e, 1, now); !errors.Is(err, store.ErrEpicAdmissionConflict) {
+		t.Fatalf("expected contract conflict, got %v", err)
+	}
+}
+
 // TestAddEpicRunSeatCapacityIsAtomic proves the throughput model's real invariant:
 // capacity belongs to an authenticated seat, not to the host string. Two distinct
 // cap-1 seats on the same (including local/empty) host can run together; one cap-2

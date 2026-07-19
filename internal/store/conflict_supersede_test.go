@@ -218,4 +218,3 @@ func reconHead(t *testing.T, st *store.Store, id string) string {
 	}
 	return head
 }
-

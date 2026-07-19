@@ -338,6 +338,9 @@ type HarnessConfig struct {
 	// BearerToken is the signed per-worker token (§7.6) for a non-loopback
 	// (cross-box) listener. Empty on loopback (the server's loopback bypass).
 	BearerToken string
+	// SeatID is the exact operator-bound capacity seat. V2 routing fails closed
+	// when it is absent; it must not be derived from account or host labels.
+	SeatID string
 	// F6 capacity advertisement. ModelSlots is the box's PER-MODEL concurrency
 	// (claude:3, codex:3); Weight is the per-box distribution bias; Accounts are
 	// the named per-model credentials (the rollover chain). All optional.
@@ -400,6 +403,7 @@ func RunOnceHarness(ctx context.Context, cfg HarnessConfig) (HarnessOutcome, err
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	c.Model = cfg.ModelLabel
+	c.SeatID = cfg.SeatID
 	reg := client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
@@ -584,6 +588,7 @@ func RunOnceHarnessBundle(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	c.Model = cfg.ModelLabel
+	c.SeatID = cfg.SeatID
 	reg := client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,
@@ -742,6 +747,7 @@ func RunOnceHarnessRemote(ctx context.Context, cfg HarnessConfig) (HarnessOutcom
 
 	c := client.NewWithToken(cfg.BaseURL, cfg.BearerToken)
 	c.Model = cfg.ModelLabel
+	c.SeatID = cfg.SeatID
 	reg := client.Registration{
 		Identity: cfg.Identity, Host: hostname(), Capabilities: caps, Arch: arch, OS: osName,
 		ModelSlots: cfg.ModelSlots, Weight: cfg.Weight, Accounts: cfg.Accounts,

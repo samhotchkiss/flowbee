@@ -213,7 +213,8 @@ func (s *Store) NormalizeStrandedReadyBuilds(ctx context.Context, now time.Time)
 func (s *Store) leasableJobIDs(ctx context.Context) ([]string, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT id FROM jobs
-		 WHERE state IN ('ready','review_pending','spec_authoring','spec_review','resolving_conflict')`)
+		 WHERE state IN ('ready','review_pending','spec_authoring','spec_review','resolving_conflict')
+		   AND COALESCE(workflow_domain,'legacy') <> 'epic_v2'`)
 	if err != nil {
 		return nil, err
 	}

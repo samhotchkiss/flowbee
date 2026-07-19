@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/content"
@@ -17,8 +18,9 @@ import (
 )
 
 type Store struct {
-	DB  *sql.DB
-	dsn string // the SQLite path, for a post-close WAL checkpoint (see Close)
+	DB         *sql.DB
+	dsn        string // the SQLite path, for a post-close WAL checkpoint (see Close)
+	writerLock *os.File
 
 	// NoEligibleWorkerDelay is how long a job may sit `ready` with no compliant
 	// worker before the no_eligible_worker alarm fires (I-6). Zero disables
@@ -46,6 +48,39 @@ type Store struct {
 	// repo is fully protected (the shipped posture). Set from config by the runtime;
 	// applied per-job in contentResultTx. NEVER include the repo that IS Flowbee.
 	AllowOwnSourceRepos map[string]bool
+
+	// EnableEpicReviewHandoffV2 gates the durable epic review reconciler. It is
+	// deliberately off by default until the incident-slice migrations and
+	// runtime wiring are enabled together.
+	EnableEpicReviewHandoffV2 bool
+
+	// EnableCapacityV2 routes v2 builders/reviewers/operations only through the
+	// identity-bound active capacity generation. It never falls back to the legacy
+	// freshness-free worker_accounts projection.
+	EnableCapacityV2 bool
+
+	// EnableDriverControlOrigin is true only after the Driver has negotiated an
+	// authenticated, non-session control-plane sender. The v2.4 capability must
+	// be proven against the running Driver, so the zero/default production posture
+	// is fail-closed. Tests using a capability fake must opt in explicitly.
+	// This gate is checked at every Flowbee-authored message materialization and
+	// claim seam; an active database binding alone is never authority.
+	EnableDriverControlOrigin bool
+	// DriverControlOriginGate, when installed by serve, is the live negotiated
+	// Driver capability. It takes precedence over the static test/CLI switch
+	// above so a token revocation or daemon downgrade closes every new
+	// materialization seam without restarting Flowbee.
+	DriverControlOriginGate func() bool
+}
+
+// HasDriverControlOrigin is the single runtime predicate for Flowbee-authored
+// terminal messages. The callback is deliberately process-local capability
+// state; durable bindings remain inventory and never confer authority.
+func (s *Store) HasDriverControlOrigin() bool {
+	if s != nil && s.DriverControlOriginGate != nil {
+		return s.DriverControlOriginGate()
+	}
+	return s != nil && s.EnableDriverControlOrigin
 }
 
 // Open opens the SQLite database with WAL + a busy timeout. A single open
@@ -78,6 +113,33 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.DB.PingContext(ctx) }
+
+// AcquireWriterLock establishes the process-lifetime control-plane writer
+// lease. SQLite serializes transactions, but it does not prevent an old serve
+// process and its replacement from alternately draining the same outbox. The
+// non-blocking OS lock makes overlapping control-plane writers fail at startup.
+func (s *Store) AcquireWriterLock() error {
+	if s.writerLock != nil {
+		return nil
+	}
+	path := strings.TrimPrefix(s.dsn, "file:")
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	if path == "" || path == ":memory:" || strings.Contains(s.dsn, ":memory:") || strings.Contains(s.dsn, "mode=memory") {
+		return nil
+	}
+	f, err := os.OpenFile(path+".writer.lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open control-plane writer lock: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("control-plane writer already active for %s: %w", path, err)
+	}
+	s.writerLock = f
+	return nil
+}
 
 // DBSizeBytes returns the on-disk size of the SQLite database (main file + WAL + SHM),
 // so the operator can SEE the ledger grow: job_events is append-only (the source of
@@ -118,6 +180,11 @@ func (s *Store) Close() error {
 			_, _ = db2.ExecContext(context.Background(), "PRAGMA wal_checkpoint(TRUNCATE)")
 			_ = db2.Close()
 		}
+	}
+	if s.writerLock != nil {
+		_ = syscall.Flock(int(s.writerLock.Fd()), syscall.LOCK_UN)
+		_ = s.writerLock.Close()
+		s.writerLock = nil
 	}
 	return err
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -48,13 +49,35 @@ func runEpic(args []string) error {
 		return err
 	}
 	defer st.Close()
+	durableV2, err := st.DurableEpicReviewHandoffV2(ctx)
+	if err != nil {
+		return fmt.Errorf("read durable epic-review-handoff v2 activation: %w", err)
+	}
+	// Environment can fail closed into v2 for an offline invocation, but it can
+	// never downgrade a database that serve durably activated. Rollback is a
+	// writer-owned `flowbee serve` operation with an explicit flag value of 0.
+	st.EnableEpicReviewHandoffV2 = durableV2 || os.Getenv("FLOWBEE_EPIC_REVIEW_HANDOFF_V2") == "1"
+	st.EnableCapacityV2 = os.Getenv("FLOWBEE_CAPACITY_ROUTING_V2") == "1" ||
+		os.Getenv("FLOWBEE_CAPACITY_V2") == "1"
 
 	switch sub {
 	case "start":
+		if st.EnableEpicReviewHandoffV2 {
+			return legacyEpicTmuxCommandDisabled("start")
+		}
+		if err := st.AcquireWriterLock(); err != nil {
+			return fmt.Errorf("legacy epic start requires exclusive control-plane writer ownership: %w", err)
+		}
 		return runEpicStart(ctx, st, rest)
 	case "status":
 		return runEpicStatus(ctx, st, rest)
 	case "abandon":
+		if st.EnableEpicReviewHandoffV2 {
+			return legacyEpicTmuxCommandDisabled("abandon")
+		}
+		if err := st.AcquireWriterLock(); err != nil {
+			return fmt.Errorf("legacy epic abandon requires exclusive control-plane writer ownership: %w", err)
+		}
 		return runEpicAbandon(ctx, st, rest)
 	case "digest":
 		return runEpicDigest(rest)
@@ -63,6 +86,14 @@ func runEpic(args []string) error {
 	default:
 		return fmt.Errorf("unknown `flowbee epic` subcommand %q (want start|status|abandon|digest|plan)", sub)
 	}
+}
+
+// legacyEpicTmuxCommandDisabled fences the two CLI commands that directly own
+// legacy tmux lifecycle. Under v2, session creation, terminal insertion, and
+// stop are Driver lifecycle/actions with stable identity, grants, and receipts;
+// these commands must not create a second control path around DriverPort.
+func legacyEpicTmuxCommandDisabled(command string) error {
+	return fmt.Errorf("flowbee epic %s is legacy-only and disabled by the durable v2 session-control boundary; use the v2 epic workflow so lifecycle and messages pass through Driver (an intentional rollback must be selected by flowbee serve)", command)
 }
 
 // safeSlugRe gates any epic-derived string (the slug, used unquoted-adjacent in
@@ -167,7 +198,15 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := st.GetEpicRun(ctx, slug); err == nil {
+	contractHash := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(content)))
+	admissionKey := "direct:" + repoID + ":" + slug
+	if existing, err := st.GetEpicRunByProjectSlug(ctx, "default", slug); err == nil {
+		// A lost CLI acknowledgement is an exact replay, not an error. Older
+		// legacy rows have no admission metadata and retain the prior message.
+		if existing.AdmissionKey == admissionKey && existing.ContractHash == contractHash {
+			fmt.Printf("epic %q is already admitted (idempotent replay)\n", slug)
+			return nil
+		}
 		return fmt.Errorf("epic %q is already registered (see `flowbee epic status`)", slug)
 	} else if !errors.Is(err, store.ErrEpicRunNotFound) {
 		return err
@@ -255,6 +294,7 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	// VISIBLE half-launched row the launching-reaper (supervision ticker) releases — not a
 	// silently-stranded host reservation. ──
 	now := time.Now()
+	epicID := ulid.New()
 	tmuxName := "epic-" + slug
 	// the selected seat's cap governs how many epics that exact seat may hold at once.
 	// AddEpicRun's atomic count-then-insert is the race-free authority — epicSelectSeat
@@ -265,7 +305,8 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 		seatCap = 1
 	}
 	if err := st.AddEpicRun(ctx, store.EpicRun{
-		ID: slug, Repo: repoID, FilePath: filePath, Title: spec.Title, Scope: spec.Scope,
+		ID: epicID, ProjectID: "default", Slug: slug, AdmissionKey: admissionKey, ContractHash: contractHash,
+		Repo: repoID, FilePath: filePath, Title: spec.Title, Scope: spec.Scope,
 		Host: seat.Box, Branch: "epic/" + slug, TmuxName: tmuxName, Agent: family,
 		AccountKey: seat.AccountKey, SeatID: seat.ID, BuilderModelFamily: builderFamily,
 	}, seatCap, now); err != nil {
@@ -283,8 +324,8 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	runner := watchdog.NewLaunchRunner()
 	worktree, base, perr := epicPreflight(ctx, runner, seat.Box, repo, slug)
 	if perr != nil {
-		raiseLaunchFailed(ctx, st, slug, repoID, "preflight failed: "+perr.Error(), now)
-		_ = st.DeleteEpicRun(ctx, slug)
+		raiseLaunchFailed(ctx, st, epicID, slug, repoID, "preflight failed: "+perr.Error(), now)
+		_ = st.DeleteEpicRun(ctx, epicID)
 		return fmt.Errorf("launch refused: %w (epic registration rolled back — nothing reserved)", perr)
 	}
 	// rollback first proves any remote agent session is stopped, then removes the private
@@ -304,7 +345,7 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 				"epic", slug, "box", seat.Box, "worktree", worktree, "err", rerr)
 			return false
 		}
-		if derr := st.DeleteEpicRun(ctx, slug); derr != nil {
+		if derr := st.DeleteEpicRun(ctx, epicID); derr != nil {
 			logger.Error("rollback: worktree was removed but the epic reservation could not be released",
 				"epic", slug, "err", derr)
 			return false
@@ -328,7 +369,7 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 		},
 	})
 	if lerr != nil {
-		raiseLaunchFailed(ctx, st, slug, repoID, "ladder infra error at stage "+string(res.Stage)+": "+lerr.Error(), now)
+		raiseLaunchFailed(ctx, st, epicID, slug, repoID, "ladder infra error at stage "+string(res.Stage)+": "+lerr.Error(), now)
 		if rollback() {
 			return fmt.Errorf("launch ladder infra error at stage %q: %w (epic registration rolled back)", res.Stage, lerr)
 		}
@@ -339,11 +380,11 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 		// interactive auth at the ssh stage — a HUMAN answers once in the LOCAL pane. Leave
 		// the session + the 'launching' row + the worktree alive; raise a human-facing item.
 		// The reaper releases it only if the human never completes it (LaunchStrandAfter).
-		raiseLaunchFailed(ctx, st, slug, repoID, "awaiting interactive auth: "+res.Evidence, now)
+		raiseLaunchFailed(ctx, st, epicID, slug, repoID, "awaiting interactive auth: "+res.Evidence, now)
 		fmt.Printf("⏸ epic %q launch is AWAITING INTERACTIVE AUTH in local tmux %q — answer the prompt in the pane, then it will proceed.\n   %s\n", slug, res.Session, res.Evidence)
 		return nil
 	case watchdog.LaunchFailed:
-		raiseLaunchFailed(ctx, st, slug, repoID, "launch ladder failed at stage "+string(res.Stage)+": "+res.Evidence, now)
+		raiseLaunchFailed(ctx, st, epicID, slug, repoID, "launch ladder failed at stage "+string(res.Stage)+": "+res.Evidence, now)
 		if rollback() { // the ladder already killed the local attach; rollback confirms remote state.
 			return fmt.Errorf("launch ladder failed at stage %q: %s (epic registration rolled back — nothing reserved)", res.Stage, res.Evidence)
 		}
@@ -358,7 +399,7 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	}, now); err != nil {
 		logger.Error("epic launched but failed to register its goal-session watch — the watchdog will NOT observe it until this is fixed", "epic", slug, "err", err)
 	}
-	if err := st.MarkEpicLaunched(ctx, slug, now); err != nil {
+	if err := st.MarkEpicLaunched(ctx, epicID, now); err != nil {
 		return fmt.Errorf("epic launched but failed to mark it running in the registry: %w", err)
 	}
 	fmt.Printf("✓ launched epic %q (seat %q, family %s, tmux %q, branch epic/%s) — run `flowbee epic status` to confirm\n",
@@ -421,10 +462,10 @@ func epicPreflight(ctx context.Context, r watchdog.Runner, box string, repo stor
 
 // raiseLaunchFailed upserts a launch_failed attention item (plan §1.3) so a master/operator
 // routes the retry/reassign. Best-effort — a failed producer must not mask the launch error.
-func raiseLaunchFailed(ctx context.Context, st *store.Store, slug, repo, detail string, now time.Time) {
+func raiseLaunchFailed(ctx context.Context, st *store.Store, epicID, slug, repo, detail string, now time.Time) {
 	_, _, _ = st.UpsertAttentionItem(ctx, store.AttentionItem{
-		ID: ulid.New(), Kind: "launch_failed", EpicID: slug, Repo: repo, Priority: 10,
-		DedupKey: slug + ":launch_failed", Blocking: true,
+		ID: ulid.New(), Kind: "launch_failed", EpicID: epicID, Repo: repo, Priority: 10,
+		DedupKey: epicID + ":launch_failed", Blocking: true,
 		Evidence: map[string]string{"detail": detail},
 	}, now)
 }
@@ -475,6 +516,9 @@ func epicSelectSeatWithQuotaOverride(ctx context.Context, st *store.Store, famil
 	allSeats, err := st.ListSeats(ctx)
 	if err != nil {
 		return store.Seat{}, seatGate{}, err
+	}
+	if st.EnableCapacityV2 {
+		return epicSelectSeatV2(ctx, st, allSeats, family, hostFilter, active, allowQuotaOverride)
 	}
 	seats := make([]store.Seat, 0, len(allSeats))
 	quotaRisk := map[string]bool{}
@@ -593,6 +637,61 @@ func epicSelectSeatWithQuotaOverride(ctx context.Context, st *store.Store, famil
 	}
 	return store.Seat{}, seatGate{refuse: true,
 		reason: fmt.Sprintf("no ready %s seat with weekly headroom", family)}, nil
+}
+
+// epicSelectSeatV2 is the only builder admission selector under the v2 flag.
+// It reads the same complete active generation as review routing and has no
+// legacy worker_accounts/account_windows fallback. Even --force-quota cannot
+// bypass missing, stale, drifted, or exhausted capacity truth.
+func epicSelectSeatV2(ctx context.Context, st *store.Store, allSeats []store.Seat, family, hostFilter string, active []store.EpicRun, allowQuotaOverride bool) (store.Seat, seatGate, error) {
+	boxLoad := map[string]int{}
+	accountBusy := map[string]bool{}
+	for _, epic := range active {
+		boxLoad[epic.Host]++
+		if epic.AccountKey != "" {
+			accountBusy[epic.AccountKey] = true
+		}
+	}
+	type eligibleSeat struct {
+		seat       store.Seat
+		collocated bool
+	}
+	var eligible []eligibleSeat
+	var reasons []string
+	for _, seat := range allSeats {
+		if seat.AgentFamily != family || (hostFilter != "" && seat.Box != hostFilter) {
+			continue
+		}
+		decision, err := st.CapacityRouteForSeat(ctx, seat.ID, time.Now().UTC(), 5*time.Minute)
+		if err != nil {
+			return store.Seat{}, seatGate{}, err
+		}
+		if !decision.Routable {
+			reasons = append(reasons, seat.ID+"="+strings.Join(decision.Reasons, ","))
+			continue
+		}
+		eligible = append(eligible, eligibleSeat{seat: seat, collocated: seat.AccountKey != "" && accountBusy[seat.AccountKey]})
+	}
+	if len(eligible) == 0 {
+		reason := fmt.Sprintf("no %s seat passes the v2 live capacity gate", family)
+		if len(reasons) > 0 {
+			reason += ": " + strings.Join(reasons, "; ")
+		}
+		if allowQuotaOverride {
+			reason += " (--force-quota cannot bypass v2 identity, freshness, reserve, or concurrency fences)"
+		}
+		return store.Seat{}, seatGate{refuse: true, hardNoSeat: true, reason: reason}, nil
+	}
+	sort.SliceStable(eligible, func(i, j int) bool {
+		if eligible[i].collocated != eligible[j].collocated {
+			return !eligible[i].collocated
+		}
+		if boxLoad[eligible[i].seat.Box] != boxLoad[eligible[j].seat.Box] {
+			return boxLoad[eligible[i].seat.Box] < boxLoad[eligible[j].seat.Box]
+		}
+		return eligible[i].seat.ID < eligible[j].seat.ID
+	})
+	return eligible[0].seat, seatGate{}, nil
 }
 
 // realTmuxClock is the production tmuxio.Clock the launch ladder + its tmuxio.Client share

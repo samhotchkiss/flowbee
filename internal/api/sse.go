@@ -23,10 +23,11 @@ func NewBroker() *Broker {
 
 // LifeEvent is one SSE payload describing a job lifecycle transition.
 type LifeEvent struct {
-	JobID string `json:"job_id"`
-	State string `json:"state"`
-	Event string `json:"event"`
-	Epoch int    `json:"lease_epoch"`
+	ProjectID string `json:"project_id,omitempty"`
+	JobID     string `json:"job_id"`
+	State     string `json:"state"`
+	Event     string `json:"event"`
+	Epoch     int    `json:"lease_epoch"`
 	// DigestSeq rides epic-lane ("epics"-topic) nudges so a constrained consumer (the
 	// elgato deck, §15.16b) can dedupe against the digest it last polled WITHOUT a re-poll.
 	// Zero (omitted) for non-epic lifecycle events. SSE stays a lossy nudge; poll is truth.
@@ -138,15 +139,19 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// topicOf extracts the SSE event topic from a published LifeEvent blob: the "epics" bucket
-// for epic-lane supervision nudges, else "lifecycle". Best-effort — an unparseable blob
+// topicOf extracts a small, versioned set of SSE topics. Project events carry
+// project_id in their payload so a portfolio client never has to infer scope
+// from a job, slug, or terminal identity. Best-effort — an unparseable blob
 // defaults to lifecycle (SSE is a lossy nudge; poll is truth).
 func topicOf(blob []byte) string {
 	var e struct {
 		State string `json:"state"`
 	}
-	if json.Unmarshal(blob, &e) == nil && e.State == "epics" {
-		return "epics"
+	if json.Unmarshal(blob, &e) == nil {
+		switch e.State {
+		case "epics", "projects":
+			return e.State
+		}
 	}
 	return "lifecycle"
 }

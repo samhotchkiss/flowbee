@@ -260,7 +260,7 @@ func TestGrokUsageFromConfig(t *testing.T) {
 	}
 	monthly := weekly
 	monthly.CurrentPeriod.Type = "USAGE_PERIOD_TYPE_MONTHLY"
-	if u := grokUsageFromConfig(monthly); u.Windows[0].WindowMinutes != 43200 || u.Windows[0].Kind != KindWeeklyAll {
+	if u := grokUsageFromConfig(monthly); u.Windows[0].WindowMinutes != 43200 || u.Windows[0].Kind != KindMonthly {
 		t.Fatalf("monthly fold: %+v", u.Windows)
 	}
 	// absent percent ⇒ a real 0% window (config present via the period).

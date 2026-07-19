@@ -72,6 +72,23 @@ its migration is written); that is expected and not a violation.
 0029_epic_drift_ci
 0030_missions
 0031_seat_concurrency
+0032_v2_control_plane
+0033_phase1_decisions
+0034_v2_capacity_observations
+0035_capacity_collector_backoff
+0036_phase1_work_intents
+0037_phase1_work_intent_transport
+0038_phase1_conversations
+0039_phase1_epic_contracts
+0040_v2_builder_launch
+0041_phase1_human_login
+0042_phase1_decision_delivery
+0043_phase2_project_ownership
+0044_phase1_conversation_delivery
+0045_phase2_project_attribution
+0046_phase2_project_breakers
+0047_phase2_project_fair_dispatch
+0048_driver_control_principal
 ```
 <!-- ladder:reserved:end -->
 

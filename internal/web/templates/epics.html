@@ -12,6 +12,82 @@
     </div>
   </header>
 
+  <section class="pf-portfolio" aria-labelledby="pf-title" data-project-portfolio>
+    <header class="pf-header">
+      <div><h2 id="pf-title">Projects</h2><p>Global portfolio state and durable per-project workload.</p></div>
+      <span>{{len .Projects}} registered</span>
+    </header>
+    <div class="pf-grid">
+      {{range .Projects}}
+      <a class="pf-card {{.StateClass}}" href="/workspace?project={{urlquery .ID}}" data-project-id="{{.ID}}">
+        <header><div><strong>{{.Name}}</strong><code>{{.ID}}</code></div><span>{{.State}}</span></header>
+        {{if .PauseReason}}<p class="pf-hold">{{.PauseReason}}</p>{{end}}
+        <dl>
+          <div><dt>Active</dt><dd>{{.Active}}</dd></div>
+          <div><dt>Parked</dt><dd>{{.Parked}}</dd></div>
+          <div><dt>Needs you</dt><dd class="{{if .NeedsYou}}warn{{end}}">{{.NeedsYou}}</dd></div>
+        </dl>
+        {{if .Blocker}}<p class="pf-blocker"><span>Oldest blocker{{if .BlockerAge}} · {{.BlockerAge}}{{end}}</span><strong>{{.Blocker}}</strong>{{if .BlockerKind}}<small>{{.BlockerKind}}</small>{{end}}</p>{{else}}<p class="pf-clear">No blocking fact</p>{{end}}
+        <footer><span>priority {{.Priority}}</span><span>weight {{.Weight}}</span><span>cap {{if .Cap}}{{.Cap}}{{else}}fleet{{end}}</span></footer>
+      </a>
+      {{else}}
+      <div class="ops-empty">No projects registered.</div>
+      {{end}}
+    </div>
+  </section>
+
+  <section class="ny-inbox" id="needs-you" aria-labelledby="ny-title" data-decision-inbox>
+    <header class="ny-header">
+      <div>
+        <h2 id="ny-title">Needs you</h2>
+        <p>Typed decisions that are waiting on human authority. Highest priority is first.</p>
+      </div>
+      <a class="ny-skip" href="#ops-pipeline-title">Skip to pipeline</a>
+    </header>
+
+    <div class="ny-summary" aria-label="Needs You summary">
+      <div class="ny-summary-primary {{if .NeedsYou.UrgentCount}}critical{{end}}">
+        <strong>{{.NeedsYou.OpenCount}}</strong>
+        <span>open</span>
+      </div>
+      <dl>
+        <div><dt>Urgent</dt><dd>{{.NeedsYou.UrgentCount}}</dd></div>
+        <div><dt>Overdue</dt><dd>{{.NeedsYou.OverdueCount}}</dd></div>
+        <div><dt>Oldest</dt><dd>{{.NeedsYou.OldestLabel}}</dd></div>
+      </dl>
+      <div class="ny-count-groups">
+        {{if .NeedsYou.Urgencies}}<div><strong>Urgency</strong>{{range .NeedsYou.Urgencies}}<span>{{.Label}} <b>{{.Count}}</b></span>{{end}}</div>{{end}}
+        {{if .NeedsYou.Projects}}<div><strong>Projects</strong>{{range .NeedsYou.Projects}}<span>{{.Label}} <b>{{.Count}}</b></span>{{end}}</div>{{end}}
+        {{if .NeedsYou.Types}}<div><strong>Types</strong>{{range .NeedsYou.Types}}<span>{{.Label}} <b>{{.Count}}</b></span>{{end}}</div>{{end}}
+        {{if .NeedsYou.Ages}}<div><strong>Age</strong>{{range .NeedsYou.Ages}}<span>{{.Label}} <b>{{.Count}}</b></span>{{end}}</div>{{end}}
+      </div>
+    </div>
+
+    {{if .NeedsYou.Actionable}}
+    <div class="ny-list" aria-live="polite">
+      {{range .NeedsYou.Actionable}}{{template "needs-you-card" .}}{{end}}
+    </div>
+    {{else}}
+    <div class="ny-clear" role="status">
+      <strong>All clear</strong>
+      <span>No typed decision is waiting for you.</span>
+    </div>
+    {{end}}
+
+    {{if .NeedsYou.Deferred}}
+    <details class="ny-history ny-deferred">
+      <summary>Deferred <span>{{len .NeedsYou.Deferred}}</span></summary>
+      <div class="ny-list ny-list-muted">{{range .NeedsYou.Deferred}}{{template "needs-you-card" .}}{{end}}</div>
+    </details>
+    {{end}}
+    {{if .NeedsYou.Recent}}
+    <details class="ny-history">
+      <summary>Recent decisions and stale requests <span>{{len .NeedsYou.Recent}}</span></summary>
+      <div class="ny-list ny-list-muted">{{range .NeedsYou.Recent}}{{template "needs-you-card" .}}{{end}}</div>
+    </details>
+    {{end}}
+  </section>
+
   {{with .Alert}}
   <section class="ops-alert" role="alert" data-capacity-alert>
     <span class="ops-alert-icon" aria-hidden="true">▲</span>
@@ -165,6 +241,111 @@
     <button type="button" id="theme-toggle" class="ops-theme" aria-pressed="false">◐ theme</button>
   </footer>
 </div>
+{{end}}
+
+{{define "needs-you-card"}}
+<article class="ny-card {{.UrgencyClass}} {{.StateClass}}" data-decision-id="{{.ID}}" data-project-id="{{.ProjectID}}" data-request-version="{{.RequestVersion}}" data-subject-version="{{.SubjectVersion}}" data-subject-sha256="{{.SubjectSHA256}}" data-decision-kind="{{.Kind}}" data-decision-state="{{.State}}">
+  <div class="ny-card-rail" aria-label="Decision metadata">
+    <span class="ny-kind {{.KindClass}}">{{.KindLabel}}</span>
+    <span class="ny-priority {{.UrgencyClass}}">{{.PriorityLabel}}</span>
+    {{if .Blocking}}<span class="ny-blocking">blocking</span>{{end}}
+    <span class="ny-state {{.StateClass}}">{{.StateLabel}}</span>
+  </div>
+  <div class="ny-card-body">
+    <header>
+      <div>
+        <h3>{{.Title}}</h3>
+        <div class="ny-provenance">
+          <a href="/workspace?project={{urlquery .ProjectID}}"><strong>{{.ProjectID}}</strong></a>
+          {{if .EpicID}}<span>epic {{.EpicID}}</span>{{end}}
+          {{if .DeliveryID}}<span>delivery {{.DeliveryID}}</span>{{end}}
+          <span>waiting for {{.RouteTo}}</span>
+        </div>
+      </div>
+      <div class="ny-time {{.DueClass}}"><strong>{{.AgeLabel}}</strong><span>{{.DueLabel}}</span></div>
+    </header>
+    {{if .Summary}}<p class="ny-summary-copy">{{.Summary}}</p>{{end}}
+    <p class="ny-prompt">{{.Prompt}}</p>
+    <p class="ny-impact">{{.Impact}}</p>
+
+    {{if .Options}}
+    <fieldset class="ny-options" {{if not .AllowAnswer}}disabled{{end}}>
+      <legend>{{if .AllowAnswer}}Choose an answer{{else}}Options provided with this request{{end}}</legend>
+      {{range .Options}}
+      <label class="ny-option {{if .Recommended}}recommended{{end}}">
+        {{if $.AllowAnswer}}<input type="radio" name="answer-{{$.ID}}" value="{{.ValueJSON}}">{{end}}
+        <span><strong>{{.Label}}{{if .Recommended}} <em>recommended</em>{{end}}</strong>
+        {{if .Description}}<small>{{.Description}}</small>{{end}}
+        {{if .Consequence}}<small class="consequence">{{.Consequence}}</small>{{end}}</span>
+      </label>
+      {{end}}
+    </fieldset>
+    {{end}}
+
+    {{if .Actionable}}
+    <div class="ny-response" data-decision-response>
+      {{if .AllowFreeAnswer}}
+      <label class="ny-field"><span>Answer</span><textarea rows="3" data-decision-answer maxlength="10000" placeholder="Type the answer required by this question"></textarea></label>
+      {{end}}
+      {{if .RequiresAuthorizationScope}}
+      <div class="ny-authorization">
+        <label class="ny-field"><span>Exact authorization scope</span><input type="text" data-decision-authorization-scope maxlength="1000" placeholder="Name the precise operation, target, and limit"></label>
+        <label class="ny-confirm"><input type="checkbox" data-decision-confirm> <span>I confirm this exact scope against subject version {{.SubjectVersion}} and hash {{.SubjectShortHash}}.</span></label>
+      </div>
+      {{end}}
+      <label class="ny-field ny-comment"><span>Comment <small>optional</small></span><textarea rows="2" data-decision-comment maxlength="10000" placeholder="Add context for the waiting actor"></textarea></label>
+      <div class="ny-actions">
+        {{if .AllowAnswer}}<button type="button" class="ny-button primary" data-decision-action="answer">Answer</button>{{end}}
+        {{range .Actions}}<button type="button" class="ny-button {{.Class}}" data-decision-action="{{.Kind}}">{{.Label}}</button>{{end}}
+        {{if .AllowDefer}}<button type="button" class="ny-button quiet" data-decision-defer-toggle aria-expanded="false">Defer</button>{{end}}
+      </div>
+      {{if .AllowDefer}}
+      <div class="ny-defer-form" data-decision-defer-form hidden>
+        <label class="ny-field"><span>Resume at</span><input type="datetime-local" data-decision-defer-until></label>
+        <label class="ny-field"><span>Or resume when</span><input type="text" data-decision-defer-condition maxlength="500" placeholder="A durable condition"></label>
+        <button type="button" class="ny-button secondary" data-decision-action="defer">Confirm defer</button>
+      </div>
+      {{end}}
+      <p class="ny-submit-status" data-decision-status role="status" aria-live="polite"></p>
+    </div>
+    {{else}}
+    <div class="ny-inactive" role="status">
+      {{if eq .State "deferred"}}Deferred {{.DeferredUntilLabel}}{{if .DeferCondition}} or until {{.DeferCondition}}{{end}}. It cannot be answered until it reopens.{{end}}
+      {{if eq .State "superseded"}}This request is stale and cannot be acted on.{{if .SupersededBy}} Current request: {{.SupersededBy}}.{{end}}{{end}}
+      {{if eq .State "cancelled"}}This request was cancelled and cannot be acted on. {{.CancellationReason}}{{end}}
+      {{if and (ne .State "deferred") (ne .State "superseded") (ne .State "cancelled")}}Resolved as {{.StateLabel}}.{{end}}
+    </div>
+    {{end}}
+
+    <details class="ny-evidence" data-decision-evidence>
+      <summary>Evidence and exact subject</summary>
+      <div class="ny-evidence-body">
+        <dl class="ny-subject">
+          <div><dt>Artifact</dt><dd>{{if .SubjectArtifactURL}}<a href="{{.SubjectArtifactURL}}" rel="noreferrer">{{.SubjectArtifactRef}}</a>{{else}}<code>{{.SubjectArtifactRef}}</code>{{end}}</dd></div>
+          <div><dt>Version</dt><dd><code>{{.SubjectVersion}}</code></dd></div>
+          <div><dt>SHA-256</dt><dd><code title="{{.SubjectSHA256}}">{{.SubjectSHA256}}</code></dd></div>
+          <div><dt>Requested by</dt><dd>{{.RequestedBy}}</dd></div>
+        </dl>
+        {{if .Evidence}}
+        <ul class="ny-evidence-list">
+          {{range .Evidence}}<li>
+            <strong>{{.Label}}</strong>{{if .Kind}}<span>{{.Kind}}</span>{{end}}
+            {{if .URL}}<a href="{{.URL}}" rel="noreferrer">Open evidence</a>{{else}}<code>{{.Ref}}</code>{{end}}
+            {{if .Version}}<small>version {{.Version}}</small>{{end}}{{if .Hash}}<small title="{{.Hash}}">{{.Hash}}</small>{{end}}
+          </li>{{end}}
+        </ul>
+        {{end}}
+        <details class="ny-schema"><summary>Response schema</summary><pre>{{.ResponseSchemaJSON}}</pre></details>
+      </div>
+    </details>
+
+    <ol class="ny-activity" aria-label="Decision activity">
+      <li class="done"><span>Requested</span><time>{{.CreatedLabel}}</time></li>
+      {{if .ViewedLabel}}<li class="done"><span>Viewed</span><time>{{.ViewedLabel}}</time></li>{{end}}
+      {{if .CurrentResponseID}}<li class="done"><span>{{.ResponseKind}} by {{.ResponseActor}}</span><time>{{.ResponseCreatedLabel}}</time></li><li class="{{if eq .ResponseAckState "acknowledged"}}done{{else}}pending{{end}}"><span>Downstream {{.ResponseAckState}}</span></li>{{else if .Actionable}}<li class="pending"><span>Waiting for response</span></li>{{end}}
+    </ol>
+  </div>
+</article>
 {{end}}
 
 {{define "ops-epic-card"}}

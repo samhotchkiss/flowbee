@@ -78,3 +78,21 @@ func TestAdoptPRParsesRearmedResult(t *testing.T) {
 		t.Fatalf("request body=%v, want repo russ pr 4153", gotBody)
 	}
 }
+
+func TestLeaseCarriesExactCapacitySeatID(t *testing.T) {
+	var gotSeat string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSeat = r.URL.Query().Get("seat_id")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	c.SeatID = "host-a|/providers/codex-a"
+	if _, ok, err := c.Lease(context.Background(), "reviewer-a", "codex", "code_reviewer"); err != nil || ok {
+		t.Fatalf("lease ok=%v err=%v", ok, err)
+	}
+	if gotSeat != c.SeatID {
+		t.Fatalf("seat_id=%q want %q", gotSeat, c.SeatID)
+	}
+}

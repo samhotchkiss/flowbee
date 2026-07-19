@@ -36,7 +36,7 @@ func NewShellRunner() ShellRunner {
 // gets this longer ceiling. SSH itself still carries ConnectTimeout=5, so an
 // unreachable host fails quickly rather than consuming the full clone window.
 func NewLaunchRunner() ShellRunner {
-	return ShellRunner{Timeout: 10 * time.Minute}
+	return ShellRunner{Timeout: 15 * time.Minute}
 }
 
 func (r ShellRunner) Run(ctx context.Context, shellCmd string) (string, error) {

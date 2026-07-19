@@ -1,0 +1,10 @@
+{
+  "provider": "grok",
+  "account_key": "grok-account-1",
+  "credential_lineage": "grok-lineage-1",
+  "source": "grok_billing_api",
+  "captured_at": "2026-07-19T16:00:00Z",
+  "windows": [
+    {"kind": "monthly", "percent": 0, "reset_at": "2026-08-19T16:00:00Z", "window_minutes": 43200}
+  ]
+}

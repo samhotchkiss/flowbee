@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -46,6 +47,24 @@ var forbidden = []string{
 	"github.com/samhotchkiss/flowbee/internal/api",
 	"github.com/google/go-github",
 	"github.com/shurcooL/githubv4",
+}
+
+// v2ControlPackages are the production packages that implement the Driver-owned
+// session boundary. None may acquire a transitive dependency on the legacy raw
+// tmux stack. This is intentionally separate from the deterministic-core check:
+// Driver adapters are impure, but their only session impurity is DriverPort.
+var v2ControlPackages = []string{
+	"github.com/samhotchkiss/flowbee/internal/driver",
+	"github.com/samhotchkiss/flowbee/internal/driverbridge",
+	"github.com/samhotchkiss/flowbee/internal/epicexec",
+	"github.com/samhotchkiss/flowbee/internal/epicflow",
+	"github.com/samhotchkiss/flowbee/internal/workintent",
+}
+
+var rawTmuxPackages = []string{
+	"github.com/samhotchkiss/flowbee/internal/tmuxio",
+	"github.com/samhotchkiss/flowbee/internal/watchdog",
+	"github.com/samhotchkiss/flowbee/internal/epicsupervisor",
 }
 
 // allowedDeterministic is a deny-list exception: deterministic stdlib hashing the
@@ -91,9 +110,82 @@ func main() {
 			}
 		}
 	}
+	for _, pkg := range v2ControlPackages {
+		out, err := exec.Command("go", "list", "-deps", pkg).Output()
+		if err != nil {
+			fmt.Printf("archcheck: skip %s (not present yet)\n", pkg)
+			continue
+		}
+		for _, dep := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			for _, raw := range rawTmuxPackages {
+				if dep == raw || strings.HasPrefix(dep, raw+"/") {
+					fmt.Printf("VIOLATION: v2 control package %s imports raw tmux package %s\n", pkg, dep)
+					violations++
+				}
+			}
+		}
+	}
+	violations += checkRawTmuxSourceBoundary()
 	if violations > 0 {
-		fmt.Printf("archcheck: %d violation(s) of the deterministic-core boundary\n", violations)
+		fmt.Printf("archcheck: %d architecture boundary violation(s)\n", violations)
 		os.Exit(1)
 	}
-	fmt.Println("archcheck: deterministic-core boundary clean")
+	fmt.Println("archcheck: deterministic-core and Driver session boundaries clean")
+}
+
+// checkRawTmuxSourceBoundary keeps the remaining legacy actuator surface small
+// and auditable. The listed files are either the legacy implementation itself or
+// a call site with an explicit durable-v2/runtime fence. Adding another import or
+// direct shell mutation fails CI instead of silently creating a second v2 route.
+func checkRawTmuxSourceBoundary() int {
+	allowedTmuxIO := map[string]bool{
+		"cmd/flowbee/epic.go":                   true, // durable v2 + writer-lock fence
+		"internal/api/masters.go":               true, // DisableLegacyPaneActuation fence
+		"internal/epicsupervisor/supervisor.go": true, // constructed only by guarded serve path
+		"internal/watchdog/ladder.go":           true, // legacy implementation
+		"tools/archcheck/main.go":               true, // this source scanner's own literal
+	}
+	allowedShellTmux := map[string]bool{
+		"internal/tmuxio/tmuxio.go":   true, // legacy implementation
+		"internal/watchdog/runner.go": true, // legacy implementation
+		"tools/archcheck/main.go":     true, // this source scanner's own literal
+	}
+	violations := 0
+	_ = filepath.WalkDir(".", func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			fmt.Printf("VIOLATION: inspect raw tmux boundary %s: %v\n", path, err)
+			violations++
+			return nil
+		}
+		if entry.IsDir() {
+			if path == ".git" || path == ".claude" ||
+				strings.HasPrefix(path, ".git"+string(filepath.Separator)) ||
+				path == "addons" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		clean := filepath.ToSlash(strings.TrimPrefix(path, "."+string(filepath.Separator)))
+		body, readErr := os.ReadFile(path)
+		if readErr != nil {
+			fmt.Printf("VIOLATION: read raw tmux boundary %s: %v\n", clean, readErr)
+			violations++
+			return nil
+		}
+		text := string(body)
+		if strings.Contains(text, `"github.com/samhotchkiss/flowbee/internal/tmuxio"`) &&
+			!allowedTmuxIO[clean] {
+			fmt.Printf("VIOLATION: unaudited raw tmux import in %s\n", clean)
+			violations++
+		}
+		if strings.Contains(text, "tmux send-keys") && !allowedShellTmux[clean] {
+			fmt.Printf("VIOLATION: unaudited direct tmux mutation in %s\n", clean)
+			violations++
+		}
+		return nil
+	})
+	return violations
 }
