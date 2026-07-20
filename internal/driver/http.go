@@ -482,7 +482,7 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 		if err != nil {
 			return LifecycleReceipt{}, fmt.Errorf("driver lifecycle ensure v3 capability: %w", err)
 		}
-		if err := validateLifecycleV3Contracts(meta.Contracts); err != nil {
+		if err := validateLifecycleV3Contracts(meta.Contracts, t); err != nil {
 			return LifecycleReceipt{}, err
 		}
 		inventory, err := p.LifecycleProfiles(ctx)
@@ -560,20 +560,38 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 	return r, nil
 }
 
-func validateLifecycleV3Contracts(c DriverContractCapabilities) error {
+func requireSupportedContract(got DriverContractCapability, want string) error {
+	if !got.Supported || got.ContractID != want {
+		return fmt.Errorf("driver contract unavailable: %s", want)
+	}
+	return nil
+}
+
+func validateLifecycleV3Contracts(c DriverContractCapabilities, t SessionTarget) error {
 	required := []struct {
 		got  DriverContractCapability
 		want string
 	}{
 		{c.LifecycleEnsure, "tmux-driver.lifecycle-ensure/v3"},
 		{c.LifecycleEnsureBootstrapArtifact, "tmux-driver.lifecycle-ensure-bootstrap-artifact/v1"},
-		{c.LifecycleHumanVisibleSession, "tmux-driver.lifecycle-human-visible-session/v1"},
-		{c.LifecycleManagedDisplayName, "tmux-driver.lifecycle-managed-display-name/v1"},
 		{c.LifecycleFlowbeeCredentialInstall, "tmux-driver.lifecycle-flowbee-credential-install/v1"},
 	}
+	if t.PresentationName != "" {
+		if t.Identity.TmuxServerDomainID == "default" {
+			required = append(required, struct {
+				got  DriverContractCapability
+				want string
+			}{c.LifecycleHumanVisibleSession, "tmux-driver.lifecycle-human-visible-session/v1"})
+		} else {
+			required = append(required, struct {
+				got  DriverContractCapability
+				want string
+			}{c.LifecycleManagedDisplayName, "tmux-driver.lifecycle-managed-display-name/v1"})
+		}
+	}
 	for _, item := range required {
-		if !item.got.Supported || item.got.ContractID != item.want {
-			return fmt.Errorf("driver lifecycle ensure v3 contract unavailable: %s", item.want)
+		if err := requireSupportedContract(item.got, item.want); err != nil {
+			return fmt.Errorf("driver lifecycle ensure v3 %w", err)
 		}
 	}
 	return nil

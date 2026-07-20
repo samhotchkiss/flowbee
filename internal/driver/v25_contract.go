@@ -102,12 +102,33 @@ func (c *DriverContractCapabilities) UnmarshalJSON(data []byte) error {
 		"lifecycle_managed_display_name", "lifecycle_flowbee_credential_install",
 		"lifecycle_external_adopt", "lifecycle_external_release",
 		"control_origin_recipient_agent_run_fence"}
-	if err := requireExactWireKeys(data, keys); err != nil {
+	// Contract capability maps are extensible.  Flowbee must reject a missing or
+	// malformed capability it depends on, but a Driver adding an unrelated
+	// capability cannot make an otherwise-safe endpoint unusable.  Preserve
+	// strict decoding for every required capability and intentionally discard
+	// unrecognized extension keys.
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil || object == nil {
+		if err != nil {
+			return err
+		}
+		return errors.New("driver wire object must be an object")
+	}
+	known := make(map[string]json.RawMessage, len(keys))
+	for _, key := range keys {
+		raw, ok := object[key]
+		if !ok {
+			return fmt.Errorf("driver wire object: missing %s", key)
+		}
+		known[key] = raw
+	}
+	knownJSON, err := json.Marshal(known)
+	if err != nil {
 		return err
 	}
 	type plain DriverContractCapabilities
 	var value plain
-	if err := decodeStrictWire(data, &value); err != nil {
+	if err := decodeStrictWire(knownJSON, &value); err != nil {
 		return err
 	}
 	*c = DriverContractCapabilities(value)
@@ -133,9 +154,17 @@ func validateDriverContracts(c DriverContractCapabilities) error {
 	}
 	for name, contractID := range requiredDriverContracts {
 		capability := actual[name]
-		if !capability.Supported || capability.ContractID != contractID {
+		if capability.ContractID != contractID {
 			return fmt.Errorf("driver metadata: unsupported contract %s", name)
 		}
+	}
+	// Control-origin is the only capability every configured endpoint must
+	// provide: Flowbee can route a human escalation to an adopted external
+	// Interactor as well as to managed workers.  Lifecycle presentation and
+	// external-adoption capabilities are deliberately endpoint-scoped and are
+	// checked immediately before the operation that needs them.
+	if !c.ControlOriginRecipientAgentRunFence.Supported {
+		return errors.New("driver metadata: unsupported contract control_origin_recipient_agent_run_fence")
 	}
 	return nil
 }

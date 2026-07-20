@@ -246,7 +246,7 @@ func (f *FakePort) EnsureLifecycleSession(_ context.Context, t SessionTarget, a 
 	}
 	v3 := t.Bootstrap != nil || t.CredentialEnvelope != nil || t.PresentationName != ""
 	if v3 {
-		if err := validateLifecycleV3Contracts(f.Meta.Contracts); err != nil {
+		if err := validateLifecycleV3Contracts(f.Meta.Contracts, t); err != nil {
 			return LifecycleReceipt{}, err
 		}
 		if err := validateLifecycleV3Launch(t); err != nil {
