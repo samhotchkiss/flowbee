@@ -38,13 +38,26 @@ type DriverEndpointInventory struct {
 // DriverEndpoint contains public routing coordinates plus a path to an
 // owner-only bearer. Bearer material is never accepted inline.
 type DriverEndpoint struct {
-	InstanceRef                 string `json:"instance_ref"`
-	UDSPath                     string `json:"uds_path"`
-	TokenFile                   string `json:"token_file"`
-	ExpectedHostID              string `json:"expected_host_id"`
-	ExpectedStoreID             string `json:"expected_store_id"`
-	ExpectedTmuxServerDomainID  string `json:"expected_tmux_server_domain_id"`
-	ExpectedTmuxServerOwnership string `json:"expected_tmux_server_ownership"`
+	InstanceRef                 string                     `json:"instance_ref"`
+	UDSPath                     string                     `json:"uds_path"`
+	TokenFile                   string                     `json:"token_file"`
+	ExpectedHostID              string                     `json:"expected_host_id"`
+	ExpectedStoreID             string                     `json:"expected_store_id"`
+	ExpectedTmuxServerDomainID  string                     `json:"expected_tmux_server_domain_id"`
+	ExpectedTmuxServerOwnership string                     `json:"expected_tmux_server_ownership"`
+	ServiceEnsure               *DriverServiceEnsureConfig `json:"service_ensure,omitempty"`
+}
+
+type DriverServiceEnsureConfig struct {
+	ServiceManagerPath   string            `json:"service_manager_path"`
+	ServiceManagerSHA256 string            `json:"service_manager_sha256"`
+	ReleaseID            string            `json:"release_id"`
+	ExecutablePath       string            `json:"executable_path"`
+	ExecutableSHA256     string            `json:"executable_sha256"`
+	ConfigPath           string            `json:"config_path"`
+	ConfigSHA256         string            `json:"config_sha256"`
+	RequiredContracts    map[string]string `json:"required_contracts"`
+	AllowUpdate          bool              `json:"allow_update,omitempty"`
 }
 
 // LoadDriverEndpointInventoryFromEnv loads the explicit endpoint inventory when
@@ -133,6 +146,21 @@ func (inventory DriverEndpointInventory) Validate() error {
 		if !filepath.IsAbs(endpoint.UDSPath) || !filepath.IsAbs(endpoint.TokenFile) {
 			return fmt.Errorf("%s UDS and token_file paths must be absolute", field)
 		}
+		if ensure := endpoint.ServiceEnsure; ensure != nil {
+			if !filepath.IsAbs(ensure.ServiceManagerPath) || !validSHA256(ensure.ServiceManagerSHA256) ||
+				strings.TrimSpace(ensure.ReleaseID) == "" || !filepath.IsAbs(ensure.ExecutablePath) ||
+				!validSHA256(ensure.ExecutableSHA256) || !filepath.IsAbs(ensure.ConfigPath) ||
+				!validSHA256(ensure.ConfigSHA256) || len(ensure.RequiredContracts) == 0 {
+				return fmt.Errorf("%s service_ensure requires exact manager, release, executable/config paths+hashes, and contracts", field)
+			}
+			seenContracts := map[string]bool{}
+			for name, contract := range ensure.RequiredContracts {
+				if strings.TrimSpace(name) == "" || strings.TrimSpace(contract) == "" || seenContracts[name] {
+					return fmt.Errorf("%s service_ensure has empty or duplicate contract", field)
+				}
+				seenContracts[name] = true
+			}
+		}
 		if err := validateSocketPath(endpoint.UDSPath); err != nil {
 			return fmt.Errorf("%s: %w", field, err)
 		}
@@ -156,6 +184,18 @@ func (inventory DriverEndpointInventory) Validate() error {
 		return errors.New("Driver endpoints inventory requires at least one managed_dedicated/non-default endpoint")
 	}
 	return nil
+}
+
+func validSHA256(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	for _, r := range value[len("sha256:"):] {
+		if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {

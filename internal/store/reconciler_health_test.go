@@ -26,6 +26,17 @@ func TestReconcilerWatchdogPersistsOneAlertAndFencesOldIncarnation(t *testing.T)
 		t.Fatalf("early watchdog=%+v err=%v", rep, err)
 	}
 	staleAt := now.Add(71 * time.Second)
+	// Active attention deduplication is project-local. A project may legitimately
+	// use the same key as a global control-plane condition without being mutated
+	// or resolved by the watchdog.
+	createAttentionProject(t, st, "alpha", now)
+	dedup := "reconciler_dead:review_handoff:1:1"
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	if _, err := st.DB.ExecContext(ctx, `INSERT INTO attention_items
+		(id,project_id,kind,state,dedup_key,occurrences,first_seen_at,last_seen_at,created_at,updated_at)
+		VALUES ('alpha-same-dedup','alpha','needs_input','open',?,1,?,?,?,?)`, dedup, stamp, stamp, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
 	if rep, err := st.ReconcileStaleReconcilers(ctx, staleAt); err != nil || rep.Alerted != 1 {
 		t.Fatalf("stale watchdog=%+v err=%v", rep, err)
 	}
@@ -44,6 +55,15 @@ func TestReconcilerWatchdogPersistsOneAlertAndFencesOldIncarnation(t *testing.T)
 	if err := st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM attention_items
 		WHERE kind='reconciler_dead' AND state='open'`).Scan(&openAttention); err != nil || openAttention != 1 {
 		t.Fatalf("open attention=%d err=%v", openAttention, err)
+	}
+	var alphaState string
+	var alphaOccurrences int
+	if err := st.DB.QueryRowContext(ctx, `SELECT state,occurrences FROM attention_items
+		WHERE project_id='alpha' AND dedup_key=?`, dedup).Scan(&alphaState, &alphaOccurrences); err != nil {
+		t.Fatal(err)
+	}
+	if alphaState != "open" || alphaOccurrences != 1 {
+		t.Fatalf("global watchdog mutated project attention state=%q occurrences=%d", alphaState, alphaOccurrences)
 	}
 	// Repeated watchdog passes are idempotent for the same stale generation.
 	if rep, err := st.ReconcileStaleReconcilers(ctx, staleAt.Add(time.Hour)); err != nil || rep.Alerted != 0 {
@@ -66,6 +86,10 @@ func TestReconcilerWatchdogPersistsOneAlertAndFencesOldIncarnation(t *testing.T)
 	if err := st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM attention_items
 		WHERE kind='reconciler_dead' AND state='resolved'`).Scan(&openAttention); err != nil || openAttention != 1 {
 		t.Fatalf("resolved attention=%d err=%v", openAttention, err)
+	}
+	if err := st.DB.QueryRowContext(ctx, `SELECT state FROM attention_items
+		WHERE project_id='alpha' AND dedup_key=?`, dedup).Scan(&alphaState); err != nil || alphaState != "open" {
+		t.Fatalf("global recovery resolved project attention state=%q err=%v", alphaState, err)
 	}
 }
 

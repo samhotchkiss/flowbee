@@ -32,7 +32,7 @@ lint: archcheck laddercheck
 	@command -v golangci-lint >/dev/null 2>&1 && golangci-lint run || echo "golangci-lint not installed; skipping"
 
 test:
-	go test ./... -short -race
+	./tools/racecheck.sh
 
 accept:
 	go test ./test/... -race

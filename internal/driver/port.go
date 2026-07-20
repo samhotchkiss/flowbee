@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -48,7 +49,53 @@ type SessionTarget struct {
 	LeaseID               string
 	LeaseEpoch            int64
 	ExternalWatchID       string
+	Bootstrap             *LifecycleBootstrapArtifact
+	CredentialEnvelope    *LifecycleCredentialEnvelope
+	PresentationName      string
 	Role                  string // legacy alias for ProfileID; production requires ProfileID.
+}
+
+type LifecycleBootstrapArtifact struct {
+	ArtifactID    string `json:"artifact_id"`
+	Format        string `json:"format"`
+	PayloadSHA256 string `json:"payload_sha256"`
+	ContentUTF8   string `json:"content_utf8"`
+}
+
+type LifecycleCredentialEnvelope struct {
+	EnvelopeID      string `json:"envelope_id"`
+	Format          string `json:"format"`
+	CredentialEpoch int64  `json:"credential_epoch"`
+	PayloadSHA256   string `json:"payload_sha256"`
+	SecretUTF8      string `json:"secret_utf8"`
+}
+
+func (e LifecycleCredentialEnvelope) String() string {
+	return fmt.Sprintf("LifecycleCredentialEnvelope{EnvelopeID:%q Format:%q CredentialEpoch:%d PayloadSHA256:%q SecretUTF8:[REDACTED]}",
+		e.EnvelopeID, e.Format, e.CredentialEpoch, e.PayloadSHA256)
+}
+
+func (e LifecycleCredentialEnvelope) GoString() string { return e.String() }
+
+type LifecycleBootstrapReceipt struct {
+	ArtifactID, Format, PayloadSHA256, Status string
+}
+
+type LifecycleCredentialReceipt struct {
+	EnvelopeID, PayloadSHA256, Status string
+	CredentialEpoch                   int64
+}
+
+// ValidateFlowbeeManagedAgentLaunch applies Flowbee's stricter product policy
+// atop Driver's independently optional v3 fields. Every spawned agent must have
+// role context, a renewable API credential, and an explicit display name at
+// process creation; a partial v3 request is valid Driver wire but not a valid
+// Flowbee actor/worker launch.
+func ValidateFlowbeeManagedAgentLaunch(t SessionTarget) error {
+	if t.Bootstrap == nil || t.CredentialEnvelope == nil || t.PresentationName == "" {
+		return errors.New("Flowbee managed agent launch requires bootstrap, credential, and display name")
+	}
+	return validateLifecycleV3Launch(t)
 }
 
 type Grant struct {
@@ -112,7 +159,17 @@ type Action struct {
 	GrantID                           string
 	GrantEpoch                        int64
 	GrantExpiresAt                    string
+	LifecycleBootstrap                *LifecycleBootstrapArtifact  `json:"-"`
+	LifecycleCredential               *LifecycleCredentialEnvelope `json:"-"`
+	LifecyclePresentationName         string                       `json:"-"`
 }
+
+func (a Action) String() string {
+	return fmt.Sprintf("Action{ActionID:%q Epoch:%d Kind:%q ProjectID:%q EpicID:%q LifecycleKey:%q TargetEpoch:%d}",
+		a.ActionID, a.Epoch, a.Kind, a.ProjectID, a.EpicID, a.LifecycleKey, a.TargetEpoch)
+}
+
+func (a Action) GoString() string { return a.String() }
 
 func NewAction(id, payload string, epoch int64) Action {
 	h := sha256.Sum256([]byte(payload))
@@ -134,7 +191,8 @@ func (a Action) SessionTarget() SessionTarget {
 		LifecycleKey: a.LifecycleKey, TargetEpoch: a.TargetEpoch, ProfileID: a.ProfileID,
 		WorkspaceRootID: a.WorkspaceRootID, WorkspaceRelativePath: a.WorkspaceRelativePath,
 		LeaseID: a.LeaseID, LeaseEpoch: a.LeaseEpoch,
-		ExternalWatchID: a.ExternalWatchID,
+		ExternalWatchID: a.ExternalWatchID, Bootstrap: a.LifecycleBootstrap,
+		CredentialEnvelope: a.LifecycleCredential, PresentationName: a.LifecyclePresentationName,
 	}
 }
 
@@ -270,22 +328,28 @@ func (e ReceiptExpectation) Validate(r Receipt) error {
 // It is intentionally distinct from a routed-message receipt: stopped proves
 // positive target absence, while ensured returns a newly fenced incarnation.
 type LifecycleReceipt struct {
-	FormatVersion      string   `json:"format_version"`
-	LifecycleReceiptID string   `json:"lifecycle_receipt_id"`
-	Operation          string   `json:"operation"`
-	ActionID           string   `json:"action_id"`
-	ActionEpoch        int64    `json:"action_epoch"`
-	LeaseID            string   `json:"lease_id"`
-	LeaseEpoch         int64    `json:"lease_epoch"`
-	LifecycleKey       string   `json:"lifecycle_key"`
-	TmuxServerDomainID string   `json:"tmux_server_domain_id"`
-	ExternalWatchID    string   `json:"external_watch_id"`
-	TargetEpoch        int64    `json:"target_epoch"`
-	Status             string   `json:"status"`
-	IdentityBefore     Identity `json:"identity_before"`
-	IdentityAfter      Identity `json:"identity_after"`
-	AbsenceObservedAt  string   `json:"absence_observed_at"`
-	DiagnosticCode     string   `json:"diagnostic_code"`
+	FormatVersion            string   `json:"format_version"`
+	LifecycleReceiptID       string   `json:"lifecycle_receipt_id"`
+	Operation                string   `json:"operation"`
+	ActionID                 string   `json:"action_id"`
+	ActionEpoch              int64    `json:"action_epoch"`
+	LeaseID                  string   `json:"lease_id"`
+	LeaseEpoch               int64    `json:"lease_epoch"`
+	LifecycleKey             string   `json:"lifecycle_key"`
+	TmuxServerDomainID       string   `json:"tmux_server_domain_id"`
+	ExternalWatchID          string   `json:"external_watch_id"`
+	TargetEpoch              int64    `json:"target_epoch"`
+	Status                   string   `json:"status"`
+	IdentityBefore           Identity `json:"identity_before"`
+	IdentityAfter            Identity `json:"identity_after"`
+	AbsenceObservedAt        string   `json:"absence_observed_at"`
+	DiagnosticCode           string   `json:"diagnostic_code"`
+	BootstrapArtifact        LifecycleBootstrapReceipt
+	CredentialInstall        LifecycleCredentialReceipt
+	PresentationName         string
+	BootstrapArtifactPresent bool
+	CredentialInstallPresent bool
+	PresentationNamePresent  bool
 }
 
 type LifecyclePresence struct {
@@ -315,6 +379,7 @@ func (r LifecycleReceipt) Uncertain() bool {
 
 type DriverPort interface {
 	Metadata(context.Context) (DriverMetadata, error)
+	LifecycleProfiles(context.Context) (LifecycleProfileInventory, error)
 	ControlOriginCapability(context.Context) (ControlOriginCapability, error)
 	SnapshotSessions(context.Context) (SessionSnapshot, error)
 	EnsureSession(context.Context, SessionTarget, Action) (Identity, error)
@@ -415,8 +480,9 @@ type DriverMetadata struct {
 	// ControlPrincipalOrigin is true only when Driver's protocol metadata
 	// explicitly advertises features.control_principal_origin=true. Missing,
 	// false, or malformed metadata never enables control-origin delivery.
-	ControlPrincipalOrigin bool
-	LifecycleControl       bool
+	ControlPrincipalOrigin        bool
+	LifecycleControl              bool
+	LifecycleProfileInventoryPath string
 }
 
 type TmuxServerMetadata struct {
@@ -436,9 +502,84 @@ type DriverContractCapabilities struct {
 	ManagedTmuxServerDomain             DriverContractCapability `json:"managed_tmux_server_domain"`
 	ManagedTmuxServerIsolation          DriverContractCapability `json:"managed_tmux_server_isolation"`
 	LifecycleEnsure                     DriverContractCapability `json:"lifecycle_ensure"`
+	LifecycleProfileInventory           DriverContractCapability `json:"lifecycle_profile_inventory"`
+	LifecycleEnsureBootstrapArtifact    DriverContractCapability `json:"lifecycle_ensure_bootstrap_artifact"`
+	LifecycleHumanVisibleSession        DriverContractCapability `json:"lifecycle_human_visible_session"`
+	LifecycleManagedDisplayName         DriverContractCapability `json:"lifecycle_managed_display_name"`
+	LifecycleFlowbeeCredentialInstall   DriverContractCapability `json:"lifecycle_flowbee_credential_install"`
 	LifecycleExternalAdopt              DriverContractCapability `json:"lifecycle_external_adopt"`
 	LifecycleExternalRelease            DriverContractCapability `json:"lifecycle_external_release"`
 	ControlOriginRecipientAgentRunFence DriverContractCapability `json:"control_origin_recipient_agent_run_fence"`
+}
+
+type LifecycleProfile struct {
+	ProfileID                         string `json:"profile_id"`
+	Provider                          string `json:"provider"`
+	InitialPromptAdapter              string `json:"initial_prompt_adapter"`
+	TargetCredentialAdapter           string `json:"target_credential_adapter"`
+	EnsureSupported                   bool   `json:"ensure_supported"`
+	BootstrapArtifactSupported        bool   `json:"bootstrap_artifact_supported"`
+	FlowbeeCredentialInstallSupported bool   `json:"flowbee_credential_install_supported"`
+	HumanVisibleSessionSupported      bool   `json:"human_visible_session_supported"`
+	ManagedDisplayNameSupported       bool   `json:"managed_display_name_supported"`
+}
+
+type LifecycleProfileInventory struct {
+	APIVersion         string             `json:"api_version"`
+	ServerTime         string             `json:"server_time"`
+	FormatVersion      string             `json:"format_version"`
+	LifecycleEnabled   bool               `json:"lifecycle_enabled"`
+	TmuxServerDomainID string             `json:"tmux_server_domain_id"`
+	Profiles           []LifecycleProfile `json:"profiles"`
+}
+
+func (i LifecycleProfileInventory) RequireManagedAgent(profileID, provider, domain string) error {
+	if i.FormatVersion != "tmux-driver.lifecycle-profile-inventory/v1" || !i.LifecycleEnabled ||
+		i.TmuxServerDomainID != domain {
+		return errors.New("driver lifecycle profile inventory is unavailable or in a different domain")
+	}
+	for _, profile := range i.Profiles {
+		if profile.ProfileID != profileID {
+			continue
+		}
+		if profile.Provider != provider || !profile.EnsureSupported ||
+			!profile.BootstrapArtifactSupported || !profile.FlowbeeCredentialInstallSupported ||
+			!profile.ManagedDisplayNameSupported || profile.HumanVisibleSessionSupported ||
+			profile.InitialPromptAdapter != "argv_element" ||
+			profile.TargetCredentialAdapter != "file_environment" {
+			return errors.New("driver lifecycle profile is not suitable for a managed Flowbee agent")
+		}
+		return nil
+	}
+	return fmt.Errorf("driver lifecycle profile %q is not configured", profileID)
+}
+
+func (i LifecycleProfileInventory) ValidateLaunch(profileID, domain string, target SessionTarget) error {
+	if i.FormatVersion != "tmux-driver.lifecycle-profile-inventory/v1" || !i.LifecycleEnabled ||
+		i.TmuxServerDomainID != domain {
+		return errors.New("driver lifecycle profile inventory authority mismatch")
+	}
+	for _, p := range i.Profiles {
+		if p.ProfileID != profileID {
+			continue
+		}
+		expectedProvider := ""
+		for _, provider := range []string{"claude", "codex", "grok"} {
+			if strings.HasPrefix(profileID, provider+"_") {
+				expectedProvider = provider
+				break
+			}
+		}
+		if expectedProvider != "" && p.Provider != expectedProvider ||
+			!p.EnsureSupported || target.Bootstrap != nil && !p.BootstrapArtifactSupported ||
+			target.CredentialEnvelope != nil && !p.FlowbeeCredentialInstallSupported ||
+			target.PresentationName != "" && domain != "default" && !p.ManagedDisplayNameSupported ||
+			target.PresentationName != "" && domain == "default" && !p.HumanVisibleSessionSupported {
+			return errors.New("driver lifecycle profile is not suitable for requested launch material")
+		}
+		return nil
+	}
+	return fmt.Errorf("driver lifecycle profile %q is not configured", profileID)
 }
 
 // SessionProjection is Driver-derived snapshot state. It contains stable IDs and

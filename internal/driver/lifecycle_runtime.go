@@ -4,22 +4,51 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
+
+var ErrLifecycleLaunchMaterial = errors.New("lifecycle launch material unavailable")
 
 type LifecycleProjector interface {
 	ProjectLifecycleResult(context.Context, Action, LifecycleReceipt, time.Time) error
 }
 
+type LifecycleLaunchMaterialResolver interface {
+	ResolveLifecycleLaunch(context.Context, Action, time.Time) (Action, func(bool), error)
+}
+
+type LifecycleLaunchMaterialFinalizer interface {
+	FinalizeLifecycleLaunch(context.Context, Action, LifecycleReceipt, time.Time) error
+}
+
+// LifecycleWorkspaceManager is the Flowbee-owned filesystem boundary required
+// by Driver managed-session lifecycle. Driver receives only a configured root
+// ID plus relative path and deliberately does not create or delete repositories.
+// Prepare runs after the immutable outbox action has been claimed and before an
+// Ensure call. Finalize runs only after Driver has returned positive absence for
+// the exact Stop action and before Store projects the worker as stopped.
+type LifecycleWorkspaceManager interface {
+	PrepareLifecycleWorkspace(context.Context, Action, time.Time) error
+	FinalizeLifecycleWorkspace(context.Context, Action, LifecycleReceipt, time.Time) error
+	// FinalizePreEffectLifecycleWorkspace removes an exact locally prepared
+	// workspace after Store has certified that the corresponding Ensure never
+	// reached Driver.  It must not inspect or mutate a terminal session.
+	FinalizePreEffectLifecycleWorkspace(context.Context, Action, time.Time) error
+}
+
 type LifecycleRuntime struct {
-	Port         DriverPort
-	Resolver     *EndpointResolver
-	Store        SQLActionStore
-	Projector    LifecycleProjector
-	Gate         LifecycleGate
-	Owner        string
-	ClaimTTL     time.Duration
-	MaximumTries int
+	Port                  DriverPort
+	Resolver              *EndpointResolver
+	Store                 SQLActionStore
+	Projector             LifecycleProjector
+	Gate                  LifecycleGate
+	Materials             LifecycleLaunchMaterialResolver
+	Workspaces            LifecycleWorkspaceManager
+	RequireManagedAgentV3 bool
+	Owner                 string
+	ClaimTTL              time.Duration
+	MaximumTries          int
 }
 
 type LifecycleRuntimeReport struct{ Reclaimed, Verified, Executed, Held, Retried, DeadLettered int }
@@ -43,11 +72,21 @@ func (r LifecycleRuntime) Tick(ctx context.Context, now time.Time) (LifecycleRun
 	if action, ok, err := r.Store.ClaimNextLifecycleVerifying(ctx, r.Owner, now, r.ClaimTTL); err != nil {
 		return out, err
 	} else if ok {
+		// A local pre-effect workspace cleanup has no Driver receipt by design.
+		// If the process died after filesystem cleanup but before Store
+		// projection, replay the idempotent local finalizer rather than trying to
+		// discover/verify a nonexistent Driver effect.
+		if action.Kind == "worker_workspace_cleanup" {
+			return r.finalizePreEffectWorkspace(ctx, action, now, out, true)
+		}
 		return r.verify(ctx, action, now, out)
 	}
 	action, ok, err := r.Store.ClaimNextLifecycleAction(ctx, r.Owner, now, r.ClaimTTL)
 	if err != nil || !ok {
 		return out, err
+	}
+	if action.Kind == "worker_workspace_cleanup" {
+		return r.finalizePreEffectWorkspace(ctx, action, now, out, false)
 	}
 	if action.Kind == "builder_launch" || action.Kind == "builder_rework" {
 		gate := r.Gate
@@ -79,13 +118,16 @@ func (r LifecycleRuntime) Tick(ctx context.Context, now time.Time) (LifecycleRun
 	if err != nil {
 		return r.retryOrDeadLetter(ctx, action, err, now, out)
 	}
-	receipt, err := r.execute(ctx, port, action)
+	receipt, err := r.executeWithMaterials(ctx, port, action, now)
 	if receipt.LifecycleReceiptID != "" {
 		if persistErr := r.Store.PersistLifecycleReceipt(ctx, receipt); persistErr != nil {
 			return out, persistErr
 		}
 	}
 	if err != nil {
+		if errors.Is(err, ErrLifecycleLaunchMaterial) {
+			return r.preEffectFailure(ctx, action, err, now, out)
+		}
 		// Once a lifecycle request reaches Driver, a transport error cannot prove
 		// the terminal was not mutated. Persist uncertainty for every response-loss
 		// shape; recovery must use by-action receipt lookup and exact presence before
@@ -108,6 +150,13 @@ func (r LifecycleRuntime) Tick(ctx context.Context, now time.Time) (LifecycleRun
 		out.DeadLettered++
 		return out, nil
 	}
+	if err := r.finalizeMaterials(ctx, action, receipt, now); err != nil {
+		if markErr := r.Store.MarkActionVerifying(ctx, action.ActionID, r.Owner, action.Epoch,
+			err.Error(), now); markErr != nil {
+			return out, markErr
+		}
+		return out, err
+	}
 	if err := r.Projector.ProjectLifecycleResult(ctx, action, receipt, now); err != nil {
 		// The Driver effect is already durable. Never repeat it because Flowbee's
 		// projection transaction failed; recover from the same receipt.
@@ -124,16 +173,143 @@ func (r LifecycleRuntime) Tick(ctx context.Context, now time.Time) (LifecycleRun
 	return out, nil
 }
 
+func (r LifecycleRuntime) preEffectFailure(ctx context.Context, action Action, cause error,
+	now time.Time, out LifecycleRuntimeReport) (LifecycleRuntimeReport, error) {
+	kind := "materials_resolve"
+	if strings.Contains(cause.Error(), "workspace:") {
+		kind = "workspace_prepare"
+	} else if strings.Contains(cause.Error(), "Flowbee managed agent launch") {
+		kind = "launch_validate"
+	}
+	dead, err := r.Store.RecordLifecyclePreEffectFailure(ctx, action.ActionID, r.Owner, action.Epoch,
+		kind, cause.Error(), r.MaximumTries, now)
+	if err != nil {
+		return out, err
+	}
+	if dead {
+		out.DeadLettered++
+	} else {
+		out.Retried++
+	}
+	return out, nil
+}
+
+// finalizePreEffectWorkspace executes a Flowbee-local cleanup effect.  It is
+// intentionally outside Driver endpoint resolution and creates no lifecycle
+// receipt: Store only materializes this action after it has re-proven zero
+// Driver receipts plus an explicit pre-effect certificate for the original
+// Ensure.  A local filesystem failure remains a claimed effect and is retried;
+// it is never projected as stopped until the exact marker/worktree is gone.
+func (r LifecycleRuntime) finalizePreEffectWorkspace(ctx context.Context, action Action, now time.Time,
+	out LifecycleRuntimeReport, verifying bool) (LifecycleRuntimeReport, error) {
+	if r.Workspaces == nil {
+		if verifying {
+			_ = r.Store.ReleaseVerifying(ctx, action.ActionID, r.Owner, action.Epoch,
+				"pre-effect workspace cleanup manager unavailable", now)
+			return out, errors.New("pre-effect workspace cleanup manager unavailable")
+		}
+		return r.retryOrDeadLetter(ctx, action, errors.New("pre-effect workspace cleanup manager unavailable"), now, out)
+	}
+	if err := r.Workspaces.FinalizePreEffectLifecycleWorkspace(ctx, action, now); err != nil {
+		if verifying {
+			if releaseErr := r.Store.ReleaseVerifying(ctx, action.ActionID, r.Owner, action.Epoch, err.Error(), now); releaseErr != nil {
+				return out, releaseErr
+			}
+			return out, err
+		}
+		return r.retryOrDeadLetter(ctx, action, err, now, out)
+	}
+	receipt := LifecycleReceipt{ActionID: action.ActionID, ActionEpoch: action.Epoch,
+		LifecycleKey: action.LifecycleKey, TargetEpoch: action.TargetEpoch,
+		Operation: "workspace_cleanup", Status: "cleaned"}
+	if err := r.Projector.ProjectLifecycleResult(ctx, action, receipt, now); err != nil {
+		if verifying {
+			if releaseErr := r.Store.ReleaseVerifying(ctx, action.ActionID, r.Owner, action.Epoch,
+				err.Error(), now); releaseErr != nil {
+				return out, releaseErr
+			}
+			return out, err
+		}
+		if markErr := r.Store.MarkActionVerifying(ctx, action.ActionID, r.Owner, action.Epoch,
+			err.Error(), now); markErr != nil {
+			return out, markErr
+		}
+		return out, err
+	}
+	var ackErr error
+	if verifying {
+		ackErr = r.Store.AcknowledgeVerifying(ctx, action.ActionID, r.Owner, action.Epoch, now)
+	} else {
+		ackErr = r.Store.AcknowledgeAction(ctx, action.ActionID, r.Owner, action.Epoch, now)
+	}
+	if ackErr != nil {
+		return out, ackErr
+	}
+	out.Executed++
+	return out, nil
+}
+
 func (r LifecycleRuntime) execute(ctx context.Context, port DriverPort, action Action) (LifecycleReceipt, error) {
 	target := action.SessionTarget()
 	switch action.Kind {
-	case "builder_park":
+	case "builder_park", "worker_stop":
 		return port.StopSession(ctx, target, action)
-	case "builder_launch", "builder_rework", "conflict_resolution":
+	case "builder_launch", "builder_rework", "conflict_resolution", "reviewer_launch", "worker_recover":
 		return port.EnsureLifecycleSession(ctx, target, action)
 	default:
 		return LifecycleReceipt{}, fmt.Errorf("unsupported Driver lifecycle action %s", action.Kind)
 	}
+}
+
+func (r LifecycleRuntime) executeWithMaterials(ctx context.Context, port DriverPort, action Action,
+	now time.Time) (LifecycleReceipt, error) {
+	ensure := action.Kind == "builder_launch" || action.Kind == "builder_rework" ||
+		action.Kind == "conflict_resolution" || action.Kind == "reviewer_launch" ||
+		action.Kind == "worker_recover"
+	cleanup := func(bool) {}
+	if ensure && r.Workspaces != nil {
+		if err := r.Workspaces.PrepareLifecycleWorkspace(ctx, action, now); err != nil {
+			return LifecycleReceipt{}, fmt.Errorf("%w: workspace: %v", ErrLifecycleLaunchMaterial, err)
+		}
+	} else if ensure && r.RequireManagedAgentV3 {
+		return LifecycleReceipt{}, fmt.Errorf("%w: workspace preparer unavailable", ErrLifecycleLaunchMaterial)
+	}
+	if ensure && r.Materials != nil {
+		var err error
+		action, cleanup, err = r.Materials.ResolveLifecycleLaunch(ctx, action, now)
+		if err != nil {
+			return LifecycleReceipt{}, fmt.Errorf("%w: %v", ErrLifecycleLaunchMaterial, err)
+		}
+	} else if ensure && r.RequireManagedAgentV3 {
+		return LifecycleReceipt{}, fmt.Errorf("%w: resolver unavailable", ErrLifecycleLaunchMaterial)
+	}
+	if ensure && r.RequireManagedAgentV3 {
+		if err := ValidateFlowbeeManagedAgentLaunch(action.SessionTarget()); err != nil {
+			cleanup(false)
+			return LifecycleReceipt{}, fmt.Errorf("%w: %v", ErrLifecycleLaunchMaterial, err)
+		}
+	}
+	receipt, err := r.execute(ctx, port, action)
+	cleanup(err == nil && receipt.Resolved())
+	return receipt, err
+}
+
+func (r LifecycleRuntime) finalizeMaterials(ctx context.Context, action Action, receipt LifecycleReceipt,
+	now time.Time) error {
+	if !receipt.Resolved() {
+		return nil
+	}
+	if action.Kind == "worker_stop" && r.Workspaces != nil {
+		if err := r.Workspaces.FinalizeLifecycleWorkspace(ctx, action, receipt, now); err != nil {
+			return fmt.Errorf("finalize lifecycle workspace: %w", err)
+		}
+	} else if action.Kind == "worker_stop" && r.RequireManagedAgentV3 {
+		return errors.New("finalize lifecycle workspace: manager unavailable")
+	}
+	if finalizer, ok := r.Materials.(LifecycleLaunchMaterialFinalizer); ok {
+		return finalizer.FinalizeLifecycleLaunch(ctx, action, receipt, now)
+	}
+	return nil
 }
 
 func (r LifecycleRuntime) verify(ctx context.Context, action Action, now time.Time,
@@ -156,8 +332,9 @@ func (r LifecycleRuntime) verify(ctx context.Context, action Action, now time.Ti
 				presenceErr.Error(), now)
 			return out, presenceErr
 		}
-		safe := (action.Kind == "builder_launch" || action.Kind == "builder_rework") && presence.ExactAbsent()
-		if action.Kind == "builder_park" {
+		safe := (action.Kind == "builder_launch" || action.Kind == "builder_rework" ||
+			action.Kind == "reviewer_launch" || action.Kind == "worker_recover") && presence.ExactAbsent()
+		if action.Kind == "builder_park" || action.Kind == "worker_stop" {
 			safe = presence.ExactAbsent() || presence.Presence == "present" &&
 				presence.Identity.SessionID == action.RecipientSessionID &&
 				presence.Identity.PaneInstanceID == action.RecipientPaneInstanceID &&
@@ -174,7 +351,7 @@ func (r LifecycleRuntime) verify(ctx context.Context, action Action, now time.Ti
 		if err := r.Store.ResumeLifecycleAfterAbsentProof(ctx, action, r.Owner, now, r.ClaimTTL); err != nil {
 			return out, err
 		}
-		recovered, executeErr := r.execute(ctx, port, action)
+		recovered, executeErr := r.executeWithMaterials(ctx, port, action, now)
 		if recovered.LifecycleReceiptID != "" {
 			if err := r.Store.PersistLifecycleReceipt(ctx, recovered); err != nil {
 				return out, err
@@ -195,6 +372,10 @@ func (r LifecycleRuntime) verify(ctx context.Context, action Action, now time.Ti
 			}
 			out.DeadLettered++
 			return out, nil
+		}
+		if err := r.finalizeMaterials(ctx, action, recovered, now); err != nil {
+			_ = r.Store.MarkActionVerifying(ctx, action.ActionID, r.Owner, action.Epoch, err.Error(), now)
+			return out, err
 		}
 		if err := r.Projector.ProjectLifecycleResult(ctx, action, recovered, now); err != nil {
 			_ = r.Store.MarkActionVerifying(ctx, action.ActionID, r.Owner, action.Epoch, err.Error(), now)
@@ -241,6 +422,10 @@ func (r LifecycleRuntime) verify(ctx context.Context, action Action, now time.Ti
 		}
 		out.DeadLettered++
 		return out, nil
+	}
+	if err := r.finalizeMaterials(ctx, action, receipt, now); err != nil {
+		_ = r.Store.MarkActionVerifying(ctx, action.ActionID, r.Owner, action.Epoch, err.Error(), now)
+		return out, err
 	}
 	if err := r.Projector.ProjectLifecycleResult(ctx, action, receipt, now); err != nil {
 		_ = r.Store.ReleaseVerifying(ctx, action.ActionID, r.Owner, action.Epoch, err.Error(), now)

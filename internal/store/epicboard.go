@@ -39,7 +39,8 @@ func (s *Store) EpicDigestSeq(ctx context.Context) (int64, error) {
 		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM driver_session_bindings
 		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM project_circuit_breakers
 		UNION ALL SELECT COALESCE(MAX(updated_at),'') FROM project_scheduler_state
-		UNION ALL SELECT COALESCE(MAX(created_at),'') FROM project_scheduler_turns`)
+		UNION ALL SELECT COALESCE(MAX(created_at),'') FROM project_scheduler_turns
+		UNION ALL SELECT COALESCE(MAX(created_at),'') FROM project_scheduler_effects`)
 	if err != nil {
 		return 0, err
 	}

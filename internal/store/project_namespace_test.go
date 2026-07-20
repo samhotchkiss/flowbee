@@ -18,13 +18,13 @@ func TestPhase2EpicBranchNamespacePreservesDefaultAndSeparatesProjects(t *testin
 	}
 }
 
-func TestPhase2EpicSessionNamespacePreservesDefaultAndSeparatesProjects(t *testing.T) {
-	if got := epicSessionNameForProject("default", "auth"); got != "epic-auth" {
-		t.Fatalf("default compatibility session=%q", got)
+func TestPhase2EpicSessionNamespaceAlwaysQualifiesProject(t *testing.T) {
+	if got := epicSessionNameForProject("default", "auth"); got != "flowbee-worker-codex-default-auth" {
+		t.Fatalf("default-qualified session=%q", got)
 	}
 	a := epicSessionNameForProject("mail", "auth")
 	b := epicSessionNameForProject("calendar", "auth")
-	if a != "epic-mail-auth" || b != "epic-calendar-auth" || a == b {
+	if a != "flowbee-worker-codex-mail-auth" || b != "flowbee-worker-codex-calendar-auth" || a == b {
 		t.Fatalf("project sessions collided: %q %q", a, b)
 	}
 }
@@ -42,6 +42,12 @@ func TestPhase2TwoProjectsMayAdmitTheSameHumanSlugWithoutSharingAuthority(t *tes
 	now := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
 	for _, projectID := range []string{"mail", "calendar"} {
 		if _, err := st.CreatePortfolioProject(ctx, PortfolioProject{ID: projectID, Name: projectID}, now); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RegisterRepo(ctx, Repo{ID: projectID, Owner: "fixture", Repo: projectID, Active: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AddProjectRepo(ctx, projectID, projectID, now); err != nil {
 			t.Fatal(err)
 		}
 		epicID := "epic-" + projectID + "-auth"

@@ -20,6 +20,12 @@ func TestPhase2DerivedChildRecordsInheritProjectOwnership(t *testing.T) {
 	if _, err := st.CreatePortfolioProject(ctx, store.PortfolioProject{ID: "mail", Name: "Mail"}, now); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "mail", Owner: "fixture", Repo: "mail", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddProjectRepo(ctx, "mail", "mail", now); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := st.SeedJob(ctx, store.SeedParams{ID: "mail-job", Kind: job.KindBuild,
 		Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: now}); err != nil {
 		t.Fatal(err)

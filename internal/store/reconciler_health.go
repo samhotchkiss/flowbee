@@ -343,7 +343,7 @@ func reconcilerStaleDedup(name string, runEpoch, staleEpoch int64) string {
 func ensureOperationalAttentionTx(ctx context.Context, tx *sql.Tx, kind, dedup, evidence, detail string, now time.Time) error {
 	nowText := now.UTC().Format(rfc3339)
 	res, err := tx.ExecContext(ctx, `UPDATE attention_items SET occurrences=occurrences+1,last_seen_at=?,
-		evidence_json=?,detail=?,updated_at=? WHERE dedup_key=? AND state<>'resolved'`,
+		evidence_json=?,detail=?,updated_at=? WHERE project_id='default' AND dedup_key=? AND state<>'resolved'`,
 		nowText, evidence, detail, nowText, dedup)
 	if err != nil {
 		return err
@@ -367,7 +367,7 @@ func ensureOperationalAttentionTx(ctx context.Context, tx *sql.Tx, kind, dedup, 
 func resolveOperationalAttentionTx(ctx context.Context, tx *sql.Tx, dedup, resolution string, now time.Time) error {
 	nowText := now.UTC().Format(rfc3339)
 	_, err := tx.ExecContext(ctx, `UPDATE attention_items SET state='resolved',resolution=?,resolved_at=?,
-		leased_by='',lease_expires_at='',updated_at=? WHERE dedup_key=? AND state<>'resolved'`,
+		leased_by='',lease_expires_at='',updated_at=? WHERE project_id='default' AND dedup_key=? AND state<>'resolved'`,
 		resolution, nowText, nowText, dedup)
 	return err
 }

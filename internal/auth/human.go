@@ -157,7 +157,16 @@ func (a *HumanAccess) Authenticate(r *http.Request) (HumanPrincipal, error) {
 			credentialKind: "session", csrfHash: claims.CSRFHash}, nil
 	}
 	if a.automation != nil {
-		if identity, err := a.automation.Authenticate(r); err == nil && identity != "" {
+		identity, err := a.automation.Authenticate(r)
+		if bearer, ok := a.automation.(*BearerAuth); ok {
+			var claims *CredentialClaims
+			identity, claims, err = bearer.authenticateWithClaims(r)
+			if err == nil && claims != nil &&
+				(claims.WorkerRole == "interactor" || claims.WorkerRole == "orchestrator") {
+				return HumanPrincipal{}, ErrHumanUnauthorized
+			}
+		}
+		if err == nil && identity != "" {
 			return HumanPrincipal{Identity: identity, SessionID: "automation:" + identity,
 				credentialKind: "automation"}, nil
 		}

@@ -24,6 +24,16 @@ func mustAddEpicRun(t *testing.T, st *store.Store, ctx context.Context, e store.
 	}
 }
 
+func bindEpicTestRepo(t *testing.T, st *store.Store, projectID, repoID string, now time.Time) {
+	t.Helper()
+	if err := st.RegisterRepo(context.Background(), store.Repo{ID: repoID, Owner: "fixture", Repo: repoID, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddProjectRepo(context.Background(), projectID, repoID, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAddEpicRunV2AdmissionIsIdempotentAndCreatesReviewObligation(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
@@ -31,6 +41,7 @@ func TestAddEpicRunV2AdmissionIsIdempotentAndCreatesReviewObligation(t *testing.
 	if _, err := st.DB.Exec(`INSERT INTO projects(id,name) VALUES ('proj-a','Project A')`); err != nil {
 		t.Fatal(err)
 	}
+	bindEpicTestRepo(t, st, "proj-a", "r", now)
 	e := store.EpicRun{ID: "epic-ulid-1", ProjectID: "proj-a", AdmissionKey: "intent-1:v1", ContractHash: "sha256:contract", Repo: "r", Branch: "dev/russ", Scope: []string{"pkg/**"}}
 	if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
 		t.Fatal(err)
@@ -67,6 +78,7 @@ func TestAddEpicRunV2AdmissionConflictsOnChangedContract(t *testing.T) {
 	if _, err := st.DB.Exec(`INSERT INTO projects(id,name) VALUES ('proj-a','Project A')`); err != nil {
 		t.Fatal(err)
 	}
+	bindEpicTestRepo(t, st, "proj-a", "r", now)
 	e := store.EpicRun{ID: "epic-contract", ProjectID: "proj-a", AdmissionKey: "intent-2:v1", ContractHash: "hash-a", Repo: "r", Scope: []string{"a/**"}}
 	if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
 		t.Fatal(err)

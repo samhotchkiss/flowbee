@@ -12,6 +12,7 @@
 package gitops
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -175,6 +176,76 @@ func (m *Mirror) AddWorktree(dir, baseSHA string) (*Worktree, error) {
 		return nil, fmt.Errorf("worktree add at %s: %w", baseSHA, err)
 	}
 	return &Worktree{Dir: dir, mirror: m, baseSHA: baseSHA}, nil
+}
+
+// RegisteredWorktree returns the exact commit recorded by git for dir. It is
+// used by the control-plane workspace reconciler after a crash between
+// `worktree add` and its own marker write. Paths are compared after filepath
+// cleaning; callers must separately enforce their configured-root boundary.
+func (m *Mirror) RegisteredWorktree(dir string) (string, bool, error) {
+	out, err := run("", "git", "--git-dir", m.Path, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "", false, fmt.Errorf("list worktrees: %w", err)
+	}
+	want, err := filepath.Abs(dir)
+	if err != nil {
+		return "", false, err
+	}
+	want = filepath.Clean(want)
+	if resolved, resolveErr := filepath.EvalSymlinks(want); resolveErr == nil {
+		want = filepath.Clean(resolved)
+	}
+	var current string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "worktree ") {
+			current = filepath.Clean(strings.TrimPrefix(line, "worktree "))
+			continue
+		}
+		if current == want && strings.HasPrefix(line, "HEAD ") {
+			sha := strings.TrimSpace(strings.TrimPrefix(line, "HEAD "))
+			if sha == "" {
+				return "", false, errors.New("registered worktree has empty HEAD")
+			}
+			return sha, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// RemoveRegisteredWorktree removes only an exact registered path at the exact
+// expected commit. A mismatched path/head is an error, never permission to
+// recursively delete an ambiguous directory.
+func (m *Mirror) RemoveRegisteredWorktree(dir, expectedSHA string) error {
+	sha, ok, err := m.RegisteredWorktree(dir)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("workspace is not registered to the expected mirror")
+	}
+	if sha != expectedSHA {
+		return fmt.Errorf("registered workspace HEAD %s differs from immutable source %s", sha, expectedSHA)
+	}
+	if _, err := run("", "git", "--git-dir", m.Path, "worktree", "remove", "--force", dir); err != nil {
+		return fmt.Errorf("remove exact worktree: %w", err)
+	}
+	return nil
+}
+
+// RemoveExactRegisteredWorktree removes an exact path registered to this
+// mirror while allowing its HEAD to have advanced. Builders legitimately move
+// HEAD while producing the epic; Flowbee's external immutable marker is what
+// binds that path to the lifecycle action before this method is called.
+func (m *Mirror) RemoveExactRegisteredWorktree(dir string) error {
+	if _, ok, err := m.RegisteredWorktree(dir); err != nil {
+		return err
+	} else if !ok {
+		return errors.New("workspace is not registered to the expected mirror")
+	}
+	if _, err := run("", "git", "--git-dir", m.Path, "worktree", "remove", "--force", dir); err != nil {
+		return fmt.Errorf("remove exact worktree: %w", err)
+	}
+	return nil
 }
 
 // PruneWorktrees reaps worktree metadata whose working directory is already gone —

@@ -43,6 +43,10 @@ type Reconciler struct {
 	// ONLY within this repo (PR numbers are repo-scoped), so one control plane runs
 	// one Reconciler per repo, each over its own github.Client.
 	repo string
+	// projectID is set only for the legacy repo-origin compatibility intake.
+	// Native v2 work arrives as an epic/work intent with durable project authority;
+	// the reconciler never infers that authority from a GitHub issue or PR.
+	projectID string
 	// mirror resolves the integration-branch tip so a label-opted issue can be
 	// adopted as a build cut from current main (GitHub-issue intake). Nil disables
 	// issue intake for this repo (e.g. tests with no local mirror).
@@ -115,6 +119,13 @@ func NewForRepo(repo string, st *store.Store, client gh.Client, clk Clock, pub P
 	return &Reconciler{store: st, gh: client, clock: clk, pub: pub, repo: repo}
 }
 
+// NewForRepoProject binds the legacy compatibility intake to an exact project.
+// Callers must obtain projectID from ResolveRepoAdmissionProject; v2 callers do
+// not use this constructor because generic GitHub adoption is disabled there.
+func NewForRepoProject(repo, projectID string, st *store.Store, client gh.Client, clk Clock, pub Publisher) *Reconciler {
+	return &Reconciler{store: st, gh: client, clock: clk, pub: pub, repo: repo, projectID: projectID}
+}
+
 // Repo returns the repo-scope handle this reconciler is bound to ("" = legacy).
 func (r *Reconciler) Repo() string { return r.repo }
 
@@ -144,59 +155,62 @@ func (r *Reconciler) Sweep(ctx context.Context) ([]store.ReconcileOutcome, error
 			outs = append(outs, out)
 		}
 	}
-	// PR intake: any OPEN, non-draft PR carrying an adopt label (flowbee:adopt or
-	// needs-claude) that Flowbee does not already track is imported into the review
-	// pipeline right here on the floor sweep — through the SAME AdoptPR path the
-	// manual `flowbee adopt <pr>` CLI drives, so its idempotency comes for free
-	// (already-tracked + unchanged is a no-op; a moved head re-arms; see AdoptPR /
-	// store.AdoptPRForReview). Merged/closed PRs are excluded — nothing to review —
-	// and a draft is excluded because it is still being worked, not ready for review.
-	// AdoptPR errors (e.g. a transient diff-fetch failure) are swallowed per-PR: one
-	// bad adopt must never abort the sweep for every other PR on the board.
-	for _, pr := range snap.PullRequests {
-		if pr.IsDraft || pr.Merged || pr.ClosedUnmerged || !hasAdoptLabel(pr.Labels) {
-			continue
-		}
-		if r.store.EnableEpicReviewHandoffV2 {
-			// Same-repository ownership cannot be disproved without the exact head
-			// branch. A partial GraphQL response must never fall through to generic
-			// adoption; retry when GitHub returns the identity fact.
-			if !pr.IsCrossRepository && pr.HeadRefName == "" {
+	// Native v2 never adopts arbitrary labeled PRs. Flowbee owns epics, not
+	// one-off PRs; owned epic artifacts were reconciled above from their durable
+	// repo+branch delivery identity. This entire label-driven path is P1/legacy
+	// compatibility only.
+	if !r.store.EnableEpicReviewHandoffV2 {
+		// PR intake: any OPEN, non-draft PR carrying an adopt label (flowbee:adopt or
+		// needs-claude) that Flowbee does not already track is imported into the review
+		// pipeline right here on the floor sweep — through the SAME AdoptPR path the
+		// manual `flowbee adopt <pr>` CLI drives, so its idempotency comes for free
+		// (already-tracked + unchanged is a no-op; a moved head re-arms; see AdoptPR /
+		// store.AdoptPRForReview). Merged/closed PRs are excluded — nothing to review —
+		// and a draft is excluded because it is still being worked, not ready for review.
+		// AdoptPR errors (e.g. a transient diff-fetch failure) are swallowed per-PR: one
+		// bad adopt must never abort the sweep for every other PR on the board.
+		for _, pr := range snap.PullRequests {
+			if pr.IsDraft || pr.Merged || pr.ClosedUnmerged || !hasAdoptLabel(pr.Labels) {
 				continue
 			}
-			// Ownership comes only from the admitted repo/branch pair. Fail closed
-			// on a lookup error or ambiguity: a transient store problem must never
-			// fall through and manufacture a second legacy review job.
-			_, owned, oerr := r.ownedEpicForPR(ctx, pr)
-			if oerr != nil || owned {
+			// API-storm gate: AdoptPR spends TWO GitHub round-trips (PullRequest +
+			// PullRequestDiff) BEFORE it reaches the store's idempotency check, and adopt
+			// labels never come off — so without this local pre-flight every already-adopted
+			// unchanged PR would cost 2 API calls per sweep forever (~27 calls/min at 10
+			// labeled PRs on a ~45s sweep), competing with the BoardSweep itself for the
+			// rate-limit budget. The snapshot already carries the authoritative base/head,
+			// so the store alone decides: only a genuinely-new or base/head-moved PR
+			// proceeds to AdoptPR. A gate read error skips this sweep (fail-quiet; the next
+			// sweep retries) rather than falling open into the very storm the gate prevents.
+			var act bool
+			var gerr error
+			if r.projectID != "" {
+				act, gerr = r.store.PRAdoptWouldActForProject(ctx, r.projectID, r.repo, pr.Number, pr.BaseRefOid, pr.HeadRefOid, now)
+			} else {
+				act, gerr = r.store.PRAdoptWouldAct(ctx, r.repo, pr.Number, pr.BaseRefOid, pr.HeadRefOid)
+			}
+			if gerr != nil || !act {
 				continue
 			}
+			_, _, _ = r.AdoptPR(ctx, pr.Number)
 		}
-		// API-storm gate: AdoptPR spends TWO GitHub round-trips (PullRequest +
-		// PullRequestDiff) BEFORE it reaches the store's idempotency check, and adopt
-		// labels never come off — so without this local pre-flight every already-adopted
-		// unchanged PR would cost 2 API calls per sweep forever (~27 calls/min at 10
-		// labeled PRs on a ~45s sweep), competing with the BoardSweep itself for the
-		// rate-limit budget. The snapshot already carries the authoritative base/head,
-		// so the store alone decides: only a genuinely-new or base/head-moved PR
-		// proceeds to AdoptPR. A gate read error skips this sweep (fail-quiet; the next
-		// sweep retries) rather than falling open into the very storm the gate prevents.
-		act, gerr := r.store.PRAdoptWouldAct(ctx, r.repo, pr.Number, pr.BaseRefOid, pr.HeadRefOid)
-		if gerr != nil || !act {
-			continue
-		}
-		_, _, _ = r.AdoptPR(ctx, pr.Number)
 	}
 	// GitHub-issue intake (build-list): adopt every label-opted, not-yet-tracked
 	// issue as a build cut from the current integration tip. Idempotent in the store
 	// (a job already tracking the issue is a no-op), so re-sweeps never duplicate.
-	if r.mirror != nil {
+	if !r.store.EnableEpicReviewHandoffV2 && r.mirror != nil {
 		base, berr := r.mirror.HeadSHA("refs/heads/" + r.branch)
 		for _, iss := range snap.Issues {
 			if berr != nil || !hasLabel(iss.Labels, IntakeLabel) {
 				continue
 			}
-			id, aerr := r.store.AdoptIssueAsBuild(ctx, r.repo, iss.Number, iss.Title, iss.Body, base, priorityFromLabels(iss.Labels), now)
+			var id string
+			var aerr error
+			if r.projectID != "" {
+				id, aerr = r.store.AdoptIssueAsBuildForProject(ctx, r.projectID, r.repo, iss.Number, iss.Title, iss.Body, base, priorityFromLabels(iss.Labels), now)
+			} else {
+				id, aerr = r.store.AdoptIssueAsBuild(ctx, r.repo, iss.Number, iss.Title, iss.Body, base, priorityFromLabels(iss.Labels), now)
+			}
 			if aerr == nil && id != "" && r.pub != nil {
 				r.pub.PublishReconcile(id, "issue_adopted")
 			}
@@ -295,6 +309,7 @@ func (r *Reconciler) AdoptPR(ctx context.Context, prNumber int) (string, bool, e
 			// route it through the generic adoption domain or fetch a second diff.
 			return "", false, nil
 		}
+		return "", false, fmt.Errorf("pr #%d is not an admitted epic artifact; generic PR adoption is disabled in v2", prNumber)
 	}
 	ciGreen := pr.CIRollup == gh.CISuccess && pr.CIHasRealSuccess
 	differ, ok := r.gh.(gh.PRDiffer)
@@ -311,11 +326,21 @@ func (r *Reconciler) AdoptPR(ctx context.Context, prNumber int) (string, bool, e
 	if pr.IsCrossRepository {
 		// A fork ref cannot own a delivery in this repository, so there is no
 		// same-repository ownership identity to fence.
-		id, rearmed, err = r.store.AdoptPRForReview(ctx, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid,
-			diff, diff == "", pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
+		if r.projectID != "" {
+			id, rearmed, err = r.store.AdoptPRForReviewInProject(ctx, r.projectID, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid,
+				diff, diff == "", pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
+		} else {
+			id, rearmed, err = r.store.AdoptPRForReview(ctx, r.repo, prNumber, pr.BaseRefOid, pr.HeadRefOid,
+				diff, diff == "", pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
+		}
 	} else {
-		id, rearmed, err = r.store.AdoptPRForReviewWithHeadRef(ctx, r.repo, prNumber, pr.HeadRefName, pr.BaseRefOid, pr.HeadRefOid,
-			diff, diff == "", pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
+		if r.projectID != "" {
+			id, rearmed, err = r.store.AdoptPRForReviewWithHeadRefInProject(ctx, r.projectID, r.repo, prNumber, pr.HeadRefName, pr.BaseRefOid, pr.HeadRefOid,
+				diff, diff == "", pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
+		} else {
+			id, rearmed, err = r.store.AdoptPRForReviewWithHeadRef(ctx, r.repo, prNumber, pr.HeadRefName, pr.BaseRefOid, pr.HeadRefOid,
+				diff, diff == "", pr.Merged, ciGreen, pr.IsDraft, pr.UpdatedAt, r.clock.Now())
+		}
 	}
 	if err != nil {
 		return "", false, err
@@ -351,7 +376,14 @@ func (r *Reconciler) ingest(ctx context.Context, pr gh.PullRequest, now time.Tim
 			return store.ReconcileOutcome{Applied: true}, true, nil
 		}
 	}
-	jobID, ok, err := r.store.JobIDForPRInRepo(ctx, r.repo, pr.Number)
+	var jobID string
+	var ok bool
+	var err error
+	if r.projectID != "" {
+		jobID, ok, err = r.store.JobIDForPRInProjectRepo(ctx, r.projectID, r.repo, pr.Number)
+	} else {
+		jobID, ok, err = r.store.JobIDForPRInRepo(ctx, r.repo, pr.Number)
+	}
 	if err != nil {
 		return store.ReconcileOutcome{}, false, err
 	}

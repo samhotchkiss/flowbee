@@ -230,7 +230,7 @@ func TestV2OwnershipRejectsForkAndFlagOffPreservesLegacyAdoption(t *testing.T) {
 		wantArtifactPR int
 		wantJobs       int
 	}{
-		{name: "fork lookalike", id: "fork", flag: true, fork: true, wantJobs: 1},
+		{name: "fork lookalike is not v2 intake", id: "fork", flag: true, fork: true, wantJobs: 0},
 		{name: "same repo missing head identity", id: "missing", flag: true, headMissing: true, wantJobs: 0},
 		{name: "flag off", id: "off", flag: false, wantJobs: 1},
 	} {

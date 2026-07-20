@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/store"
@@ -46,7 +47,7 @@ func (s *Server) portfolio(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "portfolio digest failed", http.StatusInternalServerError)
 		return
 	}
-	projects, err := s.store.ProjectDashboard(r.Context())
+	projects, err := s.store.ProjectDashboardAt(r.Context(), s.clock.Now())
 	if err != nil {
 		http.Error(w, "portfolio read failed", http.StatusInternalServerError)
 		return
@@ -104,6 +105,23 @@ func (s *Server) projectOne(w http.ResponseWriter, r *http.Request) {
 		"project": project, "repository_ids": repos, "actors": actors})
 }
 
+func (s *Server) projectActivation(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("project_id")
+	if _, ok := s.requireHumanProject(w, r, id, auth.HumanProjectRead); !ok {
+		return
+	}
+	status, err := s.store.ProjectActivation(r.Context(), id, s.clock.Now(), 5*time.Minute)
+	if errors.Is(err, store.ErrProjectNotFound) {
+		http.Error(w, "project not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "project activation read failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"schema_version": "flowbee.project-activation/v1", "activation": status})
+}
+
 func (s *Server) projectEpics(w http.ResponseWriter, r *http.Request) {
 	projectID := r.PathValue("project_id")
 	if _, ok := s.requireHumanProject(w, r, projectID, auth.HumanProjectRead); !ok {
@@ -121,6 +139,11 @@ func (s *Server) projectEpics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "project epics read failed", http.StatusInternalServerError)
 		return
 	}
+	artifacts, err := s.store.ListEpicArtifactsForProject(r.Context(), projectID)
+	if err != nil {
+		http.Error(w, "project artifacts read failed", http.StatusInternalServerError)
+		return
+	}
 	seq, err := s.store.EpicDigestSeq(r.Context())
 	if err != nil {
 		http.Error(w, "project epics digest failed", http.StatusInternalServerError)
@@ -131,6 +154,7 @@ func (s *Server) projectEpics(w http.ResponseWriter, r *http.Request) {
 		"digest_seq":     seq,
 		"project_id":     projectID,
 		"epics":          epics,
+		"artifacts":      artifacts,
 	})
 }
 

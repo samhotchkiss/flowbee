@@ -2310,6 +2310,16 @@ normal promotion; human endpoints can pause/cancel or satisfy a typed gate.
   cannot merge or widen an authorization.
 - Reviewer/builder/collector credentials carry only their role and registered
   host/session scope; workers receive no GitHub credentials.
+- Driver v3 installs actor/worker credentials only at process creation and does
+  not provide an in-place refresh operation. Managed-session credentials
+  therefore use a practically non-expiring signed expiry and are authorized on
+  every request against durable current lifecycle generation, exact active
+  Driver binding, and revocation state. Project actors additionally require the
+  exact fresh Driver session projection because they hold standing control-plane
+  authority. Stop or replacement fences every managed credential immediately;
+  actor store reset, pane/run replacement, or stale observation authority does
+  the same. Wall-clock expiry is not a hidden 24-hour pipeline shutdown
+  mechanism.
 - Human dashboard writes require an authenticated Tailnet/session identity, CSRF
   protection, and an action-specific permission.
 - High-consequence responses show the exact scope and artifact hash and may require a

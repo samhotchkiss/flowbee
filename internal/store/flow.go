@@ -161,7 +161,12 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 		var projectID, deliveryRepo, head, base string
 		var prNumber, deliveryVersion int
 		var recipientBinding DriverSessionBinding
+		routeIdentity := p.Identity
 		if domain == "epic_v2" && epicID != "" {
+			dedicatedWorkers, err := dedicatedEpicWorkersEnabledTx(ctx, s, tx)
+			if err != nil {
+				return err
+			}
 			if err := tx.QueryRowContext(ctx, `SELECT d.project_id,d.state_version,d.delivery_repo,
 				COALESCE(a.pr_number,0),d.head_sha,d.base_sha
 				FROM epic_deliveries d JOIN epic_artifacts a ON a.epic_id=d.epic_id
@@ -174,7 +179,8 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 				return err
 			}
 			if s.EnableCapacityV2 {
-				decision, routeErr := capacityRouteForSeatQuery(ctx, tx, p.SeatID, p.Now, 5*time.Minute)
+				decision, routeErr := capacityRouteForSeatQueryExcludingEpic(ctx, tx, p.SeatID,
+					epicID, p.Now, 5*time.Minute)
 				if routeErr != nil {
 					return routeErr
 				}
@@ -187,8 +193,40 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 					return nil
 				}
 			}
+			if dedicatedWorkers {
+				var dedicatedDriverIdentity, dedicatedIdentity, dedicatedFamily, dedicatedState string
+				if err := tx.QueryRowContext(ctx, `SELECT worker_identity,flowbee_identity,model_family,state
+					FROM epic_worker_sessions WHERE epic_id=? AND project_id=? AND worker_role='reviewer'`,
+					epicID, projectID).Scan(&dedicatedDriverIdentity, &dedicatedIdentity, &dedicatedFamily, &dedicatedState); err != nil {
+					return err
+				}
+				if dedicatedState != "active" || p.Identity != dedicatedIdentity ||
+					p.ModelFamily != dedicatedFamily {
+					return lease.ErrLostRace
+				}
+				var registered int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM workers
+					WHERE identity=? AND attestation_expires_at>?
+					  AND EXISTS (SELECT 1 FROM json_each(workers.attested_capabilities)
+					              WHERE value='role:code_reviewer')
+					  AND EXISTS (SELECT 1 FROM json_each(workers.attested_capabilities)
+					              WHERE value=?)`, dedicatedIdentity, p.Now.UTC().Format(rfc3339),
+					"model_family:"+dedicatedFamily).Scan(&registered); err != nil {
+					return err
+				}
+				if registered != 1 {
+					return lease.ErrLostRace
+				}
+				if _, err := tx.ExecContext(ctx, `UPDATE epic_worker_credentials SET state='installed',
+					installed_at=?,updated_at=? WHERE epic_id=? AND worker_role='reviewer'
+					AND state='issued' AND expires_at>?`, p.Now.UTC().Format(rfc3339),
+					p.Now.UTC().Format(rfc3339), epicID, p.Now.UTC().Format(rfc3339)); err != nil {
+					return err
+				}
+				routeIdentity = dedicatedDriverIdentity
+			}
 			var routeErr error
-			recipientBinding, routeErr = activeDriverSessionBindingTx(ctx, tx, projectID, p.Identity, DriverReviewerRole)
+			recipientBinding, routeErr = activeDriverSessionBindingTx(ctx, tx, projectID, routeIdentity, DriverReviewerRole)
 			if routeErr != nil {
 				detail := fmt.Sprintf("reviewer %s cannot be routed through an exact active Driver binding: %v", p.Identity, routeErr)
 				if err := markReviewClaimBindingHoldTx(ctx, tx, projectID, epicID, p.JobID, p.Identity, detail, p.Now); err != nil {
@@ -207,6 +245,9 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 				}
 				bindingHold = fmt.Errorf("%w: %s", ErrDriverSessionBindingMissing, detail)
 				return nil
+			}
+			if dedicatedWorkers && recipientBinding.SeatID != p.SeatID {
+				return lease.ErrLostRace
 			}
 		}
 

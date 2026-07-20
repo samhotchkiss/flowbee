@@ -167,7 +167,11 @@ func NewRegistry(st *store.Store, leaseTTLS, heartbeatIntervalS int, allow Allow
 // a stale capability dormant rather than silently matched.
 func (r *Registry) Register(ctx context.Context, reg Registration, now time.Time) (RegisterResponse, error) {
 	expires := now.Add(24 * time.Hour)
-	attested := r.allow.attest(reg.Identity, reg.Capabilities, reg.Arch, reg.OS)
+	allow, err := r.currentAllowlist(ctx, reg.Identity, now)
+	if err != nil {
+		return RegisterResponse{}, err
+	}
+	attested := allow.attest(reg.Identity, reg.Capabilities, reg.Arch, reg.OS)
 	claimedJSON, _ := json.Marshal(reg.Capabilities)
 	attestedJSON, _ := json.Marshal(attested)
 	result, err := r.st.DB.ExecContext(ctx, `
@@ -250,14 +254,55 @@ func (r *Registry) AttestedFor(ctx context.Context, identity string, now time.Ti
 	if err := json.Unmarshal([]byte(claimed), &claims); err != nil {
 		return nil, err
 	}
-	return r.allow.attest(identity, claims, arch, osName), nil
+	allow, err := r.currentAllowlist(ctx, identity, now)
+	if err != nil {
+		return nil, err
+	}
+	return allow.attest(identity, claims, arch, osName), nil
 }
 
 // HasRoleAuthority reports whether the current operator policy grants an
 // identity any worker role. It is used to keep capacity-only credentials off
 // control-plane and work-mutation endpoints.
-func (r *Registry) HasRoleAuthority(identity string) bool {
-	return r.allow.hasRoleAuthority(identity)
+func (r *Registry) HasRoleAuthority(ctx context.Context, identity string, now time.Time) (bool, error) {
+	allow, err := r.currentAllowlist(ctx, identity, now)
+	if err != nil {
+		return false, err
+	}
+	return allow.hasRoleAuthority(identity), nil
+}
+
+// ModelFamilyFor returns the current authority-bound model family when the
+// policy grants exactly one. It prevents an ephemeral worker from changing the
+// anti-affinity family merely by changing a lease query parameter.
+func (r *Registry) ModelFamilyFor(ctx context.Context, identity string, now time.Time) (string, bool, error) {
+	allow, err := r.currentAllowlist(ctx, identity, now)
+	if err != nil {
+		return "", false, err
+	}
+	var family string
+	for _, capability := range allow.Permit[identity] {
+		if !strings.HasPrefix(capability, "model_family:") {
+			continue
+		}
+		candidate := strings.TrimPrefix(capability, "model_family:")
+		if candidate == "" || family != "" && family != candidate {
+			return "", false, nil
+		}
+		family = candidate
+	}
+	return family, family != "", nil
+}
+
+func (r *Registry) currentAllowlist(ctx context.Context, identity string, now time.Time) (Allowlist, error) {
+	capabilities, managed, err := r.st.EpicWorkerCapabilities(ctx, identity, now)
+	if err != nil {
+		return Allowlist{}, err
+	}
+	if !managed {
+		return r.allow, nil
+	}
+	return Allowlist{Permit: map[string][]string{identity: capabilities}}, nil
 }
 
 // TouchLastSeen records a worker's most-recent contact (heartbeat liveness for

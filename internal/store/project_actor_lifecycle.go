@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 var (
@@ -33,6 +35,12 @@ type ProjectActorLifecycle struct {
 	LifecycleKey                                          string
 	TargetEpoch                                           int64
 	ProfileID, WorkspaceRootID, WorkspaceRelativePath     string
+	BootstrapFormat, BootstrapPayload, BootstrapSHA256    string
+	CredentialInstallRef, CredentialEnvelopeRef           string
+	CredentialPayloadSHA256, CredentialExpiresAt          string
+	CredentialEnvelopeDeletedAt, CredentialRevokedAt      string
+	PresentationName                                      string
+	CredentialGeneration                                  int64
 	ExternalWatchID                                       string
 	ExpectedBindingID                                     string
 	ExpectedBindingEpoch                                  int64
@@ -47,27 +55,32 @@ type ProjectActorLifecycle struct {
 }
 
 type ProjectActorLifecycleAction struct {
-	ID, ProjectID, Role, ActorID                  string
-	RouteStateVersion, IntentStateVersion         int64
-	ActionGeneration                              int64
-	Operation, State                              string
-	ActionEpoch                                   int64
-	IdempotencyKey, DedupKey, Payload, PayloadSHA string
-	InstanceRef, TargetHostID, TargetStoreID      string
-	TargetServerDomainID, TargetServerID          string
-	LifecycleOwnership, LifecycleKey              string
-	TargetEpoch                                   int64
-	ProfileID, WorkspaceRootID                    string
-	WorkspaceRelativePath, ExternalWatchID        string
-	ExpectedBindingID                             string
-	ExpectedBindingEpoch                          int64
-	ExpectedSessionID, ExpectedPaneInstanceID     string
-	ExpectedAgentRunID, LeaseID                   string
-	LeaseEpoch                                    int64
-	Attempts, RecoveryCount                       int
-	NextAttemptAt, ClaimDeadlineAt                time.Time
-	ClaimOwner, LastError                         string
-	CreatedAt, UpdatedAt                          time.Time
+	ID, ProjectID, Role, ActorID                       string
+	RouteStateVersion, IntentStateVersion              int64
+	ActionGeneration                                   int64
+	Operation, State                                   string
+	ActionEpoch                                        int64
+	IdempotencyKey, DedupKey, Payload, PayloadSHA      string
+	InstanceRef, TargetHostID, TargetStoreID           string
+	TargetServerDomainID, TargetServerID               string
+	LifecycleOwnership, LifecycleKey                   string
+	TargetEpoch                                        int64
+	ProfileID, WorkspaceRootID                         string
+	WorkspaceRelativePath, ExternalWatchID             string
+	BootstrapFormat, BootstrapPayload, BootstrapSHA256 string
+	CredentialInstallRef, CredentialEnvelopeRef        string
+	CredentialPayloadSHA256, CredentialExpiresAt       string
+	PresentationName                                   string
+	CredentialGeneration                               int64
+	ExpectedBindingID                                  string
+	ExpectedBindingEpoch                               int64
+	ExpectedSessionID, ExpectedPaneInstanceID          string
+	ExpectedAgentRunID, LeaseID                        string
+	LeaseEpoch                                         int64
+	Attempts, RecoveryCount                            int
+	NextAttemptAt, ClaimDeadlineAt                     time.Time
+	ClaimOwner, LastError                              string
+	CreatedAt, UpdatedAt                               time.Time
 }
 
 // ProjectActorLifecycleCommand is accepted only by the commit-before-effect
@@ -86,6 +99,9 @@ type ProjectActorLifecycleCommand struct {
 	TargetEpoch                               int64
 	ProfileID, WorkspaceRootID                string
 	WorkspaceRelativePath, ExternalWatchID    string
+	ManagedRecoveryProfileID                  string
+	ManagedRecoveryWorkspaceRootID            string
+	ManagedRecoveryWorkspaceRelativePath      string
 	ExpectedSessionID, ExpectedPaneInstanceID string
 	ExpectedAgentRunID                        string
 }
@@ -162,6 +178,9 @@ func normalizeProjectActorLifecycleCommand(command ProjectActorLifecycleCommand)
 	command.ActorID = strings.TrimSpace(command.ActorID)
 	command.Operation = strings.TrimSpace(command.Operation)
 	command.IdempotencyKey = strings.TrimSpace(command.IdempotencyKey)
+	command.ManagedRecoveryProfileID = strings.TrimSpace(command.ManagedRecoveryProfileID)
+	command.ManagedRecoveryWorkspaceRootID = strings.TrimSpace(command.ManagedRecoveryWorkspaceRootID)
+	command.ManagedRecoveryWorkspaceRelativePath = strings.TrimSpace(command.ManagedRecoveryWorkspaceRelativePath)
 	if command.ProjectID == "" || command.ActorID == "" || command.IdempotencyKey == "" ||
 		(command.Role != DriverInteractorRole && command.Role != DriverOrchestratorRole) ||
 		command.ExpectedRouteStateVersion < 1 || len(command.IdempotencyKey) > 200 {
@@ -307,12 +326,14 @@ func (s *Store) CommitProjectActorLifecycleIntent(ctx context.Context, command P
 			CreatedAt: created, UpdatedAt: now,
 		}
 		if existingErr == nil {
-			lifecycle.ExpectedBindingID, lifecycle.ExpectedBindingEpoch = existing.ActiveBindingID, existing.ExpectedBindingEpoch
-			lifecycle.ActiveBindingID = existing.ActiveBindingID
 			if command.Operation == "stop" || command.Operation == "release" || command.Operation == "reattach" {
 				binding, _ := activeDriverSessionBindingTx(ctx, tx, command.ProjectID, command.ActorID, command.Role)
 				lifecycle.ExpectedBindingID, lifecycle.ExpectedBindingEpoch = binding.BindingID, binding.BindingEpoch
+				lifecycle.ActiveBindingID = binding.BindingID
 			}
+		}
+		if err := s.prepareProjectActorQ3Tx(ctx, tx, command, existing, existingErr, &lifecycle, now); err != nil {
+			return err
 		}
 		var priorActor string
 		priorErr := sql.ErrNoRows
@@ -339,6 +360,11 @@ func (s *Store) CommitProjectActorLifecycleIntent(ctx context.Context, command P
 		if err := upsertProjectActorLifecycleTx(ctx, tx, lifecycle); err != nil {
 			return err
 		}
+		if command.Operation == "adopt" {
+			if err := upsertProjectActorManagedRecoveryPolicyTx(ctx, tx, command, payloadSHA, now); err != nil {
+				return err
+			}
+		}
 		action, err = insertProjectActorActionTx(ctx, tx, lifecycle, command.IdempotencyKey, payload, payloadSHA, now)
 		if err != nil {
 			return err
@@ -355,6 +381,193 @@ func (s *Store) CommitProjectActorLifecycleIntent(ctx context.Context, command P
 	return lifecycle, action, err
 }
 
+const projectActorBootstrapFormat = "flowbee.actor-bootstrap/v1"
+
+const (
+	projectActorCharterVersion        = "v1"
+	projectActorDisciplineVersion     = "v1"
+	projectActorOperatingDisciplineV1 = "Flowbee project actor operating discipline (v1)\n\nTreat Flowbee's durable project, epic, action, lease, and evidence records as authority. Never infer project identity, routing authority, workflow completion, or permission from CWD, tmux/session names, process IDs, prose, or wall-clock proximity. A Driver receipt proves transport or lifecycle mutation only; it never proves a product stage."
+	projectActorRoutingDisciplineV1   = "All managed-session communication is Flowbee-authored and Driver grant/receipt routed. Never use a direct terminal-multiplexer mutation path, never message another session directly, never create a lateral route, and stop on a stale host/store/session/pane/agent-run fence. The Interactor owns human conversation; the Orchestrator escalates only when durable product evidence cannot resolve a decision."
+)
+
+type projectActorBootstrap struct {
+	Format                     string   `json:"format"`
+	ProjectID                  string   `json:"project_id"`
+	ProjectName                string   `json:"project_name"`
+	RepositoryIDs              []string `json:"repository_ids"`
+	Role                       string   `json:"role"`
+	ActorID                    string   `json:"actor_id"`
+	ProfileID                  string   `json:"profile_id"`
+	ModelFamily                string   `json:"model_family"`
+	WorkspaceRootID            string   `json:"workspace_root_id"`
+	WorkspaceRelativePath      string   `json:"workspace_relative_path"`
+	RoleCharterVersion         string   `json:"role_charter_version"`
+	RoleCharterUTF8            string   `json:"role_charter_utf8"`
+	RoleCharterSHA256          string   `json:"role_charter_sha256"`
+	OperatingDisciplineVersion string   `json:"operating_discipline_version"`
+	OperatingDisciplineUTF8    string   `json:"operating_discipline_utf8"`
+	OperatingDisciplineSHA256  string   `json:"operating_discipline_sha256"`
+	RoutingDisciplineUTF8      string   `json:"routing_discipline_utf8"`
+	RoutingDisciplineSHA256    string   `json:"routing_discipline_sha256"`
+	InitialHandoffUTF8         string   `json:"initial_handoff_utf8"`
+	CredentialInstallRef       string   `json:"credential_install_ref"`
+}
+
+// Driver v3 installs one credential at process creation but currently has no
+// refresh operation. Actor restarts therefore rebind the same lifecycle-bound
+// issuance until a Stop or higher-epoch replacement revokes it in durable
+// state. The signed expiry is intentionally practically non-expiring; live
+// per-request lifecycle, binding, generation, projection-freshness, and
+// revocation checks are the actual trust root.
+var projectActorCredentialPracticalExpiry = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+
+func projectActorCharter(role string) string {
+	if role == DriverInteractorRole {
+		return "You are the project's focused human-facing Interactor. Maintain a concise product conversation, send all work through the project's Orchestrator, surface only genuine human decisions, and never directly schedule workers or bypass Flowbee/Driver routing."
+	}
+	return "You are the project's deterministic-planning Orchestrator. Convert Interactor intent into durable epics, submit them to Flowbee, answer product questions when evidence permits, escalate genuine human decisions to the Interactor, and never directly message or control worker sessions outside Flowbee/Driver grants."
+}
+
+func projectActorFrozenProfile(role string) (profileID, modelFamily string, ok bool) {
+	switch role {
+	case DriverInteractorRole:
+		return "claude_interactor_managed", "claude", true
+	case DriverOrchestratorRole:
+		return "codex_orchestrator", "codex", true
+	default:
+		return "", "", false
+	}
+}
+
+func projectActorInitialHandoff(role string) string {
+	if role == DriverInteractorRole {
+		return "Initial state: this project's Flowbee bootstrap is active. Work with the human to plan epics and route product logistics through the project's Orchestrator. During this phase, surface every human alert in this Interactor session; there is no external notification channel yet."
+	}
+	return "Initial state: this project's Flowbee bootstrap is active. Accept durable work intent from the Interactor, adversarially review it, submit epics to Flowbee, answer evidence-resolvable questions, and escalate genuine human decisions back to the Interactor."
+}
+
+func projectActorContextTx(ctx context.Context, tx *sql.Tx, projectID string) (string, []string, error) {
+	var name, state string
+	if err := tx.QueryRowContext(ctx, `SELECT name,state FROM projects WHERE id=?`, projectID).Scan(&name, &state); err != nil {
+		return "", nil, errors.New("project actor bootstrap requires durable project context")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || state != "active" {
+		return "", nil, errors.New("project actor bootstrap requires a named active project")
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT repo_id FROM project_repos
+		WHERE project_id=? AND state='active' ORDER BY repo_id`, projectID)
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+	var repos []string
+	for rows.Next() {
+		var repoID string
+		if err := rows.Scan(&repoID); err != nil {
+			return "", nil, err
+		}
+		if repoID = strings.TrimSpace(repoID); repoID == "" {
+			return "", nil, errors.New("project actor bootstrap contains an empty repository identity")
+		}
+		repos = append(repos, repoID)
+	}
+	if err := rows.Err(); err != nil {
+		return "", nil, err
+	}
+	if len(repos) == 0 {
+		return "", nil, errors.New("project actor bootstrap requires an active repository set")
+	}
+	return name, repos, nil
+}
+
+func (s *Store) prepareProjectActorQ3Tx(ctx context.Context, tx *sql.Tx, command ProjectActorLifecycleCommand,
+	existing ProjectActorLifecycle, existingErr error, lifecycle *ProjectActorLifecycle, now time.Time) error {
+	switch command.Operation {
+	case "ensure":
+		if s.ProjectActorCredentialMaterializer == nil {
+			return errors.New("project actor Q3 credential materializer unavailable")
+		}
+		if existingErr == nil && (command.TargetEpoch <= existing.TargetEpoch ||
+			command.TargetEpoch <= existing.CredentialGeneration) {
+			return errors.New("project actor replacement requires higher target and credential epochs")
+		}
+		expectedProfile, modelFamily, ok := projectActorFrozenProfile(command.Role)
+		if !ok || command.ProfileID != expectedProfile {
+			return fmt.Errorf("managed %s requires frozen lifecycle profile %s", command.Role, expectedProfile)
+		}
+		projectName, repositoryIDs, err := projectActorContextTx(ctx, tx, command.ProjectID)
+		if err != nil {
+			return err
+		}
+		presentation := command.ProjectID + "-" + command.Role
+		if len(presentation) > 64 {
+			return errors.New("project actor presentation name exceeds Driver bound")
+		}
+		charter := projectActorCharter(command.Role)
+		credentialInstallRef := "flowbee://actor-credentials/" + command.ProjectID + "/" + command.Role + "/" + command.ActorID
+		manifest := projectActorBootstrap{
+			Format: projectActorBootstrapFormat, ProjectID: command.ProjectID, ProjectName: projectName,
+			RepositoryIDs: repositoryIDs, Role: command.Role, ActorID: command.ActorID,
+			ProfileID: command.ProfileID, ModelFamily: modelFamily,
+			WorkspaceRootID: command.WorkspaceRootID, WorkspaceRelativePath: command.WorkspaceRelativePath,
+			RoleCharterVersion: projectActorCharterVersion, RoleCharterUTF8: charter,
+			RoleCharterSHA256:          sha256String(charter),
+			OperatingDisciplineVersion: projectActorDisciplineVersion,
+			OperatingDisciplineUTF8:    projectActorOperatingDisciplineV1,
+			OperatingDisciplineSHA256:  sha256String(projectActorOperatingDisciplineV1),
+			RoutingDisciplineUTF8:      projectActorRoutingDisciplineV1,
+			RoutingDisciplineSHA256:    sha256String(projectActorRoutingDisciplineV1),
+			InitialHandoffUTF8:         projectActorInitialHandoff(command.Role),
+			CredentialInstallRef:       credentialInstallRef,
+		}
+		payload, err := json.Marshal(manifest)
+		if err != nil {
+			return err
+		}
+		if len(payload) == 0 || len(payload) > 16<<10 || !utf8.Valid(payload) || bytes.IndexByte(payload, 0) >= 0 {
+			return errors.New("project actor bootstrap must be nonempty valid NUL-free UTF-8 within 16KiB")
+		}
+		bootstrapHash := sha256.Sum256(payload)
+		envelopeID := fmt.Sprintf("flowbee://actor-credential-envelopes/%s/%s/%s/%d/%d",
+			command.ProjectID, command.Role, command.ActorID, command.TargetEpoch, lifecycle.ActionGeneration)
+		expires := projectActorCredentialPracticalExpiry
+		credentialHash, err := s.ProjectActorCredentialMaterializer(command.ActorID,
+			command.ProjectID, command.Role, envelopeID, command.TargetEpoch, expires)
+		if err != nil {
+			return fmt.Errorf("materialize project actor Q3 credential: %w", err)
+		}
+		if credentialHash == "" {
+			return errors.New("materialize project actor Q3 credential returned empty hash")
+		}
+		lifecycle.BootstrapFormat = "initial_prompt_utf8/v1"
+		lifecycle.BootstrapPayload = string(payload)
+		lifecycle.BootstrapSHA256 = "sha256:" + hex.EncodeToString(bootstrapHash[:])
+		lifecycle.CredentialInstallRef = credentialInstallRef
+		lifecycle.CredentialGeneration = command.TargetEpoch
+		lifecycle.CredentialEnvelopeRef = envelopeID
+		lifecycle.CredentialPayloadSHA256 = credentialHash
+		lifecycle.CredentialExpiresAt = expires.Format(rfc3339)
+		lifecycle.PresentationName = presentation
+	case "stop", "reattach":
+		if command.LifecycleOwnership == "driver_managed" && existingErr == nil {
+			lifecycle.CredentialInstallRef = existing.CredentialInstallRef
+			lifecycle.CredentialGeneration = existing.CredentialGeneration
+			lifecycle.CredentialEnvelopeRef = existing.CredentialEnvelopeRef
+			lifecycle.CredentialPayloadSHA256 = existing.CredentialPayloadSHA256
+			lifecycle.CredentialExpiresAt = existing.CredentialExpiresAt
+			lifecycle.CredentialEnvelopeDeletedAt = existing.CredentialEnvelopeDeletedAt
+			lifecycle.CredentialRevokedAt = existing.CredentialRevokedAt
+			lifecycle.PresentationName = existing.PresentationName
+		}
+	case "adopt", "release":
+		// External observation/adoption never carries Flowbee-created launch material.
+	default:
+		return ErrProjectActorLifecycleConflict
+	}
+	return nil
+}
+
 func validateActorCommandShape(c ProjectActorLifecycleCommand) error {
 	completeTarget := c.InstanceRef != "" && c.TargetHostID != "" && c.TargetStoreID != "" &&
 		c.TargetServerDomainID != "" && c.TargetServerID != "" && c.LifecycleKey != "" &&
@@ -366,26 +579,36 @@ func validateActorCommandShape(c ProjectActorLifecycleCommand) error {
 	switch c.Operation {
 	case "ensure":
 		if c.LifecycleOwnership != "driver_managed" || c.ExternalWatchID != "" || exact ||
-			c.WorkspaceRootID == "" || c.WorkspaceRelativePath == "" {
+			c.WorkspaceRootID == "" || c.WorkspaceRelativePath == "" ||
+			c.ManagedRecoveryProfileID != "" || c.ManagedRecoveryWorkspaceRootID != "" ||
+			c.ManagedRecoveryWorkspaceRelativePath != "" {
 			return ErrProjectActorLifecycleConflict
 		}
 	case "adopt":
 		if c.LifecycleOwnership != "external_observed" || c.ExternalWatchID == "" || !exact ||
-			c.WorkspaceRootID != "" || c.WorkspaceRelativePath != "" {
+			c.WorkspaceRootID != "" || c.WorkspaceRelativePath != "" || c.Role != DriverInteractorRole ||
+			c.ManagedRecoveryProfileID != "claude_interactor_managed" ||
+			c.ManagedRecoveryWorkspaceRootID == "" || c.ManagedRecoveryWorkspaceRelativePath == "" {
 			return ErrProjectActorLifecycleConflict
 		}
 	case "stop":
 		if c.LifecycleOwnership != "driver_managed" || c.ExternalWatchID != "" || !exact ||
-			c.WorkspaceRootID == "" || c.WorkspaceRelativePath == "" {
+			c.WorkspaceRootID == "" || c.WorkspaceRelativePath == "" ||
+			c.ManagedRecoveryProfileID != "" || c.ManagedRecoveryWorkspaceRootID != "" ||
+			c.ManagedRecoveryWorkspaceRelativePath != "" {
 			return ErrProjectActorLifecycleConflict
 		}
 	case "release":
 		if c.LifecycleOwnership != "external_observed" || c.ExternalWatchID == "" || !exact ||
-			c.WorkspaceRootID != "" || c.WorkspaceRelativePath != "" {
+			c.WorkspaceRootID != "" || c.WorkspaceRelativePath != "" ||
+			c.ManagedRecoveryProfileID != "" || c.ManagedRecoveryWorkspaceRootID != "" ||
+			c.ManagedRecoveryWorkspaceRelativePath != "" {
 			return ErrProjectActorLifecycleConflict
 		}
 	case "reattach":
-		if !exact || (c.LifecycleOwnership == "external_observed" && (c.ExternalWatchID == "" || c.WorkspaceRootID != "" || c.WorkspaceRelativePath != "")) ||
+		if !exact || c.ManagedRecoveryProfileID != "" || c.ManagedRecoveryWorkspaceRootID != "" ||
+			c.ManagedRecoveryWorkspaceRelativePath != "" ||
+			(c.LifecycleOwnership == "external_observed" && (c.ExternalWatchID == "" || c.WorkspaceRootID != "" || c.WorkspaceRelativePath != "")) ||
 			(c.LifecycleOwnership == "driver_managed" && (c.ExternalWatchID != "" || c.WorkspaceRootID == "" || c.WorkspaceRelativePath == "")) {
 			return ErrProjectActorLifecycleConflict
 		}
@@ -399,11 +622,15 @@ func actorCommandPayload(c ProjectActorLifecycleCommand) (string, string, error)
 		TargetHostID, TargetStoreID, TargetServerDomainID, TargetServerID                   string
 		LifecycleOwnership, LifecycleKey, ProfileID, WorkspaceRootID, WorkspaceRelativePath string
 		ExternalWatchID, ExpectedSessionID, ExpectedPaneInstanceID, ExpectedAgentRunID      string
+		ManagedRecoveryProfileID, ManagedRecoveryWorkspaceRootID                            string
+		ManagedRecoveryWorkspaceRelativePath                                                string
 		RouteStateVersion, TargetEpoch                                                      int64
 	}{c.ProjectID, c.Role, c.ActorID, c.Operation, c.InstanceRef, c.TargetHostID, c.TargetStoreID,
 		c.TargetServerDomainID, c.TargetServerID, c.LifecycleOwnership, c.LifecycleKey,
 		c.ProfileID, c.WorkspaceRootID, c.WorkspaceRelativePath, c.ExternalWatchID,
 		c.ExpectedSessionID, c.ExpectedPaneInstanceID, c.ExpectedAgentRunID,
+		c.ManagedRecoveryProfileID, c.ManagedRecoveryWorkspaceRootID,
+		c.ManagedRecoveryWorkspaceRelativePath,
 		c.ExpectedRouteStateVersion, c.TargetEpoch}
 	payload, err := json.Marshal(value)
 	if err != nil {
@@ -411,6 +638,37 @@ func actorCommandPayload(c ProjectActorLifecycleCommand) (string, string, error)
 	}
 	sum := sha256.Sum256(payload)
 	return string(payload), "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func upsertProjectActorManagedRecoveryPolicyTx(ctx context.Context, tx *sql.Tx,
+	command ProjectActorLifecycleCommand, sourcePayloadSHA string, now time.Time) error {
+	if command.Role != DriverInteractorRole || command.ManagedRecoveryProfileID != "claude_interactor_managed" ||
+		command.ManagedRecoveryWorkspaceRootID == "" || command.ManagedRecoveryWorkspaceRelativePath == "" {
+		return ErrProjectActorLifecycleConflict
+	}
+	stamp := formatActorTime(now)
+	_, err := tx.ExecContext(ctx, `INSERT INTO project_actor_managed_recovery_policies
+		(project_id,role,actor_id,profile_id,workspace_root_id,workspace_relative_path,
+		 source_intent_payload_sha256,created_at,updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(project_id,role,actor_id) DO NOTHING`, command.ProjectID, command.Role,
+		command.ActorID, command.ManagedRecoveryProfileID, command.ManagedRecoveryWorkspaceRootID,
+		command.ManagedRecoveryWorkspaceRelativePath, sourcePayloadSHA, stamp, stamp)
+	if err != nil {
+		return err
+	}
+	var profile, root, path, payloadSHA string
+	if err := tx.QueryRowContext(ctx, `SELECT profile_id,workspace_root_id,workspace_relative_path,
+		source_intent_payload_sha256 FROM project_actor_managed_recovery_policies
+		WHERE project_id=? AND role=? AND actor_id=?`, command.ProjectID, command.Role, command.ActorID).
+		Scan(&profile, &root, &path, &payloadSHA); err != nil {
+		return err
+	}
+	if profile != command.ManagedRecoveryProfileID || root != command.ManagedRecoveryWorkspaceRootID ||
+		path != command.ManagedRecoveryWorkspaceRelativePath || payloadSHA != sourcePayloadSHA {
+		return ErrProjectActorLifecycleConflict
+	}
+	return nil
 }
 
 func formatActorTime(value time.Time) string {
@@ -426,7 +684,10 @@ const projectActorLifecycleColumns = `project_id,role,actor_id,route_state_versi
 	desired_state,desired_operation,lifecycle_ownership,state,state_version,action_generation,
 	intent_idempotency_key,intent_payload_json,intent_payload_sha256,instance_ref,target_host_id,target_store_id,
 	target_server_domain_id,target_server_id,lifecycle_key,target_epoch,profile_id,
-	workspace_root_id,workspace_relative_path,external_watch_id,expected_binding_id,
+	workspace_root_id,workspace_relative_path,external_watch_id,
+	bootstrap_format,bootstrap_payload,bootstrap_sha256,credential_install_ref,
+	credential_generation,credential_envelope_ref,credential_payload_sha256,credential_expires_at,
+	credential_envelope_deleted_at,credential_revoked_at,presentation_name,expected_binding_id,
 	expected_binding_epoch,expected_session_id,expected_pane_instance_id,expected_agent_run_id,
 	active_binding_id,current_action_id,recovery_count,state_entered_at,state_due_at,
 	fact_progress_at,return_state,hold_kind,hold_reason,last_error,alert_pending,created_at,updated_at`
@@ -441,6 +702,10 @@ func scanProjectActorLifecycle(row projectActorScanner) (ProjectActorLifecycle, 
 		&out.InstanceRef, &out.TargetHostID, &out.TargetStoreID, &out.TargetServerDomainID,
 		&out.TargetServerID, &out.LifecycleKey, &out.TargetEpoch, &out.ProfileID,
 		&out.WorkspaceRootID, &out.WorkspaceRelativePath, &out.ExternalWatchID,
+		&out.BootstrapFormat, &out.BootstrapPayload, &out.BootstrapSHA256,
+		&out.CredentialInstallRef, &out.CredentialGeneration, &out.CredentialEnvelopeRef,
+		&out.CredentialPayloadSHA256, &out.CredentialExpiresAt,
+		&out.CredentialEnvelopeDeletedAt, &out.CredentialRevokedAt, &out.PresentationName,
 		&out.ExpectedBindingID, &out.ExpectedBindingEpoch, &out.ExpectedSessionID,
 		&out.ExpectedPaneInstanceID, &out.ExpectedAgentRunID, &out.ActiveBindingID,
 		&out.CurrentActionID, &out.RecoveryCount, &entered, &due, &progress,
@@ -482,10 +747,13 @@ func upsertProjectActorLifecycleTx(ctx context.Context, tx *sql.Tx, l ProjectAct
 		 state,state_version,action_generation,intent_idempotency_key,intent_payload_json,intent_payload_sha256,
 		 instance_ref,target_host_id,target_store_id,target_server_domain_id,target_server_id,lifecycle_key,
 		 target_epoch,profile_id,workspace_root_id,workspace_relative_path,external_watch_id,
+		 bootstrap_format,bootstrap_payload,bootstrap_sha256,credential_install_ref,
+		 credential_generation,credential_envelope_ref,credential_payload_sha256,credential_expires_at,
+		 credential_envelope_deleted_at,credential_revoked_at,presentation_name,
 		 expected_binding_id,expected_binding_epoch,expected_session_id,expected_pane_instance_id,
 		 expected_agent_run_id,active_binding_id,current_action_id,recovery_count,state_entered_at,
 		 state_due_at,fact_progress_at,return_state,hold_kind,hold_reason,last_error,alert_pending,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(project_id,role,actor_id) DO UPDATE SET
 		 route_state_version=excluded.route_state_version,desired_state=excluded.desired_state,
 		 desired_operation=excluded.desired_operation,lifecycle_ownership=excluded.lifecycle_ownership,
@@ -497,7 +765,15 @@ func upsertProjectActorLifecycleTx(ctx context.Context, tx *sql.Tx, l ProjectAct
 		 target_server_id=excluded.target_server_id,lifecycle_key=excluded.lifecycle_key,
 		 target_epoch=excluded.target_epoch,profile_id=excluded.profile_id,
 		 workspace_root_id=excluded.workspace_root_id,workspace_relative_path=excluded.workspace_relative_path,
-		 external_watch_id=excluded.external_watch_id,expected_binding_id=excluded.expected_binding_id,
+		 external_watch_id=excluded.external_watch_id,
+		 bootstrap_format=excluded.bootstrap_format,bootstrap_payload=excluded.bootstrap_payload,
+		 bootstrap_sha256=excluded.bootstrap_sha256,credential_install_ref=excluded.credential_install_ref,
+		 credential_generation=excluded.credential_generation,credential_envelope_ref=excluded.credential_envelope_ref,
+		 credential_payload_sha256=excluded.credential_payload_sha256,
+		 credential_expires_at=excluded.credential_expires_at,
+		 credential_envelope_deleted_at=excluded.credential_envelope_deleted_at,
+		 credential_revoked_at=excluded.credential_revoked_at,presentation_name=excluded.presentation_name,
+		 expected_binding_id=excluded.expected_binding_id,
 		 expected_binding_epoch=excluded.expected_binding_epoch,expected_session_id=excluded.expected_session_id,
 		 expected_pane_instance_id=excluded.expected_pane_instance_id,expected_agent_run_id=excluded.expected_agent_run_id,
 		 active_binding_id=excluded.active_binding_id,current_action_id=excluded.current_action_id,
@@ -509,7 +785,10 @@ func upsertProjectActorLifecycleTx(ctx context.Context, tx *sql.Tx, l ProjectAct
 		l.LifecycleOwnership, l.State, l.StateVersion, l.ActionGeneration, l.IntentIdempotencyKey,
 		l.IntentPayload, l.IntentPayloadSHA, l.InstanceRef, l.TargetHostID, l.TargetStoreID, l.TargetServerDomainID,
 		l.TargetServerID, l.LifecycleKey, l.TargetEpoch, l.ProfileID, l.WorkspaceRootID,
-		l.WorkspaceRelativePath, l.ExternalWatchID, l.ExpectedBindingID, l.ExpectedBindingEpoch,
+		l.WorkspaceRelativePath, l.ExternalWatchID, l.BootstrapFormat, l.BootstrapPayload,
+		l.BootstrapSHA256, l.CredentialInstallRef, l.CredentialGeneration, l.CredentialEnvelopeRef,
+		l.CredentialPayloadSHA256, l.CredentialExpiresAt, l.CredentialEnvelopeDeletedAt,
+		l.CredentialRevokedAt, l.PresentationName, l.ExpectedBindingID, l.ExpectedBindingEpoch,
 		l.ExpectedSessionID, l.ExpectedPaneInstanceID, l.ExpectedAgentRunID, l.ActiveBindingID,
 		l.CurrentActionID, l.RecoveryCount, entered, due, progress, l.ReturnState, l.HoldKind,
 		l.HoldReason, l.LastError, b2i(l.AlertPending), created, stamp)
@@ -520,7 +799,9 @@ const projectActorActionColumns = `id,project_id,role,actor_id,route_state_versi
 	intent_state_version,action_generation,operation,state,action_epoch,idempotency_key,dedup_key,
 	payload_json,payload_sha256,instance_ref,target_host_id,target_store_id,target_server_domain_id,
 	target_server_id,lifecycle_ownership,lifecycle_key,target_epoch,profile_id,workspace_root_id,
-	workspace_relative_path,external_watch_id,expected_binding_id,expected_binding_epoch,
+	workspace_relative_path,external_watch_id,bootstrap_format,bootstrap_payload,bootstrap_sha256,
+	credential_install_ref,credential_generation,credential_envelope_ref,credential_payload_sha256,
+	credential_expires_at,presentation_name,expected_binding_id,expected_binding_epoch,
 	expected_session_id,expected_pane_instance_id,expected_agent_run_id,lease_id,lease_epoch,
 	attempts,recovery_count,next_attempt_at,claim_owner,claim_deadline_at,last_error,created_at,updated_at`
 
@@ -533,6 +814,9 @@ func scanProjectActorAction(row projectActorScanner) (ProjectActorLifecycleActio
 		&out.TargetHostID, &out.TargetStoreID, &out.TargetServerDomainID, &out.TargetServerID,
 		&out.LifecycleOwnership, &out.LifecycleKey, &out.TargetEpoch, &out.ProfileID,
 		&out.WorkspaceRootID, &out.WorkspaceRelativePath, &out.ExternalWatchID,
+		&out.BootstrapFormat, &out.BootstrapPayload, &out.BootstrapSHA256,
+		&out.CredentialInstallRef, &out.CredentialGeneration, &out.CredentialEnvelopeRef,
+		&out.CredentialPayloadSHA256, &out.CredentialExpiresAt, &out.PresentationName,
 		&out.ExpectedBindingID, &out.ExpectedBindingEpoch, &out.ExpectedSessionID,
 		&out.ExpectedPaneInstanceID, &out.ExpectedAgentRunID, &out.LeaseID, &out.LeaseEpoch,
 		&out.Attempts, &out.RecoveryCount, &next, &out.ClaimOwner, &deadline, &out.LastError,
@@ -575,6 +859,11 @@ func insertProjectActorActionTx(ctx context.Context, tx *sql.Tx, l ProjectActorL
 		LifecycleOwnership: l.LifecycleOwnership, LifecycleKey: l.LifecycleKey,
 		TargetEpoch: l.TargetEpoch, ProfileID: l.ProfileID, WorkspaceRootID: l.WorkspaceRootID,
 		WorkspaceRelativePath: l.WorkspaceRelativePath, ExternalWatchID: l.ExternalWatchID,
+		BootstrapFormat: l.BootstrapFormat, BootstrapPayload: l.BootstrapPayload,
+		BootstrapSHA256: l.BootstrapSHA256, CredentialInstallRef: l.CredentialInstallRef,
+		CredentialGeneration: l.CredentialGeneration, CredentialEnvelopeRef: l.CredentialEnvelopeRef,
+		CredentialPayloadSHA256: l.CredentialPayloadSHA256, CredentialExpiresAt: l.CredentialExpiresAt,
+		PresentationName:  l.PresentationName,
 		ExpectedBindingID: l.ExpectedBindingID, ExpectedBindingEpoch: l.ExpectedBindingEpoch,
 		ExpectedSessionID: l.ExpectedSessionID, ExpectedPaneInstanceID: l.ExpectedPaneInstanceID,
 		ExpectedAgentRunID: l.ExpectedAgentRunID,
@@ -586,19 +875,32 @@ func insertProjectActorActionTx(ctx context.Context, tx *sql.Tx, l ProjectActorL
 		 operation,state,action_epoch,idempotency_key,dedup_key,payload_json,payload_sha256,
 		 instance_ref,target_host_id,target_store_id,target_server_domain_id,target_server_id,
 		 lifecycle_ownership,lifecycle_key,target_epoch,profile_id,workspace_root_id,
-		 workspace_relative_path,external_watch_id,expected_binding_id,expected_binding_epoch,
+		 workspace_relative_path,external_watch_id,bootstrap_format,bootstrap_payload,bootstrap_sha256,
+		 credential_install_ref,credential_generation,credential_envelope_ref,credential_payload_sha256,
+		 credential_expires_at,presentation_name,expected_binding_id,expected_binding_epoch,
 		 expected_session_id,expected_pane_instance_id,expected_agent_run_id,lease_id,lease_epoch,
 		 next_attempt_at,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,'pending',0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?,'pending',0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		action.ID, action.ProjectID, action.Role, action.ActorID, action.RouteStateVersion,
 		action.IntentStateVersion, action.ActionGeneration, action.Operation, action.IdempotencyKey,
 		action.DedupKey, action.Payload, action.PayloadSHA, action.InstanceRef, action.TargetHostID,
 		action.TargetStoreID, action.TargetServerDomainID, action.TargetServerID,
 		action.LifecycleOwnership, action.LifecycleKey, action.TargetEpoch, action.ProfileID,
 		action.WorkspaceRootID, action.WorkspaceRelativePath, action.ExternalWatchID,
+		action.BootstrapFormat, action.BootstrapPayload, action.BootstrapSHA256,
+		action.CredentialInstallRef, action.CredentialGeneration, action.CredentialEnvelopeRef,
+		action.CredentialPayloadSHA256, action.CredentialExpiresAt, action.PresentationName,
 		action.ExpectedBindingID, action.ExpectedBindingEpoch, action.ExpectedSessionID,
 		action.ExpectedPaneInstanceID, action.ExpectedAgentRunID, action.LeaseID, action.LeaseEpoch,
 		formatActorTime(now), formatActorTime(now), formatActorTime(now))
+	if err != nil {
+		return action, fmt.Errorf("insert project actor lifecycle action (%s/%s, q3 format=%q bootstrap=%t bootstrap_hash=%q install=%t credential=%t credential_hash=%q expires=%t generation=%d target=%d presentation=%t): %w",
+			action.Operation, action.LifecycleOwnership, action.BootstrapFormat,
+			action.BootstrapPayload != "", action.BootstrapSHA256, action.CredentialInstallRef != "",
+			action.CredentialEnvelopeRef != "", action.CredentialPayloadSHA256,
+			action.CredentialExpiresAt != "", action.CredentialGeneration, action.TargetEpoch,
+			action.PresentationName != "", err)
+	}
 	return action, err
 }
 
@@ -686,22 +988,72 @@ func (s *Store) ReconcileProjectActorLifecycleActions(ctx context.Context, now t
 			if !strings.HasPrefix(lifecycle.State, "awaiting_") {
 				return nil
 			}
-			var existingGeneration int
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_actor_lifecycle_actions
+			var existingActionID string
+			err = tx.QueryRowContext(ctx, `SELECT id FROM project_actor_lifecycle_actions
 				WHERE project_id=? AND role=? AND actor_id=? AND action_generation=?`, lifecycle.ProjectID,
-				lifecycle.Role, lifecycle.ActorID, lifecycle.ActionGeneration).Scan(&existingGeneration); err != nil {
+				lifecycle.Role, lifecycle.ActorID, lifecycle.ActionGeneration).Scan(&existingActionID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			idempotency := lifecycle.IntentIdempotencyKey
-			if existingGeneration > 0 {
-				lifecycle.ActionGeneration++
-				idempotency = fmt.Sprintf("reconcile:%s:%s:%s:%d", lifecycle.ProjectID,
-					lifecycle.Role, lifecycle.ActorID, lifecycle.ActionGeneration)
+			if existingActionID != "" {
+				action, err := projectActorActionByIDTx(ctx, tx, existingActionID)
+				if err != nil {
+					return err
+				}
+				var receiptCount int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_actor_lifecycle_receipts
+					WHERE action_id=?`, action.ID).Scan(&receiptCount); err != nil {
+					return err
+				}
+				// A certified pre-effect cancellation may be re-armed using the exact
+				// immutable action, payload, credential envelope, and idempotency key.
+				// Minting another action for the same target epoch would either reuse
+				// one-shot credentials or lose the original delivery identity.
+				if action.State == "cancelled_superseded" && action.ActionEpoch == 0 && receiptCount == 0 {
+					stamp := formatActorTime(now)
+					res, err := tx.ExecContext(ctx, `UPDATE project_actor_lifecycle_actions
+						SET state='pending',next_attempt_at=?,claim_owner='',claim_deadline_at='',
+						last_error='',updated_at=?
+						WHERE id=? AND state='cancelled_superseded' AND action_epoch=0`, stamp, stamp, action.ID)
+					if err != nil {
+						return err
+					}
+					if n, _ := res.RowsAffected(); n != 1 {
+						return ErrProjectActorActionStale
+					}
+					lifecycle.CurrentActionID = action.ID
+					lifecycle.UpdatedAt = now
+					if err := upsertProjectActorLifecycleTx(ctx, tx, lifecycle); err != nil {
+						return err
+					}
+					report.Materialized++
+					return appendProjectActorControlEventTx(ctx, tx, lifecycle,
+						"project_actor_lifecycle_action_rearmed", map[string]any{"action_id": action.ID}, now)
+				}
+
+				// Any evidence that Driver may have observed the action is not safe to
+				// resend. Preserve it as a visible hold for exact-fact reconciliation.
+				lifecycle.State = "held"
+				lifecycle.StateVersion++
+				lifecycle.StateEnteredAt, lifecycle.StateDueAt, lifecycle.FactProgressAt = now,
+					now.Add(projectActorLifecycleActionTimeout), now
+				lifecycle.ReturnState = actorAwaitingState(lifecycle.DesiredOperation)
+				lifecycle.HoldKind = "actor_action_uncertain"
+				lifecycle.HoldReason = "existing lifecycle action may have reached Driver; exact evidence required"
+				lifecycle.LastError = lifecycle.HoldReason
+				lifecycle.AlertPending = true
+				lifecycle.UpdatedAt = now
+				if err := upsertProjectActorLifecycleTx(ctx, tx, lifecycle); err != nil {
+					return err
+				}
+				report.Held++
+				return appendProjectActorControlEventTx(ctx, tx, lifecycle,
+					"project_actor_lifecycle_action_uncertain", map[string]any{"action_id": action.ID}, now)
 			}
 			if err := upsertProjectActorLifecycleTx(ctx, tx, lifecycle); err != nil {
 				return err
 			}
-			action, err := insertProjectActorActionTx(ctx, tx, lifecycle, idempotency,
+			action, err := insertProjectActorActionTx(ctx, tx, lifecycle, lifecycle.IntentIdempotencyKey,
 				lifecycle.IntentPayload, lifecycle.IntentPayloadSHA, now)
 			if err != nil {
 				return err

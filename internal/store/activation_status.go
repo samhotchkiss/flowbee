@@ -23,6 +23,10 @@ type ProjectActivationStatus struct {
 	BuilderTopologyReadyTargets         int                         `json:"builder_topology_ready_targets"`
 	BuilderEndpointControlReadyTargets  int                         `json:"builder_endpoint_control_ready_targets"`
 	BuilderDistinctReviewerReadyTargets int                         `json:"builder_distinct_reviewer_ready_targets"`
+	EnabledReviewerTargets              int                         `json:"enabled_reviewer_targets"`
+	CurrentReviewerTargets              int                         `json:"current_reviewer_targets"`
+	ReviewerTopologyReadyTargets        int                         `json:"reviewer_topology_ready_targets"`
+	ReviewerEndpointControlReadyTargets int                         `json:"reviewer_endpoint_control_ready_targets"`
 	CurrentReviewerBindings             int                         `json:"current_reviewer_bindings"`
 	ReviewerIdentities                  []string                    `json:"reviewer_identities"`
 	Reviewers                           []ProjectReviewerActivation `json:"reviewers"`
@@ -120,11 +124,16 @@ func (s *Store) ProjectActivation(ctx context.Context, projectID string, now tim
 				}
 				switch role {
 				case DriverInteractorRole:
-					actor.TopologyReady = binding.LifecycleOwnership == "external_observed" &&
+					actor.TopologyReady = (binding.LifecycleOwnership == "external_observed" && actor.LifecycleOperation == "adopt" ||
+						binding.LifecycleOwnership == "driver_managed" && actor.LifecycleOperation == "ensure") &&
 						binding.TmuxServerDomainID == "default" && actor.TmuxServerOwnership == "external"
+					if binding.LifecycleOwnership == "driver_managed" {
+						actor.TopologyReady = actor.TopologyReady && lifecycle.PresentationName == projectID+"-"+role
+					}
 				case DriverOrchestratorRole:
 					actor.TopologyReady = binding.LifecycleOwnership == "driver_managed" &&
-						binding.TmuxServerDomainID != "default" && actor.TmuxServerOwnership == "managed_dedicated"
+						binding.TmuxServerDomainID != "default" && actor.TmuxServerOwnership == "managed_dedicated" &&
+						lifecycle.PresentationName == projectID+"-"+role
 				}
 				actor.LifecycleReady = actor.LifecycleState == "active" && lifecycleErr == nil &&
 					lifecycle.ActiveBindingID == binding.BindingID
@@ -153,7 +162,7 @@ func (s *Store) ProjectActivation(ctx context.Context, projectID string, now tim
 	// builder targets. Global seats are shared fleet inventory, not implicit
 	// project membership: an unrelated incomplete seat must not block this project,
 	// and an unrelated routable seat must never make it ready.
-	targetRows, err := s.DB.QueryContext(ctx, `SELECT t.seat_id,t.instance_ref,t.tmux_server_domain_id,t.tmux_server_instance_id,
+	targetRows, err := s.DB.QueryContext(ctx, `SELECT t.seat_id,t.instance_ref,t.tmux_server_domain_id,t.tmux_server_instance_id,t.profile_id,
 		COALESCE(s.enabled,0),COALESCE(s.agent_family,''),COALESCE(s.expected_host_id,''),COALESCE(s.expected_account_key,''),
 		COALESCE(s.expected_credential_lineage,''),COALESCE(i.store_id,''),COALESCE(i.tmux_server_ownership,'')
 		FROM builder_driver_targets t LEFT JOIN seats s ON s.id=t.seat_id
@@ -163,14 +172,14 @@ func (s *Store) ProjectActivation(ctx context.Context, projectID string, now tim
 		return ProjectActivationStatus{}, err
 	}
 	type projectTarget struct {
-		seatID, instanceRef, domainID, serverID, family, hostID, accountKey, lineage, storeID, ownership string
-		enabled                                                                                          bool
+		seatID, instanceRef, domainID, serverID, profileID, family, hostID, accountKey, lineage, storeID, ownership string
+		enabled                                                                                                     bool
 	}
 	var targets []projectTarget
 	for targetRows.Next() {
 		var target projectTarget
 		var enabled int
-		if err := targetRows.Scan(&target.seatID, &target.instanceRef, &target.domainID, &target.serverID, &enabled,
+		if err := targetRows.Scan(&target.seatID, &target.instanceRef, &target.domainID, &target.serverID, &target.profileID, &enabled,
 			&target.family,
 			&target.hostID, &target.accountKey, &target.lineage, &target.storeID, &target.ownership); err != nil {
 			targetRows.Close()
@@ -184,7 +193,17 @@ func (s *Store) ProjectActivation(ctx context.Context, projectID string, now tim
 	}
 	var seatIDs []string
 	for _, target := range targets {
-		out.EnabledBuilderTargets++
+		builderTarget := !s.EnableEpicDedicatedWorkersV2 || target.profileID == epicWorkerProfileID(target.family, "builder")
+		reviewerTarget := s.EnableEpicDedicatedWorkersV2 && target.profileID == epicWorkerProfileID(target.family, "reviewer")
+		if s.EnableEpicDedicatedWorkersV2 && !builderTarget && !reviewerTarget {
+			out.Holds = append(out.Holds, "worker_target_profile_role_invalid")
+			continue
+		}
+		if builderTarget {
+			out.EnabledBuilderTargets++
+		} else {
+			out.EnabledReviewerTargets++
+		}
 		if !target.enabled {
 			continue
 		}
@@ -198,16 +217,31 @@ func (s *Store) ProjectActivation(ctx context.Context, projectID string, now tim
 		if currentErr != nil {
 			return ProjectActivationStatus{}, currentErr
 		}
-		if current {
+		if current && builderTarget {
 			out.CurrentBuilderTargets++
+		} else if current && reviewerTarget {
+			out.CurrentReviewerTargets++
 		}
-		if target.domainID != "" && target.domainID != "default" && target.ownership == "managed_dedicated" {
+		topologyReady := target.domainID != "" && target.domainID != "default" && target.ownership == "managed_dedicated"
+		if topologyReady && builderTarget {
 			out.BuilderTopologyReadyTargets++
+		} else if topologyReady && reviewerTarget {
+			out.ReviewerTopologyReadyTargets++
 		}
-		if target.hostID != "" && target.storeID != "" && target.domainID != "" &&
+		controlReady := target.hostID != "" && target.storeID != "" && target.domainID != "" &&
 			s.DriverControlOriginEndpointGate != nil &&
-			s.DriverControlOriginEndpointGate(target.hostID, target.storeID, target.domainID) {
+			s.DriverControlOriginEndpointGate(target.hostID, target.storeID, target.domainID)
+		if controlReady && builderTarget {
 			out.BuilderEndpointControlReadyTargets++
+		} else if controlReady && reviewerTarget {
+			out.ReviewerEndpointControlReadyTargets++
+		}
+		if reviewerTarget {
+			out.Reviewers = append(out.Reviewers, ProjectReviewerActivation{WorkerIdentity: "pool:" + target.seatID,
+				SeatID: target.seatID, ModelFamily: target.family, TmuxServerDomainID: target.domainID,
+				LifecycleOwnership: "driver_managed", TmuxServerOwnership: target.ownership,
+				TopologyReady: topologyReady, EndpointControlReady: controlReady,
+				FamilyCapacityConfigured: target.hostID != "" && target.accountKey != "" && target.lineage != ""})
 		}
 	}
 	if out.EnabledBuilderTargets == 0 {
@@ -229,82 +263,98 @@ func (s *Store) ProjectActivation(ctx context.Context, projectID string, now tim
 	if out.BuilderEndpointControlReadyTargets < out.EnabledBuilderTargets {
 		out.Holds = append(out.Holds, "builder_endpoint_control_unavailable")
 	}
-	reviewerRows, err := s.DB.QueryContext(ctx, `SELECT worker_identity FROM driver_session_bindings
-		WHERE project_id=? AND role=? AND state='active' ORDER BY worker_identity`, projectID, DriverReviewerRole)
-	if err != nil {
-		return ProjectActivationStatus{}, err
+	if s.EnableEpicDedicatedWorkersV2 {
+		if out.EnabledReviewerTargets == 0 {
+			out.Holds = append(out.Holds, "no_enabled_reviewer_target")
+		}
+		if out.CurrentReviewerTargets < out.EnabledReviewerTargets {
+			out.Holds = append(out.Holds, "reviewer_target_driver_unavailable")
+		}
+		if out.ReviewerTopologyReadyTargets < out.EnabledReviewerTargets {
+			out.Holds = append(out.Holds, "reviewer_endpoint_topology_invalid")
+		}
+		if out.ReviewerEndpointControlReadyTargets < out.EnabledReviewerTargets {
+			out.Holds = append(out.Holds, "reviewer_endpoint_control_unavailable")
+		}
 	}
-	var reviewerCandidates []string
-	for reviewerRows.Next() {
-		var identity string
-		if err := reviewerRows.Scan(&identity); err != nil {
-			reviewerRows.Close()
+	if !s.EnableEpicDedicatedWorkersV2 {
+		reviewerRows, err := s.DB.QueryContext(ctx, `SELECT worker_identity FROM driver_session_bindings
+		WHERE project_id=? AND role=? AND state='active' ORDER BY worker_identity`, projectID, DriverReviewerRole)
+		if err != nil {
 			return ProjectActivationStatus{}, err
 		}
-		reviewerCandidates = append(reviewerCandidates, identity)
-	}
-	if err := reviewerRows.Close(); err != nil {
-		return ProjectActivationStatus{}, err
-	}
-	for _, identity := range reviewerCandidates {
-		binding, bindErr := s.ActiveDriverSessionBinding(ctx, projectID, identity, DriverReviewerRole)
-		if bindErr != nil {
-			if errors.Is(bindErr, sql.ErrNoRows) {
-				continue
+		var reviewerCandidates []string
+		for reviewerRows.Next() {
+			var identity string
+			if err := reviewerRows.Scan(&identity); err != nil {
+				reviewerRows.Close()
+				return ProjectActivationStatus{}, err
 			}
-			return ProjectActivationStatus{}, bindErr
+			reviewerCandidates = append(reviewerCandidates, identity)
 		}
-		current, currentErr := currentDriverBinding(ctx, s.DB, binding, now, capacityFreshFor)
-		if currentErr != nil {
-			return ProjectActivationStatus{}, currentErr
+		if err := reviewerRows.Close(); err != nil {
+			return ProjectActivationStatus{}, err
 		}
-		if current {
-			out.ReviewerIdentities = append(out.ReviewerIdentities, identity)
-			var family string
-			if err := s.DB.QueryRowContext(ctx, `SELECT provider FROM driver_session_projections
+		for _, identity := range reviewerCandidates {
+			binding, bindErr := s.ActiveDriverSessionBinding(ctx, projectID, identity, DriverReviewerRole)
+			if bindErr != nil {
+				if errors.Is(bindErr, sql.ErrNoRows) {
+					continue
+				}
+				return ProjectActivationStatus{}, bindErr
+			}
+			current, currentErr := currentDriverBinding(ctx, s.DB, binding, now, capacityFreshFor)
+			if currentErr != nil {
+				return ProjectActivationStatus{}, currentErr
+			}
+			if current {
+				out.ReviewerIdentities = append(out.ReviewerIdentities, identity)
+				var family string
+				if err := s.DB.QueryRowContext(ctx, `SELECT provider FROM driver_session_projections
 				WHERE store_id=? AND session_id=? AND pane_instance_id=? AND agent_run_id=?
 				AND tmux_server_instance_id=?`, binding.StoreID, binding.SessionID,
-				binding.PaneInstanceID, binding.AgentRunID, binding.TmuxServerInstanceID).Scan(&family); err != nil {
-				return ProjectActivationStatus{}, err
-			}
-			endpointOwnership, err := driverInstanceOwnership(ctx, s.DB, binding.HostID, binding.StoreID)
-			if err != nil {
-				return ProjectActivationStatus{}, err
-			}
-			reviewer := ProjectReviewerActivation{WorkerIdentity: identity, SeatID: binding.SeatID,
-				ModelFamily: family, TmuxServerDomainID: binding.TmuxServerDomainID,
-				LifecycleOwnership: binding.LifecycleOwnership, TmuxServerOwnership: endpointOwnership,
-				TopologyReady: binding.LifecycleOwnership == "driver_managed" && binding.TmuxServerDomainID != "default" &&
-					endpointOwnership == "managed_dedicated",
-				EndpointControlReady: s.HasDriverControlOriginForBinding(binding)}
-			if family != "" && binding.SeatID != "" {
-				var configured int
-				if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM seats WHERE id=? AND enabled=1
-					AND agent_family=? AND expected_host_id=? AND expected_account_key<>''
-					AND expected_credential_lineage<>''`, binding.SeatID, family, binding.HostID).Scan(&configured); err != nil {
+					binding.PaneInstanceID, binding.AgentRunID, binding.TmuxServerInstanceID).Scan(&family); err != nil {
 					return ProjectActivationStatus{}, err
 				}
-				reviewer.FamilyCapacityConfigured = configured > 0
+				endpointOwnership, err := driverInstanceOwnership(ctx, s.DB, binding.HostID, binding.StoreID)
+				if err != nil {
+					return ProjectActivationStatus{}, err
+				}
+				reviewer := ProjectReviewerActivation{WorkerIdentity: identity, SeatID: binding.SeatID,
+					ModelFamily: family, TmuxServerDomainID: binding.TmuxServerDomainID,
+					LifecycleOwnership: binding.LifecycleOwnership, TmuxServerOwnership: endpointOwnership,
+					TopologyReady: binding.LifecycleOwnership == "driver_managed" && binding.TmuxServerDomainID != "default" &&
+						endpointOwnership == "managed_dedicated",
+					EndpointControlReady: s.HasDriverControlOriginForBinding(binding)}
+				if family != "" && binding.SeatID != "" {
+					var configured int
+					if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM seats WHERE id=? AND enabled=1
+					AND agent_family=? AND expected_host_id=? AND expected_account_key<>''
+					AND expected_credential_lineage<>''`, binding.SeatID, family, binding.HostID).Scan(&configured); err != nil {
+						return ProjectActivationStatus{}, err
+					}
+					reviewer.FamilyCapacityConfigured = configured > 0
+				}
+				if family == "" {
+					out.Holds = append(out.Holds, "reviewer_family_missing")
+				} else if binding.SeatID == "" {
+					out.Holds = append(out.Holds, "reviewer_capacity_seat_unbound")
+				} else if !reviewer.FamilyCapacityConfigured {
+					out.Holds = append(out.Holds, "reviewer_capacity_seat_mismatch")
+				}
+				if !reviewer.TopologyReady {
+					out.Holds = append(out.Holds, "reviewer_endpoint_topology_invalid")
+				}
+				if !reviewer.EndpointControlReady {
+					out.Holds = append(out.Holds, "reviewer_endpoint_control_unavailable")
+				}
+				out.Reviewers = append(out.Reviewers, reviewer)
 			}
-			if family == "" {
-				out.Holds = append(out.Holds, "reviewer_family_missing")
-			} else if binding.SeatID == "" {
-				out.Holds = append(out.Holds, "reviewer_capacity_seat_unbound")
-			} else if !reviewer.FamilyCapacityConfigured {
-				out.Holds = append(out.Holds, "reviewer_capacity_seat_mismatch")
-			}
-			if !reviewer.TopologyReady {
-				out.Holds = append(out.Holds, "reviewer_endpoint_topology_invalid")
-			}
-			if !reviewer.EndpointControlReady {
-				out.Holds = append(out.Holds, "reviewer_endpoint_control_unavailable")
-			}
-			out.Reviewers = append(out.Reviewers, reviewer)
 		}
-	}
-	out.CurrentReviewerBindings = len(out.ReviewerIdentities)
-	if out.CurrentReviewerBindings == 0 {
-		out.Holds = append(out.Holds, "no_current_reviewer_binding")
+		out.CurrentReviewerBindings = len(out.ReviewerIdentities)
+		if out.CurrentReviewerBindings == 0 {
+			out.Holds = append(out.Holds, "no_current_reviewer_binding")
+		}
 	}
 
 	err = s.DB.QueryRowContext(ctx, `SELECT g.generation_id FROM capacity_active_generation a
@@ -368,23 +418,36 @@ func (s *Store) ProjectActivation(ctx context.Context, projectID string, now tim
 		out.Holds = append(out.Holds, "builder_distinct_reviewer_unavailable")
 	}
 
+	reviewerConfigured := out.CurrentReviewerBindings > 0
+	expectedEnabledTargets := out.EnabledBuilderTargets
+	if s.EnableEpicDedicatedWorkersV2 {
+		expectedEnabledTargets += out.EnabledReviewerTargets
+		reviewerConfigured = out.EnabledReviewerTargets > 0 &&
+			out.CurrentReviewerTargets == out.EnabledReviewerTargets &&
+			out.ReviewerTopologyReadyTargets == out.EnabledReviewerTargets
+	}
 	out.Configured = project.State == "active" && len(out.RepositoryIDs) > 0 &&
 		len(out.Actors) == 2 && out.Actors[0].BindingCurrent && out.Actors[0].LifecycleReady && out.Actors[0].TopologyReady &&
 		out.Actors[1].BindingCurrent && out.Actors[1].LifecycleReady && out.Actors[1].TopologyReady &&
 		out.EnabledSeats > 0 && out.CapacityBoundSeats == out.EnabledSeats &&
-		out.EnabledBuilderTargets > 0 && out.EnabledSeats == out.EnabledBuilderTargets &&
+		out.EnabledBuilderTargets > 0 && out.EnabledSeats == expectedEnabledTargets &&
 		out.CurrentBuilderTargets == out.EnabledBuilderTargets &&
-		out.BuilderTopologyReadyTargets == out.EnabledBuilderTargets && out.CurrentReviewerBindings > 0 &&
+		out.BuilderTopologyReadyTargets == out.EnabledBuilderTargets && reviewerConfigured &&
 		allReviewerFamiliesConfigured && allReviewerTopologyReady
 	out.LiveReady = out.Configured && out.Actors[0].EndpointControlReady && out.Actors[1].EndpointControlReady &&
 		out.BuilderEndpointControlReadyTargets == out.EnabledBuilderTargets &&
+		(!s.EnableEpicDedicatedWorkersV2 || out.ReviewerEndpointControlReadyTargets == out.EnabledReviewerTargets) &&
 		out.BuilderDistinctReviewerReadyTargets == out.EnabledBuilderTargets &&
 		out.ActiveCapacityGeneration != "" && out.RoutableSeats > 0 && allReviewerFamiliesRoutable &&
 		allReviewerEndpointControlReady
 	return out, nil
 }
 
-func currentDriverBinding(ctx context.Context, db *sql.DB, binding DriverSessionBinding, now time.Time,
+type driverBindingQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func currentDriverBinding(ctx context.Context, db driverBindingQueryer, binding DriverSessionBinding, now time.Time,
 	freshFor time.Duration) (bool, error) {
 	rows, err := db.QueryContext(ctx, `SELECT i.updated_at,c.updated_at FROM driver_instances i
 		JOIN driver_observation_cursors c ON c.store_id=i.store_id AND c.instance_ref=i.instance_ref AND c.active=1

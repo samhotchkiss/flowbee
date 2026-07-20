@@ -71,8 +71,11 @@ func runVersion(args []string) error {
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
+		if err := runBareBootstrap(nil); err != nil {
+			fmt.Fprintf(os.Stderr, "flowbee bootstrap: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	cmd, args := os.Args[1], os.Args[2:]

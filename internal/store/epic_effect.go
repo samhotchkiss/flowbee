@@ -492,6 +492,21 @@ func (s *Store) CompleteEpicCleanup(ctx context.Context, action EpicDomainAction
 			Scan(&projectID, &state, &version); err != nil {
 			return err
 		}
+		dedicatedWorkers, err := dedicatedEpicWorkersEnabledTx(ctx, s, tx)
+		if err != nil {
+			return err
+		}
+		if dedicatedWorkers {
+			var total, stopped int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*),
+				COALESCE(SUM(CASE WHEN state='stopped' THEN 1 ELSE 0 END),0)
+				FROM epic_worker_sessions WHERE epic_id=?`, action.EpicID).Scan(&total, &stopped); err != nil {
+				return err
+			}
+			if total != 2 || stopped != 2 {
+				return fmt.Errorf("epic cleanup blocked until both dedicated workers are mechanically stopped: %d/%d", stopped, total)
+			}
+		}
 		res, err := tx.ExecContext(ctx, `UPDATE epic_actions SET state='acknowledged',acknowledged_at=?,
 			claim_owner='',claim_deadline_at='',last_error='',updated_at=?
 			WHERE id=? AND state IN ('delivering','verifying') AND (claim_owner=? OR claim_owner='') AND action_epoch=?`,

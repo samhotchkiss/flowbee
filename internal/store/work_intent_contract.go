@@ -270,7 +270,8 @@ func (s *Store) ReconcileWorkIntentAdmissions(ctx context.Context, now time.Time
 		}
 		if errors.Is(err, ErrEpicScopeOverlap) || errors.Is(err, ErrEpicRunExists) ||
 			errors.Is(err, ErrEpicAdmissionConflict) ||
-			errors.Is(err, ErrEpicDistinctReviewerUnavailable) {
+			errors.Is(err, ErrEpicDistinctReviewerUnavailable) ||
+			errors.Is(err, ErrRepoAdmissionWrongOwner) {
 			if holdErr := s.holdPreparedWorkIntentAdmission(ctx, id, err.Error(), now); holdErr != nil {
 				return out, holdErr
 			}
@@ -284,19 +285,21 @@ func (s *Store) ReconcileWorkIntentAdmissions(ctx context.Context, now time.Time
 
 func (s *Store) admitPreparedWorkIntentContract(ctx context.Context, contractID string, now time.Time) error {
 	var prepared PreparedWorkIntentEpicContract
-	var slug, title, repo, specPath, scopeJSON string
+	var slug, title, repo, specPath, scopeJSON, repositoriesJSON string
 	err := s.DB.QueryRowContext(ctx, `SELECT c.id,c.project_id,c.work_intent_id,c.intent_version,
 		c.source_artifact_sha256,c.contract_version,c.contract_ref,c.contract_sha256,
 		c.contract_json,c.orchestrator_binding_id,c.submission_key,c.state,
 		COALESCE(c.admitted_epic_id,''),c.created_at,c.admitted_at,
 		json_extract(c.contract_json,'$.slug'),json_extract(c.contract_json,'$.title'),
 		json_extract(c.contract_json,'$.delivery_repo'),json_extract(c.contract_json,'$.spec_path'),
-		json_extract(c.contract_json,'$.scope') FROM work_intent_epic_contracts c WHERE c.id=?`,
+		json_extract(c.contract_json,'$.scope'),json_extract(c.contract_json,'$.repositories')
+		FROM work_intent_epic_contracts c WHERE c.id=?`,
 		contractID).Scan(&prepared.ID, &prepared.ProjectID, &prepared.WorkIntentID,
 		&prepared.IntentVersion, &prepared.SourceArtifactSHA256, &prepared.ContractVersion,
 		&prepared.ContractRef, &prepared.ContractSHA256, &prepared.ContractJSON,
 		&prepared.OrchestratorBindingID, &prepared.SubmissionKey, &prepared.State,
-		&prepared.AdmittedEpicID, new(string), new(string), &slug, &title, &repo, &specPath, &scopeJSON)
+		&prepared.AdmittedEpicID, new(string), new(string), &slug, &title, &repo, &specPath,
+		&scopeJSON, &repositoriesJSON)
 	if err != nil {
 		return err
 	}
@@ -307,12 +310,17 @@ func (s *Store) admitPreparedWorkIntentContract(ctx context.Context, contractID 
 	if err := json.Unmarshal([]byte(scopeJSON), &scope); err != nil {
 		return err
 	}
+	var repositories []string
+	if err := json.Unmarshal([]byte(repositoriesJSON), &repositories); err != nil {
+		return err
+	}
 	epicID := "epic-" + stableID(prepared.ProjectID+":"+prepared.SubmissionKey)
 	return s.AddEpicRun(ctx, EpicRun{
 		ID: epicID, ProjectID: prepared.ProjectID, Slug: slug,
 		AdmissionKey: prepared.SubmissionKey, WorkIntentID: prepared.WorkIntentID,
 		IntentVersion: prepared.IntentVersion, ContractHash: prepared.ContractSHA256,
-		Repo: repo, FilePath: specPath, Title: title, Scope: scope,
+		Repositories: repositories, DeliveryRepo: repo, Repo: repo,
+		FilePath: specPath, Title: title, Scope: scope,
 		Branch: epicBranchForProject(prepared.ProjectID, slug),
 	}, 1, now)
 }
@@ -329,15 +337,10 @@ func epicBranchForProject(projectID, slug string) string {
 }
 
 // epicSessionNameForProject is a display/compatibility name only; Driver's
-// stable identity tuple remains the routing authority. Keeping the historical
-// default-project spelling avoids breaking existing operators while the
-// project component prevents same-slug sessions from colliding on a shared
-// host during the Phase-2 migration window.
+// stable identity tuple remains the routing authority. Every display name is
+// project-qualified; there is no default-project shortening.
 func epicSessionNameForProject(projectID, slug string) string {
-	if projectID == "" || projectID == "default" {
-		return "epic-" + slug
-	}
-	return "epic-" + projectID + "-" + slug
+	return EpicWorkerDisplayName(projectID, "codex", slug)
 }
 
 func (s *Store) holdPreparedWorkIntentAdmission(ctx context.Context, contractID, detail string, now time.Time) error {

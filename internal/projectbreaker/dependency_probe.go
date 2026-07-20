@@ -23,6 +23,13 @@ type RepositoryFacts interface {
 	ReadRepositoryProbe(context.Context, string) (multirepo.RepositoryProbeFacts, error)
 }
 
+// RepositoryActionFacts is the exact repo-scoped durable project-out surface.
+// It proves action recovery from Flowbee's outbox ledger, never from a generic
+// GitHub read or an agent/session assertion.
+type RepositoryActionFacts interface {
+	ReadRepositoryActionProbe(context.Context, string) (unresolvedFailures, maxAttempts int, fingerprint string, err error)
+}
+
 // MechanicalDependencyProbe turns repository-scoped GitHub reads into the
 // evidence contract Runner persists. Project-scoped probes require every active
 // repository to pass the same mechanical predicate; one broken repository keeps
@@ -30,6 +37,7 @@ type RepositoryFacts interface {
 type MechanicalDependencyProbe struct {
 	Projects     ProjectRepos
 	Repositories RepositoryFacts
+	Actions      RepositoryActionFacts
 	Now          func() time.Time
 	RetryAfter   time.Duration
 }
@@ -83,6 +91,25 @@ func (p MechanicalDependencyProbe) Probe(ctx context.Context, req ProbeRequest) 
 		facts = append(facts, fact)
 	}
 
+	if strings.TrimSpace(req.FailureKind) == "action_failure" {
+		if p.Actions == nil {
+			return ProbeResult{FailureReason: "project-out recovery probe is not configured", RetryAfter: p.retryAfter()}, nil
+		}
+		actionRefs := make([]string, 0, len(repoIDs))
+		for _, repoID := range repoIDs {
+			unresolved, _, fingerprint, err := p.Actions.ReadRepositoryActionProbe(ctx, repoID)
+			if err != nil {
+				return ProbeResult{FailureReason: fmt.Sprintf("repository %s project-out ledger unavailable", repoID), RetryAfter: p.retryAfter()}, nil
+			}
+			if unresolved != 0 || fingerprint == "" {
+				return ProbeResult{FailureReason: fmt.Sprintf("repository %s still has %d unresolved project-out action(s)", repoID, unresolved), RetryAfter: p.retryAfter()}, nil
+			}
+			actionRefs = append(actionRefs, repoID+"@sha256:"+fingerprint)
+		}
+		return ProbeResult{Recovered: true, EvidenceKind: "project_outbox_health",
+			EvidenceRef: "project:" + req.ProjectID + "/" + strings.Join(actionRefs, ","), ObservedAt: p.now()}, nil
+	}
+
 	recovered, reason := dependencyRecovered(req.FailureKind, facts)
 	if !recovered {
 		return ProbeResult{FailureReason: reason, RetryAfter: p.retryAfter()}, nil
@@ -110,7 +137,7 @@ func dependencyRecovered(kind string, facts []multirepo.RepositoryProbeFacts) (b
 			}
 		}
 		return true, ""
-	case "merge_incident", "action_failure":
+	case "merge_incident":
 		// Read availability cannot prove that a write/effect seam recovered.
 		// Those breakers close only after a later effect-specific mechanical
 		// probe is added; fail closed rather than laundering a read receipt.

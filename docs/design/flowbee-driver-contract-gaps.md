@@ -160,3 +160,57 @@ recipient-incarnation fencing, crash-uncertain no-resend, transport-success vers
 stage-success, and zero direct tmux/tmux-send paths. Until these pass against the
 current Driver worktree and the pinned candidate, production routed messaging is
 not live and the fail-closed hold remains the correct state.
+
+## GAP-FD-004 — atomic managed-session bootstrap artifact injection
+
+**Status:** shipped wire contract; runtime certification pending. The binding
+authority is tmux-driver
+`docs/design-v2.5-q3-lifecycle-bootstrap-addendum.md`. Flowbee must require all
+five exact `/v2/meta` contract entries before emitting this effect:
+
+- `lifecycle_ensure=tmux-driver.lifecycle-ensure/v3`;
+- `lifecycle_ensure_bootstrap_artifact=tmux-driver.lifecycle-ensure-bootstrap-artifact/v1`;
+- `lifecycle_human_visible_session=tmux-driver.lifecycle-human-visible-session/v1`;
+- `lifecycle_managed_display_name=tmux-driver.lifecycle-managed-display-name/v1`; and
+- `lifecycle_flowbee_credential_install=tmux-driver.lifecycle-flowbee-credential-install/v1`.
+
+Ensure v3 carries `launch.bootstrap` with exact `artifact_id`,
+`format=initial_prompt_utf8/v1`, `payload_sha256`, and `content_utf8`; the
+profile injects those public bytes as one pre-exec argv element. It separately
+carries the secret-bearing `launch.credential_envelope` with exact envelope ID,
+`format=flowbee_target_bearer_utf8/v1`, credential epoch, hash, and secret. The
+credential is installed into Driver's owner-only target area and only its path
+is exposed through the profile's fixed environment. Public bootstrap and secret
+credential are never combined or persisted in Flowbee's public action ledger.
+
+The v3 idempotency fingerprint binds target/action/lease fences, profile,
+workspace, display name, bootstrap ID/hash, and credential ID/epoch/hash. The
+same action and generation may only rebound the same exact material. Replacing
+an incarnation requires a new action plus higher target and credential epochs;
+Stop removes Driver's local file, while Flowbee separately revokes issuer-side
+authority. Receipts are `tmux-driver.lifecycle-receipt/v3` and expose only
+content-free bootstrap/credential status and hashes. Any uncertain staging,
+install, or exec outcome is reconciled by the original action; it is never
+blindly resent with changed material.
+
+Managed worker presentation names are always
+`flowbee-worker-{model}-{project-slug}-{epic-slug}` and are display-only. They
+are requested only from a profile with `managed_display_name=true`; stable
+Driver identities remain the sole routing and recovery authority.
+
+**Current safe posture:** Flowbee must keep worker creation fail-closed until
+the pinned daemon independently passes the v2.5 runtime/conformance gates and
+Flowbee's strict request/receipt, replay, uncertainty, replacement, Stop-removal,
+and secret-nondisclosure tests. The old post-spawn routed-message contract is
+not accepted as Ensure-time bootstrap injection and cannot make this gate green.
+
+**Live certification evidence (2026-07-19):** the installed pinned
+`local.tmux-driver.default` daemon was read-ready and authenticated the
+`flowbee-control` principal, but Flowbee's read-only UDS conformance stopped at
+metadata validation because `/v2/meta` omitted the exact
+`lifecycle_profile_inventory="/v2/lifecycle/profiles"` feature entry. This is
+not a Flowbee fallback opportunity: it prevents profile/domain validation for
+all managed v3 effects. Keep local dispatch paused and record the Driver-side
+contract correction plus a fresh dual-endpoint conformance result before
+activation. The required `managed_dedicated` launchd endpoint was also not
+installed at this probe, so the two-endpoint canary gate remains open.

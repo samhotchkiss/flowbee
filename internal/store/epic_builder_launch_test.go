@@ -32,6 +32,7 @@ func newBuilderLaunchHarnessForHost(t *testing.T, maximum int, seatBox, capacity
 	t.Helper()
 	ctx := context.Background()
 	st := testutil.NewStore(t)
+	installTestEpicWorkerMaterialProvider(st)
 	st.EnableCapacityV2 = true
 	st.EnableDriverControlOrigin = true // future-capability fake route
 	now := time.Date(2026, 7, 19, 19, 0, 0, 0, time.UTC)
@@ -216,6 +217,187 @@ func (h builderLaunchHarness) addEpic(t *testing.T, id string) {
 		Branch: "epic/" + id, Slug: id, Title: "Build " + id,
 		FilePath: "epics/" + id + ".md", Scope: []string{id + "/**"}}, 1, h.now); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func (h builderLaunchHarness) addProject(t *testing.T, projectID, state string, cap int) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := h.st.CreatePortfolioProject(ctx, store.PortfolioProject{
+		ID: projectID, Name: projectID, State: state, SchedulerWeight: 1, ConcurrencyCap: cap,
+	}, h.now); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.st.UpsertBuilderDriverTarget(ctx, store.BuilderDriverTarget{
+		ProjectID: projectID, SeatID: h.seat.ID, InstanceRef: h.instanceRef,
+		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-build",
+		ProfileID: "codex-builder", WorkspaceRootID: "workspace-build",
+		WorkspaceRelativeBase: "repos", Enabled: true,
+	}, h.now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (h builderLaunchHarness) addProjectEpic(t *testing.T, projectID, id string) {
+	t.Helper()
+	ctx := context.Background()
+	repoID := projectID + "-repo"
+	if err := h.st.RegisterRepo(ctx, store.Repo{ID: repoID, Owner: "fixture",
+		Repo: repoID, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.st.AddProjectRepo(ctx, projectID, repoID, h.now); err != nil {
+		t.Fatal(err)
+	}
+	// RegisterRepo preserves the legacy default-project mapping. Native Phase-2
+	// admission carries explicit authority, so this fixture disables that legacy
+	// route and proves the exact project/repository membership instead.
+	if _, err := h.st.DB.ExecContext(ctx, `UPDATE project_repos SET state='paused'
+		WHERE project_id='default' AND repo_id=?`, repoID); err != nil {
+		t.Fatal(err)
+	}
+	// This helper isolates builder scheduling from the independent admission-time
+	// distinct-reviewer contract. The launch reconcile below still runs with the
+	// production capacity-v2 gate enabled.
+	capacityV2 := h.st.EnableCapacityV2
+	h.st.EnableCapacityV2 = false
+	defer func() { h.st.EnableCapacityV2 = capacityV2 }()
+	if err := h.st.AddEpicRun(ctx, store.EpicRun{ID: id, ProjectID: projectID,
+		Repo: repoID, Branch: "epic/" + id, Slug: id, Title: "Build " + id,
+		FilePath: "epics/" + id + ".md", Scope: []string{id + "/**"}}, 1, h.now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuilderLaunchProjectPolicyGateSkipsHeldAndMakesHealthyProgress(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name         string
+		state        string
+		breakerScope string
+		cap          int
+		occupyCap    bool
+	}{
+		{name: "paused project", state: "paused"},
+		{name: "archived project", state: "archived"},
+		{name: "open project breaker", state: "active", breakerScope: "project"},
+		{name: "open repository breaker", state: "active", breakerScope: "repository"},
+		{name: "project concurrency cap", state: "active", cap: 1, occupyCap: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newBuilderLaunchHarness(t, 1)
+			admissionState := tc.state
+			if tc.state == "paused" || tc.state == "archived" {
+				admissionState = "active"
+			}
+			h.addProject(t, "a-held", admissionState, tc.cap)
+			h.addProject(t, "z-healthy", "active", 0)
+			if tc.breakerScope != "" {
+				repoID := ""
+				if tc.breakerScope == "repository" {
+					repoID = "a-held-repo"
+					if err := h.st.RegisterRepo(ctx, store.Repo{ID: repoID, Owner: "fixture",
+						Repo: repoID, Active: true}); err != nil {
+						t.Fatal(err)
+					}
+					if err := h.st.AddProjectRepo(ctx, "a-held", repoID, h.now); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := h.st.RecordProjectBreakerFailure(ctx, store.ProjectBreakerFailure{
+					ProjectID: "a-held", RepoID: repoID, Kind: "action_failure", Reason: "fixture breaker",
+					RetryAfter: time.Hour, EvidenceRef: "fixture://breaker",
+				}, h.now.Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.occupyCap {
+				h.addProjectEpic(t, "a-held", "a-held-resident")
+				if _, err := h.st.DB.ExecContext(ctx, `UPDATE epics SET seat_id='other-physical-seat'
+					WHERE id='a-held-resident'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A backlog from the held project sorts before the healthy project. The
+			// pass must skip every held candidate and still acquire healthy compute.
+			for _, id := range []string{"a-held-1", "a-held-2", "a-held-3"} {
+				h.addProjectEpic(t, "a-held", id)
+			}
+			h.addProjectEpic(t, "z-healthy", "z-healthy-1")
+			if admissionState != tc.state {
+				if _, err := h.st.DB.ExecContext(ctx, `UPDATE projects SET state=?
+					WHERE id='a-held'`, tc.state); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := h.st.DB.ExecContext(ctx, `INSERT INTO project_scheduler_state
+				(pool,project_id,deficit,last_served_at,state_version,updated_at)
+				VALUES ('build','a-held',7,'',1,?)`, h.now.Format(time.RFC3339Nano)); err != nil {
+				t.Fatal(err)
+			}
+
+			rep, err := h.st.ReconcileBuilderLaunches(ctx, h.now.Add(time.Minute),
+				5*time.Minute, "codex", 5)
+			if err != nil || rep.ActionsCreated != 1 {
+				t.Fatalf("reconcile=%+v err=%v", rep, err)
+			}
+			var healthyActions, heldActions, heldDeficit, turns, effects int
+			var heldLastServed string
+			_ = h.st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM epic_actions
+				WHERE project_id='z-healthy' AND kind='builder_launch'`).Scan(&healthyActions)
+			_ = h.st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM epic_actions
+				WHERE project_id='a-held' AND kind='builder_launch'`).Scan(&heldActions)
+			_ = h.st.DB.QueryRowContext(ctx, `SELECT deficit,last_served_at FROM project_scheduler_state
+				WHERE pool='build' AND project_id='a-held'`).Scan(&heldDeficit, &heldLastServed)
+			_ = h.st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_scheduler_turns
+				WHERE project_id='a-held'`).Scan(&turns)
+			_ = h.st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_scheduler_effects
+				WHERE project_id='a-held'`).Scan(&effects)
+			// Resetting stale credit for an ineligible project is normalization,
+			// not service. No last-served clock or turn/effect may be charged.
+			if healthyActions != 1 || heldActions != 0 || heldDeficit != 0 ||
+				heldLastServed != "" || turns != 0 || effects != 0 {
+				t.Fatalf("healthy_actions=%d held_actions=%d deficit=%d served=%q turns=%d effects=%d",
+					healthyActions, heldActions, heldDeficit, heldLastServed, turns, effects)
+			}
+		})
+	}
+}
+
+func TestConcurrentBuilderLaunchesRespectProjectCapAcrossFreeSeatCapacity(t *testing.T) {
+	ctx := context.Background()
+	h := newBuilderLaunchHarness(t, 2) // physical seat could run both
+	if _, err := h.st.DB.ExecContext(ctx, `UPDATE projects SET concurrency_cap=1
+		WHERE id='default'`); err != nil {
+		t.Fatal(err)
+	}
+	h.addEpic(t, "project-cap-one")
+	h.addEpic(t, "project-cap-two")
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, err := h.st.ReconcileBuilderLaunches(ctx, h.now.Add(time.Minute),
+				5*time.Minute, "codex", 5)
+			results <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var assigned, actions, effects int
+	_ = h.st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM epics
+		WHERE project_id='default' AND seat_id<>''`).Scan(&assigned)
+	_ = h.st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM epic_actions
+		WHERE project_id='default' AND kind='builder_launch'`).Scan(&actions)
+	_ = h.st.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_scheduler_effects
+		WHERE project_id='default' AND effect_kind='builder_launch'`).Scan(&effects)
+	if assigned != 1 || actions != 1 || effects != 1 {
+		t.Fatalf("project cap race assigned=%d actions=%d effects=%d", assigned, actions, effects)
 	}
 }
 

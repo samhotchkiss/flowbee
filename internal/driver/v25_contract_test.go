@@ -24,7 +24,7 @@ func TestV25MetadataHandshakeFailsClosed(t *testing.T) {
 			meta["contracts"].(map[string]any)["lifecycle_ensure"].(map[string]any)["contract_id"] = "tmux-driver.lifecycle-ensure/v1"
 		}},
 		{name: "unsupported contract", mutate: func(meta map[string]any) {
-			meta["contracts"].(map[string]any)["managed_tmux_server_isolation"].(map[string]any)["supported"] = false
+			meta["contracts"].(map[string]any)["control_origin_recipient_agent_run_fence"].(map[string]any)["supported"] = false
 		}},
 		{name: "illegal domain ownership", mutate: func(meta map[string]any) {
 			meta["tmux_server"].(map[string]any)["domain_id"] = "default"
@@ -45,6 +45,44 @@ func TestV25MetadataHandshakeFailsClosed(t *testing.T) {
 				t.Fatal("unsafe v2.5 metadata was accepted")
 			}
 		})
+	}
+}
+
+func TestV25MetadataHandshakeAllowsAdditiveContractCapability(t *testing.T) {
+	meta := controlOriginMetaFixture(true, true)
+	meta["contracts"].(map[string]any)["managed_utility_observer"] = map[string]any{
+		"supported": true, "contract_id": "tmux-driver.managed-utility-observer/v1",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(meta)
+	}))
+	defer srv.Close()
+	if _, err := (&HTTPPort{BaseURL: srv.URL, Token: "secret"}).Metadata(context.Background()); err != nil {
+		t.Fatalf("additive Driver contract capability must not reject required v2.5 handshake: %v", err)
+	}
+}
+
+func TestV25LifecycleV3ContractsAreScopedToPresentationDomain(t *testing.T) {
+	managed := defaultDriverContractCapabilities()
+	managed.LifecycleHumanVisibleSession.Supported = false
+	managedTarget := SessionTarget{Identity: Identity{TmuxServerDomainID: "flowbee"}, PresentationName: "flowbee-worker-codex-russ-epic"}
+	if err := validateLifecycleV3Contracts(managed, managedTarget); err != nil {
+		t.Fatalf("managed endpoint must not require external human-visible presentation: %v", err)
+	}
+	managed.LifecycleManagedDisplayName.Supported = false
+	if err := validateLifecycleV3Contracts(managed, managedTarget); err == nil {
+		t.Fatal("managed endpoint accepted a named launch without managed-display capability")
+	}
+
+	external := defaultDriverContractCapabilities()
+	external.LifecycleManagedDisplayName.Supported = false
+	externalTarget := SessionTarget{Identity: Identity{TmuxServerDomainID: "default"}, PresentationName: "russ-interactor"}
+	if err := validateLifecycleV3Contracts(external, externalTarget); err != nil {
+		t.Fatalf("external endpoint must not require managed display naming: %v", err)
+	}
+	external.LifecycleHumanVisibleSession.Supported = false
+	if err := validateLifecycleV3Contracts(external, externalTarget); err == nil {
+		t.Fatal("external endpoint accepted a visible launch without human-visible capability")
 	}
 }
 

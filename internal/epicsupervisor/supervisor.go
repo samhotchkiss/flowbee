@@ -206,7 +206,7 @@ func (s *Supervisor) produceForEpic(ctx context.Context, e store.EpicRun, paneSt
 		s.upsert(ctx, e, attention.KindNeedsInput, 20, e.ID+":needs_input", true,
 			map[string]string{"pane_state": paneState, "last_line": clip(lastLine, 200)}, now)
 	} else {
-		s.clear(ctx, e.ID+":needs_input", now)
+		s.clear(ctx, e.ProjectID, e.ID+":needs_input", now)
 	}
 
 	// blocked_non_resumable — the lifecycle state reached 'blocked'.
@@ -214,7 +214,7 @@ func (s *Supervisor) produceForEpic(ctx context.Context, e store.EpicRun, paneSt
 		s.upsert(ctx, e, attention.KindBlockedNonResumable, 10, e.ID+":blocked", true,
 			map[string]string{"blockers": clip(e.StatusBlockers, 300)}, now)
 	} else {
-		s.clear(ctx, e.ID+":blocked", now)
+		s.clear(ctx, e.ProjectID, e.ID+":blocked", now)
 	}
 
 	// auth_dead — a distinct human-only state (plan §12.4/§12.13): never auto-resumed.
@@ -222,7 +222,7 @@ func (s *Supervisor) produceForEpic(ctx context.Context, e store.EpicRun, paneSt
 		s.upsert(ctx, e, attention.KindAuthDead, 10, e.ID+":auth_dead", true,
 			map[string]string{"detail": "auth_dead — human re-login required"}, now)
 	} else {
-		s.clear(ctx, e.ID+":auth_dead", now)
+		s.clear(ctx, e.ProjectID, e.ID+":auth_dead", now)
 	}
 
 	// usage_critical — the BOUND account is critically capped AND the reading is trustworthy
@@ -233,7 +233,7 @@ func (s *Supervisor) produceForEpic(ctx context.Context, e store.EpicRun, paneSt
 				s.upsert(ctx, e, attention.KindUsageCritical, 15, e.ID+":usage:"+e.AccountKey, false,
 					map[string]string{"account": e.AccountKey, "weekly_pct": ftoa(aw.WeeklyPct), "severity": aw.Severity}, now)
 			} else {
-				s.clear(ctx, e.ID+":usage:"+e.AccountKey, now)
+				s.clear(ctx, e.ProjectID, e.ID+":usage:"+e.AccountKey, now)
 			}
 		}
 	}
@@ -305,9 +305,9 @@ func (s *Supervisor) recoverStrandedDeliveries(ctx context.Context, now time.Tim
 		}
 		var rerr error
 		if landed {
-			rerr = s.store.RecoverStrandedAwaitingAck(ctx, it.ID, it.DeliveryKey, now)
+			rerr = s.store.RecoverStrandedAwaitingAckForProject(ctx, it.ProjectID, it.ID, it.DeliveryKey, now)
 		} else {
-			rerr = s.store.ReopenStranded(ctx, it.ID, now)
+			rerr = s.store.ReopenStrandedForProject(ctx, it.ProjectID, it.ID, now)
 		}
 		if rerr != nil {
 			s.logger.Warn("epic supervision: recover stranded delivery", "item", it.ID, "landed", landed, "err", rerr)
@@ -329,7 +329,7 @@ func (s *Supervisor) reapExpiredLeases(ctx context.Context, now time.Time) {
 // resolve as acked; else if past T_ack with no change → reopen as steer_not_processed (a
 // politely-stalling agent that absorbed a nudge and kept drifting must not look handled).
 func (s *Supervisor) runAckLoop(ctx context.Context, workingTransition map[string]bool, now time.Time) {
-	items, err := s.store.ListOpenAttention(ctx, attention.StateAwaitingAck, nil, "")
+	items, err := s.store.ListAllOpenAttention(ctx, attention.StateAwaitingAck, nil, "")
 	if err != nil {
 		s.logger.Warn("epic supervision: list awaiting_ack", "err", err)
 		return
@@ -337,14 +337,14 @@ func (s *Supervisor) runAckLoop(ctx context.Context, workingTransition map[strin
 	for _, it := range items {
 		since := store.ParseTimeOrZero(it.AwaitingSince)
 		if s.epicAdvancedSince(ctx, it.EpicID, workingTransition[it.EpicID], since) {
-			if aerr := s.store.AckAttention(ctx, it.ID, now); aerr != nil {
+			if aerr := s.store.AckAttentionForProject(ctx, it.ProjectID, it.ID, now); aerr != nil {
 				s.logger.Warn("epic supervision: ack", "item", it.ID, "err", aerr)
 			}
 			continue
 		}
 		pure := attention.Item{State: it.State, AwaitingSince: since}
 		if attention.AckExpired(pure, now, s.cfg.AckTimeout) {
-			if rerr := s.store.ReopenUnacked(ctx, it.ID, now); rerr != nil {
+			if rerr := s.store.ReopenUnackedForProject(ctx, it.ProjectID, it.ID, now); rerr != nil {
 				s.logger.Warn("epic supervision: reopen unacked", "item", it.ID, "err", rerr)
 			}
 		}
@@ -405,7 +405,7 @@ func (s *Supervisor) reapDeadMasters(ctx context.Context, now time.Time) {
 			freshest = t
 		}
 	}
-	open, err := s.store.ListOpenAttention(ctx, "", nil, "")
+	open, err := s.store.ListAllOpenAttention(ctx, "", nil, "")
 	if err != nil {
 		return
 	}
@@ -417,10 +417,10 @@ func (s *Supervisor) reapDeadMasters(ctx context.Context, now time.Time) {
 		})
 	}
 	if attention.ShouldRaiseMasterAbsent(items, freshest, now, s.cfg.Policy) {
-		s.upsertRaw(ctx, attention.KindMasterAbsent, 3, "master_absent", "", "", false,
+		s.upsertRaw(ctx, attention.KindMasterAbsent, 3, "master_absent", "default", "", "", false,
 			map[string]string{"detail": "no live master while human-warranting items are open"}, now)
 	} else {
-		s.clear(ctx, "master_absent", now)
+		s.clear(ctx, "default", "master_absent", now)
 	}
 }
 
@@ -430,7 +430,7 @@ func (s *Supervisor) reapDeadMasters(ctx context.Context, now time.Time) {
 // master pane is not IDLE_AT_PROMPT (WORKING/compacting panes are left alone). The ping is
 // resolved through the family verb table (NotifyMaster), so it can NEVER carry pane content.
 func (s *Supervisor) pushToWake(ctx context.Context, now time.Time) {
-	open, err := s.store.ListOpenAttention(ctx, "open", nil, "")
+	open, err := s.store.ListAllOpenAttention(ctx, "open", nil, "")
 	if err != nil || len(open) == 0 {
 		return
 	}
@@ -488,20 +488,23 @@ func (s *Supervisor) pushToWake(ctx context.Context, now time.Time) {
 // ── item construction helpers ──
 
 func (s *Supervisor) upsert(ctx context.Context, e store.EpicRun, kind attention.Kind, prio int, dedup string, blocking bool, evidence map[string]string, now time.Time) {
-	s.upsertRaw(ctx, kind, prio, dedup, e.ID, e.Repo, blocking, evidence, now)
+	s.upsertRaw(ctx, kind, prio, dedup, e.ProjectID, e.ID, e.Repo, blocking, evidence, now)
 }
 
-func (s *Supervisor) upsertRaw(ctx context.Context, kind attention.Kind, prio int, dedup, epicID, repo string, blocking bool, evidence map[string]string, now time.Time) {
+func (s *Supervisor) upsertRaw(ctx context.Context, kind attention.Kind, prio int, dedup, projectID, epicID, repo string, blocking bool, evidence map[string]string, now time.Time) {
 	if _, _, err := s.store.UpsertAttentionItem(ctx, store.AttentionItem{
-		ID: ulid.New(), Kind: string(kind), EpicID: epicID, Repo: repo, Priority: prio,
+		ID: ulid.New(), ProjectID: projectID, Kind: string(kind), EpicID: epicID, Repo: repo, Priority: prio,
 		DedupKey: dedup, Blocking: blocking, Evidence: evidence,
 	}, now); err != nil {
 		s.logger.Warn("epic supervision: upsert attention", "kind", kind, "dedup", dedup, "err", err)
 	}
 }
 
-func (s *Supervisor) clear(ctx context.Context, dedup string, now time.Time) {
-	if _, err := s.store.AutoResolveCleared(ctx, dedup, now); err != nil {
+func (s *Supervisor) clear(ctx context.Context, projectID, dedup string, now time.Time) {
+	if projectID == "" {
+		projectID = "default"
+	}
+	if _, err := s.store.AutoResolveClearedForProject(ctx, projectID, dedup, now); err != nil {
 		s.logger.Warn("epic supervision: auto-resolve cleared", "dedup", dedup, "err", err)
 	}
 }

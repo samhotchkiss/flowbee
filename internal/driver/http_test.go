@@ -555,7 +555,8 @@ func TestHTTPPortObservationUsesFullV2EnvelopeAndStableSnapshotIdentity(t *testi
 			_ = json.NewEncoder(w).Encode(map[string]any{"api_version": "2.3", "host_id": host,
 				"store_id": store, "instance": "local", "producer_boot_id": boot,
 				"replay_floor_cursor": "tdc2.floor", "durable_high_water_cursor": "tdc2.high",
-				"features": map[string]any{"lifecycle_control": true}, "tmux_server": map[string]any{
+				"features": map[string]any{"lifecycle_control": true,
+					"lifecycle_profile_inventory": "/v2/lifecycle/profiles"}, "tmux_server": map[string]any{
 					"domain_id": "flowbee", "ownership": "managed_dedicated", "instance_id": server,
 					"connection_visibility": "isolated_socket"}, "contracts": driverContractsFixture()})
 		case "/v2/sessions":
@@ -661,6 +662,7 @@ func controlReceiptFixture(grantID, recipientID, paneID string) map[string]any {
 func controlOriginMetaFixture(enabled, include bool) map[string]any {
 	features := map[string]any{}
 	features["lifecycle_control"] = true
+	features["lifecycle_profile_inventory"] = "/v2/lifecycle/profiles"
 	if include {
 		features["control_principal_origin"] = enabled
 	}

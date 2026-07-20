@@ -2,6 +2,7 @@ package tmuxio
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -172,6 +173,20 @@ func TestListPanes(t *testing.T) {
 	}
 	if panes[1].SessionName != "my session" || panes[1].PaneID != "%7" || panes[1].CurrentCommand != "ssh" {
 		t.Errorf("pane1 (space in name) = %+v", panes[1])
+	}
+}
+
+func TestListPanesAcceptsEscapedOctalFieldSeparator(t *testing.T) {
+	row := strings.Join([]string{"runner", "0", "%1", "4242", "node", "80", "24"}, `\037`)
+	c, _, _ := newFakeClient(func(cmd string) (string, error) {
+		if strings.Contains(cmd, "list-panes") {
+			return row + "\n", nil
+		}
+		return "", fmt.Errorf("unexpected command: %q", cmd)
+	})
+	panes, err := c.ListPanes(context.Background())
+	if err != nil || len(panes) != 1 || panes[0].PaneID != "%1" || panes[0].Width != 80 {
+		t.Fatalf("ListPanes escaped separator = %+v, %v", panes, err)
 	}
 }
 
@@ -426,6 +441,19 @@ func runSend(t *testing.T, fr *fakeRunner, target, msg string, opts SendOptions)
 }
 
 const paneFacts80 = "%1" + fieldSep + "80" + fieldSep + "0"
+
+func TestResolvePaneAcceptsEscapedOctalFieldSeparator(t *testing.T) {
+	c, _, _ := newFakeClient(func(cmd string) (string, error) {
+		if strings.Contains(cmd, "display-message") {
+			return `%1\03780\0370` + "\n", nil
+		}
+		return "", fmt.Errorf("unexpected command: %q", cmd)
+	})
+	pane, err := c.resolvePane(context.Background(), "%1")
+	if err != nil || pane.id != "%1" || pane.width != 80 || pane.inMode {
+		t.Fatalf("resolve escaped separator = %+v, %v", pane, err)
+	}
+}
 
 func TestSendStrongCleanSubmit(t *testing.T) {
 	msg := "run the test suite"

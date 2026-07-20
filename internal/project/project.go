@@ -1227,6 +1227,7 @@ func (s *Sender) seedBuildFromSpec(ctx context.Context, spec job.Job, now time.T
 	}
 	if _, err := s.store.SeedJob(ctx, store.SeedParams{
 		ID:                 buildID,
+		ProjectID:          spec.ProjectID,
 		Kind:               job.KindBuild,
 		Flow:               "build",
 		Stage:              "build",

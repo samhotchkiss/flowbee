@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/store"
+	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
 
 func TestEpicCLIActuationIsFencedWhenV2Enabled(t *testing.T) {
@@ -100,6 +103,34 @@ func TestServeV2SelectionPersistsAndOnlyExplicitServeRollbackClears(t *testing.T
 	t.Setenv("FLOWBEE_EPIC_REVIEW_HANDOFF_V2", "0")
 	if enabled, err := selectDurableEpicReviewHandoffV2(ctx, st); err != nil || enabled {
 		t.Fatalf("rollback = %v, err=%v", enabled, err)
+	}
+}
+
+func TestDedicatedWorkerSelectionSurvivesOmittedEnvironment(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	if err := st.SetDurableEpicDedicatedWorkersV2(ctx, true, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	prior, existed := os.LookupEnv("FLOWBEE_EPIC_DEDICATED_WORKERS_V2")
+	if err := os.Unsetenv("FLOWBEE_EPIC_DEDICATED_WORKERS_V2"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv("FLOWBEE_EPIC_DEDICATED_WORKERS_V2", prior)
+		} else {
+			_ = os.Unsetenv("FLOWBEE_EPIC_DEDICATED_WORKERS_V2")
+		}
+	})
+	selected, explicit, err := desiredDurableEpicDedicatedWorkersV2(ctx, st)
+	if err != nil || !selected || explicit {
+		t.Fatalf("omitted-env restart selection enabled=%v explicit=%v err=%v", selected, explicit, err)
+	}
+	t.Setenv("FLOWBEE_EPIC_DEDICATED_WORKERS_V2", "0")
+	selected, explicit, err = desiredDurableEpicDedicatedWorkersV2(ctx, st)
+	if err != nil || selected || !explicit {
+		t.Fatalf("explicit disable selection enabled=%v explicit=%v err=%v", selected, explicit, err)
 	}
 }
 

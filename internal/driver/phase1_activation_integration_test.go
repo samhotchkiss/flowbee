@@ -163,6 +163,12 @@ func seedPhase1BuilderRoute(t *testing.T, st *store.Store, now time.Time) {
 	t.Helper()
 	ctx := context.Background()
 	st.EnableCapacityV2 = true
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "russ", Owner: "fixture", Repo: "russ", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddProjectRepo(ctx, "default", "russ", now); err != nil {
+		t.Fatal(err)
+	}
 	seat := store.Seat{Box: "phase1-builder-host", AgentFamily: "codex",
 		CodexHome: "/codex/phase1", Health: store.SeatReady, MaxConcurrent: 1}
 	if err := st.AddSeat(ctx, seat, now); err != nil {
@@ -214,7 +220,7 @@ func seedPhase1BuilderRoute(t *testing.T, st *store.Store, now time.Time) {
 		SeatID: reviewer.ID, HostID: reviewer.Box, StoreID: "phase1-review-store",
 		TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "phase1-review-server",
 		LifecycleOwnership: "driver_managed", LifecycleKey: "phase1-reviewer",
-		TargetEpoch: 1, ProfileID: "grok-reviewer", WorkspaceRootID: "phase1-workspace",
+		TargetEpoch: 1, ProfileID: "grok_reviewer", WorkspaceRootID: "phase1-workspace",
 		WorkspaceRelativePath: "review", SessionID: "phase1-review-session",
 		PaneInstanceID: "phase1-review-pane", AgentRunID: "phase1-review-run",
 		Provider: "grok", ObservedAt: now,
