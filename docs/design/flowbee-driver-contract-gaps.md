@@ -203,3 +203,14 @@ the pinned daemon independently passes the v2.5 runtime/conformance gates and
 Flowbee's strict request/receipt, replay, uncertainty, replacement, Stop-removal,
 and secret-nondisclosure tests. The old post-spawn routed-message contract is
 not accepted as Ensure-time bootstrap injection and cannot make this gate green.
+
+**Live certification evidence (2026-07-19):** the installed pinned
+`local.tmux-driver.default` daemon was read-ready and authenticated the
+`flowbee-control` principal, but Flowbee's read-only UDS conformance stopped at
+metadata validation because `/v2/meta` omitted the exact
+`lifecycle_profile_inventory="/v2/lifecycle/profiles"` feature entry. This is
+not a Flowbee fallback opportunity: it prevents profile/domain validation for
+all managed v3 effects. Keep local dispatch paused and record the Driver-side
+contract correction plus a fresh dual-endpoint conformance result before
+activation. The required `managed_dedicated` launchd endpoint was also not
+installed at this probe, so the two-endpoint canary gate remains open.
