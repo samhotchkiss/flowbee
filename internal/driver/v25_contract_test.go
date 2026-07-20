@@ -62,6 +62,30 @@ func TestV25MetadataHandshakeAllowsAdditiveContractCapability(t *testing.T) {
 	}
 }
 
+func TestV25LifecycleV3ContractsAreScopedToPresentationDomain(t *testing.T) {
+	managed := defaultDriverContractCapabilities()
+	managed.LifecycleHumanVisibleSession.Supported = false
+	managedTarget := SessionTarget{Identity: Identity{TmuxServerDomainID: "flowbee"}, PresentationName: "flowbee-worker-codex-russ-epic"}
+	if err := validateLifecycleV3Contracts(managed, managedTarget); err != nil {
+		t.Fatalf("managed endpoint must not require external human-visible presentation: %v", err)
+	}
+	managed.LifecycleManagedDisplayName.Supported = false
+	if err := validateLifecycleV3Contracts(managed, managedTarget); err == nil {
+		t.Fatal("managed endpoint accepted a named launch without managed-display capability")
+	}
+
+	external := defaultDriverContractCapabilities()
+	external.LifecycleManagedDisplayName.Supported = false
+	externalTarget := SessionTarget{Identity: Identity{TmuxServerDomainID: "default"}, PresentationName: "russ-interactor"}
+	if err := validateLifecycleV3Contracts(external, externalTarget); err != nil {
+		t.Fatalf("external endpoint must not require managed display naming: %v", err)
+	}
+	external.LifecycleHumanVisibleSession.Supported = false
+	if err := validateLifecycleV3Contracts(external, externalTarget); err == nil {
+		t.Fatal("external endpoint accepted a visible launch without human-visible capability")
+	}
+}
+
 func TestV25ControlAndSessionOriginsStaySeparate(t *testing.T) {
 	control := NewAction("control", "payload", 3)
 	control.SenderPrincipalID = "flowbee-control"
