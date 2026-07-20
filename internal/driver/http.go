@@ -76,6 +76,25 @@ type HTTPError struct {
 	Code   string
 }
 
+// PreEffectError certifies that a lifecycle failure occurred before Flowbee
+// submitted any mutation to Driver. Runtimes may safely retry this class of
+// failure; every other error after an action is claimed remains uncertain and
+// must be reconciled by receipt/presence rather than blindly resent.
+//
+// This marker must not be used for HTTP failures: a response error can arrive
+// after Driver has accepted the request.
+type PreEffectError struct{ Err error }
+
+func (e *PreEffectError) Error() string { return e.Err.Error() }
+func (e *PreEffectError) Unwrap() error { return e.Err }
+
+func preEffect(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &PreEffectError{Err: err}
+}
+
 func (e *HTTPError) Error() string {
 	if e.Code == "" {
 		return fmt.Sprintf("driver http %d", e.Status)
@@ -445,7 +464,7 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 		t.LifecycleKey == "" || t.TargetEpoch < 1 || profile == "" ||
 		t.WorkspaceRootID == "" || t.WorkspaceRelativePath == "" || t.Identity.TmuxServerDomainID == "" ||
 		t.Identity.HostID == "" || t.Identity.StoreID == "" || t.Identity.TmuxServerInstanceID == "" {
-		return LifecycleReceipt{}, errors.New("driver lifecycle ensure: incomplete fenced target")
+		return LifecycleReceipt{}, preEffect(errors.New("driver lifecycle ensure: incomplete fenced target"))
 	}
 	type ensureRequest struct {
 		FormatVersion string `json:"format_version"`
@@ -476,21 +495,21 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 	format := "tmux-driver.lifecycle-ensure/v2"
 	if v3 {
 		if err := validateLifecycleV3Launch(t); err != nil {
-			return LifecycleReceipt{}, err
+			return LifecycleReceipt{}, preEffect(err)
 		}
 		meta, err := p.Metadata(ctx)
 		if err != nil {
-			return LifecycleReceipt{}, fmt.Errorf("driver lifecycle ensure v3 capability: %w", err)
+			return LifecycleReceipt{}, preEffect(fmt.Errorf("driver lifecycle ensure v3 capability: %w", err))
 		}
 		if err := validateLifecycleV3Contracts(meta.Contracts, t); err != nil {
-			return LifecycleReceipt{}, err
+			return LifecycleReceipt{}, preEffect(err)
 		}
 		inventory, err := p.LifecycleProfiles(ctx)
 		if err != nil {
-			return LifecycleReceipt{}, fmt.Errorf("driver lifecycle profile inventory: %w", err)
+			return LifecycleReceipt{}, preEffect(fmt.Errorf("driver lifecycle profile inventory: %w", err))
 		}
 		if err := inventory.ValidateLaunch(profile, t.Identity.TmuxServerDomainID, t); err != nil {
-			return LifecycleReceipt{}, err
+			return LifecycleReceipt{}, preEffect(err)
 		}
 		format = "tmux-driver.lifecycle-ensure/v3"
 	}

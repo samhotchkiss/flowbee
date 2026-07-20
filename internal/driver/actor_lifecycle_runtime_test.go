@@ -270,6 +270,39 @@ type lostRecoveryEnsureResponsePort struct {
 	lost bool
 }
 
+type preEffectRejectingEnsurePort struct{ *FakePort }
+
+func (p *preEffectRejectingEnsurePort) EnsureLifecycleSession(context.Context, SessionTarget, Action) (LifecycleReceipt, error) {
+	return LifecycleReceipt{}, preEffect(errors.New("profile inventory rejected before lifecycle submission"))
+}
+
+func TestActorLifecycleRuntimeKnownPreEffectEnsureFailureIsRetryable(t *testing.T) {
+	st, route, now := actorRuntimeProject(t, flowstore.DriverOrchestratorRole, "russ-orchestrator")
+	materials := SQLLifecycleLaunchMaterials{DB: st.DB, EnvelopeDirectory: t.TempDir(),
+		WorkerAuthSecret: []byte("known-pre-effect-secret")}
+	st.ProjectActorCredentialMaterializer = materials.PrepareEnvelope
+	fake := endpointRuntimeFake("mac", "managed-store", "flowbee", "managed_dedicated")
+	resolver := actorRuntimeResolver(t, nil, &preEffectRejectingEnsurePort{FakePort: fake})
+	if _, _, err := st.CommitProjectActorLifecycleIntent(context.Background(),
+		managedActorCommand(route, fake.Meta.TmuxServer.InstanceID), now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	runtime := ActorLifecycleRuntime{Resolver: resolver, Store: st, Owner: "known-pre-effect",
+		ClaimTTL: time.Minute, MaxRecovery: 3, Materials: materials, RequireManagedAgentV3: true}
+	report, err := runtime.Tick(context.Background(), now.Add(2*time.Minute))
+	if err != nil || report.Retried != 1 || fake.EnsureCalls != 0 {
+		t.Fatalf("known pre-effect failure was not retried report=%+v ensure_calls=%d err=%v", report, fake.EnsureCalls, err)
+	}
+	lifecycle, err := st.CurrentProjectActorLifecycle(context.Background(), "russ", flowstore.DriverOrchestratorRole)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := st.GetProjectActorLifecycleAction(context.Background(), lifecycle.CurrentActionID)
+	if err != nil || action.State != "pending" || lifecycle.State != "awaiting_ensure" {
+		t.Fatalf("pre-effect rejection became uncertain action=%+v lifecycle=%+v err=%v", action, lifecycle, err)
+	}
+}
+
 func (p *lostRecoveryEnsureResponsePort) EnsureLifecycleSession(ctx context.Context,
 	target SessionTarget, action Action) (LifecycleReceipt, error) {
 	receipt, err := p.FakePort.EnsureLifecycleSession(ctx, target, action)

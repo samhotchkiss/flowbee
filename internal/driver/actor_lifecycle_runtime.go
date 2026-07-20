@@ -153,6 +153,10 @@ func (r ActorLifecycleRuntime) Tick(ctx context.Context, now time.Time) (ActorLi
 	receipt, executeErr := executeActorLifecycle(ctx, endpoint.Port, driverAction)
 	cleanup(executeErr == nil && receipt.Resolved())
 	if executeErr != nil {
+		var knownPreEffect *PreEffectError
+		if errors.As(executeErr, &knownPreEffect) {
+			return r.preEffectFailure(ctx, action, executeErr, now, report)
+		}
 		// Once the lifecycle method was invoked, Flowbee cannot infer whether the
 		// Driver committed before the response was lost. Verification is the only
 		// safe continuation; this action is never returned to pending here.
