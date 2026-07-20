@@ -207,12 +207,40 @@ func validateLifecycleProfile(p LifecycleProfile) error {
 func (i *LifecycleProfileInventory) UnmarshalJSON(data []byte) error {
 	keys := []string{"api_version", "server_time", "format_version", "lifecycle_enabled",
 		"tmux_server_domain_id", "profiles"}
-	if err := requireExactWireKeys(data, keys); err != nil {
+	// The inventory is an extensible Driver capability document. Require and
+	// strictly decode every field Flowbee relies on, but do not make a new
+	// unrelated profile category (for example utility_profiles) an outage for
+	// managed agent lifecycle. This mirrors contract-capability decoding above.
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil || object == nil {
+		if err != nil {
+			return err
+		}
+		return errors.New("driver lifecycle profile inventory must be an object")
+	}
+	known := make(map[string]json.RawMessage, len(keys))
+	for _, key := range keys {
+		raw, ok := object[key]
+		if !ok {
+			return fmt.Errorf("driver lifecycle profile inventory missing %s", key)
+		}
+		known[key] = raw
+	}
+	for key := range object {
+		if key == "utility_profiles" {
+			continue
+		}
+		if _, required := known[key]; !required {
+			return fmt.Errorf("driver lifecycle profile inventory: missing or unknown field %s", key)
+		}
+	}
+	knownJSON, err := json.Marshal(known)
+	if err != nil {
 		return err
 	}
 	type plain LifecycleProfileInventory
 	var value plain
-	if err := decodeStrictWire(data, &value); err != nil {
+	if err := decodeStrictWire(knownJSON, &value); err != nil {
 		return err
 	}
 	*i = LifecycleProfileInventory(value)

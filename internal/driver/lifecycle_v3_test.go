@@ -150,6 +150,29 @@ func TestHTTPLifecycleProfileInventoryIsStrictAndDomainBound(t *testing.T) {
 	}
 }
 
+func TestHTTPLifecycleProfileInventoryAcceptsAdditiveUtilityProfiles(t *testing.T) {
+	inventory := managedProfileInventoryFixture()
+	inventory["utility_profiles"] = []map[string]any{{
+		"profile_id": "driver_stream_console", "utility_kind": "driver_stream_console",
+		"ensure_supported": true, "ensure_authorized": true, "stop_supported": true, "stop_authorized": true,
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/meta":
+			_ = json.NewEncoder(w).Encode(controlOriginMetaFixture(true, true))
+		case "/v2/lifecycle/profiles":
+			_ = json.NewEncoder(w).Encode(inventory)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	port := &HTTPPort{BaseURL: srv.URL, Token: "token"}
+	if _, err := port.LifecycleProfiles(context.Background()); err != nil {
+		t.Fatalf("additive utility profile rejected: %v", err)
+	}
+}
+
 func managedProfileInventoryFixture() map[string]any {
 	profile := managedProfile("codex_builder", "codex")
 	raw, _ := json.Marshal(profile)
