@@ -61,7 +61,7 @@ actual_sha=$(shasum -a 256 "$FLOWBEE_CANARY_BINARY" | awk '{print $1}')
 [[ "$actual_sha" == "$FLOWBEE_CANARY_BINARY_SHA256" ]] ||
   fail "pinned binary SHA-256 mismatch: got ${actual_sha}"
 binary_source_commit=$("$FLOWBEE_CANARY_BINARY" version --json 2>/dev/null |
-  sed -n 's/.*"source_commit":"\\([0-9a-f][0-9a-f]*\\)".*/\\1/p')
+  sed -n 's/.*"source_commit":"\([0-9a-f][0-9a-f]*\)".*/\1/p')
 [[ "$binary_source_commit" == "$FLOWBEE_CANARY_SOURCE_COMMIT" ]] ||
   fail "pinned binary source commit does not match FLOWBEE_CANARY_SOURCE_COMMIT: got ${binary_source_commit:-missing}"
 
