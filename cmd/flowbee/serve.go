@@ -642,19 +642,7 @@ func runServe(args []string) error {
 			})
 		}
 		reconcilerOwner := fmt.Sprintf("serve-%d", os.Getpid())
-		reconcilerGrace := map[string]time.Duration{
-			"review_handoff":              3 * time.Minute,
-			"review_verdict":              3 * time.Minute,
-			"delivery_backstop":           3 * time.Minute,
-			"alert_interactor_projection": time.Minute,
-			"driver_executor":             30 * time.Second,
-			"builder_lifecycle":           30 * time.Second,
-			"project_actor_lifecycle":     30 * time.Second,
-			"builder_launch":              30 * time.Second,
-			"epic_effects":                30 * time.Second,
-			"project_breaker_probe":       time.Minute,
-			"reconciler_watchdog":         time.Minute,
-		}
+		reconcilerGrace := baseV2ReconcilerGrace()
 		for _, endpoint := range driverEndpoints {
 			reconcilerGrace[driverEndpointReconcilerName("driver_observer", endpoint.InstanceRef)] = 30 * time.Second
 			reconcilerGrace[driverEndpointReconcilerName("driver_control_capability", endpoint.InstanceRef)] = 30 * time.Second
