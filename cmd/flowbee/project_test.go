@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,6 +11,19 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
+
+func TestConfigureProjectActorCredentialMaterializerPreparesOwnerOnlyEnvelope(t *testing.T) {
+	st := testutil.NewStore(t)
+	dir := t.TempDir()
+	t.Setenv("FLOWBEE_WORKER_ENVELOPE_DIR", filepath.Join(dir, "envelopes"))
+	configureProjectActorCredentialMaterializer(st, config.Config{DatabaseURL: filepath.Join(dir, "flowbee.db"), WorkerAuthSecret: "secret"})
+	if st.ProjectActorCredentialMaterializer == nil {
+		t.Fatal("project CLI did not configure credential materializer")
+	}
+	if _, err := st.ProjectActorCredentialMaterializer("actor", "russ", store.DriverOrchestratorRole, "envelope", 1, time.Now()); err != nil {
+		t.Fatalf("prepare envelope: %v", err)
+	}
+}
 
 func TestBindObservedProjectSessionRequiresRouteAndExactLiveLifecycleTarget(t *testing.T) {
 	ctx := context.Background()

@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -45,6 +46,7 @@ func runProject(args []string) error {
 		return err
 	}
 	defer st.Close()
+	configureProjectActorCredentialMaterializer(st, cfg)
 	if sub != "list" && sub != "ls" && sub != "status" {
 		if err := st.AcquireWriterLock(); err != nil {
 			return fmt.Errorf("project onboarding requires the control-plane writer to be stopped: %w", err)
@@ -68,6 +70,25 @@ func runProject(args []string) error {
 	default:
 		return fmt.Errorf("unknown `flowbee project` subcommand %q (want add|list|attach-repo|bind-actor|actor-lifecycle|bind-session|status)", sub)
 	}
+}
+
+// configureProjectActorCredentialMaterializer gives the offline project
+// lifecycle CLI the same one-shot, owner-only credential-envelope preparation
+// seam that serve uses. Without it an operator cannot durably commit a managed
+// actor Ensure before serve starts, while serve cannot create that actor without
+// the committed intent—a bootstrap cycle. It creates no Driver session.
+func configureProjectActorCredentialMaterializer(st *store.Store, cfg config.Config) {
+	if st == nil || strings.TrimSpace(cfg.WorkerAuthSecret) == "" {
+		return
+	}
+	dir := strings.TrimSpace(os.Getenv("FLOWBEE_WORKER_ENVELOPE_DIR"))
+	if dir == "" {
+		dir = filepath.Join(filepath.Dir(cfg.DatabaseURL), "worker-envelopes")
+	}
+	materials := driver.SQLLifecycleLaunchMaterials{
+		DB: st.DB, EnvelopeDirectory: dir, WorkerAuthSecret: []byte(cfg.WorkerAuthSecret),
+	}
+	st.ProjectActorCredentialMaterializer = materials.PrepareEnvelope
 }
 
 func runProjectAdd(ctx context.Context, st *store.Store, args []string) error {
