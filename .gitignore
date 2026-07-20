@@ -18,6 +18,7 @@
 *.db
 *.db-wal
 *.db-shm
+*.db.writer.lock
 
 # Editor / OS
 .DS_Store

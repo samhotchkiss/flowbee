@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -56,6 +57,15 @@ type Config struct {
 	// exclusion (a same-family reviewer can't rubber-stamp) in the credential instead of
 	// the worker's word. A bare "identity" leaves model_family worker-asserted (legacy).
 	EnrolledIdentities []string `yaml:"enrolled_identities"`
+	// WorkerAttestations is the production authorization policy for capabilities
+	// claimed by each enrolled worker. Authentication proves who called; this map
+	// separately bounds what that identity may do. Values use the scheduler's
+	// canonical role:/model_family:/tool: capability strings. An enrolled identity
+	// omitted from this map may authenticate (capacity collectors need that) but
+	// attests no scheduling capability. FLOWBEE_WORKER_ATTESTATIONS_JSON is the
+	// environment form, for example {"reviewer-russ":["role:code_reviewer",
+	// "model_family:grok"]}.
+	WorkerAttestations map[string][]string `yaml:"worker_attestations"`
 	// AuthLoopbackBypass lets same-box (127.0.0.1) workers skip the token even when
 	// WorkerAuthSecret is set (§12.4 "bearer fallback on loopback"). Default true.
 	AuthLoopbackBypass bool `yaml:"auth_loopback_bypass"`
@@ -126,6 +136,15 @@ type Config struct {
 	// Default false (enabled). Set FLOWBEE_SESSION_WATCH to a falsey value (0/false/off/no)
 	// to disable — mirrors FLOWBEE_SELF_UNBLOCK's reversible-switch convention exactly.
 	SessionWatchDisabled bool `yaml:"session_watch_disabled"`
+
+	// EpicSupervisionDisabled is the kill-switch for the consolidated epic-supervision
+	// ticker (epic-lane Phase 6b, plan §12.2): the ONE 2-minute-tick batch that classifies
+	// each epic pane, produces/auto-resolves attention items, reaps stranded launches +
+	// expired leases, recovers crash-window deliveries, runs the send-and-ack loop, reaps
+	// dead masters, and pings an idle master (plan §1/§12.3/§15.10). Default false (enabled).
+	// Set FLOWBEE_EPIC_SUPERVISION to a falsey value (0/false/off/no) to disable — mirrors
+	// FLOWBEE_SESSION_WATCH's reversible-switch convention exactly.
+	EpicSupervisionDisabled bool `yaml:"epic_supervision_disabled"`
 
 	// AdvisorEnabled turns on Rung E: the read-only, single-shot LLM advisor consulted for a
 	// job the deterministic janitor could not rescue (a stall past its mechanical unblock
@@ -262,14 +281,16 @@ func Load() (Config, error) {
 		}
 	}
 
-	applyEnv(&c)
+	if err := applyEnv(&c); err != nil {
+		return c, err
+	}
 	if err := c.Validate(); err != nil {
 		return c, err
 	}
 	return c, nil
 }
 
-func applyEnv(c *Config) {
+func applyEnv(c *Config) error {
 	if v := os.Getenv("FLOWBEE_DATABASE_URL"); v != "" {
 		c.DatabaseURL = v
 	}
@@ -305,6 +326,13 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("FLOWBEE_ENROLLED_IDENTITIES"); v != "" {
 		c.EnrolledIdentities = splitCSV(v)
+	}
+	if v := os.Getenv("FLOWBEE_WORKER_ATTESTATIONS_JSON"); v != "" {
+		var policy map[string][]string
+		if err := json.Unmarshal([]byte(v), &policy); err != nil {
+			return fmt.Errorf("parse FLOWBEE_WORKER_ATTESTATIONS_JSON: %w", err)
+		}
+		c.WorkerAttestations = policy
 	}
 	if v := os.Getenv("FLOWBEE_AUTH_LOOPBACK_BYPASS"); v != "" {
 		c.AuthLoopbackBypass = v == "1" || v == "true"
@@ -358,6 +386,15 @@ func applyEnv(c *Config) {
 			c.SessionWatchDisabled = false
 		}
 	}
+	// epic-supervision kill-switch: same falsey-string convention.
+	if v := os.Getenv("FLOWBEE_EPIC_SUPERVISION"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "0", "false", "off", "no", "disable", "disabled":
+			c.EpicSupervisionDisabled = true
+		default:
+			c.EpicSupervisionDisabled = false
+		}
+	}
 	// Rung-E advisor is opt-in: any truthy value enables it.
 	if v := os.Getenv("FLOWBEE_ADVISOR"); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
@@ -379,6 +416,7 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("FLOWBEE_GITHUB_DEFAULT_BRANCH"); v != "" {
 		c.GithubDefaultBranch = v
 	}
+	return nil
 }
 
 func splitCSV(v string) []string {
@@ -414,6 +452,40 @@ func (c Config) Validate() error {
 	}
 	if c.CostCeilingUSD < 0 {
 		return fmt.Errorf("cost_ceiling_usd (%.2f) must be >= 0", c.CostCeilingUSD)
+	}
+	enrolledFamilies := make(map[string]string, len(c.EnrolledIdentities))
+	for _, entry := range c.EnrolledIdentities {
+		id, family, _ := strings.Cut(strings.TrimSpace(entry), ":")
+		if id == "" {
+			return errors.New("enrolled_identities contains an empty identity")
+		}
+		if prior, exists := enrolledFamilies[id]; exists && prior != family {
+			return fmt.Errorf("enrolled identity %q declares conflicting model families", id)
+		}
+		enrolledFamilies[id] = family
+	}
+	for identity, capabilities := range c.WorkerAttestations {
+		identity = strings.TrimSpace(identity)
+		family, enrolled := enrolledFamilies[identity]
+		if identity == "" || !enrolled {
+			return fmt.Errorf("worker_attestations identity %q is not enrolled", identity)
+		}
+		seenCaps := map[string]bool{}
+		for _, capability := range capabilities {
+			capability = strings.TrimSpace(capability)
+			if capability == "" || (!strings.HasPrefix(capability, "role:") &&
+				!strings.HasPrefix(capability, "model_family:") && !strings.HasPrefix(capability, "tool:")) {
+				return fmt.Errorf("worker_attestations[%q] has invalid capability %q", identity, capability)
+			}
+			if strings.HasSuffix(capability, ":") || seenCaps[capability] {
+				return fmt.Errorf("worker_attestations[%q] has empty or duplicate capability %q", identity, capability)
+			}
+			seenCaps[capability] = true
+			if family != "" && strings.HasPrefix(capability, "model_family:") &&
+				capability != "model_family:"+family {
+				return fmt.Errorf("worker_attestations[%q] model family conflicts with enrolled identity family %q", identity, family)
+			}
+		}
 	}
 	// the F9 multi-repo registry: each repo needs a unique handle + GitHub coords, or it
 	// silently fails at runtime (no mirror, no API URL — the loops just no-op). Catch the

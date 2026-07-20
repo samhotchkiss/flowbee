@@ -28,6 +28,8 @@ func TestRunningConfigEndpointRequiresAuthAndIsRedacted(t *testing.T) {
 	authn := auth.NewBearer([]byte("server-secret"), []string{"worker"}, false)
 	srv := api.New(st, clock.NewFake(time.Unix(1000, 0)), ulid.NewMinter(nil), api.Config{
 		Authenticator: authn,
+		DriverControl: api.DriverControlReadiness{Required: true, Status: "route_unavailable",
+			Gap: "GAP-FD-003", Reason: "control origin unsupported"},
 		RunningConfig: api.RunningConfig{
 			ConfigPath:           "/home/sam/.flowbee/flowbee.yaml",
 			DatabaseURL:          "/home/sam/.flowbee/flowbee.db",
@@ -56,7 +58,8 @@ func TestRunningConfigEndpointRequiresAuthAndIsRedacted(t *testing.T) {
 		t.Fatalf("GET /v1/config status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{`"version":"test-version"`, `"github_token_present":true`, `"worker_auth_configured":true`, `"allow_self_merge":true`} {
+	for _, want := range []string{`"version":"test-version"`, `"github_token_present":true`, `"worker_auth_configured":true`, `"allow_self_merge":true`,
+		`"driver_control":{"required":true,"available":false,"status":"route_unavailable","gap":"GAP-FD-003"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("running config missing %s: %s", want, body)
 		}
@@ -71,6 +74,40 @@ func TestRunningConfigEndpointRequiresAuthAndIsRedacted(t *testing.T) {
 	srv.PrivateHandler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /configz status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRunningConfigEndpointReadsLiveDriverControlState(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir()+"/flowbee.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
+		t.Fatal(err)
+	}
+	current := api.DriverControlReadiness{Required: true, Available: true, Status: "ready"}
+	srv := api.New(st, clock.NewFake(time.Unix(1000, 0)), ulid.NewMinter(nil), api.Config{
+		DriverControl:        current,
+		DriverControlCurrent: func() api.DriverControlReadiness { return current },
+	}, "v2")
+	request := func() string {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/configz", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+		srv.PrivateHandler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("configz status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		return rec.Body.String()
+	}
+	if body := request(); !strings.Contains(body, `"available":true`) {
+		t.Fatalf("ready config=%s", body)
+	}
+	current = api.DriverControlReadiness{Required: true, Status: "route_unavailable", Gap: "GAP-FD-003", Reason: "scope revoked"}
+	if body := request(); !strings.Contains(body, `"available":false`) || !strings.Contains(body, "scope revoked") {
+		t.Fatalf("revoked config=%s", body)
 	}
 }
 

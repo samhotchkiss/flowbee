@@ -7,8 +7,13 @@ else is in scope.
 ## Branch
 
 One branch per epic: `epic/<slug>` cut from current main at start. Never
-force-push. Never rebase unless a `## Amendments` entry on this branch
-explicitly instructs it.
+force-push. Never rebase — full stop, even to catch up with main.
+
+If main moves under you and a step genuinely needs it, integrating main is
+allowed ONLY when a `## Amendments` entry on this branch explicitly instructs
+it, and ONLY as `git merge origin/main` (a merge commit) — never a rebase. The
+never-rebase rule stands no matter what an amendment says: an amendment can
+authorize a merge-of-main, never a history rewrite.
 
 ## Work order
 
@@ -35,6 +40,19 @@ Blockers: <none, or what's stopping you and what you need>
 Liveness is monitored separately (heartbeat) — `## Status` is for MEANING,
 not a keepalive ping. Don't touch it just to bump the timestamp.
 
+## Explainer
+
+Maintain `epics/<slug>-explainer.html` on your branch: a single self-contained
+HTML page (mermaid diagram + prose — follow the vendored method at
+`docs/skills/visual-explainer/SKILL.md`) that tells a human what this epic is
+building and where it stands. Write it with your FIRST commit as the
+plan-of-record (what you're building and the step flow); refresh it when a step
+completes or the plan deviates; finalize it at finish as the as-built story —
+reviewers read it. It is for humans: `## Status` stays the machine truth (the
+dashboard and gate parse it), and the explainer is NEVER parsed by automation.
+The explainer file is in scope implicitly, exactly like the epic `.md` itself,
+so keeping it current never counts as widening scope.
+
 ## Commits
 
 Commit at natural boundaries, not one giant commit at the end. Every
@@ -43,6 +61,19 @@ step-completion commit carries the trailer:
 ```
 Epic-Step: N/M — <short criterion>
 ```
+
+## Push and the draft PR
+
+Push every step-completion commit as you make it — one push per completion,
+don't batch pushes for the end. CI runs per push, so a red result localizes to
+the step that broke it instead of surfacing as one opaque failure at hour 40.
+
+Open the PR as a DRAFT right after your first step-completion push, from
+`epic/<slug>`, titled with the epic's title. Keep pushing step commits onto it;
+CI re-runs on each push and Flowbee reads the result per head. Leave it a draft
+the whole way — a draft PR is the running CI surface, not a request for review.
+Do NOT mark it ready or label it `needs-claude` while steps remain (that
+happens once, at finish).
 
 ## Scope
 
@@ -67,9 +98,12 @@ independent — halt instead. Do not silently widen scope.
   `go test ./...` — this must include `test/acceptance`, not just unit
   packages. A step that only ran unit tests is not validated.
 - Migrations: never renumber or reuse a filename already applied anywhere
-  (main or another live epic branch). New migrations take the next free
-  number after what's on main when you write them — check main right
-  before adding one, since another epic may have taken a number meanwhile.
+  (main or another live epic branch). Never hand-pick a migration number —
+  reserve one with `flowbee migration reserve <slug>` (it appends the next
+  free number to `internal/store/migrations/LADDER.md` under a lock and
+  prints the filename to create). Parallel epics that both guess a number
+  collide; the allocator + the `laddercheck` CI gate exist to stop exactly
+  that. Create the file the allocator names, and nothing else.
 - Never print, log, cat, or echo `serve.env` or `fleet.env` — secrets. If a
   step seems to require reading one, that's a blocker, not a workaround.
 
@@ -77,9 +111,11 @@ independent — halt instead. Do not silently widen scope.
 
 Full `go test ./...` (including `test/acceptance`) green. Finalize
 `## Status`: `State: done`, every checklist box checked with its evidence.
-Open exactly one PR from `epic/<slug>` titled with the epic's title, body
-linking the epic file and summarizing what shipped. Label it `needs-claude`.
-Then stop — do not keep working after the PR is open.
+Then take the DRAFT PR you opened early (see Push) to completion: push the
+final commits, fill in the body linking the epic file and summarizing what
+shipped, mark it READY FOR REVIEW, and label it `needs-claude`. It is exactly
+one PR per epic — the same one you opened as a draft, now ready — never a
+second PR. Then stop — do not keep working after the PR is marked ready.
 
 ## Escalation
 

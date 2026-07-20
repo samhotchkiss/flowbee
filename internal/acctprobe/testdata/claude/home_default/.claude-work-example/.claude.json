@@ -1,0 +1,24 @@
+{
+  "oauthAccount": {
+    "accountUuid": "acct-work-0000-0000-000000000002",
+    "emailAddress": "work@example.com",
+    "organizationName": "Example Work Org",
+    "organizationUuid": "org-work-0000-0000-000000000002",
+    "organizationRateLimitTier": "default_max_5x",
+    "seatTier": "enterprise"
+  },
+  "cachedUsageUtilization": {
+    "fetchedAtMs": 1784200500000,
+    "accountUuid": "acct-work-0000-0000-000000000002",
+    "utilization": {
+      "five_hour": {"utilization": 5, "resets_at": "2026-07-16T22:00:00+00:00"},
+      "seven_day": {"utilization": 60, "resets_at": "2026-07-21T00:00:00+00:00"},
+      "extra_usage": {"is_enabled": true, "monthly_limit": 100, "used_credits": 12},
+      "limits": [
+        {"kind": "session", "group": "session", "percent": 5, "severity": "normal", "resets_at": "2026-07-16T22:00:00+00:00", "scope": null, "is_active": true},
+        {"kind": "weekly_all", "group": "weekly", "percent": 60, "severity": "critical", "resets_at": "2026-07-21T00:00:00+00:00", "scope": null, "is_active": true}
+      ],
+      "spend": {"percent": 30, "enabled": true}
+    }
+  }
+}

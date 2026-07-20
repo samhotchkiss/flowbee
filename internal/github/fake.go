@@ -559,6 +559,20 @@ func (f *Fake) DeletedBranches() []string {
 	return append([]string(nil), f.deletedBranches...)
 }
 
+// BranchExists implements the cleanup verification read. Branches exist by
+// default in the fake until DeleteBranch records their exact name.
+func (f *Fake) BranchExists(ctx context.Context, branch string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("BranchExists(%s)", branch))
+	for _, deleted := range f.deletedBranches {
+		if deleted == branch {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // Drafted returns the PR numbers converted back to draft (compensation assertions).
 func (f *Fake) Drafted() []int {
 	f.mu.Lock()

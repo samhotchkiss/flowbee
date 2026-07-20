@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // Broker is a tiny in-process pub/sub for the read-only /v1/events SSE feed. The
@@ -22,10 +23,15 @@ func NewBroker() *Broker {
 
 // LifeEvent is one SSE payload describing a job lifecycle transition.
 type LifeEvent struct {
-	JobID string `json:"job_id"`
-	State string `json:"state"`
-	Event string `json:"event"`
-	Epoch int    `json:"lease_epoch"`
+	ProjectID string `json:"project_id,omitempty"`
+	JobID     string `json:"job_id"`
+	State     string `json:"state"`
+	Event     string `json:"event"`
+	Epoch     int    `json:"lease_epoch"`
+	// DigestSeq rides epic-lane ("epics"-topic) nudges so a constrained consumer (the
+	// elgato deck, §15.16b) can dedupe against the digest it last polled WITHOUT a re-poll.
+	// Zero (omitted) for non-epic lifecycle events. SSE stays a lossy nudge; poll is truth.
+	DigestSeq int64 `json:"digest_seq,omitempty"`
 }
 
 func (b *Broker) subscribe() (int, chan []byte) {
@@ -101,18 +107,51 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	// SSE hygiene (plan §15.16b): a keepalive COMMENT every 20s so a half-open socket on a
+	// slept laptop is detected instead of going silently stale. Comment lines (":"-prefixed)
+	// are ignored by every SSE client, so this never disturbs a data consumer.
+	keepalive := time.NewTicker(20 * time.Second)
+	defer keepalive.Stop()
+
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-keepalive.C:
+			if _, err := w.Write([]byte(": keepalive\n\n")); err != nil {
+				return
+			}
+			flusher.Flush()
 		case msg, ok := <-ch:
 			if !ok {
 				return
 			}
+			// named event: per topic (plan §15.16b) so a client can subscribe by topic. The
+			// topic is the event's State bucket ("epics" for epic-lane nudges), defaulting to
+			// "lifecycle". A data-only consumer (which reads only "data:" lines) is unaffected.
+			topic := topicOf(msg)
+			_, _ = w.Write([]byte("event: " + topic + "\n"))
 			_, _ = w.Write([]byte("data: "))
 			_, _ = w.Write(msg)
 			_, _ = w.Write([]byte("\n\n"))
 			flusher.Flush()
 		}
 	}
+}
+
+// topicOf extracts a small, versioned set of SSE topics. Project events carry
+// project_id in their payload so a portfolio client never has to infer scope
+// from a job, slug, or terminal identity. Best-effort — an unparseable blob
+// defaults to lifecycle (SSE is a lossy nudge; poll is truth).
+func topicOf(blob []byte) string {
+	var e struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal(blob, &e) == nil {
+		switch e.State {
+		case "epics", "projects":
+			return e.State
+		}
+	}
+	return "lifecycle"
 }

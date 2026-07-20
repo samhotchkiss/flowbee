@@ -26,6 +26,10 @@ type Client struct {
 	// every lease so the server can record it on the bound event for the §F card. Display
 	// only; empty omits the param (older/unlabeled workers just show no model on the card).
 	Model string
+	// SeatID is the operator-bound physical provider seat used by the v2
+	// fail-closed capacity gate. It is never inferred from an account label, host,
+	// CWD, or worker identity.
+	SeatID string
 }
 
 func New(baseURL string) *Client {
@@ -100,7 +104,15 @@ type RegisterResponse struct {
 
 func (c *Client) Register(ctx context.Context, reg Registration) (RegisterResponse, error) {
 	var out RegisterResponse
-	if err := c.postJSON(ctx, "/v1/workers/register", nil, reg, &out); err != nil {
+	path := "/v1/workers/register"
+	if reg.Identity != "" {
+		// Bearer-authenticated servers ignore this as an authority source and bind
+		// registration to the token. It exists for the explicit loopback-bypass
+		// posture, whose authenticator binds identity from the query string because
+		// middleware cannot safely consume and replay the JSON body.
+		path += "?identity=" + url.QueryEscape(reg.Identity)
+	}
+	if err := c.postJSON(ctx, path, nil, reg, &out); err != nil {
 		return out, err
 	}
 	return out, nil
@@ -109,6 +121,7 @@ func (c *Client) Register(ctx context.Context, reg Registration) (RegisterRespon
 // LeaseGrant is the §7.2 lease envelope.
 type LeaseGrant struct {
 	JobID        string `json:"job_id"`
+	ProjectID    string `json:"project_id"`
 	Kind         string `json:"kind"`
 	Role         string `json:"role"`
 	BaseSHA      string `json:"base_sha"`
@@ -190,6 +203,23 @@ type LeaseContext struct {
 	// (with its own git credential), and derives its local mirror path per repo. Empty
 	// in single-repo deployments (the worker falls back to its configured --repo-url).
 	RepoURL string `json:"repo_url,omitempty"`
+	// EpicCriteria is the epic-lane Phase 3 criteria-driven review section (task
+	// brief point 3): for a code_reviewer job bound to an epic PR (branch
+	// epic/<slug>, detected server-side via store.EpicForHeadSHA), the epic's Goal,
+	// Constraints/Non-Goals, and full ## Steps list (each with its Validate:
+	// criterion) — content that is FROZEN at epic launch (spec immutability), read
+	// once alongside EpicChecklist. Empty for every non-epic-PR review (zero
+	// behavior change).
+	EpicCriteria string `json:"epic_criteria,omitempty"`
+	// EpicChecklist is the epic's claimed ## Status checklist (each step's [x]/[ ]
+	// plus its evidence string), read AS OF the SAME PR head EpicCriteria was read
+	// from — kept SEPARATE from EpicCriteria (rather than one combined string)
+	// because it is the part that scales with step count/evidence verbosity and is
+	// therefore the part renderReviewBrief truncates first when the brief would
+	// exceed maxTotalBriefBytes (the fixed Goal/Constraints/Steps text stays intact
+	// so the reviewer always knows what it's judging against, even if the claimed
+	// status itself is cut short).
+	EpicChecklist string `json:"epic_checklist,omitempty"`
 }
 
 // Lease long-polls for a lease. ok=false means a 204 (no work this round).
@@ -214,6 +244,9 @@ func (c *Client) leaseWithLens(ctx context.Context, identity, family, role, lens
 	q.Set("model_family", family)
 	if c.Model != "" {
 		q.Set("model", c.Model)
+	}
+	if c.SeatID != "" {
+		q.Set("seat_id", c.SeatID)
 	}
 	// F6 capacity: declare this worker's agent login so dispatch can gate it OUT when the
 	// account is rate-limited (the per-account ceiling). Empty/unset => never gated.

@@ -12,6 +12,7 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/config"
 	gh "github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/job"
+	actorprotocol "github.com/samhotchkiss/flowbee/protocol/flowbee/v2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -121,7 +122,29 @@ func Doctor(ctx context.Context, opts DoctorOptions) (DoctorReport, error) {
 	// and surface an OPEN API even when it's the intended (trusted-tailnet) posture.
 	checkWorkerAuth(cfg, &rep)
 
+	// (6) v2 actor contract: this is embedded in the binary, so a malformed or
+	// incomplete operating/recovery bundle fails doctor before any actor receives a
+	// lease. The content hash is the compatibility identity actors present during
+	// their startup handshake.
+	checkActorProtocol(&rep)
+
 	return rep, nil
+}
+
+func checkActorProtocol(rep *DoctorReport) {
+	contract, err := actorprotocol.Load()
+	if err != nil {
+		rep.add("actor-protocol", StatusFail, err.Error())
+		return
+	}
+	hash, err := actorprotocol.BundleHash()
+	if err != nil {
+		rep.add("actor-protocol", StatusFail, err.Error())
+		return
+	}
+	rep.add("actor-protocol", StatusPass,
+		fmt.Sprintf("%s version=%s bundle=%s roles=%d recovery_codes=%d",
+			contract.Protocol.ID, contract.Version(), hash, len(contract.Roles), len(contract.RecoveryCodes)))
 }
 
 // checkWorkerAuth mirrors serve's §7.6 trust-boundary decision so an operator sees the

@@ -390,6 +390,20 @@ func TestCheckWorkerAuth(t *testing.T) {
 	}
 }
 
+func TestDoctorActorProtocolBundleIsGreenAndIdentified(t *testing.T) {
+	var rep DoctorReport
+	checkActorProtocol(&rep)
+	got := findCheck(rep, "actor-protocol")
+	if got.Status != StatusPass {
+		t.Fatalf("actor protocol check=%+v", got)
+	}
+	for _, want := range []string{"flowbee.actor-protocol/v2", "version=2.0", "bundle=sha256:", "roles=10"} {
+		if !strings.Contains(got.Detail, want) {
+			t.Fatalf("actor protocol detail %q missing %q", got.Detail, want)
+		}
+	}
+}
+
 // TestDoctorHonorsConfigPath: ConfigPath (what serve uses via FLOWBEE_CONFIG) must win
 // over Root — doctor validates THAT file and resolves flows/ next to it, so it checks
 // the same config serve runs instead of a stray cwd/flowbee.yaml.

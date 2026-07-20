@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/ledger"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
@@ -61,6 +62,44 @@ func TestAutonomousMergeHeadMoveRearmsReviewAndAbandonsOutbox(t *testing.T) {
 	}
 	if status != "abandoned" {
 		t.Fatalf("stale merge outbox status=%q want abandoned", status)
+	}
+}
+
+func TestAutonomousMergeBaseMoveRearmsReviewAndAbandonsOutbox(t *testing.T) {
+	st, fake, sender, _ := newSender(t)
+	ctx := context.Background()
+	sender.WithHistory(&fakeHistory{tip: "head-sha", diffOut: diffAdding("docs/operating.md", "clean")}, "main")
+	mergingJob(t, st, "j")
+	// The head still matches the verdict, but main advanced after review.
+	setLiveGreenPR(fake, 42, "moved-base-sha", "head-sha")
+
+	if _, err := sender.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if n := fake.Enqueued(); len(n) != 0 {
+		t.Fatalf("a PR whose live base differs from the reviewed base must not merge, got %v", n)
+	}
+	if j, _ := st.GetJob(ctx, "j"); j.State != job.StateReady || j.Verdict != nil || j.BaseSHA != "moved-base-sha" || j.HeadSHA != "" {
+		t.Fatalf("moved-base state/verdict/base/head=%s/%+v/%s/%s, want ready/nil/moved-base-sha/empty", j.State, j.Verdict, j.BaseSHA, j.HeadSHA)
+	}
+	events, err := st.LoadEvents(ctx, "j")
+	if err != nil {
+		t.Fatalf("load events: %v", err)
+	}
+	folded, err := ledger.Fold(events)
+	if err != nil {
+		t.Fatalf("fold events: %v", err)
+	}
+	if folded.BaseSHA != "moved-base-sha" || folded.HeadSHA != "" {
+		t.Fatalf("folded base/head=%s/%s, want moved-base-sha/empty", folded.BaseSHA, folded.HeadSHA)
+	}
+	var status string
+	if err := st.DB.QueryRowContext(ctx,
+		`SELECT status FROM outbox WHERE job_id='j' AND action=?`, store.ActionEnqueueMerge).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "abandoned" {
+		t.Fatalf("stale-base merge outbox status=%q want abandoned", status)
 	}
 }
 

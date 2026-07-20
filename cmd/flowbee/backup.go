@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/config"
@@ -85,6 +87,138 @@ func takeSnapshot(ctx context.Context, db *sql.DB, dir string, keep int) (path s
 		pruned = pruneSnapshots(dir, keep)
 	}
 	return snap, fi.Size(), pruned, nil
+}
+
+// takePreMigrationSnapshot is the mandatory rollback point for an existing
+// database before forward-only migrations. Unlike an operator backup it accepts
+// a legitimately empty ledger: schema integrity and the exact pre-migration
+// version set are the proof that matters here.
+func takePreMigrationSnapshot(ctx context.Context, db *sql.DB, dir string, pending []string) (string, error) {
+	if len(pending) == 0 {
+		return "", nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create backup dir %q: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", fmt.Errorf("secure backup dir %q: %w", dir, err)
+	}
+	stamp := time.Now().Format("20060102-150405.000")
+	first, last := strings.TrimSuffix(pending[0], ".sql"), strings.TrimSuffix(pending[len(pending)-1], ".sql")
+	path := filepath.Join(dir, fmt.Sprintf("pre-migration-%s-to-%s-%s.db", first, last, stamp))
+	if err := takeVerifiedRollbackSnapshot(ctx, db, path); err != nil {
+		return "", fmt.Errorf("pre-migration snapshot: %w", err)
+	}
+	return path, nil
+}
+
+// takeVerifiedRollbackSnapshot creates a checkpointed SQLite copy and proves it
+// carries the exact applied-migration set, passes quick_check, and has no foreign
+// key violations. It accepts an empty ledger, which is valid for a pre-migration
+// or pre-restore rollback point.
+func takeVerifiedRollbackSnapshot(ctx context.Context, db *sql.DB, path string) error {
+	appliedBefore, err := appliedMigrationVersions(ctx, db)
+	if err != nil {
+		return fmt.Errorf("read source migration versions: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "VACUUM INTO ?", path); err != nil {
+		return err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.Remove(path)
+		}
+	}()
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("secure snapshot: %w", err)
+	}
+	check, err := sql.Open("sqlite", path)
+	if err != nil {
+		return fmt.Errorf("open snapshot: %w", err)
+	}
+	defer check.Close()
+	var quick string
+	if err := check.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&quick); err != nil || quick != "ok" {
+		if err != nil {
+			return fmt.Errorf("verify snapshot: %w", err)
+		}
+		return fmt.Errorf("verify snapshot: quick_check=%q", quick)
+	}
+	rows, err := check.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return fmt.Errorf("verify snapshot foreign keys: %w", err)
+	}
+	hasForeignKeyFailure := rows.Next()
+	if closeErr := rows.Close(); closeErr != nil {
+		return closeErr
+	}
+	if hasForeignKeyFailure {
+		return errors.New("verify snapshot: foreign_key_check failed")
+	}
+	appliedAfter, err := appliedMigrationVersions(ctx, check)
+	if err != nil {
+		return fmt.Errorf("verify snapshot migration versions: %w", err)
+	}
+	if strings.Join(appliedBefore, "\x00") != strings.Join(appliedAfter, "\x00") {
+		return fmt.Errorf("verify snapshot migration versions: source=%v snapshot=%v", appliedBefore, appliedAfter)
+	}
+	keep = true
+	return nil
+}
+
+func appliedMigrationVersions(ctx context.Context, db *sql.DB) ([]string, error) {
+	var hasTable int
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master
+		WHERE type='table' AND name='schema_migrations')`).Scan(&hasTable); err != nil {
+		return nil, err
+	}
+	if hasTable == 0 {
+		return nil, nil
+	}
+	rows, err := db.QueryContext(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var versions []string
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return nil, err
+		}
+		versions = append(versions, version)
+	}
+	return versions, rows.Err()
+}
+
+// migrateWithRollbackSnapshot is the only production entry point for applying
+// embedded migrations. Existing databases are snapshotted and independently
+// verified before the first forward-only migration is attempted; fresh empty
+// databases do not need a rollback point. Keeping this policy at the command
+// boundary lets store.MigrateUp remain a small primitive for isolated tests
+// while making serve, migrate, seed, and offline human bootstrap fail closed in
+// exactly the same way.
+func migrateWithRollbackSnapshot(ctx context.Context, db *sql.DB, dir string) (string, error) {
+	pending, err := store.PendingMigrations(ctx, db)
+	if err != nil {
+		return "", err
+	}
+	existing, err := store.HasUserSchema(ctx, db)
+	if err != nil {
+		return "", err
+	}
+	var snapshot string
+	if existing && len(pending) > 0 {
+		snapshot, err = takePreMigrationSnapshot(ctx, db, dir, pending)
+		if err != nil {
+			return "", fmt.Errorf("refusing migration without a verified rollback snapshot: %w", err)
+		}
+	}
+	if err := store.MigrateUp(ctx, db); err != nil {
+		return snapshot, err
+	}
+	return snapshot, nil
 }
 
 // verifySnapshot opens the freshly-written snapshot read-only and runs an integrity

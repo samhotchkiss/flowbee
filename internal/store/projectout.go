@@ -179,11 +179,13 @@ func (s *Store) EnqueueMergeForJob(ctx context.Context, jobID string, now time.T
 
 // InvalidateStaleMergeAuthorization fails closed after GitHub rejects an
 // expected-head merge or project-OUT detects that its outbox row no longer
-// matches the persisted verdict. The verdict is invalidated, the build is
-// re-armed, and every pending SHA-bound rendering is retained as abandoned
+// matches the persisted verdict. When observedBase is non-empty, the replacement
+// build is bound to that live integration head; otherwise the prior base is
+// preserved until reconcile refreshes it. The verdict is invalidated, the build
+// is re-armed, and every pending SHA-bound rendering is retained as abandoned
 // history. For adopted PRs, keep the cumulative patch so base-starting builders
 // can apply it before making the requested correction.
-func (s *Store) InvalidateStaleMergeAuthorization(ctx context.Context, jobID string, now time.Time) error {
+func (s *Store) InvalidateStaleMergeAuthorization(ctx context.Context, jobID, observedBase string, now time.Time) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		j, seq, err := loadJobTx(ctx, tx, jobID)
 		if err != nil {
@@ -202,7 +204,7 @@ func (s *Store) InvalidateStaleMergeAuthorization(ctx context.Context, jobID str
 			   FROM jobs WHERE id=?`, jobID).Scan(&adopted, &cumulativePatch, &declared); err != nil {
 			return err
 		}
-		if err := supersedeTx(ctx, tx, &j, seq, ReconciledPR{BaseSHA: j.BaseSHA}, "project-out", now); err != nil {
+		if err := supersedeTx(ctx, tx, &j, seq, ReconciledPR{BaseSHA: observedBase}, "project-out", now); err != nil {
 			return err
 		}
 		if adopted == 1 && cumulativePatch != "" {

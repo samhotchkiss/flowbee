@@ -34,7 +34,7 @@ func TestStaleReviewBuilds(t *testing.T) {
 	mainTip := "tip999"
 	seed("stale", "old111", "diff --git a/f b/f\n+x", "review_pending")  // behind + has patch -> stale
 	seed("current", mainTip, "diff --git a/f b/f\n+y", "review_pending") // already on tip -> skip
-	seed("nopatch", "old111", "", "review_pending")                     // behind but no patch -> skip
+	seed("nopatch", "old111", "", "review_pending")                      // behind but no patch -> skip
 	seed("building", "old111", "diff --git a/f b/f\n+z", "building")     // not review_pending -> skip
 
 	ids, err := st.StaleReviewBuilds(ctx, "", mainTip)

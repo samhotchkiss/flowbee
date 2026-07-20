@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/samhotchkiss/flowbee/client"
 )
@@ -123,6 +124,163 @@ func TestRenderReviewBriefCapsOversizedDiff(t *testing.T) {
 	}
 	if !strings.Contains(fb, "$FLOWBEE_DIFF_FILE") || !strings.Contains(fb, "MUST open and read") {
 		t.Fatalf("an oversized diff must fall back to a forceful $FLOWBEE_DIFF_FILE read instruction\n%s", fb)
+	}
+}
+
+// TestRenderReviewBriefNonEpicPRUnaffected proves the epic-lane Phase 3 brief
+// injection is a complete no-op when the lease context carries no epic criteria
+// (the overwhelmingly common, non-epic-PR review) — byte-identical to the brief a
+// pre-Phase-3 build would have rendered from the same non-epic fields.
+func TestRenderReviewBriefNonEpicPRUnaffected(t *testing.T) {
+	withEpic := &client.LeaseContext{Identity: "r", Task: "t", Diff: "d"}
+	withoutEpicFields := &client.LeaseContext{Identity: "r", Task: "t", Diff: "d"}
+	got := renderReviewBrief("job-1", "code_reviewer", withEpic)
+	want := renderReviewBrief("job-1", "code_reviewer", withoutEpicFields)
+	if got != want {
+		t.Fatalf("a lease context with no EpicCriteria must render byte-identically:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(got, "Epic Contract") {
+		t.Fatalf("brief should not mention the Epic Contract section at all when EpicCriteria is empty\n%s", got)
+	}
+}
+
+// TestRenderReviewBriefInjectsEpicCriteria: a code_reviewer job carrying epic
+// criteria gets the structured "Epic Contract" section, including the claimed status
+// checklist, when it comfortably fits the size cap.
+func TestRenderReviewBriefInjectsEpicCriteria(t *testing.T) {
+	c := &client.LeaseContext{
+		Identity: "r", Task: "t", Diff: "d",
+		EpicCriteria:  "**Goal:**\n\nShip the thing.\n\n1. step one\n   Validate: go test ./...\n",
+		EpicChecklist: "State: done\n\n- [x] Step 1 — step one (evidence: go test passed)\n",
+	}
+	brief := renderReviewBrief("job-1", "code_reviewer", c)
+	for _, want := range []string{
+		"Epic Contract", "Ship the thing.", "step one", "Validate: go test ./...",
+		"Claimed status", "State: done", "[x] Step 1", "go test passed",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("epic brief missing %q\n%s", want, brief)
+		}
+	}
+}
+
+// TestRenderReviewBriefEpicDecisionOverridesDiffOnly (review M2): for an epic PR the
+// Decision block must be the epic-specific one — which renders LAST and explicitly
+// overrides the generic diff-only carve-outs — not the generic "do not bounce for
+// things you could not confirm without the source/tests" framing (which, landing last,
+// would silently un-supersede the RUN-THE-CODE instruction the Epic Contract carries).
+func TestRenderReviewBriefEpicDecisionOverridesDiffOnly(t *testing.T) {
+	epic := &client.LeaseContext{
+		Identity: "r", Task: "t", Diff: "d",
+		EpicCriteria:  "**Goal:**\n\nShip it.\n\n- RUN THE CODE and run targeted tests.\n",
+		EpicChecklist: "State: done\n- [x] Step 1 — x (evidence: y)\n",
+	}
+	brief := renderReviewBrief("job-1", "code_reviewer", epic)
+	if !strings.Contains(brief, "EPIC PR — this OVERRIDES") {
+		t.Fatalf("epic brief must carry the epic-specific Decision block\n%s", brief)
+	}
+	// the generic diff-only Decision carve-out must NOT be the one that lands for an epic.
+	if strings.Contains(brief, "those are not blocking") {
+		t.Fatalf("epic brief must NOT emit the generic diff-only Decision block\n%s", brief)
+	}
+	// the generic diff-only TOP block ("you are NOT expected to run tests … FROM THE DIFF")
+	// must be SUPPRESSED for an epic PR too — absence beats supersession, so a top-to-bottom
+	// read never encounters a "don't run anything" framing before the RUN-THE-CODE contract.
+	if strings.Contains(brief, "NOT expected to run tests") {
+		t.Fatalf("epic brief must SUPPRESS the generic diff-only top block\n%s", brief)
+	}
+	// ordering: the overriding Decision must come AFTER the Epic Contract section so a
+	// top-to-bottom read ends on "run the code", not on a diff-only framing.
+	if ci, di := strings.Index(brief, "Epic Contract"), strings.Index(brief, "EPIC PR — this OVERRIDES"); ci < 0 || di < ci {
+		t.Fatalf("the epic Decision (%d) must render after the Epic Contract section (%d)", di, ci)
+	}
+
+	// a NON-epic review keeps the generic Decision block unchanged.
+	generic := renderReviewBrief("job-1", "code_reviewer", &client.LeaseContext{Identity: "r", Task: "t", Diff: "d"})
+	if !strings.Contains(generic, "those are not blocking") {
+		t.Fatalf("a non-epic review must keep the generic Decision block\n%s", generic)
+	}
+	// the top diff-only block still renders for an ordinary (non-epic) review.
+	if !strings.Contains(generic, "NOT expected to run tests") {
+		t.Fatalf("a non-epic review must keep the generic diff-only top block\n%s", generic)
+	}
+	if strings.Contains(generic, "EPIC PR — this OVERRIDES") {
+		t.Fatalf("a non-epic review must NOT carry the epic Decision block\n%s", generic)
+	}
+}
+
+// TestRenderReviewBriefTruncatesEpicChecklistNotCriteria: when the FULL epic section
+// (fixed criteria + checklist) would blow the total brief cap, the FIXED
+// Goal/Constraints/Steps criteria stays intact and only the CHECKLIST is truncated,
+// with an explicit note — the brief never silently drops the epic's own contract, and
+// never exceeds maxTotalBriefBytes (the argv-limit guard every brief must respect).
+func TestRenderReviewBriefTruncatesEpicChecklistNotCriteria(t *testing.T) {
+	criteria := "**Goal:**\n\nShip the thing UNIQUE_GOAL_MARKER.\n\n"
+	giantChecklist := strings.Repeat("- [x] Step N — done (evidence: blah blah blah)\n", 10000) // huge
+	c := &client.LeaseContext{
+		Identity: "r", Task: "t", Diff: "d",
+		EpicCriteria:  criteria,
+		EpicChecklist: giantChecklist,
+	}
+	brief := renderReviewBrief("job-1", "code_reviewer", c)
+	if len(brief) > maxTotalBriefBytes {
+		t.Fatalf("rendered brief (%d bytes) must never exceed maxTotalBriefBytes (%d) — argv limit", len(brief), maxTotalBriefBytes)
+	}
+	if !strings.Contains(brief, "UNIQUE_GOAL_MARKER") {
+		t.Fatalf("the FIXED criteria (Goal/Constraints/Steps) must survive truncation intact\n%s", brief[:2000])
+	}
+	if !strings.Contains(brief, "TRUNCATED") {
+		t.Fatalf("an oversized checklist must be truncated WITH an explicit note, not silently cut\n%s", brief[len(brief)-2000:])
+	}
+	if strings.Contains(brief, giantChecklist) {
+		t.Fatal("the full giant checklist must NOT be embedded whole")
+	}
+}
+
+// TestRenderReviewBriefTruncatesGiantEpicCriteria (review F5): the criteria section
+// is only "fixed" per epic, not fixed in SIZE — a pathological Steps list can alone
+// exceed the total cap, so the criteria must ALSO truncate (with a note) rather than
+// being written unconditionally past the argv limit.
+func TestRenderReviewBriefTruncatesGiantEpicCriteria(t *testing.T) {
+	giantCriteria := "UNIQUE_CRITERIA_HEAD_MARKER\n" +
+		strings.Repeat("999. do a pathological amount of step text here\n   Validate: go test ./...\n", 8000)
+	c := &client.LeaseContext{
+		Identity: "r", Task: "t", Diff: "d",
+		EpicCriteria:  giantCriteria,
+		EpicChecklist: "State: done\n- [x] Step 1 — x (evidence: y)\n",
+	}
+	brief := renderReviewBrief("job-1", "code_reviewer", c)
+	if len(brief) > maxTotalBriefBytes {
+		t.Fatalf("rendered brief (%d bytes) must never exceed maxTotalBriefBytes (%d) even for a giant criteria", len(brief), maxTotalBriefBytes)
+	}
+	if !strings.Contains(brief, "UNIQUE_CRITERIA_HEAD_MARKER") {
+		t.Fatal("the criteria's head must survive (truncated from the tail, not dropped)")
+	}
+	if !strings.Contains(brief, "criteria TRUNCATED") {
+		t.Fatal("a truncated criteria must carry an explicit note")
+	}
+	if !strings.Contains(brief, "Claimed status") {
+		t.Fatal("the claimed-status section header must survive even when the criteria was truncated")
+	}
+}
+
+// TestRenderReviewBriefEpicTruncationIsRuneSafe (review F5): a byte-count cut can
+// land mid-rune (the epic checklist format itself uses multi-byte em dashes), and a
+// naive s[:budget] slice would leave invalid UTF-8 in the rendered brief.
+func TestRenderReviewBriefEpicTruncationIsRuneSafe(t *testing.T) {
+	// worst case: the truncatable content is ALL multi-byte runes, so any misaligned
+	// byte cut is guaranteed to split one.
+	c := &client.LeaseContext{
+		Identity: "r", Task: "t", Diff: "d",
+		EpicCriteria:  strings.Repeat("—", 200_000),
+		EpicChecklist: strings.Repeat("—", 200_000),
+	}
+	brief := renderReviewBrief("job-1", "code_reviewer", c)
+	if len(brief) > maxTotalBriefBytes {
+		t.Fatalf("rendered brief (%d bytes) exceeds the cap", len(brief))
+	}
+	if !utf8.ValidString(brief) {
+		t.Fatal("truncation split a multi-byte rune: the rendered brief is not valid UTF-8")
 	}
 }
 

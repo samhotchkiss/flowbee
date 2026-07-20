@@ -19,6 +19,25 @@ import (
 	"strings"
 )
 
+// RepoMirrorPath resolves a repo's control-plane bare mirror path from the shared
+// FLOWBEE_MIRROR_PATH root (base) and a repo id. The legacy single-repo "default"
+// (or empty id) keeps using base directly; any additional repo gets a sibling
+// <dir>/<id>.git, so a non-default repo's build never resolves a base SHA (or reads
+// a file) from another repo's tree. Empty when no mirror is configured (base == "").
+//
+// This is the ONE derivation both cmd/flowbee's controlMirrorFor and internal/api's
+// per-repo mirror lookup share, so they cannot drift (previously duplicated in two
+// packages that could disagree).
+func RepoMirrorPath(base, repoID string) string {
+	if base == "" {
+		return ""
+	}
+	if repoID == "" || repoID == "default" {
+		return base
+	}
+	return filepath.Join(filepath.Dir(base), repoID+".git")
+}
+
 // gitCredHelper is an inline git credential helper that supplies a GitHub token from the
 // ENVIRONMENT (FLOWBEE_GITHUB_TOKEN, which the control-plane process already holds), so
 // the token never appears in argv. argv (/proc/pid/cmdline) is world-readable and shows

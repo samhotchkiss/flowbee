@@ -137,7 +137,7 @@ func reReview(t *testing.T, st *store.Store, id, reviewer string, i int) {
 	if _, err := st.ClaimReviewJob(ctx, store.ClaimReviewParams{
 		JobID: id, LeaseID: fmt.Sprintf("rl-%s-%d", id, i), Identity: reviewer, ModelFamily: "opus",
 		Attested: []string{"role:code_reviewer", "model_family:opus"},
-		TTL: time.Minute, Now: now.Add(2 * time.Second),
+		TTL:      time.Minute, Now: now.Add(2 * time.Second),
 	}); err != nil {
 		t.Fatalf("re-claim review %d: %v", i, err)
 	}

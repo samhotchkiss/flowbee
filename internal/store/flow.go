@@ -2,10 +2,13 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/engine"
@@ -103,6 +106,7 @@ type ClaimReviewParams struct {
 	JobID       string
 	LeaseID     string
 	Identity    string
+	SeatID      string // v2 fail-closed physical capacity seat; never inferred from account label.
 	ModelFamily string
 	Model       string // ACTUAL model/agent doing the work (e.g. "codex"); recorded on the bound event for the card. Distinct from the ModelFamily anti-affinity tag.
 	// Lens is the resolved review lens (F5) fenced into the lease for this
@@ -112,6 +116,7 @@ type ClaimReviewParams struct {
 	Attested []string
 	TTL      time.Duration
 	Now      time.Time
+	Fair     *ProjectFairClaim
 }
 
 // ClaimReviewJob runs the atomic claim for the code_review gate stage:
@@ -121,10 +126,16 @@ type ClaimReviewParams struct {
 func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease.Lease, error) {
 	deadline := p.Now.Add(p.TTL)
 	var result *lease.Lease
+	var bindingHold error
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		var reqJSON, curState string
+		if err := projectConcurrencyGateTx(ctx, tx, p.JobID); err != nil {
+			return err
+		}
+		var reqJSON, curState, domain, epicID string
 		if err := tx.QueryRowContext(ctx,
-			`SELECT required_capabilities, state FROM jobs WHERE id = ?`, p.JobID).Scan(&reqJSON, &curState); err != nil {
+			`SELECT required_capabilities, state, COALESCE(workflow_domain,'legacy'),
+			        COALESCE(epic_delivery_id,'') FROM jobs WHERE id = ?`, p.JobID).
+			Scan(&reqJSON, &curState, &domain, &epicID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return lease.ErrLostRace
 			}
@@ -141,6 +152,62 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 		// limit could still claim a review and overcommit. No-op when no slots advertised.
 		if err := modelSlotGateTx(ctx, tx, "", p.Identity, p.ModelFamily); err != nil {
 			return err
+		}
+
+		// Native epic reviews are routed only from durable, exact Driver
+		// incarnations. The polling worker supplies its Flowbee identity, never raw
+		// tmux/session coordinates. Missing or ambiguous route facts commit a visible
+		// hold and do not claim the job or create a send action.
+		var projectID, deliveryRepo, head, base string
+		var prNumber, deliveryVersion int
+		var recipientBinding DriverSessionBinding
+		if domain == "epic_v2" && epicID != "" {
+			if err := tx.QueryRowContext(ctx, `SELECT d.project_id,d.state_version,d.delivery_repo,
+				COALESCE(a.pr_number,0),d.head_sha,d.base_sha
+				FROM epic_deliveries d JOIN epic_artifacts a ON a.epic_id=d.epic_id
+				WHERE d.epic_id=? AND d.state='review_queued' AND d.review_job_id=?
+				  AND d.hold_reason=''`, epicID, p.JobID).
+				Scan(&projectID, &deliveryVersion, &deliveryRepo, &prNumber, &head, &base); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return lease.ErrLostRace
+				}
+				return err
+			}
+			if s.EnableCapacityV2 {
+				decision, routeErr := capacityRouteForSeatQuery(ctx, tx, p.SeatID, p.Now, 5*time.Minute)
+				if routeErr != nil {
+					return routeErr
+				}
+				if !decision.Routable {
+					detail := "review capacity route held: " + strings.Join(decision.Reasons, ",")
+					if err := markReviewCapacityHoldTx(ctx, tx, projectID, epicID, p.JobID, p.SeatID, detail, p.Now); err != nil {
+						return err
+					}
+					bindingHold = fmt.Errorf("%w: %s", ErrNoCapacity, detail)
+					return nil
+				}
+			}
+			var routeErr error
+			recipientBinding, routeErr = activeDriverSessionBindingTx(ctx, tx, projectID, p.Identity, DriverReviewerRole)
+			if routeErr != nil {
+				detail := fmt.Sprintf("reviewer %s cannot be routed through an exact active Driver binding: %v", p.Identity, routeErr)
+				if err := markReviewClaimBindingHoldTx(ctx, tx, projectID, epicID, p.JobID, p.Identity, detail, p.Now); err != nil {
+					return err
+				}
+				bindingHold = fmt.Errorf("%w: %s", ErrDriverSessionBindingMissing, detail)
+				return nil
+			}
+			if !s.HasDriverControlOriginForBinding(recipientBinding) {
+				detail := fmt.Sprintf("%s: reviewer endpoint %s/%s/%s is not ready",
+					ErrDriverControlOriginUnavailable, recipientBinding.HostID, recipientBinding.StoreID,
+					recipientBinding.TmuxServerDomainID)
+				if err := markReviewClaimBindingHoldTx(ctx, tx, projectID, epicID, p.JobID,
+					p.Identity, detail, p.Now); err != nil {
+					return err
+				}
+				bindingHold = fmt.Errorf("%w: %s", ErrDriverSessionBindingMissing, detail)
+				return nil
+			}
 		}
 
 		// §6.3.1 atomic claim of the gate stage. The anti-affinity NOT EXISTS clause
@@ -226,6 +293,38 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 			int(p.TTL/time.Second), deadline.Format(rfc3339)); err != nil {
 			return fmt.Errorf("insert review lease audit: %w", err)
 		}
+		if err := commitProjectFairClaimTx(ctx, tx, p.LeaseID, p.Fair); err != nil {
+			return fmt.Errorf("commit project fair turn: %w", err)
+		}
+		if domain == "epic_v2" && epicID != "" {
+			if err := ensureReviewWakeActionTx(ctx, tx, reviewWakeActionParams{
+				ProjectID: projectID, EpicID: epicID, JobID: p.JobID, Repo: deliveryRepo,
+				PRNumber: prNumber, HeadSHA: head, BaseSHA: base, Lens: p.Lens,
+				LeaseID: p.LeaseID, LeaseEpoch: newEpoch, Deadline: deadline,
+				Recipient: recipientBinding, Now: p.Now,
+			}); err != nil {
+				return err
+			}
+			nowText := p.Now.UTC().Format(rfc3339)
+			if _, err := tx.ExecContext(ctx, `UPDATE epic_deliveries SET
+				state='in_review', state_version=state_version+1, reviewer_identity=?,
+				reviewer_model_family=?, review_started_at=?, last_reviewer_fact_at=?,
+				state_entered_at=?, state_due_at=?, updated_at=?
+				WHERE epic_id=? AND state_version=?`, p.Identity, p.ModelFamily, nowText,
+				nowText, nowText, deadline.UTC().Format(rfc3339), nowText, epicID, deliveryVersion); err != nil {
+				return err
+			}
+			var epicSeq int
+			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(epic_seq),0)+1 FROM control_events WHERE epic_id=?`, epicID).Scan(&epicSeq); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO control_events
+				(project_id,epic_id,kind,from_state,to_state,state_version,epic_seq,actor_kind,actor_id,payload_json,created_at)
+				VALUES (?,?,'review_claimed','review_queued','in_review',?,?,'reviewer',?,'{}',?)`,
+				projectID, epicID, deliveryVersion+1, epicSeq, p.Identity, nowText); err != nil {
+				return err
+			}
+		}
 		result = &lease.Lease{
 			LeaseID: p.LeaseID, JobID: p.JobID, Epoch: newEpoch,
 			Identity: p.Identity, ModelFamily: p.ModelFamily, TTL: p.TTL,
@@ -236,7 +335,155 @@ func (s *Store) ClaimReviewJob(ctx context.Context, p ClaimReviewParams) (*lease
 	if err != nil {
 		return nil, err
 	}
+	if bindingHold != nil {
+		return nil, bindingHold
+	}
 	return result, nil
+}
+
+type reviewWakeActionParams struct {
+	ProjectID, EpicID, JobID, Repo string
+	PRNumber                       int
+	HeadSHA, BaseSHA, Lens         string
+	LeaseID                        string
+	LeaseEpoch                     int
+	Deadline                       time.Time
+	Recipient                      DriverSessionBinding
+	Now                            time.Time
+}
+
+// ensureReviewWakeActionTx is called only after ClaimReviewJob's serialized
+// review_pending→code_review UPDATE succeeds. Consequently review_queued means a
+// durable obligation exists, while a Driver send action proves a real reviewer
+// lease and exact target were atomically bound. Transport acknowledgement remains
+// separate from review-stage completion.
+func ensureReviewWakeActionTx(ctx context.Context, tx *sql.Tx, p reviewWakeActionParams) error {
+	payloadBytes, err := json.Marshal(map[string]any{
+		"assignment_version": 1,
+		"base_sha":           p.BaseSHA,
+		"epic_id":            p.EpicID,
+		"head_sha":           p.HeadSHA,
+		"job_id":             p.JobID,
+		"lease_epoch":        p.LeaseEpoch,
+		"lease_id":           p.LeaseID,
+		"lens":               p.Lens,
+		"pr_number":          p.PRNumber,
+		"project_id":         p.ProjectID,
+		"repo":               p.Repo,
+		"type":               "review_assignment",
+	})
+	if err != nil {
+		return err
+	}
+	dedup := fmt.Sprintf("%s:%s:review_wake:%s:%s:%d", p.ProjectID, p.EpicID,
+		p.HeadSHA, p.BaseSHA, p.LeaseEpoch)
+	idHash := sha256.Sum256([]byte(dedup))
+	actionID := "review-wake-" + hex.EncodeToString(idHash[:12])
+	grantID := stableUUID("driver-review-grant/v1", dedup)
+	payloadHash := sha256.Sum256(payloadBytes)
+	nowText := p.Now.UTC().Format(rfc3339)
+	var evidenceBaselineStoreSeq, evidenceBaselineUncertaintyEpoch uint64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(high_store_seq),0),
+		COALESCE(MAX(uncertainty_epoch),0) FROM driver_observation_cursors
+		WHERE store_id=?`, p.Recipient.StoreID).Scan(&evidenceBaselineStoreSeq,
+		&evidenceBaselineUncertaintyEpoch); err != nil {
+		return fmt.Errorf("capture review wake evidence baseline: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO epic_actions
+		(id,project_id,epic_id,kind,state,action_epoch,dedup_key,payload_json,payload_sha256,
+		 evidence_baseline_store_seq,evidence_baseline_uncertainty_epoch,
+		 executor_kind,target_role,target_host_id,target_store_id,target_server_domain_id,target_server_id,lifecycle_key,
+		 target_epoch,profile_id,workspace_root_id,workspace_relative_path,lease_id,lease_epoch,
+		 sender_principal_id,recipient_session_id,recipient_pane_instance_id,
+		 recipient_agent_run_id,grant_id,grant_epoch,grant_expires_at,head_sha,base_sha,
+		 next_attempt_at,created_at,updated_at)
+		VALUES (?,?,?,'review_wake','pending',0,?,?,?,?,?,'driver','code_reviewer',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)`,
+		actionID, p.ProjectID, p.EpicID, dedup, string(payloadBytes),
+		"sha256:"+hex.EncodeToString(payloadHash[:]), evidenceBaselineStoreSeq,
+		evidenceBaselineUncertaintyEpoch, p.Recipient.HostID, p.Recipient.StoreID,
+		p.Recipient.TmuxServerDomainID, p.Recipient.TmuxServerInstanceID, p.Recipient.LifecycleKey, p.Recipient.TargetEpoch,
+		p.Recipient.ProfileID, p.Recipient.WorkspaceRootID, p.Recipient.WorkspaceRelativePath,
+		p.LeaseID, p.LeaseEpoch, DriverControlIdentity,
+		p.Recipient.SessionID, p.Recipient.PaneInstanceID, p.Recipient.AgentRunID, grantID,
+		p.Deadline.UTC().Format(rfc3339), p.HeadSHA, p.BaseSHA, nowText, nowText, nowText)
+	if err != nil {
+		if !isUniqueConstraintErr(err) {
+			return fmt.Errorf("materialize Driver review wake: %w", err)
+		}
+		var gotKind, gotHash, gotLeaseID, gotRecipientSession, gotRecipientPane, gotRecipientRun string
+		var gotLeaseEpoch int
+		if qerr := tx.QueryRowContext(ctx, `SELECT kind,payload_sha256,lease_id,lease_epoch,
+			recipient_session_id,recipient_pane_instance_id,recipient_agent_run_id
+			FROM epic_actions WHERE dedup_key=? AND state<>'cancelled_superseded'`, dedup).
+			Scan(&gotKind, &gotHash, &gotLeaseID, &gotLeaseEpoch, &gotRecipientSession,
+				&gotRecipientPane, &gotRecipientRun); qerr != nil {
+			return fmt.Errorf("materialize Driver review wake collision: %w", qerr)
+		}
+		if gotKind != "review_wake" || gotHash != "sha256:"+hex.EncodeToString(payloadHash[:]) ||
+			gotLeaseID != p.LeaseID || gotLeaseEpoch != p.LeaseEpoch ||
+			gotRecipientSession != p.Recipient.SessionID || gotRecipientPane != p.Recipient.PaneInstanceID ||
+			gotRecipientRun != p.Recipient.AgentRunID {
+			return fmt.Errorf("Driver review wake dedup collision for %s", dedup)
+		}
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE attention_items SET state='resolved',resolution='driver_binding_claimed',
+		resolved_at=?,updated_at=? WHERE epic_id=? AND kind='review_claim_stalled' AND state<>'resolved'`,
+		nowText, nowText, p.EpicID)
+	return err
+}
+
+func markReviewClaimBindingHoldTx(ctx context.Context, tx *sql.Tx, projectID, epicID, jobID, reviewer, detail string, now time.Time) error {
+	var version int
+	if err := tx.QueryRowContext(ctx, `SELECT state_version FROM epic_deliveries
+		WHERE epic_id=? AND state='review_queued' AND review_job_id=?`, epicID, jobID).Scan(&version); err != nil {
+		return err
+	}
+	nowText := now.UTC().Format(rfc3339)
+	res, err := tx.ExecContext(ctx, `UPDATE epic_deliveries SET
+		state_version=state_version+1,hold_kind='review_session_unbound',hold_reason=?,
+		return_state='review_queued',alert_pending=1,last_error=?,state_due_at=?,updated_at=?
+		WHERE epic_id=? AND state='review_queued' AND review_job_id=? AND state_version=?`,
+		detail, detail, now.Add(24*time.Hour).UTC().Format(rfc3339), nowText,
+		epicID, jobID, version)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return lease.ErrLostRace
+	}
+	dedupHash := sha256.Sum256([]byte(epicID + "\x00" + reviewer))
+	dedup := "review_claim_stalled:" + epicID + ":" + hex.EncodeToString(dedupHash[:8])
+	attentionID := "review-claim-stalled-" + hex.EncodeToString(dedupHash[:12])
+	insertResult, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO attention_items
+		(id,kind,epic_id,repo,priority,state,dedup_key,blocking,leased_by,item_epoch,
+		 lease_expires_at,awaiting_since,delivery_key,evidence_json,detail,resolution,verdict,
+		 occurrences,first_seen_at,last_seen_at,resolved_at,created_at,updated_at)
+		VALUES (?,'review_claim_stalled',?,'',10,'open',?,1,'',0,'','',?,
+		 json_object('job_id',?,'reviewer_identity',?,'reason',?),?,'','',1,?,?,'',?,?)`, attentionID, epicID, dedup, jobID,
+		jobID, reviewer, detail, detail, nowText, nowText, nowText, nowText)
+	if err != nil {
+		return err
+	}
+	inserted, _ := insertResult.RowsAffected()
+	occurrenceDelta := 1
+	if inserted == 1 {
+		occurrenceDelta = 0
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE attention_items SET
+		occurrences=occurrences+?,last_seen_at=?,detail=?,
+		evidence_json=json_object('job_id',?,'reviewer_identity',?,'reason',?),
+		state=CASE WHEN state='resolved' THEN 'open' ELSE state END,resolved_at='',updated_at=?
+		WHERE dedup_key=?`, occurrenceDelta, nowText, detail, jobID, reviewer, detail, nowText, dedup); err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"epic_id": epicID, "job_id": jobID, "reviewer_identity": reviewer, "reason": detail,
+	})
+	if err := ensureControlAlertTx(ctx, tx, projectID, epicID, "review_claim_stalled", dedup, string(payload), now); err != nil {
+		return err
+	}
+	return appendEpicControlEventTx(ctx, tx, projectID, epicID, "review_claim_held",
+		"review_queued", "review_queued", version+1, "scheduler", string(payload), now)
 }
 
 // ReviewResultParams is a fenced code-review result carrying the reviewer's verdict
@@ -535,6 +782,9 @@ func (s *Store) ReviewResult(ctx context.Context, src FactSource, p job.Policy, 
 			 WHERE job_id = ? AND lease_epoch = ? AND ended_at IS NULL`,
 			in.JobID, j.LeaseEpoch); err != nil {
 			return fmt.Errorf("close review lease: %w", err)
+		}
+		if err := projectEpicReviewResultTx(ctx, tx, in.JobID, final, minted, in.Notes, in.Now); err != nil {
+			return fmt.Errorf("project epic review result: %w", err)
 		}
 
 		resp = ReviewResultResponse{

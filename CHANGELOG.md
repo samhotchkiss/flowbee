@@ -11,6 +11,25 @@ Early and moving fast. The deterministic engine (milestones **M0–M12**) is bui
 committed, and green; a second pass of configurable-flow features (**F1–F14**) layers
 the operator surface, multi-repo support, and onboarding on top of it.
 
+### Added — Flowbee v2 control plane (pre-activation)
+
+- Durable epic deliveries and immutable, epoch-fenced Driver action outboxes with
+  separate transport receipts and stage evidence.
+- Crash-recoverable CI-green-to-review handoff, reviewer-verdict, builder lifecycle,
+  merge/cleanup, and delivery backstop reconcilers with pushed control alerts.
+- Strict tmux-driver v2.3 observation/lifecycle integration over UDS; no product path
+  calls raw tmux or standalone `tmux-send`.
+- Authenticated project workspaces, durable human conversations and typed decisions,
+  one-time fragment login links, CSRF protection, and an offline owner-only bootstrap.
+- Multi-project ownership, portfolio views, fair dispatch, project circuit breakers,
+  project-scoped identities, and restart acceptance tests.
+- Live Codex/Grok capacity collection and fail-closed identity/lineage-aware routing.
+
+Full control-plane-authored Driver messaging remains held on `GAP-FD-003`: the
+shipped Driver requires an exact live session sender and has no authenticated
+non-session Flowbee origin. The dashboard exposes this as degraded; synthetic sender
+bindings and direct terminal fallbacks are rejected.
+
 ### Added — engine milestones (M0–M12)
 
 - **M0 — Scaffold.** Buildable single binary; stdlib CLI dispatch

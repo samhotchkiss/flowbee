@@ -26,7 +26,14 @@ const AgingRate = 600 * time.Second
 // Candidate is a leasable (`ready`) job as the scheduler sees it: enough to rank
 // and to test capability eligibility. It is folded from the jobs projection.
 type Candidate struct {
-	JobID                string
+	JobID string
+	// ProjectID is the durable project owner used by the Phase-2 project-fair
+	// scheduler. Legacy rows are backfilled to "default" by migration 0043.
+	ProjectID string
+	// Pool is the capability-isolated scheduling pool. A fair scheduling pass is
+	// always for exactly one pool, so review work can never consume a build turn
+	// (or vice versa).
+	Pool                 string
 	Priority             int
 	EnqueuedAt           time.Time
 	RequiredCapabilities []string

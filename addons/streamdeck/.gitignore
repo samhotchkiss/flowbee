@@ -1,0 +1,4 @@
+node_modules/
+com.samhotchkiss.flowbee.sdPlugin/bin/
+com.samhotchkiss.flowbee.sdPlugin/logs/
+*.streamDeckPlugin

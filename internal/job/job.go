@@ -291,12 +291,13 @@ func hasPrefix(caps []string, prefix string) bool {
 // Job is the projection folded from job_events (Domain A). M1 carries the lease
 // columns + counters the lease thread needs; later milestones extend it.
 type Job struct {
-	ID    string
-	Kind  Kind
-	Flow  string
-	Stage string
-	State State
-	Role  Role
+	ID        string
+	ProjectID string
+	Kind      Kind
+	Flow      string
+	Stage     string
+	State     State
+	Role      Role
 
 	// Repo is the F9 repo-scope handle (the repos.id this job belongs to). Empty is
 	// the legacy single-repo default. It is a resolved Domain-A fact: the scheduler

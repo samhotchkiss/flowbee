@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -18,15 +21,18 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/epicspec"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/store"
+	"github.com/samhotchkiss/flowbee/internal/tmuxio"
+	"github.com/samhotchkiss/flowbee/internal/ulid"
 	"github.com/samhotchkiss/flowbee/internal/watchdog"
 )
 
 // runEpic is the `flowbee epic <start|status|abandon>` CLI (epic-lane Phase 2).
 // Talks directly to the local control-plane DB and control-plane mirror on disk —
-// same posture as `flowbee session`/`flowbee host`: pure local reads/writes for
-// status+abandon, and for `start` a series of git-mirror reads + ssh/tmux calls
-// that need no serve process running (the mirror is just files on disk; `start`
-// provisions/reads it exactly like serve's own mirror-refresh loop does).
+// same posture as `flowbee session`/`flowbee host`: local reads/writes for status,
+// an exact registered tmux stop followed by a local write for abandon, and for
+// `start` a series of git-mirror reads + ssh/tmux calls that need no serve process
+// running (the mirror is just files on disk; `start` provisions/reads it exactly
+// like serve's own mirror-refresh loop does).
 func runEpic(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: flowbee epic <start|status|abandon> ...")
@@ -43,17 +49,51 @@ func runEpic(args []string) error {
 		return err
 	}
 	defer st.Close()
+	durableV2, err := st.DurableEpicReviewHandoffV2(ctx)
+	if err != nil {
+		return fmt.Errorf("read durable epic-review-handoff v2 activation: %w", err)
+	}
+	// Environment can fail closed into v2 for an offline invocation, but it can
+	// never downgrade a database that serve durably activated. Rollback is a
+	// writer-owned `flowbee serve` operation with an explicit flag value of 0.
+	st.EnableEpicReviewHandoffV2 = durableV2 || os.Getenv("FLOWBEE_EPIC_REVIEW_HANDOFF_V2") == "1"
+	st.EnableCapacityV2 = os.Getenv("FLOWBEE_CAPACITY_ROUTING_V2") == "1" ||
+		os.Getenv("FLOWBEE_CAPACITY_V2") == "1"
 
 	switch sub {
 	case "start":
+		if st.EnableEpicReviewHandoffV2 {
+			return legacyEpicTmuxCommandDisabled("start")
+		}
+		if err := st.AcquireWriterLock(); err != nil {
+			return fmt.Errorf("legacy epic start requires exclusive control-plane writer ownership: %w", err)
+		}
 		return runEpicStart(ctx, st, rest)
 	case "status":
 		return runEpicStatus(ctx, st, rest)
 	case "abandon":
+		if st.EnableEpicReviewHandoffV2 {
+			return legacyEpicTmuxCommandDisabled("abandon")
+		}
+		if err := st.AcquireWriterLock(); err != nil {
+			return fmt.Errorf("legacy epic abandon requires exclusive control-plane writer ownership: %w", err)
+		}
 		return runEpicAbandon(ctx, st, rest)
+	case "digest":
+		return runEpicDigest(rest)
+	case "plan":
+		return runEpicPlan(ctx, st, rest)
 	default:
-		return fmt.Errorf("unknown `flowbee epic` subcommand %q (want start|status|abandon)", sub)
+		return fmt.Errorf("unknown `flowbee epic` subcommand %q (want start|status|abandon|digest|plan)", sub)
 	}
+}
+
+// legacyEpicTmuxCommandDisabled fences the two CLI commands that directly own
+// legacy tmux lifecycle. Under v2, session creation, terminal insertion, and
+// stop are Driver lifecycle/actions with stable identity, grants, and receipts;
+// these commands must not create a second control path around DriverPort.
+func legacyEpicTmuxCommandDisabled(command string) error {
+	return fmt.Errorf("flowbee epic %s is legacy-only and disabled by the durable v2 session-control boundary; use the v2 epic workflow so lifecycle and messages pass through Driver (an intentional rollback must be selected by flowbee serve)", command)
 }
 
 // safeSlugRe gates any epic-derived string (the slug, used unquoted-adjacent in
@@ -103,15 +143,16 @@ func deriveSlug(filePath string) (string, error) {
 
 func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	fs := flag.NewFlagSet("epic start", flag.ContinueOnError)
-	hostFlag := fs.String("host", "", "box to launch the epic on (overrides the epic file's frontmatter host:; must be `flowbee host add`-ed first)")
+	hostFlag := fs.String("host", "", "restrict seat selection to this box (an override that must name a registered seat's box; §15.13)")
 	tzFlag := fs.String("tz", "", "the host's IANA timezone (default: probe the box via `date`/`timedatectl`, else assume serve-local — mirrors `flowbee session add --tz`)")
-	agentFlag := fs.String("agent", "", "coding agent to launch (overrides the epic file's frontmatter agent:; default codex)")
-	forceQuota := fs.Bool("force-quota", false, "launch even if the agent's account usage is >=75% (fresh reading) — see the quota-gate WHY comment")
+	agentFlag := fs.String("agent", "", "coding agent family to launch (overrides the epic file's frontmatter agent:; claude|codex|grok, default codex)")
+	planFlag := fs.Bool("plan", false, "dry-run: validate step count + scope-overlap + selected-seat headroom, do NOT launch (§5f/§10c)")
+	forceQuota := fs.Bool("force-quota", false, "launch even if no seat has weekly headroom (bypasses the severity/seat-health gate — use sparingly)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: flowbee epic start <repo> <epics/....md> [--host <box>] [--tz <iana>] [--agent <name>] [--force-quota]")
+		return fmt.Errorf("usage: flowbee epic start <repo> <epics/....md> [--host <box>] [--tz <iana>] [--agent claude|codex|grok] [--plan] [--force-quota]")
 	}
 	repoID, filePath := fs.Arg(0), fs.Arg(1)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -157,42 +198,22 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := st.GetEpicRun(ctx, slug); err == nil {
+	contractHash := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(content)))
+	admissionKey := "direct:" + repoID + ":" + slug
+	if existing, err := st.GetEpicRunByProjectSlug(ctx, "default", slug); err == nil {
+		// A lost CLI acknowledgement is an exact replay, not an error. Older
+		// legacy rows have no admission metadata and retain the prior message.
+		if existing.AdmissionKey == admissionKey && existing.ContractHash == contractHash {
+			fmt.Printf("epic %q is already admitted (idempotent replay)\n", slug)
+			return nil
+		}
 		return fmt.Errorf("epic %q is already registered (see `flowbee epic status`)", slug)
 	} else if !errors.Is(err, store.ErrEpicRunNotFound) {
 		return err
 	}
 
-	// ── host resolution + occupancy (one-box-one-epic) ──
-	// NOTE (review m6): the occupancy + scope checks here are FAST FEEDBACK only —
-	// they refuse an obviously-doomed launch before the expensive ssh preflight.
-	// The AUTHORITATIVE, race-free versions run inside store.AddEpicRun's
-	// transaction (check+insert atomically), so two concurrent `epic start`s that
-	// both pass these reads still cannot double-book a host or a scope.
-	host := *hostFlag
-	if host == "" {
-		host = spec.Host
-	}
-	if host == "" {
-		return fmt.Errorf("no host specified (--host, or the epic file's frontmatter host:) — see `flowbee host list` for registered boxes")
-	}
-	hostRow, err := st.GetEpicHost(ctx, host)
-	if err != nil {
-		if errors.Is(err, store.ErrEpicHostNotFound) {
-			return fmt.Errorf("host %q is not registered (run `flowbee host add %s` first)", host, host)
-		}
-		return err
-	}
-	if !hostRow.Enabled {
-		return fmt.Errorf("host %q is disabled", host)
-	}
-	if held, occupied, err := st.HostActiveEpic(ctx, host); err != nil {
-		return err
-	} else if occupied {
-		return fmt.Errorf("host %q already holds active epic %q — one-box-one-epic (see `flowbee epic status`)", host, held.ID)
-	}
-
-	// ── scope reservation (blast-radius overlap, same repo only) ──
+	// ── scope reservation (blast-radius overlap, same repo only) — fast feedback; the
+	// authoritative, race-free check runs inside store.AddEpicRun's tx (review m6). ──
 	active, err := st.ListActiveEpicRuns(ctx)
 	if err != nil {
 		return err
@@ -206,146 +227,489 @@ func runEpicStart(ctx context.Context, st *store.Store, args []string) error {
 		}
 	}
 
-	// ── agent resolution + validation (M2: this string is shell-executed on the
-	// box as the tmux session command, and spec.Agent comes from the epic FILE —
-	// validate BEFORE it is ever used to build a command) ──
-	agent := *agentFlag
-	if agent == "" {
-		agent = spec.Agent
+	// ── agent FAMILY resolution (the seat registry provisions a session of this family;
+	// it also drives cross-family review). Seats are keyed on claude|codex. ──
+	family := *agentFlag
+	if family == "" {
+		family = spec.Agent
 	}
-	if agent == "" {
-		agent = "codex" // author-epic/SKILL.md's documented default coding agent
+	if family == "" {
+		family = "codex" // author-epic/SKILL.md's documented default coding agent
 	}
-	if err := validateAgent(agent); err != nil {
+	if err := validateAgent(family); err != nil {
 		return err
 	}
 
-	// ── quota gate ──
-	if !*forceQuota {
-		blocked, reason, qerr := epicQuotaGate(ctx, st, agent, time.Now())
-		if qerr != nil {
-			return qerr
-		}
-		if blocked {
-			return fmt.Errorf("quota gate: %s — retry later, or pass --force-quota to launch anyway", reason)
-		}
+	// ── SEAT SELECTION = launch (plan §15.13): pick a ready seat of the epic's family with
+	// weekly headroom, reading account_windows.severity + seat HEALTH (NOT just
+	// worker_accounts.usage_pct — a weekly_scoped-only critical is invisible there, per the
+	// 0028 capacity-store note). Anti-collocation prefers a seat not already powering an
+	// active epic. Refuses on no-seat / no-headroom; fails open on a probe error / stale
+	// critical (§4.4/§12.14 — a flaky ssh must not ground the fleet). ──
+	seat, gate, serr := epicSelectSeatWithQuotaOverride(ctx, st, family, *hostFlag, active, *forceQuota)
+	if serr != nil {
+		return serr
+	}
+	// --force-quota bypasses ONLY the headroom/severity refusal — never a hard no-seat (m2):
+	// launching with no seat would come up on the box's DEFAULT account with an empty
+	// builder_model, breaking the cross-family review handoff.
+	if gate.hardNoSeat {
+		return fmt.Errorf("launch refused: %s", gate.reason)
+	}
+	if !*forceQuota && gate.refuse {
+		return fmt.Errorf("launch refused: %s (pass --force-quota to override)", gate.reason)
+	}
+	if *forceQuota && gate.warning != "" && !*planFlag {
+		fmt.Printf("⚠ %s\n", gate.warning)
 	}
 
-	// ── preflight on the host (reuses the watchdog Runner abstraction) ──
-	// A GENEROUS per-command timeout (not the watchdog's 15s default): this runner
-	// drives the one-shot launch, whose Preflight may `gh repo clone` a large repo
-	// (the russ repo is 869 MiB packed) that a 15s timeout SIGKILLs mid-checkout —
-	// which then stranded a partial dir and refused the launch (Bug 1). This is a
-	// launch, not the every-2-min watch pass, so a long ceiling is correct; the fast
-	// checks (gh auth, df, home, tmux) and an unreachable box (ssh ConnectTimeout=5)
-	// all still return/fail quickly regardless of this ceiling.
-	runner := watchdog.ShellRunner{Timeout: 15 * time.Minute}
-	homeOut, herr := runner.Run(ctx, watchdog.HomeDirCmd(host))
-	if herr != nil {
-		return fmt.Errorf("resolve home directory on %q: %w", host, herr)
+	// ── step-count advisory (§10c: warn > ~12, never refuse) ──
+	if n := len(spec.Steps); n > 12 {
+		fmt.Printf("⚠ %d steps declared (> ~12) — consider splitting this epic (§10 sizing); launching anyway.\n", n)
 	}
-	home := strings.TrimSpace(homeOut)
-	if home == "" {
-		return fmt.Errorf("could not resolve a home directory on host %q (is it reachable? `gh` and `tmux` must both be installed there)", host)
-	}
-	checkoutPath := home + "/epics/" + repoID // the documented ~/epics/<repo> convention, as a resolved literal path
 
+	if *planFlag {
+		fmt.Printf("plan (dry-run) for epic %q in repo %q:\n", slug, repoID)
+		fmt.Printf("  steps declared: %d\n", len(spec.Steps))
+		fmt.Printf("  scope-overlap:  OK (disjoint from every active epic)\n")
+		if gate.refuse {
+			fmt.Printf("  seat/headroom:  REFUSE — %s\n", gate.reason)
+		} else {
+			fmt.Printf("  seat/headroom:  OK — seat %q (family %s, box %q, account %q)%s\n",
+				seat.ID, seat.AgentFamily, dashIfEmpty(seat.Box), dashIfEmpty(seat.AccountKey), gateNote(gate))
+		}
+		fmt.Println("  (dry-run — nothing launched)")
+		return nil
+	}
+
+	builderFamily := seat.AgentFamily
 	tz := *tzFlag
 	if tz != "" {
 		if _, lerr := time.LoadLocation(tz); lerr != nil {
 			return fmt.Errorf("invalid --tz %q (want an IANA name like America/Denver): %w", tz, lerr)
 		}
-	} else if tzOut, terr := runner.Run(ctx, watchdog.TimezoneCmd(host)); terr == nil {
-		if probe := strings.TrimSpace(tzOut); probe != "" {
-			if _, lerr := time.LoadLocation(probe); lerr == nil {
-				tz = probe
-			}
-			// an unresolvable probe result (e.g. a bare "MST" abbreviation from the
-			// date +%Z fallback) leaves tz="" — the documented "assume serve-local"
-			// default, same as AddGoalSession's own --tz-omitted behavior.
-		}
 	}
 
-	pre, err := watchdog.Preflight(ctx, runner, watchdog.PreflightParams{
-		Box: host, CheckoutPath: checkoutPath, OwnerRepo: repo.Owner + "/" + repo.Repo,
-		// disk is probed at HOME, not at the (possibly not-yet-cloned) checkout —
-		// df against a nonexistent path parses as 0 free and refused every first
-		// launch onto a fresh box (review MAJOR M1). Home always exists and shares
-		// the checkout's filesystem under the ~/epics/<repo> convention.
-		DiskProbePath: home,
-		// refresh a REUSED checkout to a clean current default branch (Bug 2) — a
-		// reused seat is typically left on the prior epic's branch with a stale main,
-		// so the runner would otherwise cut epic/<slug> from a stale base missing the
-		// freshly-merged spec. `branch` is already normalized to "main" when empty.
-		DefaultBranch: branch,
-	})
-	if err != nil {
-		return fmt.Errorf("preflight on %q: %w", host, err)
-	}
-	if !pre.GhAuthOK {
-		return fmt.Errorf("preflight failed: `gh auth status` is not authenticated on host %q — run `gh auth login` there first (the epic will need it to open its final PR)", host)
-	}
-	const minFreeKB = 10 * 1024 * 1024 // 10G, per the design doc's disk gate
-	if pre.DiskFreeKB < minFreeKB {
-		return fmt.Errorf("preflight failed: host %q has only %.1fG free at %s (need >=10G)", host, float64(pre.DiskFreeKB)/(1024*1024), home)
-	}
-	if pre.ClonedFresh {
-		logger.Info("cloned a fresh checkout", "host", host, "path", checkoutPath, "repo", repo.Owner+"/"+repo.Repo)
-	}
-
-	// ── register (state=launching) BEFORE the tmux launch, so a crash here leaves a
-	// visible half-launched row rather than nothing — see AddEpicRun's doc. ──
+	// ── register (state=launching) BEFORE the launch ladder, so a crash mid-launch leaves a
+	// VISIBLE half-launched row the launching-reaper (supervision ticker) releases — not a
+	// silently-stranded host reservation. ──
 	now := time.Now()
+	epicID := ulid.New()
 	tmuxName := "epic-" + slug
+	// the selected seat's cap governs how many epics that exact seat may hold at once.
+	// AddEpicRun's atomic count-then-insert is the race-free authority — epicSelectSeat
+	// already excluded a full seat, but a
+	// concurrent start could have filled the last slot between selection and here.
+	seatCap := seat.MaxConcurrent
+	if seatCap < 1 {
+		seatCap = 1
+	}
 	if err := st.AddEpicRun(ctx, store.EpicRun{
-		ID: slug, Repo: repoID, FilePath: filePath, Title: spec.Title, Scope: spec.Scope,
-		Host: host, Branch: "epic/" + slug, TmuxName: tmuxName, Agent: agent,
-	}, now); err != nil {
-		// ErrEpicHostBusy / ErrEpicScopeOverlap here mean a CONCURRENT start won the
-		// race between our fast-feedback checks above and this atomic insert (m6) —
-		// the wrapped error already names the winning epic and the colliding glob.
+		ID: epicID, ProjectID: "default", Slug: slug, AdmissionKey: admissionKey, ContractHash: contractHash,
+		Repo: repoID, FilePath: filePath, Title: spec.Title, Scope: spec.Scope,
+		Host: seat.Box, Branch: "epic/" + slug, TmuxName: tmuxName, Agent: family,
+		AccountKey: seat.AccountKey, SeatID: seat.ID, BuilderModelFamily: builderFamily,
+	}, seatCap, now); err != nil {
 		return fmt.Errorf("register epic: %w", err)
 	}
 
-	// ── launch: tmux new-session + send the goal, reusing the watchdog's exact
-	// double-Enter submit-verify mechanics. ──
-	goal := fmt.Sprintf("/goal execute the epic at %s per epics/INSTRUCTIONS.md. Work on branch epic/%s.", filePath, slug)
-	verified, launchErr := watchdog.LaunchEpicSession(ctx, runner, watchdog.LaunchParams{
-		Box: host, TmuxName: tmuxName, Dir: checkoutPath, StartCmd: agent, Goal: goal,
-		SettleDelay: 800 * time.Millisecond,
-	})
-	if launchErr != nil {
-		_ = st.DeleteEpicRun(ctx, slug) // roll back the registration — see AddEpicRun's doc
-		// best-effort kill of any half-created session (review m7): a failure AFTER
-		// tmux new-session succeeded (e.g. the goal send failed) would otherwise
-		// leak the session, and a same-slug retry would then permanently fail on
-		// tmux's duplicate-session error. Harmless when the failure was at create
-		// time (killing a nonexistent session just errors, which we log and ignore).
-		if _, kerr := runner.Run(ctx, watchdog.KillTmuxSessionCmd(host, tmuxName)); kerr != nil {
-			logger.Warn("rollback: could not kill the half-created tmux session (it may simply not exist)",
-				"epic", slug, "host", host, "tmux", tmuxName, "err", kerr)
-		}
-		return fmt.Errorf("launch failed on %q: %w (epic registration rolled back — nothing is reserved)", host, launchErr)
+	// ── PREFLIGHT the seat's box BEFORE the ladder: resolve its home, ensure the repo is
+	// cloned at <home>/dev/<repo>, verify gh auth + free disk, and cut this epic's PRIVATE
+	// per-slug worktree from that base (the isolation that lets two epics coexist on one
+	// box). The fresh seat accounts have only the `gh` CLI (no repo cloned), and the 6b
+	// launch gate previously ran the ladder with NO checkout — so the agent came up in the
+	// seat's empty home. epicPreflight returns the WORKTREE (what the ladder cwds into) and
+	// the base (what the rollback path removes the worktree against). A failure rolls back
+	// the 'launching' row (never run the ladder into a missing/shared checkout). ──
+	runner := watchdog.NewLaunchRunner()
+	worktree, base, perr := epicPreflight(ctx, runner, seat.Box, repo, slug)
+	if perr != nil {
+		raiseLaunchFailed(ctx, st, epicID, slug, repoID, "preflight failed: "+perr.Error(), now)
+		_ = st.DeleteEpicRun(ctx, epicID)
+		return fmt.Errorf("launch refused: %w (epic registration rolled back — nothing reserved)", perr)
 	}
-	if !verified {
-		logger.Warn("could not verify the goal was SUBMITTED (the pane neither showed the unsubmitted input line nor parsed as pursuing/working after two checks — a wrapped goal line in a narrow pane is the known blind spot). The epic is registered and the session exists; check the tmux session by hand",
-			"epic", slug, "host", host, "tmux", tmuxName)
+	// rollback first proves any remote agent session is stopped, then removes the private
+	// worktree, then releases the durable reservation. If the host is unreachable or either
+	// cleanup step fails, the row/worktree stay visible: deleting them while a remote agent
+	// may still own that cwd risks data loss and would let a new epic overbook the seat.
+	rollback := func() bool {
+		if seat.Box != "" {
+			if _, kerr := runner.Run(ctx, watchdog.KillTmuxSessionCmd(seat.Box, tmuxName)); kerr != nil {
+				logger.Error("rollback: remote tmux stop could not be confirmed; preserving epic reservation and worktree for recovery",
+					"epic", slug, "box", seat.Box, "worktree", worktree, "err", kerr)
+				return false
+			}
+		}
+		if rerr := watchdog.RemoveEpicWorktree(ctx, runner, seat.Box, base, worktree); rerr != nil {
+			logger.Error("rollback: could not remove the per-epic worktree; preserving epic reservation for recovery",
+				"epic", slug, "box", seat.Box, "worktree", worktree, "err", rerr)
+			return false
+		}
+		if derr := st.DeleteEpicRun(ctx, epicID); derr != nil {
+			logger.Error("rollback: worktree was removed but the epic reservation could not be released",
+				"epic", slug, "err", derr)
+			return false
+		}
+		return true
 	}
 
-	// the tmux session IS now running the agent regardless of what happens below —
-	// a goal_sessions registration failure must NOT roll back the launch (that would
-	// abandon a live agent with no record of it). It's logged loudly instead.
+	// ── THE LAUNCH LADDER (plan §15.15): drive a LOCAL tmux session through the staged,
+	// pane-classified launch machine, composed from tmuxio primitives + the family verb
+	// table. The local pane is the attach; a remote seat lives in a remote tmux the ssh
+	// line creates. The agent comes up cwd'd into the epic's PRIVATE worktree (never the
+	// shared base) — it cuts epic/<slug> from the detached HEAD there. ──
+	client := tmuxio.New()
+	res, lerr := watchdog.RunLadder(ctx, client, realTmuxClock{}, watchdog.LadderParams{
+		Slug:     slug,
+		SpecPath: filePath,
+		Checkout: worktree,
+		Seat: watchdog.LaunchSeat{
+			Box: seat.Box, AgentFamily: seat.AgentFamily, ConfigDir: seat.ConfigDir,
+			CodexHome: seat.CodexHome, Account: seat.AccountKey, ExtraEnv: seat.ExtraEnv,
+		},
+	})
+	if lerr != nil {
+		raiseLaunchFailed(ctx, st, epicID, slug, repoID, "ladder infra error at stage "+string(res.Stage)+": "+lerr.Error(), now)
+		if rollback() {
+			return fmt.Errorf("launch ladder infra error at stage %q: %w (epic registration rolled back)", res.Stage, lerr)
+		}
+		return fmt.Errorf("launch ladder infra error at stage %q: %w (cleanup unconfirmed; epic reservation and worktree preserved for recovery)", res.Stage, lerr)
+	}
+	switch res.Outcome {
+	case watchdog.LaunchAwaitingAuth:
+		// interactive auth at the ssh stage — a HUMAN answers once in the LOCAL pane. Leave
+		// the session + the 'launching' row + the worktree alive; raise a human-facing item.
+		// The reaper releases it only if the human never completes it (LaunchStrandAfter).
+		raiseLaunchFailed(ctx, st, epicID, slug, repoID, "awaiting interactive auth: "+res.Evidence, now)
+		fmt.Printf("⏸ epic %q launch is AWAITING INTERACTIVE AUTH in local tmux %q — answer the prompt in the pane, then it will proceed.\n   %s\n", slug, res.Session, res.Evidence)
+		return nil
+	case watchdog.LaunchFailed:
+		raiseLaunchFailed(ctx, st, epicID, slug, repoID, "launch ladder failed at stage "+string(res.Stage)+": "+res.Evidence, now)
+		if rollback() { // the ladder already killed the local attach; rollback confirms remote state.
+			return fmt.Errorf("launch ladder failed at stage %q: %s (epic registration rolled back — nothing reserved)", res.Stage, res.Evidence)
+		}
+		return fmt.Errorf("launch ladder failed at stage %q: %s (cleanup unconfirmed; epic reservation and worktree preserved for recovery)", res.Stage, res.Evidence)
+	}
+
+	// LaunchVerified: the CLI is up and the pane classified WORKING. Register the goal-
+	// session watch (box records the seat box for the §15.15 dual-path fallback) and mark
+	// the epic running. A goal-session registration failure must NOT roll back a live agent.
 	if err := st.AddGoalSession(ctx, store.GoalSession{
-		ID: tmuxName, Box: host, TmuxName: tmuxName, TZ: tz, Repo: repoID, Note: "epic: " + spec.Title,
+		ID: tmuxName, Box: seat.Box, TmuxName: tmuxName, TZ: tz, Repo: repoID, Note: "epic: " + spec.Title,
 	}, now); err != nil {
 		logger.Error("epic launched but failed to register its goal-session watch — the watchdog will NOT observe it until this is fixed", "epic", slug, "err", err)
 	}
-	if err := st.MarkEpicLaunched(ctx, slug, now); err != nil {
+	if err := st.MarkEpicLaunched(ctx, epicID, now); err != nil {
 		return fmt.Errorf("epic launched but failed to mark it running in the registry: %w", err)
 	}
-
-	fmt.Printf("✓ launched epic %q on %q (tmux %q, branch epic/%s) — run `flowbee epic status` to confirm\n", slug, host, tmuxName, slug)
+	fmt.Printf("✓ launched epic %q (seat %q, family %s, tmux %q, branch epic/%s) — run `flowbee epic status` to confirm\n",
+		slug, seat.ID, builderFamily, res.Session, slug)
 	return nil
+}
+
+// epicPreflight ensures the seat's box is launch-ready BEFORE the ladder runs and cuts this
+// epic's PRIVATE worktree. It resolves the box's home over the SAME Runner the goal-session
+// watchdog uses (local for box="", ssh otherwise), computes the SHARED per-repo base
+// checkout (<home>/dev/<repo>) and this epic's per-slug worktree (<home>/dev/.flowbee-wt/
+// <repo>/<slug>), runs watchdog.Preflight (gh auth + free disk + clone the base if absent),
+// then cuts the worktree DETACHED at origin/<defaultBranch> so the agent gets a fully
+// isolated tree (the epic runner cuts epic/<slug> inside it per epics/INSTRUCTIONS.md; two
+// epics on one box never share a working tree). It returns (worktree, base): the ladder cwds
+// into the worktree, and the caller's rollback removes the worktree against the base. A
+// non-nil error is launch-blocking (unreachable box / failed clone / gh not authenticated /
+// failed worktree-add — NEVER a fallback to the shared base) — the caller rolls back the
+// 'launching' registration.
+func epicPreflight(ctx context.Context, r watchdog.Runner, box string, repo store.Repo, slug string) (worktree, base string, err error) {
+	if repo.Owner == "" || repo.Repo == "" {
+		return "", "", fmt.Errorf("repo %q is missing its github owner/repo — cannot resolve the checkout to clone", repo.ID)
+	}
+	homeOut, err := r.Run(ctx, watchdog.HomeDirCmd(box))
+	if err != nil {
+		return "", "", fmt.Errorf("resolve home on box %q: %w", boxLabel(box), err)
+	}
+	home := strings.TrimSpace(homeOut)
+	if home == "" {
+		return "", "", fmt.Errorf("box %q reported an empty $HOME", boxLabel(box))
+	}
+	base = watchdog.EpicBasePath(home, repo.Repo)
+	worktree = watchdog.EpicWorktreePath(home, repo.Repo, slug)
+	pf, err := watchdog.Preflight(ctx, r, watchdog.PreflightParams{
+		Box:           box,
+		CheckoutPath:  base,
+		DiskProbePath: home,
+		OwnerRepo:     repo.Owner + "/" + repo.Repo,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("preflight on box %q: %w", boxLabel(box), err)
+	}
+	if !pf.GhAuthOK {
+		return "", "", fmt.Errorf("box %q: gh is not authenticated (the epic's Finish step opens a PR via gh) — run `gh auth login` on the box", boxLabel(box))
+	}
+	// cut the epic's private worktree from the freshly-ensured base, DETACHED at
+	// origin/<defaultBranch>. A failure is launch-blocking — a best-effort remove clears any
+	// partial worktree registration so a same-slug retry isn't blocked, then the error
+	// propagates (we NEVER fall back to the shared base tree).
+	branch := repo.DefaultBranch
+	if branch == "" {
+		branch = "main"
+	}
+	if werr := watchdog.ProvisionEpicWorktree(ctx, r, box, base, worktree, branch); werr != nil {
+		_ = watchdog.RemoveEpicWorktree(ctx, r, box, base, worktree)
+		return "", "", werr
+	}
+	return worktree, base, nil
+}
+
+// raiseLaunchFailed upserts a launch_failed attention item (plan §1.3) so a master/operator
+// routes the retry/reassign. Best-effort — a failed producer must not mask the launch error.
+func raiseLaunchFailed(ctx context.Context, st *store.Store, epicID, slug, repo, detail string, now time.Time) {
+	_, _, _ = st.UpsertAttentionItem(ctx, store.AttentionItem{
+		ID: ulid.New(), Kind: "launch_failed", EpicID: epicID, Repo: repo, Priority: 10,
+		DedupKey: epicID + ":launch_failed", Blocking: true,
+		Evidence: map[string]string{"detail": detail},
+	}, now)
+}
+
+// seatGate is epicSelectSeat's headroom verdict — refuse (no-seat / no-headroom) with a
+// reason, or an OK seat possibly carrying a fail-open warning (a probe error / stale
+// critical is NOT a hard refusal, §4.4/§12.14). hardNoSeat marks the ONE refusal
+// --force-quota must NEVER bypass: there is no ready seat of the family at all, so a forced
+// launch would come up on the box's DEFAULT account (wrong-account launch) with an empty
+// builder_model that breaks the §5b cross-family review handoff (m2). Only the
+// headroom/severity refusal is a "you know better, override it" call.
+type seatGate struct {
+	refuse     bool
+	hardNoSeat bool
+	reason     string
+	warning    string
+}
+
+func gateNote(g seatGate) string {
+	if g.warning != "" {
+		return " (warning: " + g.warning + ")"
+	}
+	return ""
+}
+
+// epicSelectSeat picks a ready seat of the epic's family with weekly headroom AND spare
+// per-seat CONCURRENCY (plan §15.13c + §4.3), reading account_windows.severity + seat HEALTH
+// — NOT just worker_accounts.usage_pct (a weekly_scoped-only critical is invisible there;
+// the 0028 capacity-store note requires this). A seat is CAPACITY-ELIGIBLE iff the number of
+// active epics bound to that seat is below max_concurrent (0031). Distinct seats on one
+// physical host can therefore work simultaneously; a single cap-2 seat admits two epics.
+// Among eligible seats it prefers the LEAST-LOADED box (spread epics across boxes/accounts),
+// with the existing anti-collocation (prefer a seat whose account is not already powering
+// an active epic) and seat-id order as the deterministic tiebreak. hostFilter (if set)
+// restricts to seats on that box. Refuses on no-seat / all-seats-at-cap / no-headroom;
+// a probe error / stale critical fails OPEN (a flaky ssh must not ground the fleet).
+func epicSelectSeat(ctx context.Context, st *store.Store, family, hostFilter string, active []store.EpicRun) (store.Seat, seatGate, error) {
+	return epicSelectSeatWithQuotaOverride(ctx, st, family, hostFilter, active, false)
+}
+
+// epicSelectSeatWithQuotaOverride is the production selector. allowQuotaOverride is
+// true only for the explicit --force-quota path: it may use limit_critical seats or an
+// account with a fresh critical window, but it still requires a registered, enabled,
+// reachable/authenticated seat with a real capacity slot. This prevents the old override
+// bug where bypassing a quota refusal returned a zero-value seat and silently escaped the
+// per-seat admission gate.
+func epicSelectSeatWithQuotaOverride(ctx context.Context, st *store.Store, family, hostFilter string, active []store.EpicRun, allowQuotaOverride bool) (store.Seat, seatGate, error) {
+	allSeats, err := st.ListSeats(ctx)
+	if err != nil {
+		return store.Seat{}, seatGate{}, err
+	}
+	if st.EnableCapacityV2 {
+		return epicSelectSeatV2(ctx, st, allSeats, family, hostFilter, active, allowQuotaOverride)
+	}
+	seats := make([]store.Seat, 0, len(allSeats))
+	quotaRisk := map[string]bool{}
+	for _, s := range allSeats {
+		if s.AgentFamily != family || !s.Enabled || (hostFilter != "" && s.Box != hostFilter) {
+			continue
+		}
+		switch s.Health {
+		case store.SeatReady:
+			seats = append(seats, s)
+		case store.SeatLimitCritical:
+			// Keep quota-limited seats in the candidate set long enough to evaluate
+			// capacity. A free one is overrideable; a full one is still a hard cap.
+			quotaRisk[s.ID] = true
+			seats = append(seats, s)
+		}
+	}
+	if len(seats) == 0 {
+		return store.Seat{}, seatGate{refuse: true, hardNoSeat: true,
+			reason: fmt.Sprintf("no ready %s seat available (register one with `flowbee seat discover <box>`; a `%s` epic needs a ready `%s` seat)", family, family, family)}, nil
+	}
+	// Per-seat load is the capacity dimension. Host load remains only a spread heuristic.
+	// An old active row without SeatID is charged to every candidate seat on its host so a
+	// half-migrated registry fails closed instead of silently overbooking it.
+	boxLoad := map[string]int{}
+	seatLoad := map[string]int{}
+	unboundBoxLoad := map[string]int{}
+	busy := map[string]bool{}
+	for _, e := range active {
+		boxLoad[e.Host]++
+		if e.SeatID != "" {
+			seatLoad[e.SeatID]++
+		} else {
+			unboundBoxLoad[e.Host]++
+		}
+		if e.AccountKey != "" {
+			busy[e.AccountKey] = true
+		}
+	}
+	var headroom, collocated []store.Seat
+	sawCriticalHeadroom := false
+	sawAtCap := false
+	for _, s := range seats {
+		// CAPACITY first: this exact seat must have a free slot. A cap<1 read off an old
+		// row normalizes to 1 — never an unbounded seat.
+		cap := s.MaxConcurrent
+		if cap < 1 {
+			cap = 1
+		}
+		if seatLoad[s.ID]+unboundBoxLoad[s.Box] >= cap {
+			sawAtCap = true
+			continue
+		}
+		if quotaRisk[s.ID] && !allowQuotaOverride {
+			sawCriticalHeadroom = true
+			continue
+		}
+		// Read account_windows.severity directly (belt-and-suspenders over seat health):
+		// a weekly_scoped-only critical excludes the seat even though usage_pct is below
+		// ceiling. A probe error / stale critical (CriticalNonStale=false) does NOT exclude
+		// — fail open (§12.14).
+		if s.AccountKey != "" {
+			if aw, ok, gerr := st.GetAccountWindow(ctx, s.AccountKey); gerr == nil && ok && aw.CriticalNonStale() {
+				sawCriticalHeadroom = true
+				if !allowQuotaOverride {
+					continue // this account is weekly-critical (non-stale) — cannot finish an epic on it
+				}
+				quotaRisk[s.ID] = true
+			}
+		}
+		if s.AccountKey != "" && busy[s.AccountKey] {
+			collocated = append(collocated, s)
+			continue
+		}
+		headroom = append(headroom, s)
+	}
+	// prefer the LEAST-LOADED box within each bucket (spread load), stable so the
+	// ListReadySeats id-order stays the deterministic tiebreak among equal loads.
+	byLoad := func(list []store.Seat) func(i, j int) bool {
+		return func(i, j int) bool { return boxLoad[list[i].Box] < boxLoad[list[j].Box] }
+	}
+	sort.SliceStable(headroom, byLoad(headroom))
+	sort.SliceStable(collocated, byLoad(collocated))
+	pick := func(list []store.Seat) (store.Seat, bool) {
+		if len(list) == 0 {
+			return store.Seat{}, false
+		}
+		return list[0], true
+	}
+	if seat, ok := pick(headroom); ok {
+		gate := seatGate{}
+		if quotaRisk[seat.ID] {
+			gate.warning = "--force-quota selected a quota-critical seat; capacity is still enforced, but this epic may exhaust the account before completion"
+		}
+		return seat, gate, nil
+	}
+	if seat, ok := pick(collocated); ok {
+		// no non-collocated seat with headroom; accept a collocated one with a warning.
+		warning := "chosen seat's account already powers another active epic (weekly budget shared)"
+		if quotaRisk[seat.ID] {
+			warning = "--force-quota selected a quota-critical seat whose account already powers another active epic"
+		}
+		return seat, seatGate{warning: warning}, nil
+	}
+	if sawCriticalHeadroom {
+		return store.Seat{}, seatGate{refuse: true,
+			reason: fmt.Sprintf("every ready %s seat's account is weekly-critical (severity=critical) — no weekly headroom to finish an epic", family)}, nil
+	}
+	if sawAtCap {
+		// Every ready seat of the family is at its concurrent-epic cap. This is hardNoSeat:
+		// there is no slot to place onto, and
+		// --force-quota must not conjure one (AddEpicRun's atomic cap gate would refuse a
+		// forced over-book anyway).
+		return store.Seat{}, seatGate{refuse: true, hardNoSeat: true,
+			reason: fmt.Sprintf("every ready %s seat is at its concurrent-epic cap — wait for an active epic to finish, add another seat, or raise a seat's cap with `flowbee seat set-max-concurrent`", family)}, nil
+	}
+	return store.Seat{}, seatGate{refuse: true,
+		reason: fmt.Sprintf("no ready %s seat with weekly headroom", family)}, nil
+}
+
+// epicSelectSeatV2 is the only builder admission selector under the v2 flag.
+// It reads the same complete active generation as review routing and has no
+// legacy worker_accounts/account_windows fallback. Even --force-quota cannot
+// bypass missing, stale, drifted, or exhausted capacity truth.
+func epicSelectSeatV2(ctx context.Context, st *store.Store, allSeats []store.Seat, family, hostFilter string, active []store.EpicRun, allowQuotaOverride bool) (store.Seat, seatGate, error) {
+	boxLoad := map[string]int{}
+	accountBusy := map[string]bool{}
+	for _, epic := range active {
+		boxLoad[epic.Host]++
+		if epic.AccountKey != "" {
+			accountBusy[epic.AccountKey] = true
+		}
+	}
+	type eligibleSeat struct {
+		seat       store.Seat
+		collocated bool
+	}
+	var eligible []eligibleSeat
+	var reasons []string
+	for _, seat := range allSeats {
+		if seat.AgentFamily != family || (hostFilter != "" && seat.Box != hostFilter) {
+			continue
+		}
+		decision, err := st.CapacityRouteForSeat(ctx, seat.ID, time.Now().UTC(), 5*time.Minute)
+		if err != nil {
+			return store.Seat{}, seatGate{}, err
+		}
+		if !decision.Routable {
+			reasons = append(reasons, seat.ID+"="+strings.Join(decision.Reasons, ","))
+			continue
+		}
+		eligible = append(eligible, eligibleSeat{seat: seat, collocated: seat.AccountKey != "" && accountBusy[seat.AccountKey]})
+	}
+	if len(eligible) == 0 {
+		reason := fmt.Sprintf("no %s seat passes the v2 live capacity gate", family)
+		if len(reasons) > 0 {
+			reason += ": " + strings.Join(reasons, "; ")
+		}
+		if allowQuotaOverride {
+			reason += " (--force-quota cannot bypass v2 identity, freshness, reserve, or concurrency fences)"
+		}
+		return store.Seat{}, seatGate{refuse: true, hardNoSeat: true, reason: reason}, nil
+	}
+	sort.SliceStable(eligible, func(i, j int) bool {
+		if eligible[i].collocated != eligible[j].collocated {
+			return !eligible[i].collocated
+		}
+		if boxLoad[eligible[i].seat.Box] != boxLoad[eligible[j].seat.Box] {
+			return boxLoad[eligible[i].seat.Box] < boxLoad[eligible[j].seat.Box]
+		}
+		return eligible[i].seat.ID < eligible[j].seat.ID
+	})
+	return eligible[0].seat, seatGate{}, nil
+}
+
+// realTmuxClock is the production tmuxio.Clock the launch ladder + its tmuxio.Client share
+// (tmuxio's own default clock is unexported, and RunLadder needs the SAME clock the client
+// was built with — here both use the wall clock).
+type realTmuxClock struct{}
+
+func (realTmuxClock) Now() time.Time { return time.Now() }
+func (realTmuxClock) Sleep(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
 }
 
 // epicQuotaGate implements the design doc's quota gate: "refuse if the launch
@@ -403,22 +767,144 @@ func epicQuotaGate(ctx context.Context, st *store.Store, agent string, now time.
 	return false, "", nil // the primary account has no usage row at all: fail-open
 }
 
+// runEpicDigest is `flowbee epic digest` (plan §2.1) — the deterministically-compiled
+// board (master + all epics + attention) via the HTTP API's GET /v1/epics/digest, so the
+// master/operator reads one screen instead of pane-scraping. `--id <slug>` fetches one
+// epic's digest (optionally with `--tail` for the bounded UNTRUSTED pane tail).
+func runEpicDigest(args []string) error {
+	fs := flag.NewFlagSet("epic digest", flag.ContinueOnError)
+	id := fs.String("id", "", "one epic's digest (default: the whole board)")
+	tail := fs.Bool("tail", false, "with --id, include the bounded UNTRUSTED pane tail")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := "/v1/epics/digest"
+	if *id != "" {
+		path = "/v1/epics/" + *id + "/digest"
+		if *tail {
+			path += "?tail=1"
+		}
+	}
+	var raw json.RawMessage
+	if _, err := masterGet(path, &raw); err != nil {
+		return err
+	}
+	fmt.Println(string(raw))
+	return nil
+}
+
+// runEpicPlan is `flowbee epic plan` (plan §4.5 / §15.12f, ADVISORY read-only — the
+// dispatcher itself is Phase 9). It surfaces the placement read-model authoring designs
+// AROUND (author-epic §10b): every active epic's RESERVED scope globs + subsystem
+// adjacency, and the ready-seat capacity per family. Pure local reads, no launch.
+func runEpicPlan(ctx context.Context, st *store.Store, args []string) error {
+	fs := flag.NewFlagSet("epic plan", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	active, err := st.ListActiveEpicRuns(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Println("active epics (reserved scope — author your scope: to NOT overlap; overlap is a hard launch refusal):")
+	if len(active) == 0 {
+		fmt.Println("  (none)")
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "  EPIC\tREPO\tSTATE\tSUBSYSTEMS\tSCOPE")
+	for _, e := range active {
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\n", e.ID, dashIfEmpty(e.Repo), e.State,
+			dashIfEmpty(strings.Join(subsystemsOf(e.Scope), ",")), dashIfEmpty(strings.Join(e.Scope, " ")))
+	}
+	tw.Flush() //nolint:errcheck
+
+	fmt.Println("\nready seats (a launch of family F needs a ready F seat with weekly headroom):")
+	seats, err := st.ListSeats(ctx)
+	if err != nil {
+		return err
+	}
+	byFamily := map[string]int{}
+	for _, s := range seats {
+		if s.Enabled && s.Health == store.SeatReady {
+			byFamily[s.AgentFamily]++
+		}
+	}
+	if len(byFamily) == 0 {
+		fmt.Println("  (no ready seats — `flowbee seat discover <box>` to register one)")
+	}
+	for _, fam := range []string{"claude", "codex", "grok"} {
+		fmt.Printf("  %s: %d ready seat(s)\n", fam, byFamily[fam])
+	}
+	return nil
+}
+
+// subsystemsOf reduces scope globs to their coarse top-level subsystem dirs (the first two
+// path segments) — the §15.5a subsystem-adjacency signal a human eyeballs so two epics with
+// disjoint globs don't silently build the same adapter.
+func subsystemsOf(scope []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, g := range scope {
+		parts := strings.SplitN(g, "/", 3)
+		key := parts[0]
+		if len(parts) >= 2 {
+			key = parts[0] + "/" + parts[1]
+		}
+		key = strings.TrimSuffix(key, "**")
+		key = strings.TrimSuffix(key, "/")
+		if key != "" && !seen[key] {
+			seen[key] = true
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
 func runEpicAbandon(ctx context.Context, st *store.Store, args []string) error {
+	return runEpicAbandonWithRunner(ctx, st, args, watchdog.NewShellRunner(), os.Stdout)
+}
+
+// runEpicAbandonWithRunner is the testable abandon boundary. The durable transition
+// releases both the seat and scope, so it MUST happen only after the runner confirms
+// that this row's exact registered tmux session is absent. The private worktree is
+// deliberately left in place after the process stops so unpushed work remains recoverable.
+func runEpicAbandonWithRunner(ctx context.Context, st *store.Store, args []string, runner watchdog.Runner, w io.Writer) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: flowbee epic abandon <id>")
 	}
 	id := args[0]
+	// Resolve first both for the friendlier missing-id error and to bind cleanup to the
+	// immutable host/tmux pair stored for this exact epic (never to an id-derived guess).
+	epic, gerr := st.GetEpicRun(ctx, id)
+	if errors.Is(gerr, store.ErrEpicRunNotFound) {
+		return fmt.Errorf("no such epic %q", id)
+	}
+	if gerr != nil {
+		return gerr
+	}
+	if strings.TrimSpace(epic.TmuxName) == "" {
+		return fmt.Errorf("cannot abandon epic %q: it has no registered tmux session name, so a stop cannot be confirmed; the epic remains active with its scope, seat, and private worktree preserved", id)
+	}
+	where := "the local host"
+	if epic.Host != "" {
+		where = epic.Host + " and its local attach"
+		if _, err := runner.Run(ctx, watchdog.KillTmuxSessionCmd(epic.Host, epic.TmuxName)); err != nil {
+			return fmt.Errorf("cannot abandon epic %q: could not confirm remote tmux session %q stopped on %s; the epic remains active with its scope, seat, and private worktree preserved: %w",
+				id, epic.TmuxName, epic.Host, err)
+		}
+	}
+	if _, err := runner.Run(ctx, watchdog.KillTmuxSessionCmd("", epic.TmuxName)); err != nil {
+		return fmt.Errorf("cannot abandon epic %q: could not confirm local tmux session %q stopped; the epic remains active with its scope, seat, and private worktree preserved: %w",
+			id, epic.TmuxName, err)
+	}
 	if err := st.AbandonEpicRun(ctx, id, time.Now()); err != nil {
 		if errors.Is(err, store.ErrEpicRunNotFound) {
 			return fmt.Errorf("no such epic %q", id)
 		}
-		return err
+		return fmt.Errorf("tmux session %q was stopped, but epic %q could not be marked abandoned (its reservations remain held): %w", epic.TmuxName, id, err)
 	}
-	// operator decision, called out explicitly (§ task brief): abandon releases the
-	// scope/host reservation and stops the watchdog watching it, but the tmux
-	// session itself (and any still-running agent inside it) is left alone.
-	fmt.Printf("epic %q abandoned — scope + host reservation released, goal-session watch disabled.\n"+
-		"the tmux session was NOT killed; if it's still running, stop it by hand (`tmux kill-session -t epic-%s` on its host).\n", id, id)
+	fmt.Fprintf(w, "epic %q abandoned — tmux session %q stopped on %s; scope + seat reservation released; goal-session watch disabled.\n"+
+		"the private worktree was preserved for inspection and recovery.\n", id, epic.TmuxName, where)
 	return nil
 }
 

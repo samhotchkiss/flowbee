@@ -1,0 +1,24 @@
+{
+  "oauthAccount": {
+    "accountUuid": "acct-live-0000-0000-000000000003",
+    "emailAddress": "live@example.com",
+    "organizationName": "Example Live Org",
+    "organizationUuid": "org-live-0000-0000-000000000003",
+    "organizationRateLimitTier": "default_max_20x",
+    "seatTier": null
+  },
+  "cachedUsageUtilization": {
+    "fetchedAtMs": 1784203000000,
+    "accountUuid": "acct-live-0000-0000-000000000003",
+    "utilization": {
+      "five_hour": {"utilization": 9, "resets_at": "2026-07-16T20:00:00+00:00"},
+      "seven_day": {"utilization": 21, "resets_at": "2026-07-22T00:00:00+00:00"},
+      "extra_usage": {"is_enabled": false},
+      "limits": [
+        {"kind": "session", "group": "session", "percent": 9, "severity": "normal", "resets_at": "2026-07-16T20:00:00+00:00", "scope": null, "is_active": true},
+        {"kind": "weekly_all", "group": "weekly", "percent": 21, "severity": "normal", "resets_at": "2026-07-22T00:00:00+00:00", "scope": null, "is_active": true}
+      ],
+      "spend": {"percent": 0, "enabled": false}
+    }
+  }
+}

@@ -3,6 +3,9 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,10 +14,186 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
 
+// mustAddEpicRun registers an epic at the DEFAULT host cap of 1 (the original
+// one-box-one-epic behavior) — the cases exercising a higher cap call AddEpicRun
+// directly with the cap they want.
 func mustAddEpicRun(t *testing.T, st *store.Store, ctx context.Context, e store.EpicRun, now time.Time) {
 	t.Helper()
-	if err := st.AddEpicRun(ctx, e, now); err != nil {
+	if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
 		t.Fatalf("add epic run %q: %v", e.ID, err)
+	}
+}
+
+func TestAddEpicRunV2AdmissionIsIdempotentAndCreatesReviewObligation(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	if _, err := st.DB.Exec(`INSERT INTO projects(id,name) VALUES ('proj-a','Project A')`); err != nil {
+		t.Fatal(err)
+	}
+	e := store.EpicRun{ID: "epic-ulid-1", ProjectID: "proj-a", AdmissionKey: "intent-1:v1", ContractHash: "sha256:contract", Repo: "r", Branch: "dev/russ", Scope: []string{"pkg/**"}}
+	if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	// Lost-ack retry may choose a different local slug, but the stable key returns
+	// success and must not create another delivery obligation.
+	e.ID = "different-retry-slug"
+	if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
+		t.Fatalf("idempotent retry: %v", err)
+	}
+	var epics, deliveries int
+	if err := st.DB.QueryRow(`SELECT COUNT(*) FROM epics WHERE project_id=? AND admission_key=?`, e.ProjectID, e.AdmissionKey).Scan(&epics); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DB.QueryRow(`SELECT COUNT(*) FROM epic_deliveries WHERE project_id=?`, e.ProjectID).Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if epics != 1 || deliveries != 1 {
+		t.Fatalf("duplicate admission: epics=%d deliveries=%d", epics, deliveries)
+	}
+	var required int
+	if err := st.DB.QueryRow(`SELECT review_required FROM epic_deliveries WHERE epic_id=?`, "epic-ulid-1").Scan(&required); err != nil {
+		t.Fatal(err)
+	}
+	if required != 1 {
+		t.Fatalf("review obligation not durable: %d", required)
+	}
+}
+
+func TestAddEpicRunV2AdmissionConflictsOnChangedContract(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := st.DB.Exec(`INSERT INTO projects(id,name) VALUES ('proj-a','Project A')`); err != nil {
+		t.Fatal(err)
+	}
+	e := store.EpicRun{ID: "epic-contract", ProjectID: "proj-a", AdmissionKey: "intent-2:v1", ContractHash: "hash-a", Repo: "r", Scope: []string{"a/**"}}
+	if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	e.ID, e.ContractHash = "epic-contract-retry", "hash-b"
+	if err := st.AddEpicRun(ctx, e, 1, now); !errors.Is(err, store.ErrEpicAdmissionConflict) {
+		t.Fatalf("expected contract conflict, got %v", err)
+	}
+}
+
+// TestAddEpicRunSeatCapacityIsAtomic proves the throughput model's real invariant:
+// capacity belongs to an authenticated seat, not to the host string. Two distinct
+// cap-1 seats on the same (including local/empty) host can run together; one cap-2
+// seat admits exactly two racing starts and refuses the third. The binding is part
+// of the initial insert, so a launching row is visible to the next atomic count.
+func TestAddEpicRunSeatCapacityIsAtomic(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	addSeat := func(seat store.Seat) store.Seat {
+		t.Helper()
+		if err := st.AddSeat(ctx, seat, now); err != nil {
+			t.Fatalf("add seat %+v: %v", seat, err)
+		}
+		seat.ID = seat.ComposeID()
+		return seat
+	}
+	localA := addSeat(store.Seat{
+		Box: "", AgentFamily: "codex", CodexHome: "/flowbee/codex-a",
+		AccountKey: "acct-a", Health: store.SeatReady, MaxConcurrent: 1,
+	})
+	localB := addSeat(store.Seat{
+		Box: "", AgentFamily: "codex", CodexHome: "/flowbee/codex-b",
+		AccountKey: "acct-b", Health: store.SeatReady, MaxConcurrent: 1,
+	})
+	fast := addSeat(store.Seat{
+		Box: "fastbox", AgentFamily: "codex", CodexHome: "/flowbee/codex-fast",
+		AccountKey: "acct-fast", Health: store.SeatReady, MaxConcurrent: 2,
+	})
+	sharedA := addSeat(store.Seat{
+		Box: "shared-host", AgentFamily: "codex", CodexHome: "/flowbee/shared-a",
+		AccountKey: "acct-shared-a", Health: store.SeatReady, MaxConcurrent: 1,
+	})
+	sharedB := addSeat(store.Seat{
+		Box: "shared-host", AgentFamily: "codex", CodexHome: "/flowbee/shared-b",
+		AccountKey: "acct-shared-b", Health: store.SeatReady, MaxConcurrent: 1,
+	})
+
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "local-a", Repo: "r", Host: "wrong-host", SeatID: localA.ID,
+		AccountKey: "wrong-account", BuilderModelFamily: "wrong-family", Scope: []string{"a/**"},
+	}, 99, now); err != nil {
+		t.Fatalf("first local seat: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "local-b", Repo: "r", SeatID: localB.ID, Scope: []string{"b/**"},
+	}, 1, now); err != nil {
+		t.Fatalf("a distinct cap-1 seat on the same local host must run concurrently: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "local-a-2", Repo: "r", SeatID: localA.ID, Scope: []string{"c/**"},
+	}, 99, now); !errors.Is(err, store.ErrEpicHostBusy) {
+		t.Fatalf("a second epic on the same cap-1 local seat must be refused, got %v", err)
+	}
+	got, err := st.GetEpicRun(ctx, "local-a")
+	if err != nil || got.SeatID != localA.ID || got.Host != "" || got.AccountKey != "acct-a" || got.BuilderModelFamily != "codex" {
+		t.Fatalf("initial insert must atomically persist the selected binding: err=%v epic=%+v", err, got)
+	}
+	for i, seat := range []store.Seat{sharedA, sharedB} {
+		if err := st.AddEpicRun(ctx, store.EpicRun{
+			ID: fmt.Sprintf("shared-%d", i), Repo: "r", SeatID: seat.ID,
+			Scope: []string{fmt.Sprintf("shared/%d/**", i)},
+		}, 1, now); err != nil {
+			t.Fatalf("distinct cap-1 seat %d on one nonempty host must admit concurrently: %v", i, err)
+		}
+	}
+
+	const racers = 3
+	start := make(chan struct{})
+	type result struct {
+		id  string
+		err error
+	}
+	results := make(chan result, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			id := fmt.Sprintf("race-%d", i)
+			results <- result{id: id, err: st.AddEpicRun(ctx, store.EpicRun{
+				ID: id, Repo: "r", SeatID: fast.ID,
+				Scope: []string{fmt.Sprintf("race/%d/**", i)},
+			}, 999, now)}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	succeeded, capped := 0, 0
+	var admitted []string
+	for result := range results {
+		err := result.err
+		switch {
+		case err == nil:
+			succeeded++
+			admitted = append(admitted, result.id)
+		case errors.Is(err, store.ErrEpicHostBusy):
+			capped++
+		default:
+			t.Fatalf("unexpected racing registration error: %v", err)
+		}
+	}
+	if succeeded != 2 || capped != 1 {
+		t.Fatalf("cap-2 racing starts: succeeded=%d capped=%d, want 2/1", succeeded, capped)
+	}
+	if err := st.AbandonEpicRun(ctx, admitted[0], now.Add(time.Minute)); err != nil {
+		t.Fatalf("release one slot: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "after-release", Repo: "r", SeatID: fast.ID, Scope: []string{"after/**"},
+	}, 1, now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("a terminal epic must release one exact-seat slot: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "ghost", Repo: "r", SeatID: "missing", Scope: []string{"ghost/**"}}, 99, now); !errors.Is(err, store.ErrSeatNotFound) {
+		t.Fatalf("unknown bound seat must fail closed, got %v", err)
 	}
 }
 
@@ -29,7 +208,7 @@ func TestEpicRunCRUDAndLifecycle(t *testing.T) {
 		Branch: "epic/2026-07-03-frobnicator", TmuxName: "epic-2026-07-03-frobnicator", Agent: "codex",
 	}, now)
 
-	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "2026-07-03-frobnicator"}, now); !errors.Is(err, store.ErrEpicRunExists) {
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "2026-07-03-frobnicator"}, 1, now); !errors.Is(err, store.ErrEpicRunExists) {
 		t.Fatalf("expected ErrEpicRunExists, got %v", err)
 	}
 
@@ -186,8 +365,9 @@ func TestEpicRunAbandonReleasesHostAndDisablesSession(t *testing.T) {
 	if gs.Enabled {
 		t.Fatalf("expected the linked goal session to be disabled (watch paused) after abandon")
 	}
-	// abandon does NOT delete the tmux session's registration, only pauses watching
-	// it — the row must still exist (an operator decision to kill it, not ours).
+	// The store transition does NOT delete the tmux session's registration, only pauses
+	// watching it. The CLI has already stopped the process before invoking this method;
+	// the registry row remains as durable history.
 	if _, err := st.GetGoalSession(ctx, "epic-e3"); err != nil {
 		t.Fatalf("expected goal session row to still exist: %v", err)
 	}
@@ -331,10 +511,10 @@ func TestAddEpicRunAtomicGates(t *testing.T) {
 		ID: "first", Repo: "russ", Host: "buncher", Scope: []string{"internal/foo/**"},
 	}, now)
 
-	// same host, disjoint scope, different repo: host occupancy refuses.
+	// same host at cap 1, disjoint scope, different repo: host occupancy refuses.
 	err := st.AddEpicRun(ctx, store.EpicRun{
 		ID: "second", Repo: "other", Host: "buncher", Scope: []string{"cmd/**"},
-	}, now)
+	}, 1, now)
 	if !errors.Is(err, store.ErrEpicHostBusy) {
 		t.Fatalf("expected ErrEpicHostBusy, got %v", err)
 	}
@@ -342,7 +522,7 @@ func TestAddEpicRunAtomicGates(t *testing.T) {
 	// different host, overlapping scope, SAME repo: scope reservation refuses.
 	err = st.AddEpicRun(ctx, store.EpicRun{
 		ID: "third", Repo: "russ", Host: "imac", Scope: []string{"internal/**"},
-	}, now)
+	}, 1, now)
 	if !errors.Is(err, store.ErrEpicScopeOverlap) {
 		t.Fatalf("expected ErrEpicScopeOverlap, got %v", err)
 	}
@@ -350,7 +530,7 @@ func TestAddEpicRunAtomicGates(t *testing.T) {
 	// different host, overlapping scope, DIFFERENT repo: allowed (scope is repo-local).
 	if err := st.AddEpicRun(ctx, store.EpicRun{
 		ID: "fourth", Repo: "other", Host: "imac", Scope: []string{"internal/**"},
-	}, now); err != nil {
+	}, 1, now); err != nil {
 		t.Fatalf("cross-repo overlapping scope should be allowed: %v", err)
 	}
 
@@ -360,7 +540,77 @@ func TestAddEpicRunAtomicGates(t *testing.T) {
 	}
 	if err := st.AddEpicRun(ctx, store.EpicRun{
 		ID: "fifth", Repo: "russ", Host: "buncher", Scope: []string{"internal/foo/**"},
-	}, now); err != nil {
+	}, 1, now); err != nil {
 		t.Fatalf("expected the abandoned epic's reservations released: %v", err)
+	}
+}
+
+// TestAddEpicRunHostCapAdmitsUpToCapThenRefuses is the 2-concurrent-epics-per-seat gate:
+// with cap=2 a host admits TWO active epics and refuses the THIRD with ErrEpicHostBusy. The
+// count-then-insert is one tx on a MaxOpenConns(1) store, so a cap-2 host can never end with
+// 3 active epics even under concurrent starts (the serialization is structural — this test
+// pins the cap arithmetic the tx enforces). cap=1 reproduces one-box-one-epic exactly, and a
+// cap read back as 0 (a row predating 0029, or an unresolved caller) normalizes to 1.
+func TestAddEpicRunHostCapAdmitsUpToCapThenRefuses(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+
+	// two disjoint-scope epics on the same cap-2 host both register.
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "c1", Repo: "russ", Host: "codexbox", Scope: []string{"internal/a/**"},
+	}, 2, now); err != nil {
+		t.Fatalf("first epic on a cap-2 host should register: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "c2", Repo: "russ", Host: "codexbox", Scope: []string{"internal/b/**"},
+	}, 2, now); err != nil {
+		t.Fatalf("second epic on a cap-2 host should register (headroom): %v", err)
+	}
+
+	// the third is refused — the host is at its cap of 2, and the message names the cap.
+	err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "c3", Repo: "russ", Host: "codexbox", Scope: []string{"internal/c/**"},
+	}, 2, now)
+	if !errors.Is(err, store.ErrEpicHostBusy) {
+		t.Fatalf("third epic past cap 2 must be refused with ErrEpicHostBusy, got %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "cap 2") {
+		t.Fatalf("ErrEpicHostBusy message should mention the cap, got %v", err)
+	}
+
+	// cap=1 on a DIFFERENT host reproduces one-box-one-epic exactly (no regression).
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "s1", Repo: "russ", Host: "claudebox", Scope: []string{"internal/d/**"},
+	}, 1, now); err != nil {
+		t.Fatalf("first epic on a cap-1 host should register: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "s2", Repo: "russ", Host: "claudebox", Scope: []string{"internal/e/**"},
+	}, 1, now); !errors.Is(err, store.ErrEpicHostBusy) {
+		t.Fatalf("second epic on a cap-1 host must be refused (one-box-one-epic), got %v", err)
+	}
+
+	// once one cap-2 epic finishes, a slot frees and the next registers.
+	if err := st.AbandonEpicRun(ctx, "c1", now); err != nil {
+		t.Fatalf("abandon c1: %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "c3b", Repo: "russ", Host: "codexbox", Scope: []string{"internal/c/**"},
+	}, 2, now); err != nil {
+		t.Fatalf("a freed cap-2 slot should admit the next epic: %v", err)
+	}
+
+	// a cap read back as 0 (a row predating the column, or a caller that forgot to resolve
+	// it) is normalized to 1, never an unbounded host.
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "z1", Repo: "russ", Host: "zerobox", Scope: []string{"internal/z/**"},
+	}, 0, now); err != nil {
+		t.Fatalf("cap 0 should behave as cap 1 (admit the first): %v", err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{
+		ID: "z2", Repo: "russ", Host: "zerobox", Scope: []string{"internal/y/**"},
+	}, 0, now); !errors.Is(err, store.ErrEpicHostBusy) {
+		t.Fatalf("cap 0 normalized to 1 must refuse the second, got %v", err)
 	}
 }

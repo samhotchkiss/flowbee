@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8" />
+	<script src="sdpi-components.js"></script>
+</head>
+<body>
+	<sdpi-item label="Repo (optional)">
+		<sdpi-textfield setting="repo" placeholder="empty = pause everything"></sdpi-textfield>
+	</sdpi-item>
+	<sdpi-item label="Flowbee URL">
+		<sdpi-textfield setting="baseUrl" global placeholder="http://127.0.0.1:7070"></sdpi-textfield>
+	</sdpi-item>
+	<sdpi-item label="API token">
+		<sdpi-password setting="token" global placeholder="flowbee token … (loopback: leave empty)"></sdpi-password>
+	</sdpi-item>
+	<sdpi-item label="Master session">
+		<sdpi-textfield setting="masterSession" global placeholder="tmux session of your master agent"></sdpi-textfield>
+	</sdpi-item>
+	<sdpi-item label="Terminal app">
+		<sdpi-select setting="terminalApp" global>
+			<option value="iTerm">iTerm2</option>
+			<option value="Terminal">Terminal.app</option>
+		</sdpi-select>
+	</sdpi-item>
+	<sdpi-item label="SSH hosts allowed">
+		<sdpi-textfield setting="sshAllowedHosts" global placeholder="comma-separated; empty = remote blocked"></sdpi-textfield>
+	</sdpi-item>
+	<sdpi-item label="Poll every (s)">
+		<sdpi-range setting="pollSeconds" global min="2" max="30" step="1" default="5" showlabels></sdpi-range>
+	</sdpi-item>
+</body>
+</html>

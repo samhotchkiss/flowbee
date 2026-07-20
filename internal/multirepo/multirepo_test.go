@@ -61,6 +61,22 @@ func TestMultiRepoControlPlane(t *testing.T) {
 	if got := mgr.Repos(); len(got) != 2 || got[0] != "core" || got[1] != "web" {
 		t.Fatalf("managed repos = %v, want [core web]", got)
 	}
+	coreEffects, err := mgr.ForRepo(ctx, "core")
+	if err != nil {
+		t.Fatalf("resolve core v2 effects: %v", err)
+	}
+	if err := coreEffects.DeleteBranch(ctx, "epic/repo-fence-proof"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fakes["core"].DeletedBranches(); len(got) != 1 || got[0] != "epic/repo-fence-proof" {
+		t.Fatalf("core effect route=%v", got)
+	}
+	if got := fakes["web"].DeletedBranches(); len(got) != 0 {
+		t.Fatalf("core effect crossed into web client: %v", got)
+	}
+	if _, err := mgr.ForRepo(ctx, "missing"); err == nil {
+		t.Fatal("unknown v2 effect repo must fail closed")
+	}
 
 	// ── a job from EACH repo ──
 	// core's job is MORE urgent (priority 1; lower = more urgent) => cross-repo
@@ -185,6 +201,49 @@ func TestMultiRepoControlPlane(t *testing.T) {
 	}
 	if countCalls(fakes["web"].Calls(), "BoardSweep") != 1 {
 		t.Fatalf("web BoardSweep count != 1: %v", fakes["web"].Calls())
+	}
+}
+
+func TestRepositoryProbeUsesStableRepoIDAndReadOnlyGitHubSurface(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "repo-stable-a", Owner: "acme", Repo: "same-name", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "repo-stable-b", Owner: "other", Repo: "same-name", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	fakes := map[string]*gh.Fake{"repo-stable-a": gh.NewFake(), "repo-stable-b": gh.NewFake()}
+	fakes["repo-stable-a"].SetPR(gh.PullRequest{Number: 9, HeadRefOid: "head-a", BaseRefOid: "base-a", CIRollup: gh.CISuccess})
+	fakes["repo-stable-a"].SetPR(gh.PullRequest{Number: 2, HeadRefOid: "head-b", BaseRefOid: "base-b", CIRollup: gh.CIPending})
+	mgr, err := multirepo.New(ctx, st, clock.NewFake(time.Unix(20_000, 0)), nil,
+		func(repo store.Repo) (gh.Client, gh.Writer, error) { return fakes[repo.ID], fakes[repo.ID], nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := mgr.ReadRepositoryProbe(ctx, "repo-stable-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := mgr.ReadRepositoryProbe(ctx, "repo-stable-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.RepoID != "repo-stable-a" || first.Fingerprint == "" || first.Fingerprint != second.Fingerprint {
+		t.Fatalf("unstable mechanical facts: first=%+v second=%+v", first, second)
+	}
+	if first.PullRequests != 2 || first.GreenPullRequests != 1 || first.PendingPullRequests != 1 {
+		t.Fatalf("unexpected facts: %+v", first)
+	}
+	if got := fakes["repo-stable-b"].Calls(); len(got) != 0 {
+		t.Fatalf("stable-id probe crossed repository boundary: %v", got)
+	}
+	if _, err := mgr.ReadRepositoryProbe(ctx, "same-name"); err == nil {
+		t.Fatal("owner/repo name must not be accepted as durable routing authority")
+	}
+	if got := fakes["repo-stable-a"].Calls(); len(got) != 2 || got[0] != "BoardSweep" || got[1] != "BoardSweep" {
+		t.Fatalf("probe called a GitHub mutation surface: %v", got)
 	}
 }
 

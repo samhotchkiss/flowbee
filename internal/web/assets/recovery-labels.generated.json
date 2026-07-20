@@ -1,0 +1,182 @@
+{
+  "action_ack_overdue": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/action_ack_overdue",
+    "owner": "flowbee",
+    "severity": "warning"
+  },
+  "action_delivery_uncertain": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/action_delivery_uncertain",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "artifact_advanced": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/artifact_advanced",
+    "owner": "flowbee",
+    "severity": "info"
+  },
+  "artifact_never_produced": {
+    "attention_kind": "artifact_overdue",
+    "help_path": "/help/recovery/artifact_never_produced",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "builder_host_unreachable": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/builder_host_unreachable",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "builder_launch_stalled": {
+    "attention_kind": "launch_failed",
+    "help_path": "/help/recovery/builder_launch_stalled",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "builder_progress_stalled": {
+    "attention_kind": "build_stalled",
+    "help_path": "/help/recovery/builder_progress_stalled",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "capacity_identity_mismatch": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/capacity_identity_mismatch",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "capacity_live_unavailable": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/capacity_live_unavailable",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "capacity_pool_exhausted": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/capacity_pool_exhausted",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "ci_never_green": {
+    "attention_kind": "ci_pending_overdue",
+    "help_path": "/help/recovery/ci_never_green",
+    "owner": "flowbee",
+    "severity": "warning"
+  },
+  "cleanup_overdue": {
+    "attention_kind": "cleanup_overdue",
+    "help_path": "/help/recovery/cleanup_overdue",
+    "owner": "flowbee",
+    "severity": "warning"
+  },
+  "conflict_resolution_stalled": {
+    "attention_kind": "conflict_resolution_stalled",
+    "help_path": "/help/recovery/conflict_resolution_stalled",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "decision_ack_overdue": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/decision_ack_overdue",
+    "owner": "flowbee",
+    "severity": "warning"
+  },
+  "epic_admission_ack_stalled": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/epic_admission_ack_stalled",
+    "owner": "flowbee",
+    "severity": "warning"
+  },
+  "epic_admission_outcome_uncertain": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/epic_admission_outcome_uncertain",
+    "owner": "orchestrator",
+    "severity": "critical"
+  },
+  "hold_overdue": {
+    "attention_kind": "hold_overdue",
+    "help_path": "/help/recovery/hold_overdue",
+    "owner": "flowbee",
+    "severity": "warning"
+  },
+  "lease_expired": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/lease_expired",
+    "owner": "flowbee",
+    "severity": "warning"
+  },
+  "merge_dispatch_stalled": {
+    "attention_kind": "merge_dispatch_stalled",
+    "help_path": "/help/recovery/merge_dispatch_stalled",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "operational_supervisor_absent": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/operational_supervisor_absent",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "orchestrator_claim_expired": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/orchestrator_claim_expired",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "orchestrator_route_absent": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/orchestrator_route_absent",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "protocol_incompatible": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/protocol_incompatible",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "reconciler_dead": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/reconciler_dead",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "review_capacity_unavailable": {
+    "attention_kind": "review_capacity_exhausted",
+    "help_path": "/help/recovery/review_capacity_unavailable",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "review_dispatch_missing": {
+    "attention_kind": "review_dispatch_stalled",
+    "help_path": "/help/recovery/review_dispatch_missing",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "review_verdict_overdue": {
+    "attention_kind": "review_verdict_overdue",
+    "help_path": "/help/recovery/review_verdict_overdue",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "rework_dispatch_stalled": {
+    "attention_kind": "builder_rework_stalled",
+    "help_path": "/help/recovery/rework_dispatch_stalled",
+    "owner": "flowbee",
+    "severity": "critical"
+  },
+  "work_intent_capture_unacked": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/work_intent_capture_unacked",
+    "owner": "interactor",
+    "severity": "critical"
+  },
+  "work_intent_promotion_stalled": {
+    "attention_kind": "",
+    "help_path": "/help/recovery/work_intent_promotion_stalled",
+    "owner": "flowbee",
+    "severity": "critical"
+  }
+}

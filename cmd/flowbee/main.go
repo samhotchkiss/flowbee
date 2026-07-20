@@ -94,6 +94,8 @@ func main() {
 		err = runSpec(args)
 	case "repo":
 		err = runRepo(args)
+	case "project":
+		err = runProject(args)
 	case "serve":
 		err = runServe(args)
 	case "up":
@@ -102,6 +104,8 @@ func main() {
 		err = runFleet(args)
 	case "migrate":
 		err = runMigrate(args)
+	case "migration":
+		err = runMigration(args)
 	case "seed":
 		err = runSeed(args)
 	case "token":
@@ -138,8 +142,18 @@ func main() {
 		err = runSession(args)
 	case "host":
 		err = runHost(args)
+	case "seat":
+		err = runSeat(args)
 	case "epic":
 		err = runEpic(args)
+	case "master":
+		err = runMaster(args)
+	case "attention":
+		err = runAttention(args)
+	case "human":
+		err = runHuman(args)
+	case "watchdog":
+		err = runWatchdog(args)
 	case "version", "-v", "--version":
 		err = runVersion(args)
 	default:
@@ -154,5 +168,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|list|status|spec|repo|card|up|fleet|serve|token|migrate|work|lease|submit|requeue|adopt|cancel|retry-outbox|backup|build|restore|pause|resume|session|host|epic|seed|version>")
+	fmt.Fprintln(os.Stderr, "usage: flowbee <init|doctor|board|list|status|spec|repo|project|card|up|fleet|serve|watchdog|token|human|migrate|migration|work|lease|submit|requeue|adopt|cancel|retry-outbox|backup|build|restore|pause|resume|session|host|seat|epic|master|attention|seed|version>")
 }

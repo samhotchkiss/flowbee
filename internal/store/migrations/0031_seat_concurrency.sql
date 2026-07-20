@@ -1,0 +1,32 @@
+-- 0031: per-seat concurrent-epic cap (epic-lane: 2-concurrent-epics-per-seat).
+--
+-- NUMBER: 0029/0030 were already forward-reserved in migrations/LADDER.md for
+-- 0029_epic_drift_ci (Phase 8) and 0030_missions (Phase 9); this cap is the next FREE
+-- number, 0031 (reserved via `flowbee migration reserve seat_concurrency`), so it does
+-- not collide with those pending phases the way the prior 0027 attempt would have.
+--
+-- BACKGROUND. epic-lane launch placement (0028_epic_capacity.sql, plan §15.13) binds
+-- an epic to a SEAT — (account, box, family, config dir) — and, until now, held every
+-- seat to ONE active epic at a time. That rule was conservative — a multi-day unattended
+-- agent wanted the whole seat — but it leaves a fast seat idle at 50% while
+-- a single epic runs, when the two epics have file-disjoint scope and each gets its own
+-- git worktree (the isolation that makes coexistence safe). The seat IS the per-box
+-- placement/capacity unit here, so the per-seat cap the design calls for is a column on
+-- this table. Multiple authenticated seats may share one physical host; each contributes
+-- its own capacity while host load remains a placement/spread signal.
+--
+-- max_concurrent is the number of ACTIVE epics the exact seat may hold at once. DEFAULT 1
+-- deliberately PRESERVES today's one-epic-per-seat behavior for every existing and
+-- future seat (so claude/grok seats stay 1-wide) until an operator raises it (a codex box
+-- gets 2). This migration sets NO seat to 2 — that is operational data an operator writes
+-- later via `flowbee seat add --max-concurrent N` / `flowbee seat set-max-concurrent`,
+-- never a schema default, so a freshly-discovered seat is always the safe cap of 1.
+--
+-- The cap is ENFORCED the same way occupancy always was: a launch-time COUNT over the
+-- active epics bound to the exact seat, inside store.AddEpicRun's single transaction (the store
+-- pins MaxOpenConns(1), so the count-then-insert serializes against concurrent starts and
+-- a cap-2 seat can never end with 3 active epics). It is NOT a DB constraint, because
+-- "active" is a STATE predicate over the epics table, not a static flag this row can carry
+-- — same rationale the 0026 comment gives for occupancy itself. The seat row is loaded
+-- within that transaction, so stale caller-provided capacity cannot bypass the limit.
+ALTER TABLE seats ADD COLUMN max_concurrent INTEGER NOT NULL DEFAULT 1;

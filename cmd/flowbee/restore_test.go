@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -167,6 +169,130 @@ func TestRestoreRejectsEmpty(t *testing.T) {
 	defer liveStore.Close()
 	if _, err := liveStore.GetJob(ctx, "safe_job"); err != nil {
 		t.Fatalf("live DB was altered despite empty snapshot: %v", err)
+	}
+}
+
+func TestRestoreFailsClosedWhileControlPlaneWriterIsActive(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	backupDir := filepath.Join(dir, "backups")
+
+	sourceDB := filepath.Join(dir, "source.db")
+	seedTestDB(t, ctx, sourceDB, "source_job")
+	t.Setenv("FLOWBEE_DATABASE_URL", sourceDB)
+	t.Setenv("FLOWBEE_BACKUP_DIR", backupDir)
+	t.Setenv("FLOWBEE_CONFIG", "")
+	if err := runBackup([]string{"--keep", "10"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshots, _ := filepath.Glob(filepath.Join(backupDir, "flowbee-*.db"))
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshots=%v", snapshots)
+	}
+
+	liveDB := filepath.Join(dir, "live.db")
+	seedTestDB(t, ctx, liveDB, "live_job")
+	t.Setenv("FLOWBEE_DATABASE_URL", liveDB)
+	active, err := store.Open(ctx, liveDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	if err := active.AcquireWriterLock(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = runRestore([]string{"--force", snapshots[0]})
+	if err == nil || !strings.Contains(err.Error(), "writer to be stopped") {
+		t.Fatalf("restore err=%v", err)
+	}
+	if _, err := active.GetJob(ctx, "live_job"); err != nil {
+		t.Fatalf("live database changed after refused restore: %v", err)
+	}
+	if safeties, _ := filepath.Glob(filepath.Join(backupDir, "pre-restore-*.db")); len(safeties) != 0 {
+		t.Fatalf("restore wrote safety snapshots before taking the writer fence: %v", safeties)
+	}
+}
+
+func TestRestoreSafetySnapshotIncludesCommittedWALAndResolvesFileURI(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	backupDir := filepath.Join(dir, "backups")
+
+	sourceDB := filepath.Join(dir, "source.db")
+	seedTestDB(t, ctx, sourceDB, "source_job")
+	t.Setenv("FLOWBEE_DATABASE_URL", sourceDB)
+	t.Setenv("FLOWBEE_BACKUP_DIR", backupDir)
+	t.Setenv("FLOWBEE_CONFIG", "")
+	if err := runBackup([]string{"--keep", "10"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshots, _ := filepath.Glob(filepath.Join(backupDir, "flowbee-*.db"))
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshots=%v", snapshots)
+	}
+
+	liveDB := filepath.Join(dir, "live.db")
+	seedTestDB(t, ctx, liveDB, "live_job")
+	walWriter, err := sql.Open("sqlite", liveDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := walWriter.Exec(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := walWriter.Exec(`CREATE TABLE wal_marker(value TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := walWriter.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := walWriter.Exec(`INSERT INTO wal_marker(value) VALUES ('committed-in-wal')`); err != nil {
+		t.Fatal(err)
+	}
+	// Capture the main file + committed WAL while the connection is alive, then
+	// put that pair back after a clean close. This deterministically models the
+	// files left by an abrupt process death without leaving a concurrent writer
+	// in the restore test.
+	crashMain, crashWAL := filepath.Join(dir, "crash-main.db"), filepath.Join(dir, "crash.db-wal")
+	if err := copyFile(liveDB, crashMain); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(liveDB+"-wal", crashWAL); err != nil {
+		t.Fatal(err)
+	}
+	if err := walWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(crashMain, liveDB); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(crashWAL, liveDB+"-wal"); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(liveDB + "-shm")
+
+	// A file URI must resolve to the same concrete target used by the writer
+	// lock, stat, backup, rename, and stale-sidecar cleanup operations.
+	t.Setenv("FLOWBEE_DATABASE_URL", "file:"+liveDB+"?cache=shared")
+	if err := runRestore([]string{"--force", snapshots[0]}); err != nil {
+		t.Fatal(err)
+	}
+	safeties, _ := filepath.Glob(filepath.Join(backupDir, "pre-restore-*.db"))
+	if len(safeties) != 1 {
+		t.Fatalf("safety snapshots=%v", safeties)
+	}
+	safety, err := sql.Open("sqlite", safeties[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer safety.Close()
+	var marker string
+	if err := safety.QueryRow(`SELECT value FROM wal_marker`).Scan(&marker); err != nil || marker != "committed-in-wal" {
+		t.Fatalf("safety snapshot lost committed WAL state: marker=%q err=%v", marker, err)
+	}
+	if _, err := os.Stat(liveDB + ".writer.lock"); err != nil {
+		t.Fatalf("resolved writer lock path: %v", err)
 	}
 }
 

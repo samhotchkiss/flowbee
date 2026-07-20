@@ -1,15 +1,72 @@
 package worker
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"sort"
 	"testing"
+	"time"
+
+	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
 
 func sortedAttest(a Allowlist, identity string, claimed []string, arch, os string) []string {
 	got := a.attest(identity, claimed, arch, os)
 	sort.Strings(got)
 	return got
+}
+
+func TestAttestedForRevalidatesPersistedClaimsAgainstCurrentPolicyAndExpiry(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	now := time.Date(2026, 7, 19, 20, 0, 0, 0, time.UTC)
+	legacy := NewRegistry(st, 300, 30, OpenAllowlist())
+	if _, err := legacy.Register(ctx, Registration{WorkerID: "worker-1", Identity: "worker",
+		Arch: "arm64", OS: "darwin", Capabilities: []string{
+			"role:eng_worker", "role:code_reviewer", "arch:arm64", "arch:amd64", "os:linux",
+		}}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	strict := NewRegistry(st, 300, 30, Allowlist{Permit: map[string][]string{
+		"worker": {"role:eng_worker"},
+	}})
+	got, err := strict.AttestedFor(ctx, "worker", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(got)
+	want := []string{"arch:arm64", "role:eng_worker"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("restart revalidation attested=%v want=%v", got, want)
+	}
+	got, err = strict.AttestedFor(ctx, "worker", now.Add(24*time.Hour))
+	if err != nil || len(got) != 0 {
+		t.Fatalf("expired attestation remained authoritative: caps=%v err=%v", got, err)
+	}
+}
+
+func TestRegisterRejectsWorkerIDReassignmentAtomically(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewStore(t)
+	reg := NewRegistry(st, 300, 30, OpenAllowlist())
+	now := time.Unix(1000, 0)
+	if _, err := reg.Register(ctx, Registration{WorkerID: "stable", Identity: "capacity-local"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Register(ctx, Registration{WorkerID: "stable", Identity: "reviewer-russ",
+		Capabilities: []string{"role:code_reviewer"}}, now); !errors.Is(err, ErrWorkerIDReassignment) {
+		t.Fatalf("worker id reassignment err=%v want %v", err, ErrWorkerIDReassignment)
+	}
+	var identity, caps string
+	if err := st.DB.QueryRowContext(ctx, `SELECT identity,attested_capabilities FROM workers WHERE worker_id='stable'`).
+		Scan(&identity, &caps); err != nil {
+		t.Fatal(err)
+	}
+	if identity != "capacity-local" || caps != "null" {
+		t.Fatalf("reassignment mutated owner row: identity=%q caps=%s", identity, caps)
+	}
 }
 
 func TestAttestOpenAllowlistGatesArchOSByHandshake(t *testing.T) {

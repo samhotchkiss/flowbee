@@ -1,0 +1,11 @@
+{
+  "provider": "codex",
+  "account_key": "codex-account-1",
+  "credential_lineage": "codex-lineage-1",
+  "source": "codex_app_server",
+  "captured_at": "2026-07-19T16:00:00Z",
+  "windows": [
+    {"kind": "weekly_all", "percent": 42, "reset_at": "2026-07-24T16:00:00Z", "window_minutes": 10080},
+    {"kind": "weekly_scoped", "scope": "codex_bengalfox", "display": "Spark", "percent": 12, "reset_at": "2026-07-24T16:00:00Z", "window_minutes": 10080}
+  ]
+}

@@ -66,7 +66,7 @@ func TestF10ArchLotteryRoutesTestJobToArmWorkerOnly(t *testing.T) {
 	}
 
 	// the x86 worker tries first — it MUST lose the race (no arch:arm64 attested).
-	x86Attested, _ := reg.AttestedFor(ctx, "x86-tester")
+	x86Attested, _ := reg.AttestedFor(ctx, "x86-tester", now)
 	_, err = st.ClaimReadyJob(ctx, store.ClaimParams{
 		JobID: "arm-test", LeaseID: "l-x86", Identity: "x86-tester", ModelFamily: "codex",
 		Role: job.RoleTester, Attested: x86Attested, TTL: time.Minute, Now: now,
@@ -79,7 +79,7 @@ func TestF10ArchLotteryRoutesTestJobToArmWorkerOnly(t *testing.T) {
 	}
 
 	// the arm64 worker wins.
-	armAttested, _ := reg.AttestedFor(ctx, "arm-tester")
+	armAttested, _ := reg.AttestedFor(ctx, "arm-tester", now)
 	ls, err := st.ClaimReadyJob(ctx, store.ClaimParams{
 		JobID: "arm-test", LeaseID: "l-arm", Identity: "arm-tester", ModelFamily: "codex",
 		Role: job.RoleTester, Attested: armAttested, TTL: time.Minute, Now: now,

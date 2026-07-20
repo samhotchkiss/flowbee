@@ -106,6 +106,28 @@ func TestCostCeilingNegativeRejected(t *testing.T) {
 	}
 }
 
+func TestWorkerAttestationsEnvAndValidation(t *testing.T) {
+	t.Setenv("FLOWBEE_ENROLLED_IDENTITIES", "reviewer-russ:grok,capacity-local")
+	t.Setenv("FLOWBEE_WORKER_ATTESTATIONS_JSON",
+		`{"reviewer-russ":["role:code_reviewer","tool:git"],"capacity-local":[]}`)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.WorkerAttestations["reviewer-russ"]; len(got) != 2 || got[0] != "role:code_reviewer" {
+		t.Fatalf("worker attestations=%v", c.WorkerAttestations)
+	}
+
+	t.Setenv("FLOWBEE_WORKER_ATTESTATIONS_JSON", `{"rogue":["role:code_reviewer"]}`)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "is not enrolled") {
+		t.Fatalf("unenrolled attestation policy accepted: %v", err)
+	}
+	t.Setenv("FLOWBEE_WORKER_ATTESTATIONS_JSON", `{"reviewer-russ":["role:eng_worker","role:eng_worker"]}`)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "duplicate capability") {
+		t.Fatalf("duplicate attestation capability accepted: %v", err)
+	}
+}
+
 // TestReposConfig proves the F9 multi-repo registry parses from YAML, including the
 // active default (true when unset) and explicit park.
 func TestReposConfig(t *testing.T) {

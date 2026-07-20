@@ -41,15 +41,29 @@ func (s *Store) RegisterRepo(ctx context.Context, r Repo) error {
 	if r.Active {
 		active = 1
 	}
-	_, err := s.DB.ExecContext(ctx, `
-		INSERT INTO repos (id, owner, repo, default_branch, active)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT (id) DO UPDATE SET
-			owner = excluded.owner,
-			repo = excluded.repo,
-			default_branch = excluded.default_branch,
-			active = excluded.active`,
-		r.ID, r.Owner, r.Repo, branch, active)
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO repos (id, owner, repo, default_branch, active)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (id) DO UPDATE SET
+				owner = excluded.owner,
+				repo = excluded.repo,
+				default_branch = excluded.default_branch,
+				active = excluded.active`,
+			r.ID, r.Owner, r.Repo, branch, active); err != nil {
+			return err
+		}
+		state := "paused"
+		if r.Active {
+			state = "active"
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO project_repos
+			(project_id,repo_id,state,created_at,updated_at)
+			VALUES ('default',?,?,datetime('now'),datetime('now'))
+			ON CONFLICT(project_id,repo_id) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at`,
+			r.ID, state)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("register repo %q: %w", r.ID, err)
 	}
@@ -107,15 +121,22 @@ func (s *Store) SetRepoActive(ctx context.Context, id string, active bool) error
 	if active {
 		a = 1
 	}
-	res, err := s.DB.ExecContext(ctx,
-		`UPDATE repos SET active = ? WHERE id = ?`, a, id)
-	if err != nil {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE repos SET active = ? WHERE id = ?`, a, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrRepoNotFound
+		}
+		state := "paused"
+		if active {
+			state = "active"
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE project_repos SET state=?,updated_at=datetime('now')
+			WHERE project_id='default' AND repo_id=?`, state, id)
 		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrRepoNotFound
-	}
-	return nil
+	})
 }
 
 // JobIDForPRInRepo resolves the job bound to a GitHub PR number WITHIN a repo

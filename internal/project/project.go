@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/content"
+	"github.com/samhotchkiss/flowbee/internal/epicspec"
 	gh "github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
@@ -72,6 +73,222 @@ func contentDenyReason(actualDiff string, allowOwnSource bool) string {
 	return "content gate (actual diff) " + strings.Join(reasons, "; ")
 }
 
+// epicDenyReason is the epic-lane extension of the content-integrity gate (task brief
+// point 2): for an epic PR — detected via store.EpicForHeadSHA, which SHA-tip-matches
+// j.HeadSHA against every epic registered for repo (GitHub gives Flowbee no fact naming
+// a PR's head branch NAME, only its SHA — see that function's doc) — judge the diff
+// AGAINST THE EPIC'S OWN LAUNCH-PINNED CONTRACT rather than as a generic diff: every
+// pinned ## Steps entry must be checked with non-empty evidence, State: must be exactly
+// "done", Blockers: must be empty, AND every touched path must fall inside the epic's
+// launch-pinned scope (a REAL per-file glob match, epicspec.CheckScope — not the
+// conservative launch-time overlap heuristic).
+//
+// review M1 — WHOSE contract: the Goal/Steps and scope: are frozen at launch and MUST
+// come from the pinned source (scope from e.Scope, stored by AddEpicRun from the
+// main-committed spec; Steps from the epic file at the PR BASE), because the PR HEAD is
+// author-controlled — a lying agent could widen scope: to '**' or delete/renumber its
+// own ## Steps at head and self-certify. Only the CLAIMED ## Status is read from head.
+// A head whose ## Steps drift from the pinned ones is a spec-immutability breach and is
+// denied explicitly. NB — detection is a coincidental-SHA match (headSHA == an epic
+// branch tip). In the astronomically-unlikely event an ORDINARY PR's head SHA collides
+// with an epic branch tip, this gate would judge it against that epic's contract and,
+// at worst, route a legitimate merge to a human — the FAIL-CLOSED direction, never a
+// wrongful merge; the safe way to be wrong.
+//
+// Returns ("", nil) — no denial — for the overwhelmingly common non-epic PR, and
+// when repo has no epics in the detection window at all (zero extra mirror I/O
+// then — see store.EpicForHeadSHA). Detection trouble fails CLOSED-to-RETRY
+// (review F2): a mirror fetch/rev-parse error against a live epic's branch, or a
+// bare I/O error reading the pinned contract at the (reachable) base, returns a
+// non-nil error so the caller RETRIES the merge row — a transient mirror outage must
+// never let an unevidenced epic PR merge disguised as an ordinary one. Once an epic IS
+// identified: an empty base SHA, an absent/unparseable pinned contract, or an
+// unreadable contract at head all fail CLOSED to HANDOFF (a deny reason, not an
+// error) — a PR that provably belongs to epic <slug> but can't be contract-verified
+// must reach a human, not retry forever.
+func (s *Sender) epicDenyReason(ctx context.Context, repo, baseSHA, headSHA, actualDiff string) (string, error) {
+	return s.epicDenyReasonFor(ctx, "", repo, baseSHA, headSHA, actualDiff)
+}
+
+func (s *Sender) epicDenyReasonFor(ctx context.Context, expectedEpicID, repo, baseSHA, headSHA, actualDiff string) (string, error) {
+	if s.history == nil || headSHA == "" {
+		return "", nil
+	}
+	e, ok, err := s.store.EpicForHeadSHA(ctx, s.history, repo, headSHA, s.clock.Now())
+	if err != nil {
+		return "", fmt.Errorf("epic-PR detection: %w", err)
+	}
+	if !ok {
+		return "", nil // clean non-match across every epic in the window: an ordinary PR
+	}
+	if expectedEpicID != "" && e.ID != expectedEpicID {
+		return fmt.Sprintf("expected epic %q but head resolves to epic %q", expectedEpicID, e.ID), nil
+	}
+	// review m4: an epic-detected PR with NO base SHA cannot be contract-verified (no
+	// diff to scope-check, no launch-pinned ref to read). Fail CLOSED to a human rather
+	// than the (base-guarded) content path silently skipping the epic gate entirely.
+	if baseSHA == "" {
+		return fmt.Sprintf("epic %q PR has no base SHA — cannot verify against the launch-pinned contract", e.ID), nil
+	}
+
+	// review M1 (the load-bearing fix): judge against the LAUNCH-PINNED contract, not
+	// the author-controlled PR head. The Goal/Steps and the scope: globs are frozen at
+	// launch (spec-immutable by contract, committed to main pre-launch); reading them
+	// from head would let a lying agent widen scope: to '**' or delete/renumber its own
+	// ## Steps at head and self-certify. So: pinned Steps come from the epic file at the
+	// PR BASE, scope comes from the launch-stored e.Scope, and ONLY the claimed ##
+	// Status is read from head.
+	specPinned, _, perr := s.store.EpicContractAtRef(s.history, e, baseSHA)
+	if perr != nil {
+		// permanent contract problems at the pinned ref → handoff; a bare I/O error
+		// against the (reachable) base is transient → retry (review M1/F2).
+		if errors.Is(perr, store.ErrEpicFileAbsent) {
+			return fmt.Sprintf("epic %q: launch-pinned contract %s absent at PR base — cannot verify spec immutability", e.ID, e.FilePath), nil
+		}
+		if errors.Is(perr, store.ErrEpicSpecUnparseable) {
+			return fmt.Sprintf("epic %q: launch-pinned contract unparseable at PR base: %v", e.ID, perr), nil
+		}
+		return "", fmt.Errorf("epic %q pinned-contract read at base: %w", e.ID, perr)
+	}
+	specHead, sbHead, herr := s.store.EpicContractAtRef(s.history, e, headSHA)
+	if herr != nil {
+		// head is author-controlled; an absent/unparseable/unreadable contract at head
+		// is a claim the author must fix — route to a human, do not retry forever.
+		return fmt.Sprintf("epic %q contract unreadable at PR head: %v", e.ID, herr), nil
+	}
+
+	var reasons []string
+	// spec-immutability breach (review M1c): the ## Steps the agent presents at head
+	// MUST match the launch-pinned ones. A head that adds/removes/renumbers/reworries a
+	// step has edited a frozen contract — deny explicitly (and the evidence check below
+	// still judges against the PINNED steps regardless, so shrinking head's list can
+	// never shrink what must be evidenced).
+	if !stepsMatch(specPinned.Steps, specHead.Steps) {
+		reasons = append(reasons, fmt.Sprintf("epic %q spec-immutability breach: ## Steps changed since launch (%d pinned vs %d at head)",
+			e.ID, len(specPinned.Steps), len(specHead.Steps)))
+	}
+	// evidence: PINNED steps vs the CLAIMED head ## Status.
+	if ev := epicspec.CheckEvidence(specPinned, sbHead); !ev.Clear {
+		reasons = append(reasons, fmt.Sprintf("epic %q evidence incomplete: %s", e.ID, strings.Join(ev.Failures, "; ")))
+	}
+	// scope honesty (review M1a + F1): match against the LAUNCH-PINNED scope (e.Scope,
+	// stored by AddEpicRun from the main-committed spec — never the head frontmatter a
+	// lying agent could widen to '**'), PLUS the epic's OWN spec file AND its explainer
+	// (epics/<slug>-explainer.html) implicitly. Every real epic PR touches both: the
+	// contract MANDATES ## Status updates on the epic's own .md and a maintained
+	// -explainer.html on its branch, so author-globs-only would fail every all-green epic
+	// on its own mandatory status/explainer commits (the F1 catch-22). Only e's OWN spec
+	// and explainer are implicit; a diff touching a DIFFERENT epic's file still violates.
+	scope := append(append([]string{}, e.Scope...), e.FilePath, epicExplainerPath(e.FilePath))
+	if out := epicspec.CheckScope(scope, content.TouchedPaths(actualDiff)); len(out) > 0 {
+		reasons = append(reasons, fmt.Sprintf("epic %q scope violation: %s", e.ID, strings.Join(out, ", ")))
+	}
+	return strings.Join(reasons, "; "), nil
+}
+
+// MergeAuthorizationDeniedError is a deterministic product-safety denial. The
+// v2 executor must park it for a human rather than retrying the same immutable
+// artifact. Transport/mirror errors remain ordinary retryable errors.
+type MergeAuthorizationDeniedError struct{ Reason string }
+
+func (e *MergeAuthorizationDeniedError) Error() string { return e.Reason }
+
+// AuthorizeEpicV2Merge reuses the production autonomous-merge safety boundary
+// for a v2 delivery. It binds the action to the registered epic, verifies the
+// mirror's exact branch tip, evaluates the real base..head diff and launch-pinned
+// contract, then performs a final authoritative PR/required-CI refetch. No
+// GitHub mutation occurs here; the caller immediately follows a nil result with
+// an expected-head merge request.
+func (s *Sender) AuthorizeEpicV2Merge(ctx context.Context, epicID, projectID, repo string, prNumber int, branch, baseSHA, headSHA string) error {
+	deny := func(format string, args ...any) error {
+		return &MergeAuthorizationDeniedError{Reason: fmt.Sprintf(format, args...)}
+	}
+	if s.repo != repo {
+		return deny("merge repository %q is not owned by sender %q", repo, s.repo)
+	}
+	if s.history == nil {
+		return deny("v2 autonomous merge requires a repository mirror")
+	}
+	if epicID == "" || prNumber <= 0 || branch == "" || baseSHA == "" || headSHA == "" {
+		return deny("v2 merge action lacks exact epic, PR, branch, base, or head identity")
+	}
+	e, err := s.store.GetEpicRun(ctx, epicID)
+	if err != nil {
+		return deny("registered epic %q is unavailable: %v", epicID, err)
+	}
+	if e.ProjectID != projectID || e.Repo != repo || e.Branch != branch {
+		return deny("merge action does not match registered epic identity")
+	}
+	if err := s.history.FetchBranch(branch); err != nil {
+		return fmt.Errorf("authorize v2 merge: fetch %s: %w", branch, err)
+	}
+	tip, err := s.history.HeadSHA("refs/heads/" + branch)
+	if err != nil {
+		return fmt.Errorf("authorize v2 merge: resolve %s: %w", branch, err)
+	}
+	if tip != headSHA {
+		return fmt.Errorf("%w: mirror branch moved from %s to %s", gh.ErrMergeHeadModified, headSHA, tip)
+	}
+	actualDiff, err := s.history.DiffBetween(baseSHA, headSHA)
+	if err != nil {
+		return fmt.Errorf("authorize v2 merge: diff %s..%s: %w", baseSHA, headSHA, err)
+	}
+	if reason := contentDenyReason(actualDiff, s.allowOwnSource); reason != "" {
+		return deny("%s", reason)
+	}
+	if reason, err := s.epicDenyReasonFor(ctx, epicID, repo, baseSHA, headSHA, actualDiff); err != nil {
+		return fmt.Errorf("authorize v2 merge: %w", err)
+	} else if reason != "" {
+		return deny("%s", reason)
+	}
+
+	// This is deliberately last: it is the immediate authoritative PR/base/head/
+	// required-check read before the expected-head mutation.
+	ci, err := s.liveMergeCI(ctx, prNumber, baseSHA, headSHA)
+	if err != nil {
+		var stale *staleMergeAuthorizationError
+		if errors.As(err, &stale) {
+			if stale.observedBase != baseSHA {
+				return fmt.Errorf("%w: PR base moved from %s to %s", gh.ErrMergeBaseModified, baseSHA, stale.observedBase)
+			}
+			return fmt.Errorf("%w: PR head moved from %s", gh.ErrMergeHeadModified, headSHA)
+		}
+		return err
+	}
+	if ci.failed {
+		return deny("authoritative CI failed: %s", strings.Join(ci.failingChecks, ", "))
+	}
+	if !ci.green {
+		return errMergeCINotReady
+	}
+	return nil
+}
+
+// epicExplainerPath derives an epic's human-facing explainer path from its spec path:
+// epics/<slug>.md -> epics/<slug>-explainer.html (contract §Explainer / plan §15.14). It
+// is implicitly in scope alongside the spec so maintaining it never trips the gate.
+func epicExplainerPath(specPath string) string {
+	return strings.TrimSuffix(specPath, ".md") + "-explainer.html"
+}
+
+// stepsMatch reports whether two ## Steps lists are the same frozen contract: same
+// count, and each step's number/text/validate equal after trimming (so a pure
+// reformatting is tolerated, but any added/removed/renumbered/reworded step — the
+// evidence-shrinking edit the immutability rule exists to catch — is not).
+func stepsMatch(pinned, head []epicspec.Step) bool {
+	if len(pinned) != len(head) {
+		return false
+	}
+	for i := range pinned {
+		if pinned[i].N != head[i].N ||
+			strings.TrimSpace(pinned[i].Text) != strings.TrimSpace(head[i].Text) ||
+			strings.TrimSpace(pinned[i].Validate) != strings.TrimSpace(head[i].Validate) {
+			return false
+		}
+	}
+	return true
+}
+
 type liveMergeCIResult struct {
 	green         bool
 	failed        bool
@@ -79,7 +296,17 @@ type liveMergeCIResult struct {
 	checkURLs     map[string]string
 }
 
-func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedHead string) (liveMergeCIResult, error) {
+// staleMergeAuthorizationError carries the live base Flowbee observed while
+// re-checking the PR. The outbox drain uses it to re-arm the build on the new
+// integration head instead of preserving the now-stale reviewed base.
+type staleMergeAuthorizationError struct {
+	observedBase string
+}
+
+func (e *staleMergeAuthorizationError) Error() string { return errStaleMergeAuthorization.Error() }
+func (e *staleMergeAuthorizationError) Unwrap() error { return errStaleMergeAuthorization }
+
+func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedBase, expectedHead string) (liveMergeCIResult, error) {
 	reader, ok := s.gh.(gh.Client)
 	if !ok || prNumber == 0 {
 		return liveMergeCIResult{}, errMergeCINotReady
@@ -91,8 +318,11 @@ func (s *Sender) liveMergeCI(ctx context.Context, prNumber int, expectedHead str
 	if !ok {
 		return liveMergeCIResult{}, errMergeCINotReady
 	}
-	if expectedHead != "" && pr.HeadRefOid != expectedHead {
-		return liveMergeCIResult{}, errStaleMergeAuthorization
+	if pr.IsDraft || pr.ClosedUnmerged || pr.Merged || pr.IsCrossRepository || pr.CheckContextsTruncated {
+		return liveMergeCIResult{}, errMergeCINotReady
+	}
+	if pr.BaseRefOid != expectedBase || pr.HeadRefOid != expectedHead {
+		return liveMergeCIResult{}, &staleMergeAuthorizationError{observedBase: pr.BaseRefOid}
 	}
 	if ms, ok := s.gh.(gh.MergeUnsticker); ok {
 		state, found, err := ms.PullMergeableState(ctx, prNumber)
@@ -290,7 +520,7 @@ const maxOutboxAttempts = 100
 // conflict stays not-mergeable past the retries and then routes correctly.
 const mergeMergeabilityRetries = 3
 
-var errStaleMergeAuthorization = errors.New("merge authorization does not match the reviewed head")
+var errStaleMergeAuthorization = errors.New("merge authorization does not match the reviewed base/head")
 var errMergeCINotReady = errors.New("merge blocked: live required checks are not terminal green")
 var errMergeCIFailedRouted = errors.New("merge blocked: live required checks failed and repair was routed")
 
@@ -381,6 +611,12 @@ type HistoryWriter interface {
 	// CP-computed ACTUAL change, used to re-run the WHOLE content gate against the real
 	// branch (not the worker's self-reported patch) before an autonomous merge lands.
 	DiffBetween(base, head string) (string, error)
+	// ReadFileAtRef reads a single file's bytes AS OF ref (a full ref like
+	// "refs/heads/<branch>" or a raw SHA) — the epic-lane Phase 3 evidence gate's
+	// read of an epic's own spec file AT THE PR HEAD (epicDenyReason), the same way
+	// cmd/flowbee/epic.go's ingestEpicStatuses already reads an epic file off its
+	// branch. found=false (no error) means the path does not exist at that ref.
+	ReadFileAtRef(ref, path string) (string, bool, error)
 }
 
 // WithHistory wires the local-git history writer + the branch its dedicated
@@ -462,7 +698,12 @@ func (s *Sender) DrainOnce(ctx context.Context) (int, error) {
 		detail, err := s.send(ctx, row)
 		if err != nil {
 			if errors.Is(err, errStaleMergeAuthorization) || errors.Is(err, gh.ErrMergeHeadModified) {
-				if ierr := s.store.InvalidateStaleMergeAuthorization(ctx, row.JobID, s.clock.Now()); ierr != nil {
+				var stale *staleMergeAuthorizationError
+				var observedBase string
+				if errors.As(err, &stale) {
+					observedBase = stale.observedBase
+				}
+				if ierr := s.store.InvalidateStaleMergeAuthorization(ctx, row.JobID, observedBase, s.clock.Now()); ierr != nil {
 					return sent, ierr
 				}
 				if s.pub != nil {
@@ -731,12 +972,14 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 			return "", errStaleMergeAuthorization
 		}
 		expectedHead = row.HeadSHA
+		var actualDiff string
 		if j.BaseSHA != "" {
 			br := store.IssueBranch(s.resolveIssueNum(ctx, j), row.JobID)
 			if ferr := s.history.FetchBranch(br); ferr != nil {
 				return "", fmt.Errorf("verify autonomous merge: fetch %s: %w", br, ferr)
 			}
-			actualDiff, derr := s.history.DiffBetween(j.BaseSHA, j.HeadSHA)
+			var derr error
+			actualDiff, derr = s.history.DiffBetween(j.BaseSHA, j.HeadSHA)
 			if derr != nil {
 				// An UNREACHABLE revision is permanent, not transient: Flowbee self-merged by
 				// promoting an epoch commit, but GitHub SQUASH-merged the PR and discarded that
@@ -766,7 +1009,29 @@ func (s *Sender) send(ctx context.Context, row store.OutboxRow) (string, error) 
 				return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
 			}
 		}
-		ci, err := s.liveMergeCI(ctx, number, expectedHead)
+		// epic-lane (task brief point 2, review M1/m4): an epic PR (branch epic/<slug>,
+		// auto-adopted by Phase 0) is judged against the EPIC'S OWN LAUNCH-PINNED CONTRACT,
+		// not as a generic diff — see epicDenyReason. This runs OUTSIDE the base-guarded
+		// content block on purpose (m4): an epic-detected PR must fail CLOSED even when the
+		// content re-verify was skipped for an empty base, never silently skip its own gate.
+		// ("", nil) for the overwhelmingly common non-epic PR; a detection ERROR (transient
+		// mirror trouble against a live epic's branch, or an I/O error reading the pinned
+		// contract) RETRIES the merge row — never a blind merge of a possibly-unevidenced
+		// epic PR (review F2/M1).
+		reason, eerr := s.epicDenyReason(ctx, j.Repo, j.BaseSHA, j.HeadSHA, actualDiff)
+		if eerr != nil {
+			return "", fmt.Errorf("verify autonomous merge: %w", eerr)
+		}
+		if reason != "" {
+			if rerr := s.store.RouteSelfMergeToHandoff(ctx, row.JobID, reason, s.clock.Now()); rerr != nil {
+				return "", fmt.Errorf("route self-merge to handoff (epic evidence): %w", rerr)
+			}
+			if s.pub != nil {
+				s.pub.PublishReconcile(row.JobID, "project_out:self_merge_denied")
+			}
+			return "autonomous merge DENIED (" + reason + ") -> merge_handoff", nil
+		}
+		ci, err := s.liveMergeCI(ctx, number, j.BaseSHA, expectedHead)
 		if err != nil {
 			return "", err
 		}

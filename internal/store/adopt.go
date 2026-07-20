@@ -39,13 +39,43 @@ func adoptedPRJobID(repo string, prNumber int) string {
 // "start fresh" default); the rest stay quiescent. The flowbee:adopt label opts a
 // specific PR in regardless of the watermark.
 func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark time.Time, now time.Time) ([]string, error) {
+	return s.AdoptSweepForRepo(ctx, "", snap, watermark, now)
+}
+
+// AdoptSweepForRepo is the repository-scoped form used by v2-aware callers.
+// The legacy wrapper passes an empty repo; under the v2 flag that deliberately
+// fails closed on any exact owned branch rather than risking a duplicate review.
+func (s *Store) AdoptSweepForRepo(ctx context.Context, repo string, snap gh.BoardSnapshot, watermark time.Time, now time.Time) ([]string, error) {
 	var adopted []string
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		for _, pr := range snap.PullRequests {
+			if s.EnableEpicReviewHandoffV2 && !pr.IsCrossRepository {
+				// A same-repository PR without a head branch cannot be proven
+				// unowned. GitHub normally supplies this field; fail closed during
+				// a partial/legacy read and retry on the next sweep.
+				if pr.HeadRefName == "" {
+					continue
+				}
+				var owned int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM epic_deliveries
+					WHERE branch=? AND (?='' OR delivery_repo=?)
+					  AND state NOT IN ('complete','abandoned')`,
+					pr.HeadRefName, repo, repo).Scan(&owned); err != nil {
+					return fmt.Errorf("adopt owned-branch fence pr %d: %w", pr.Number, err)
+				}
+				if owned > 1 {
+					return fmt.Errorf("%w: adopt sweep repo=%q branch=%q", ErrEpicArtifactOwnershipAmbiguous, repo, pr.HeadRefName)
+				}
+				if owned == 1 {
+					continue
+				}
+			}
 			// skip PRs already bound to a Flowbee-originated job (idempotent re-sweep).
 			var existing string
 			err := tx.QueryRowContext(ctx,
-				`SELECT id FROM jobs WHERE pr_number = ? LIMIT 1`, pr.Number).Scan(&existing)
+				`SELECT id FROM jobs
+				  WHERE pr_number = ? AND (?='' OR COALESCE(repo,'')=?)
+				  LIMIT 1`, pr.Number, repo, repo).Scan(&existing)
 			if err == nil {
 				continue // already known (originated or previously adopted)
 			}
@@ -56,7 +86,7 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 			if hasLabel(pr.Labels, "flowbee:adopt") {
 				optIn = true
 			}
-			id := fmt.Sprintf("adopt-pr-%d", pr.Number)
+			id := adoptedPRJobID(repo, pr.Number)
 			state := job.StateQuiescent
 			optInI := 0
 			if optIn {
@@ -66,12 +96,12 @@ func (s *Store) AdoptSweep(ctx context.Context, snap gh.BoardSnapshot, watermark
 				optInI = 1
 			}
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO jobs (id, kind, flow, stage, state, role, pr_number, base_sha, head_sha,
+				INSERT INTO jobs (id, kind, flow, stage, state, role, repo, pr_number, base_sha, head_sha,
 				                  blocked_by, required_capabilities, enqueued_at,
 				                  lease_epoch, attempts, max_attempts, bounces, max_bounces, job_seq,
 				                  adopted, opted_in, priority)
-				VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, ?, 5)`,
-				id, string(state), pr.Number, pr.BaseRefOid, pr.HeadRefOid,
+				VALUES (?, 'build', 'build', 'review', ?, 'code_reviewer', ?, ?, ?, ?, '[]', ?, ?, 0, 0, 5, 0, 4, 1, 1, ?, 5)`,
+				id, string(state), repo, pr.Number, pr.BaseRefOid, pr.HeadRefOid,
 				marshalStrings([]string{"role:code_reviewer"}), now.Format(rfc3339), optInI); err != nil {
 				return fmt.Errorf("insert adopted job pr %d: %w", pr.Number, err)
 			}
@@ -212,11 +242,49 @@ func (s *Store) PRAdoptWouldAct(ctx context.Context, repo string, prNumber int, 
 // job id with rearmed=true after superseding stale review authorization and re-arming
 // code review against the refreshed diff.
 func (s *Store) AdoptPRForReview(ctx context.Context, repo string, prNumber int, baseSHA, headSHA, patchDiff string, diffEmpty bool, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, bool, error) {
+	return s.adoptPRForReview(ctx, repo, prNumber, "", false, baseSHA, headSHA,
+		patchDiff, diffEmpty, merged, ciGreen, isDraft, updatedAt, now)
+}
+
+// AdoptPRForReviewWithHeadRef is the ownership-aware targeted adoption path.
+// The exact same-repository head branch is checked against admitted epic
+// deliveries inside the same transaction that would insert the legacy job. This
+// closes the admission-after-preflight race: either the epic owner is visible and
+// adoption is a no-op, or the legacy job commits first and artifact ingestion
+// deterministically absorbs it.
+//
+// This method is for same-repository PRs and requires a non-empty authoritative
+// branch identity while the v2 gate is enabled. Cross-repository PRs use the
+// legacy method because a fork ref can never own a delivery in this repository.
+func (s *Store) AdoptPRForReviewWithHeadRef(ctx context.Context, repo string, prNumber int, headRefName, baseSHA, headSHA, patchDiff string, diffEmpty bool, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, bool, error) {
+	return s.adoptPRForReview(ctx, repo, prNumber, headRefName, true, baseSHA, headSHA,
+		patchDiff, diffEmpty, merged, ciGreen, isDraft, updatedAt, now)
+}
+
+func (s *Store) adoptPRForReview(ctx context.Context, repo string, prNumber int, headRefName string, enforceOwnedFence bool, baseSHA, headSHA, patchDiff string, diffEmpty bool, merged, ciGreen, isDraft bool, updatedAt, now time.Time) (string, bool, error) {
 	id := adoptedPRJobID(repo, prNumber)
 	replacementID := id + "-" + ulid.New()
 	adopted := ""
 	rearmed := false
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if enforceOwnedFence && s.EnableEpicReviewHandoffV2 {
+			if headRefName == "" {
+				return errors.New("adopt owned-branch fence: same-repository head branch is required")
+			}
+			var owners int
+			err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM epic_deliveries
+				WHERE delivery_repo=? AND branch=?
+				  AND state NOT IN ('complete','abandoned')`, repo, headRefName).Scan(&owners)
+			if err != nil {
+				return fmt.Errorf("adopt owned-branch fence pr %d: %w", prNumber, err)
+			}
+			if owners > 1 {
+				return fmt.Errorf("%w: adopt pr=%d repo=%q branch=%q", ErrEpicArtifactOwnershipAmbiguous, prNumber, repo, headRefName)
+			}
+			if owners == 1 {
+				return nil // admission owns the review obligation; never duplicate it
+			}
+		}
 		var existing string
 		var existingAdopted int
 		err := tx.QueryRowContext(ctx,

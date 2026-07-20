@@ -38,10 +38,11 @@ const (
 	KindMergeHandoff    EventKind = "merge_handoff"    // mergeable -> merge_handoff
 	KindMergeStarted    EventKind = "merge_started"    // mergeable -> merging (self_merge)
 	// M6 reconcile-IN event kinds (Domain-B-driven transitions; actor='reconcile').
-	KindFactsReconciled EventKind = "facts_reconciled" // a sweep/refetch wrote Domain-B facts (audit)
-	KindSuperseded      EventKind = "superseded"       // SHA move re-armed the job to ready (I-5, §6.2.4)
-	KindAdoptRearmed    EventKind = "adopt_rearmed"    // targeted adopt observed a new PR SHA and re-armed review
-	KindBaseRefreshed   EventKind = "base_refreshed"   // a ready job's base_sha advanced to the new main after a sibling merge
+	KindFactsReconciled   EventKind = "facts_reconciled"    // a sweep/refetch wrote Domain-B facts (audit)
+	KindSuperseded        EventKind = "superseded"          // SHA move re-armed the job to ready (I-5, §6.2.4)
+	KindAdoptRearmed      EventKind = "adopt_rearmed"       // targeted adopt observed a new PR SHA and re-armed review
+	KindEpicAdoptAbsorbed EventKind = "epic_adopt_absorbed" // an admitted epic superseded a legacy adopted review execution
+	KindBaseRefreshed     EventKind = "base_refreshed"      // a ready job's base_sha advanced to the new main after a sibling merge
 	// M7 spec-flow + project-OUT event kinds.
 	KindSpecAuthored      EventKind = "spec_authored"       // Flowbee committed spec.md, opened spec_review (§11.6)
 	KindSpecClaim         EventKind = "spec_claim"          // the spec reviewer's CLAIM (untrusted, I-9)
@@ -107,6 +108,22 @@ const (
 	// ci_green@sha fact it produced is honored by the merge gate exactly like
 	// reconciled GitHub-Actions CI. Audit-only on the build job (no projection move).
 	KindTestCIRecorded EventKind = "test_ci_recorded"
+
+	// Epic-lane Phase 5 (plan §1, §9-P5) attention-queue + master-registry audit
+	// kinds. These events are appended to job_events keyed on the EPIC id (epic-scoped
+	// items), the SUPERVISOR label (registration), or the ATTENTION item id (item-scoped
+	// events with no epic, e.g. master_absent) — never on a `jobs` row. Fold ignores
+	// them (no case below), by design: the attention_items / supervisors tables are the
+	// rich source of truth, and these rows are an ordered audit trail the operator drawer
+	// reads back per epic (plan §1.5 "the drawer's intervention history reads the ledger").
+	// The event's LeaseEpoch carries the item's item_epoch (or the supervisor epoch) — the
+	// fence in force when it was emitted — matching the ledger's fencing convention.
+	KindAttentionOpened      EventKind = "attention_opened"      // a typed condition became an active item (or was reopened)
+	KindAttentionLeased      EventKind = "attention_leased"      // a master leased an open item (item_epoch++)
+	KindAttentionResolved    EventKind = "attention_resolved"    // an item reached resolved (acked|dismissed|cleared)
+	KindAttentionEscalated   EventKind = "attention_escalated"   // an item routed to the operator (human takeover)
+	KindSupervisorRegistered EventKind = "supervisor_registered" // a master (re-)registered; epoch bumped, prior leases orphaned
+	KindEpicIntervention     EventKind = "epic_intervention"     // a master-authored steer's delivery verdict (strong|weak|failed)
 )
 
 // Event is one appended ledger row. Payload holds kind-specific RESOLVED facts as
@@ -464,6 +481,20 @@ func Fold(events []Event) (job.Job, error) {
 			j.BaseSHA = e.Payload.BaseSHA
 			j.HeadSHA = e.Payload.HeadSHA
 			j.EnqueuedAt = e.CreatedAt
+			j.LeaseID = ""
+			j.BoundIdentity = ""
+			j.BoundModelFamily = ""
+			j.BoundLens = ""
+
+		case KindEpicAdoptAbsorbed:
+			// Admission owns this PR's review obligation. The pre-existing
+			// generic adopted execution becomes inert history: fence its epoch,
+			// revoke any lease, and clear any stale verdict authorization. A
+			// separate deterministic epic_v2 job is materialized only after the
+			// delivery's durable review handoff is eligible.
+			j.State = e.ToState
+			j.LeaseEpoch = e.LeaseEpoch
+			j.Verdict = nil
 			j.LeaseID = ""
 			j.BoundIdentity = ""
 			j.BoundModelFamily = ""

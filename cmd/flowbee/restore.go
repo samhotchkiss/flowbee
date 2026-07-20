@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/config"
+	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
 // runRestore replaces the control-plane DB with a verified backup snapshot, safely:
@@ -76,6 +77,10 @@ func runRestore(args []string) error {
 		return err
 	}
 	liveDB := cfg.DatabaseURL
+	liveDBPath, ok := store.SQLiteFilePath(liveDB)
+	if !ok {
+		return fmt.Errorf("restore requires a filesystem-backed SQLite database (got %q)", liveDB)
+	}
 
 	// Step 2: require --force + print the confirmation notice so the user knows the scope.
 	if !*force {
@@ -87,25 +92,48 @@ func runRestore(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "WARNING: ensure `flowbee serve` is stopped before a restore\n")
 
+	// The warning is not the fence. Hold the same OS writer lease as `serve` for
+	// the complete backup-and-replace interval so an old server, a replacement,
+	// or another offline mutation cannot race this destructive operation.
+	writerLock, err := store.AcquireWriterLockForDSN(liveDB)
+	if err != nil {
+		return fmt.Errorf("restore requires the control-plane writer to be stopped: %w", err)
+	}
+	defer writerLock.Close()
+
 	// Step 3: safety-backup the live DB (makes the restore itself reversible).
 	if err := os.MkdirAll(*dir, 0o700); err != nil {
 		return fmt.Errorf("create backup dir %q: %w", *dir, err)
 	}
-	if _, statErr := os.Stat(liveDB); statErr == nil {
+	if err := os.Chmod(*dir, 0o700); err != nil {
+		return fmt.Errorf("secure backup dir %q: %w", *dir, err)
+	}
+	if _, statErr := os.Stat(liveDBPath); statErr == nil {
 		ts := time.Now().Format("20060102-150405.000")
 		safetySnap := filepath.Join(*dir, "pre-restore-"+ts+".db")
-		if err := copyFile(liveDB, safetySnap); err != nil {
+		liveStore, err := store.Open(ctx, liveDB)
+		if err != nil {
+			return fmt.Errorf("open live DB for safety snapshot: %w", err)
+		}
+		err = takeVerifiedRollbackSnapshot(ctx, liveStore.DB, safetySnap)
+		closeErr := liveStore.Close()
+		if err != nil {
 			return fmt.Errorf("safety backup of live DB failed — aborting: %w", err)
 		}
+		if closeErr != nil {
+			return fmt.Errorf("close live DB after safety backup: %w", closeErr)
+		}
 		fmt.Printf("  safety backup → %s\n", safetySnap)
+	} else if os.IsNotExist(statErr) {
+		fmt.Printf("  (no existing DB at %s — skipping safety backup)\n", liveDBPath)
 	} else {
-		fmt.Printf("  (no existing DB at %s — skipping safety backup)\n", liveDB)
+		return fmt.Errorf("inspect live DB %q: %w", liveDBPath, statErr)
 	}
 
 	// Step 4: atomic replace — copy snapshot to a sibling temp file, then rename over the
 	// live DB. Same directory → rename is atomic on a single filesystem; a crash mid-copy
 	// leaves the temp file (not the live DB) incomplete.
-	liveDir := filepath.Dir(liveDB)
+	liveDir := filepath.Dir(liveDBPath)
 	tmp, err := os.CreateTemp(liveDir, ".flowbee-restore-*.db")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -116,7 +144,7 @@ func runRestore(args []string) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("stage snapshot to temp: %w", err)
 	}
-	if err := os.Rename(tmpPath, liveDB); err != nil {
+	if err := os.Rename(tmpPath, liveDBPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("atomic rename: %w", err)
 	}
@@ -124,17 +152,17 @@ func runRestore(args []string) error {
 	// Step 5: remove stale WAL/SHM sidecars — they belong to the replaced DB and must not
 	// be replayed against the snapshot (different DB identity = data corruption).
 	for _, suf := range []string{"-wal", "-shm"} {
-		if err := os.Remove(liveDB + suf); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "warning: could not remove %s%s: %v\n", liveDB, suf, err)
+		if err := os.Remove(liveDBPath + suf); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "warning: could not remove %s%s: %v\n", liveDBPath, suf, err)
 		}
 	}
 
-	fi, _ := os.Stat(liveDB)
+	fi, _ := os.Stat(liveDBPath)
 	var size int64
 	if fi != nil {
 		size = fi.Size()
 	}
-	fmt.Printf("✓ restored: %s → %s (%d bytes)\n", snapPath, liveDB, size)
+	fmt.Printf("✓ restored: %s → %s (%d bytes)\n", snapPath, liveDBPath, size)
 	fmt.Println("  (jobs table is a pure fold of the append-only ledger — restore is internally consistent)")
 	return nil
 }

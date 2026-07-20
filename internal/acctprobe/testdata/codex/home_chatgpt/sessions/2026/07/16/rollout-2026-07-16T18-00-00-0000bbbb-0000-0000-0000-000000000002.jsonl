@@ -1,0 +1,2 @@
+{"timestamp":"2026-07-16T18:00:00.000Z","type":"session_meta","payload":{"id":"sess-2-fresh-no-token-count"}}
+{"timestamp":"2026-07-16T18:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"hello, no token_count event yet"}}

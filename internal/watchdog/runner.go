@@ -31,6 +31,14 @@ func NewShellRunner() ShellRunner {
 	return ShellRunner{Timeout: 15 * time.Second}
 }
 
+// NewLaunchRunner allows a first clone of a large repository to finish. Ordinary
+// supervision probes keep the tight 15s bound; only the explicit launch preflight
+// gets this longer ceiling. SSH itself still carries ConnectTimeout=5, so an
+// unreachable host fails quickly rather than consuming the full clone window.
+func NewLaunchRunner() ShellRunner {
+	return ShellRunner{Timeout: 15 * time.Minute}
+}
+
 func (r ShellRunner) Run(ctx context.Context, shellCmd string) (string, error) {
 	timeout := r.Timeout
 	if timeout <= 0 {
@@ -54,25 +62,25 @@ func (r ShellRunner) Run(ctx context.Context, shellCmd string) (string, error) {
 // capturePaneCmd builds the "read the current status line" command — just the
 // visible pane, matching the exact form given in the task brief.
 func capturePaneCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux capture-pane -t "+shQuote(tmuxName)+" -p")
+	return remoteWrap(box, "tmux capture-pane -t "+shQuote(exactTarget(tmuxName))+" -p")
 }
 
 // captureScrollbackCmd adds -S -60 for diagnosis (classifying WHY a session is
 // blocked needs the reason text that scrolled by, not just the current line).
 func captureScrollbackCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux capture-pane -t "+shQuote(tmuxName)+" -p -S -60")
+	return remoteWrap(box, "tmux capture-pane -t "+shQuote(exactTarget(tmuxName))+" -p -S -60")
 }
 
 // sendResumeCmd sends the literal "/goal resume" text followed by Enter.
 func sendResumeCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux send-keys -t "+shQuote(tmuxName)+" "+shQuote("/goal resume")+" Enter")
+	return remoteWrap(box, "tmux send-keys -t "+shQuote(exactTarget(tmuxName))+" "+shQuote("/goal resume")+" Enter")
 }
 
 // sendEnterCmd sends a bare Enter — the fix for the observed "TUI's slash-command
 // menu swallows the first Enter, leaving the text unsubmitted in the input line"
 // failure mode.
 func sendEnterCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux send-keys -t "+shQuote(tmuxName)+" Enter")
+	return remoteWrap(box, "tmux send-keys -t "+shQuote(exactTarget(tmuxName))+" Enter")
 }
 
 // ── epic-lane Phase 2 additions ──
@@ -101,7 +109,7 @@ func sendEnterCmd(box, tmuxName string) string {
 // HomeDirCmd resolves a box's home directory as a LITERAL path (`echo $HOME`,
 // expanded by the target shell since it's embedded unquoted in the whole inner
 // command, not inside a shQuote'd argument). The epic launcher calls this ONCE per
-// launch and builds the checkout path (home + "/epics/" + repoID) from the
+// launch and builds the checkout path (home + "/dev/" + repo) from the
 // returned literal string — deliberately NOT by embedding "$HOME" itself inside a
 // path that other commands later shQuote() as an argument, since shQuote's single
 // quotes would suppress the shell's own variable expansion right when it's needed.
@@ -135,53 +143,51 @@ func RepoCheckoutExistsCmd(box, path string) string {
 // deliberately `gh`, not a raw `git clone` with a token-bearing URL: the preflight
 // already required `gh auth status` to pass, so the same credential (never placed
 // in argv, unlike a token-bearing https URL would be — `ps` on the remote box is
-// world-readable) clones the epic's checkout. mkdir -p's the parent first since
-// the ~/epics/ convention directory may not exist yet on a freshly provisioned box.
-//
-// TEMP-THEN-MV + SELF-CLEAN (Bug 1): the clone lands in a SIBLING `<path>.partial`
-// and is atomically `mv`'d into place ONLY after `gh repo clone` succeeds, so the
-// target `<path>` never appears as anything but a COMPLETE checkout. This exists
-// because a big-repo clone (the russ repo is 869 MiB packed) can exceed the
-// Runner's command timeout and be SIGKILLed mid-checkout — a clone straight into
-// `<path>` would then strand a partial directory there, and the NEXT launch attempt
-// would die with "destination path already exists and is not an empty directory".
-// The leading `rm -rf -- <path>.partial` clears any partial a prior killed attempt
-// left in the temp slot, so every attempt self-cleans and retries cleanly; the
-// real `<path>` is never touched until the mv, so a failed clone can't corrupt an
-// otherwise-good checkout either.
+// world-readable) clones the epic's checkout. Concurrent first launches coordinate
+// through an atomic, host-local mkdir lock. The lock owner clones to a mktemp sibling
+// and only then renames the COMPLETE tree into place; waiters return only after that
+// completed checkout is visible. This avoids both a half-populated canonical .git
+// directory and the subtle `mv -n <dir> <existing-dir>` behavior that can nest a
+// losing clone inside the winner. A dead lock owner and its recorded partial tree
+// are reclaimed from its PID (with an age fallback for the tiny
+// mkdir-before-PID-write crash window).
 func CloneRepoCmd(box, ownerRepo, path string) string {
-	partial := shQuote(path + ".partial")
-	return remoteWrap(box, "rm -rf -- "+partial+
-		" && mkdir -p -- "+shQuote(parentDirUnix(path))+
-		" && gh repo clone "+shQuote(ownerRepo)+" "+partial+" -- --quiet"+
-		" && mv -- "+partial+" "+shQuote(path))
-}
-
-// RepoRefreshCmd refreshes an ALREADY-CLONED checkout at path onto a clean current
-// `branch` — `git fetch --quiet origin <branch> && git checkout --quiet <branch> &&
-// git reset --hard -q origin/<branch>`, run inside the checkout. The epic preflight
-// calls this when a seat's base checkout is REUSED (Bug 2): a reused seat is
-// typically left on the PRIOR epic's branch with a stale local `main`, so without
-// this refresh the epic runner would cut `epic/<slug>` from a stale base and could
-// not even find its own freshly-merged spec file.
-//
-// FAIL-SAFE CONTRACT: this is deliberately NOT a force — it does NOT `git clean` or
-// stash. If the working tree has UNCOMMITTED CHANGES, `git checkout`/`git reset`
-// fails, the Runner returns a nonzero exit, and Preflight propagates it up as a
-// launch-BLOCKING error. We never silently discard a half-finished epic's work; the
-// operator is told to resolve the dirty tree by hand. The prior epic's OWN branch
-// (already pushed as its PR) is untouched — we only move the BASE branch forward,
-// so nothing already captured in a PR is at risk.
-//
-// TRUST BOUNDARY: branch is the repo registry's default_branch — an operator-set,
-// trusted value — but is still shQuote'd like every other argument here, and the
-// `origin/<branch>` token is built as shQuote("origin/"+branch) so a branch with
-// shell metacharacters can never break out of its single argument.
-func RepoRefreshCmd(box, path, branch string) string {
-	return remoteWrap(box, "cd "+shQuote(path)+
-		" && git fetch --quiet origin "+shQuote(branch)+
-		" && git checkout --quiet "+shQuote(branch)+
-		" && git reset --hard -q "+shQuote("origin/"+branch))
+	return remoteWrap(box,
+		"target="+shQuote(path)+"; "+
+			"lock=\"${target}.flowbee-clone.lock\"; partial=; held=; "+
+			"cleanup() { "+
+			"if test -n \"$partial\"; then rm -rf -- \"$partial\"; fi; "+
+			"if test -n \"$held\"; then "+
+			"owner=$(cat \"$lock/pid\" 2>/dev/null || true); "+
+			"if test \"$owner\" = \"$$\"; then rm -rf -- \"$lock\"; fi; "+
+			"fi; }; "+
+			"trap cleanup EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; "+
+			"mkdir -p -- "+shQuote(parentDirUnix(path))+" || exit 1; "+
+			"if test -d \"$target/.git\"; then exit 0; fi; "+
+			"while ! mkdir -- \"$lock\" 2>/dev/null; do "+
+			"if test -d \"$target/.git\"; then exit 0; fi; "+
+			"owner=$(cat \"$lock/pid\" 2>/dev/null || true); stale=; "+
+			"case \"$owner\" in ''|*[!0-9]*) ;; *) "+
+			"if ! kill -0 \"$owner\" 2>/dev/null; then stale=yes; fi ;; esac; "+
+			"if test -z \"$stale\" && test -n \"$(find \"$lock\" -prune -mmin +15 -print 2>/dev/null)\"; then stale=yes; fi; "+
+			"if test -n \"$stale\"; then "+
+			"stale_lock=\"${lock}.stale.$$\"; "+
+			"if test ! -e \"$stale_lock\" && mv -- \"$lock\" \"$stale_lock\" 2>/dev/null; then "+
+			"orphan=$(cat \"$stale_lock/partial\" 2>/dev/null || true); "+
+			"case \"$orphan\" in \"$target\".flowbee-clone.*) rm -rf -- \"$orphan\" ;; esac; "+
+			"rm -rf -- \"$stale_lock\"; fi; "+
+			"fi; sleep 1; "+
+			"done; "+
+			"held=yes; printf '%s\\n' \"$$\" >\"$lock/pid\" || exit 1; "+
+			"if test -d \"$target/.git\"; then exit 0; fi; "+
+			"if test -e \"$target\" || test -L \"$target\"; then "+
+			"printf '%s\\n' \"flowbee: checkout target exists but is not a git checkout: $target\" >&2; exit 1; "+
+			"fi; "+
+			"partial=$(mktemp -d \"${target}.flowbee-clone.XXXXXX\") || exit 1; "+
+			"printf '%s\\n' \"$partial\" >\"$lock/partial\" || exit 1; "+
+			"gh repo clone "+shQuote(ownerRepo)+" \"$partial\" -- --quiet || exit 1; "+
+			"mv -- \"$partial\" \"$target\" || exit 1; partial=; "+
+			"test -d \"$target/.git\"")
 }
 
 // TimezoneCmd probes a box's IANA timezone name (the `flowbee epic start --tz`
@@ -209,15 +215,16 @@ func NewTmuxSessionCmd(box, tmuxName, dir, startCmd string) string {
 		" -c "+shQuote(dir)+" "+shQuote(startCmd))
 }
 
-// KillTmuxSessionCmd kills a tmux session by name — used ONLY on the failed-launch
-// ROLLBACK path (review m7): a launch that created the session but then failed to
-// send its goal would otherwise leak the session, and a same-slug retry would then
-// permanently fail on tmux's duplicate-session error. Best-effort by contract (the
-// caller logs but ignores a failure — the session may legitimately not exist when
-// the failure was at create time). NEVER used on a live epic: `flowbee epic
-// abandon` deliberately leaves the session running (operator decision).
+// KillTmuxSessionCmd ensures an exact tmux session is stopped. It is used by both
+// failed-launch rollback and explicit epic abandon: neither path may release a durable
+// seat/scope reservation while its agent could still be running. It succeeds when the
+// exact session is already absent (idempotence), and verifies absence after a kill so a
+// runner error means cleanup was not confirmed and the caller must retain reservations.
 func KillTmuxSessionCmd(box, tmuxName string) string {
-	return remoteWrap(box, "tmux kill-session -t "+shQuote(tmuxName))
+	target := shQuote(exactTarget(tmuxName))
+	return remoteWrap(box, "command -v tmux >/dev/null 2>&1 && { "+
+		"if tmux has-session -t "+target+" 2>/dev/null; then tmux kill-session -t "+target+"; fi; "+
+		"! tmux has-session -t "+target+" 2>/dev/null; }")
 }
 
 // SendGoalCmd sends literal text + Enter into an existing tmux pane — the ONE
@@ -227,7 +234,39 @@ func KillTmuxSessionCmd(box, tmuxName string) string {
 // the launcher builds from trusted inputs (repo id, slug), mirroring sendResumeCmd's
 // shape exactly but parameterized since the payload differs per epic.
 func SendGoalCmd(box, tmuxName, text string) string {
-	return remoteWrap(box, "tmux send-keys -t "+shQuote(tmuxName)+" "+shQuote(text)+" Enter")
+	return remoteWrap(box, "tmux send-keys -t "+shQuote(exactTarget(tmuxName))+" "+shQuote(text)+" Enter")
+}
+
+// WorktreeAddCmd creates a per-epic git worktree at `worktree`, checked out DETACHED at
+// origin/<branch>, sharing the base checkout's .git object store — the isolation that lets
+// two epics coexist on one box without a second full clone. It first `git -C <base>
+// fetch`es origin/<branch> so the worktree starts from a current base (a reused base may be
+// stale), mkdir -p's the worktree's PARENT (the <home>/dev/.flowbee-wt/<repo>/ tree may not
+// exist yet), then adds the worktree DETACHED so the epic runner can `git checkout -b
+// epic/<slug>` inside it — two worktrees never conflict on a branch name, and a detached
+// HEAD lets the new branch be cut cleanly. A failure is launch-BLOCKING by contract (the
+// caller refuses the launch and rolls back) — we NEVER fall back to the shared base tree,
+// which is exactly the cross-epic tree corruption the per-epic worktree exists to prevent.
+//
+// TRUST BOUNDARY: base/worktree are control-plane-derived literal paths and branch is the
+// repo registry's default_branch (operator-set, trusted) — but every one is shQuote'd like
+// every other argument here, and the origin/<branch> checkout target is built as
+// shQuote("origin/"+branch) so a branch with shell metacharacters can never break out of
+// its single argument (mirrors RepoRefreshCmd / SendGoalCmd).
+func WorktreeAddCmd(box, base, worktree, branch string) string {
+	return remoteWrap(box, "git -C "+shQuote(base)+" fetch --quiet origin "+shQuote(branch)+
+		" && mkdir -p -- "+shQuote(parentDirUnix(worktree))+
+		" && git -C "+shQuote(base)+" worktree add --detach "+shQuote(worktree)+" "+shQuote("origin/"+branch))
+}
+
+// WorktreeRemoveCmd tears a per-epic worktree back down — `git -C <base> worktree remove
+// --force <worktree>`, run against the base checkout that owns it. It is restricted to the
+// launch-failure ROLLBACK path, before a launch is declared verified; explicit abandon
+// preserves its session and worktree together so unpushed operator data is never erased.
+// Best-effort by contract at the call site (a box that's unreachable, or a worktree git
+// never created, must not hide the original launch failure).
+func WorktreeRemoveCmd(box, base, worktree string) string {
+	return remoteWrap(box, "git -C "+shQuote(base)+" worktree remove --force "+shQuote(worktree))
 }
 
 // parentDirUnix returns the parent directory of a UNIX-style (forward-slash) path,
@@ -265,4 +304,37 @@ func remoteWrap(box, inner string) string {
 // emit an escaped literal quote, reopen.
 func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// exactTarget forces EXACT session-name matching on a tmux -t target.
+//
+// A bare `tmux -t <name>` PREFIX-matches session names: `send-keys -t flowbee`
+// delivers keystrokes to session `flowbee-claude` when no session is named exactly
+// `flowbee`, and `kill-session -t epic-fix` kills `epic-fix-v2`. For a watcher that
+// TYPES "/goal resume" INTO and (on rollback) KILLS agent sessions by their
+// registered name, prefix-matching is a wrong-target hazard of the highest order.
+// tmux accepts a leading `=` on the SESSION part of a target to force an exact
+// match, so this prepends it. A bare session name also gains a trailing `:`
+// (`=flowbee:`): the target-PANE parser behind capture-pane/send-keys REJECTS a
+// lone `=name` ("can't find pane: =name") and needs a pane-qualified target, while
+// kill-session accepts `=name:` too, so one form is correct across capture, send,
+// and kill (verified against tmux 3.6a). Every tmuxName the watcher passes is a
+// registered goal-session name, so it always takes this branch; the
+// pane/window/session-id sigils and the already-`=`'d / empty cases are handled
+// defensively so this stays semantically identical to internal/tmuxio's helper of
+// the same name (a target already `=`-, `%`-, `@`-, or `$`-prefixed is left
+// untouched; a compound target already carrying `:` is not given a second one; ""
+// is never fabricated into a bare "=").
+func exactTarget(target string) string {
+	if target == "" {
+		return ""
+	}
+	switch target[0] {
+	case '=', '%', '@', '$':
+		return target
+	}
+	if !strings.Contains(target, ":") {
+		return "=" + target + ":"
+	}
+	return "=" + target
 }

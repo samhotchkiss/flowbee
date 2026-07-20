@@ -21,11 +21,13 @@ package multirepo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/epicexec"
 	gh "github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/project"
 	"github.com/samhotchkiss/flowbee/internal/reconcile"
@@ -50,7 +52,11 @@ type GitHubFactory func(r store.Repo) (gh.Client, gh.Writer, error)
 
 // repoLoop bundles one repo's two scoped loops.
 type repoLoop struct {
-	repo   store.Repo
+	repo store.Repo
+	// client is retained as the read-only, repository-scoped GitHub fact
+	// boundary. Recovery probes use it to establish mechanical dependency
+	// health without gaining access to the writer or mutating workflow state.
+	client gh.Client
 	rec    *reconcile.Reconciler
 	sender *project.Sender
 	// unsticker is the repo's client viewed as the optional #214 merge_handoff un-stick
@@ -58,6 +64,16 @@ type repoLoop struct {
 	// repo's client doesn't implement it (e.g. a minimal test fake) — the un-stick is then
 	// skipped for that repo.
 	unsticker gh.MergeUnsticker
+	// effects is the exact combined read/write surface for v2 merge and cleanup.
+	// It remains repo-scoped; an action for repo A can never fall through to B's
+	// GitHub installation identity.
+	effects epicexec.GitHub
+}
+
+type effectGitHub struct {
+	gh.Client
+	gh.Writer
+	gh.BranchExistenceReader
 }
 
 // Manager owns the per-repo loops over one shared store. It is built from the
@@ -174,11 +190,21 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 			}
 		}
 		unsticker, _ := client.(gh.MergeUnsticker) // nil if the client doesn't support it
+		var effects epicexec.GitHub
+		branchReader, _ := client.(gh.BranchExistenceReader)
+		if branchReader == nil {
+			branchReader, _ = writer.(gh.BranchExistenceReader)
+		}
+		if branchReader != nil {
+			effects = effectGitHub{Client: client, Writer: writer, BranchExistenceReader: branchReader}
+		}
 		m.loops[r.ID] = &repoLoop{
 			repo:      r,
+			client:    client,
 			rec:       rec,
 			sender:    sender,
 			unsticker: unsticker,
+			effects:   effects,
 		}
 		m.order = append(m.order, r.ID)
 	}
@@ -188,6 +214,42 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 
 // Repos returns the managed repo ids in stable order.
 func (m *Manager) Repos() []string { return append([]string(nil), m.order...) }
+
+// ForRepo implements epicexec.GitHubResolver. Resolution is explicit and
+// fail-closed; it never selects a default repo for a durable effect.
+func (m *Manager) ForRepo(_ context.Context, repo string) (epicexec.GitHub, error) {
+	loop, ok := m.loops[repo]
+	if !ok {
+		return nil, fmt.Errorf("unknown v2 effect repository %q", repo)
+	}
+	if loop.effects == nil {
+		return nil, fmt.Errorf("repository %q GitHub client lacks v2 effect/verification surface", repo)
+	}
+	return loop.effects, nil
+}
+
+// AuthorizeEpicMerge implements epicexec.MergeAuthorizer using the same
+// repo-scoped mirror, content denylist, launch-pinned epic contract, required CI
+// evaluation, and autonomous-merge policy as the legacy production sender.
+func (m *Manager) AuthorizeEpicMerge(ctx context.Context, action store.EpicDomainAction) error {
+	if !m.autoMergeHandoff {
+		return &epicexec.MergeAuthorizationDenied{Reason: "repository autonomous-merge policy/circuit breaker is closed"}
+	}
+	loop, ok := m.loops[action.Repo]
+	if !ok {
+		return &epicexec.MergeAuthorizationDenied{Reason: fmt.Sprintf("unknown v2 merge repository %q", action.Repo)}
+	}
+	err := loop.sender.AuthorizeEpicV2Merge(ctx, action.EpicID, action.ProjectID, action.Repo,
+		action.PRNumber, action.Branch, action.BaseSHA, action.HeadSHA)
+	if err == nil {
+		return nil
+	}
+	var denied *project.MergeAuthorizationDeniedError
+	if errors.As(err, &denied) {
+		return &epicexec.MergeAuthorizationDenied{Reason: denied.Error()}
+	}
+	return err
+}
 
 // SweepAll runs one reconcile-IN sweep PER managed repo (the §8.1 floor, per repo).
 // Each repo's sweep reads its own board and binds its PRs only within that repo. It

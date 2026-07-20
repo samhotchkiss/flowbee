@@ -16,3 +16,6 @@ func (fakeMergeHistory) CommitHistory(branch, message string, files []gitops.His
 func (fakeMergeHistory) HeadSHA(ref string) (string, error)            { return "", nil }
 func (fakeMergeHistory) FetchBranch(branch string) error               { return nil }
 func (fakeMergeHistory) DiffBetween(base, head string) (string, error) { return "", nil }
+func (fakeMergeHistory) ReadFileAtRef(ref, path string) (string, bool, error) {
+	return "", false, nil
+}

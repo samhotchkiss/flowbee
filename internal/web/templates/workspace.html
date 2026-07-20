@@ -1,0 +1,56 @@
+{{define "workspace.html"}}
+<section class="iw-workspace" data-conversation-workspace data-project-id="{{.ProjectID}}"
+  data-driver-control-available="{{.DriverControlAvailable}}" aria-labelledby="iw-title">
+  <header class="iw-header">
+    <div>
+      <p class="iw-eyebrow">Project workspace</p>
+      <h1 id="iw-title">Talk to your Interactor</h1>
+      <p>Durable project conversation. Delivery is routed by Flowbee; a receipt is shown separately from an Interactor response.</p>
+    </div>
+    <form class="iw-project-form" method="get" action="/workspace" data-workspace-project-form>
+      <label for="iw-project">Project</label>
+      <div><input id="iw-project" name="project" value="{{.ProjectID}}" maxlength="128" pattern="[A-Za-z0-9._:-]+" autocomplete="off"><button type="submit">Open</button></div>
+    </form>
+  </header>
+
+  <div class="iw-route" data-workspace-route aria-live="polite">
+    <span class="iw-route-state" data-workspace-connection>Connecting</span>
+    <strong data-workspace-project>{{.ProjectID}}</strong>
+    <span data-workspace-focus>Loading exact Interactor route…</span>
+  </div>
+
+  {{if and .DriverControlRequired (not .DriverControlAvailable)}}
+  <div class="iw-control-hold" role="alert" data-driver-control-hold>
+    <strong>Driver control route unavailable{{if .DriverControlGap}} · {{.DriverControlGap}}{{end}}</strong>
+    <span>{{if .DriverControlReason}}{{.DriverControlReason}}{{else}}Flowbee-authored messages are durably held; observation remains available, but automation is not live.{{end}}</span>
+  </div>
+  {{end}}
+
+  <div class="iw-layout">
+    <aside class="iw-threads" aria-label="Project conversation threads">
+      <div class="iw-panel-heading"><strong>Threads</strong><span data-workspace-thread-count>0</span></div>
+      <div class="iw-thread-list" data-workspace-threads>
+        <p class="iw-empty">Loading durable threads…</p>
+      </div>
+    </aside>
+
+    <section class="iw-conversation" aria-label="Focused Interactor conversation">
+      <header class="iw-conversation-head">
+        <div><strong data-workspace-thread-title>No thread selected</strong><span data-workspace-thread-focus>Project focus</span></div>
+        <code data-workspace-binding>route pending</code>
+      </header>
+      <div class="iw-messages" data-workspace-messages role="log" aria-live="polite" aria-relevant="additions text">
+        <div class="iw-empty"><strong>Loading conversation</strong><span>History will resume from durable state.</span></div>
+      </div>
+      <form class="iw-composer" data-workspace-composer>
+        <label for="iw-message">Message the project Interactor</label>
+        <textarea id="iw-message" data-workspace-input rows="3" maxlength="100000" placeholder="Describe what you want to build, change, or decide…" required></textarea>
+        <div>
+          <p data-workspace-status>{{if .DriverControlAvailable}}Messages persist before delivery. Enter sends; Shift+Enter adds a line.{{else}}Messages are held until Driver supports an authenticated Flowbee control origin.{{end}}</p>
+          <button type="submit" data-workspace-send disabled>Send</button>
+        </div>
+      </form>
+    </section>
+  </div>
+</section>
+{{end}}
