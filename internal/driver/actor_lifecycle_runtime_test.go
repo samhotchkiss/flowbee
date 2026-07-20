@@ -303,6 +303,34 @@ func TestActorLifecycleRuntimeKnownPreEffectEnsureFailureIsRetryable(t *testing.
 	}
 }
 
+type rejectedEnsurePort struct{ *FakePort }
+
+func (p *rejectedEnsurePort) EnsureLifecycleSession(context.Context, SessionTarget, Action) (LifecycleReceipt, error) {
+	return LifecycleReceipt{}, &HTTPError{Status: 400, Code: "invalid_request", Detail: "workspace root is not configured"}
+}
+
+func TestActorLifecycleRuntimeLifecycleHTTPValidationRejectionIsRetryable(t *testing.T) {
+	st, route, now := actorRuntimeProject(t, flowstore.DriverOrchestratorRole, "russ-orchestrator")
+	materials := SQLLifecycleLaunchMaterials{DB: st.DB, EnvelopeDirectory: t.TempDir(),
+		WorkerAuthSecret: []byte("http-validation-rejection-secret")}
+	st.ProjectActorCredentialMaterializer = materials.PrepareEnvelope
+	fake := endpointRuntimeFake("mac", "managed-store", "flowbee", "managed_dedicated")
+	resolver := actorRuntimeResolver(t, nil, &rejectedEnsurePort{FakePort: fake})
+	if _, _, err := st.CommitProjectActorLifecycleIntent(context.Background(),
+		managedActorCommand(route, fake.Meta.TmuxServer.InstanceID), now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	report, err := (ActorLifecycleRuntime{Resolver: resolver, Store: st, Owner: "http-validation",
+		ClaimTTL: time.Minute, MaxRecovery: 3, Materials: materials, RequireManagedAgentV3: true}).Tick(context.Background(), now.Add(2*time.Minute))
+	if err != nil || report.Retried != 1 {
+		t.Fatalf("HTTP validation rejection was not retried report=%+v err=%v", report, err)
+	}
+	lifecycle, err := st.CurrentProjectActorLifecycle(context.Background(), "russ", flowstore.DriverOrchestratorRole)
+	if err != nil || lifecycle.State != "awaiting_ensure" || lifecycle.LastError == "" {
+		t.Fatalf("HTTP validation rejection became uncertain lifecycle=%+v err=%v", lifecycle, err)
+	}
+}
+
 func (p *lostRecoveryEnsureResponsePort) EnsureLifecycleSession(ctx context.Context,
 	target SessionTarget, action Action) (LifecycleReceipt, error) {
 	receipt, err := p.FakePort.EnsureLifecycleSession(ctx, target, action)

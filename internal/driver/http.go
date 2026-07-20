@@ -74,6 +74,7 @@ func (p *HTTPPort) ControlOriginCapability(ctx context.Context) (ControlOriginCa
 type HTTPError struct {
 	Status int
 	Code   string
+	Detail string
 }
 
 // PreEffectError certifies that a lifecycle failure occurred before Flowbee
@@ -97,7 +98,13 @@ func preEffect(err error) error {
 
 func (e *HTTPError) Error() string {
 	if e.Code == "" {
+		if e.Detail != "" {
+			return fmt.Sprintf("driver http %d: %s", e.Status, e.Detail)
+		}
 		return fmt.Sprintf("driver http %d", e.Status)
+	}
+	if e.Detail != "" {
+		return fmt.Sprintf("driver http %d: %s: %s", e.Status, e.Code, e.Detail)
 	}
 	return fmt.Sprintf("driver http %d: %s", e.Status, e.Code)
 }
@@ -136,16 +143,21 @@ func (p *HTTPPort) call(ctx context.Context, method, path, idem string, in, out 
 	defer r.Body.Close()
 	if r.StatusCode < 200 || r.StatusCode >= 300 {
 		var problem struct {
-			Code  string `json:"code"`
-			Error struct {
-				Code string `json:"code"`
+			Code   string `json:"code"`
+			Detail string `json:"detail"`
+			Error  struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
 			} `json:"error"`
 		}
 		_ = json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&problem)
 		if problem.Code == "" {
 			problem.Code = problem.Error.Code
 		}
-		return &HTTPError{Status: r.StatusCode, Code: problem.Code}
+		if problem.Detail == "" {
+			problem.Detail = problem.Error.Message
+		}
+		return &HTTPError{Status: r.StatusCode, Code: problem.Code, Detail: problem.Detail}
 	}
 	if out != nil {
 		return json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(out)

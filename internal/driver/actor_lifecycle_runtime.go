@@ -154,7 +154,7 @@ func (r ActorLifecycleRuntime) Tick(ctx context.Context, now time.Time) (ActorLi
 	cleanup(executeErr == nil && receipt.Resolved())
 	if executeErr != nil {
 		var knownPreEffect *PreEffectError
-		if errors.As(executeErr, &knownPreEffect) {
+		if errors.As(executeErr, &knownPreEffect) || lifecycleHTTPRejectedPreEffect(executeErr) {
 			return r.preEffectFailure(ctx, action, executeErr, now, report)
 		}
 		// Once the lifecycle method was invoked, Flowbee cannot infer whether the
@@ -182,6 +182,24 @@ func (r ActorLifecycleRuntime) Tick(ctx context.Context, now time.Time) (ActorLi
 	}
 	report.Executed++
 	return report, nil
+}
+
+// lifecycleHTTPRejectedPreEffect recognizes Driver responses that semantically
+// reject the request before a lifecycle engine mutation.  In particular, the
+// v2 lifecycle handler validates an invalid_request body before it dispatches
+// to the mutation engine.  Do not include 408/409/429 here: those can coexist
+// with a previously accepted effect and must remain verification-only.
+func lifecycleHTTPRejectedPreEffect(err error) bool {
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	switch httpErr.Status {
+	case 400, 401, 403, 404, 405, 413, 415, 422:
+		return true
+	default:
+		return false
+	}
 }
 
 type actorPresenceReport struct{ Scanned, Held, Recovered, Errors int }
