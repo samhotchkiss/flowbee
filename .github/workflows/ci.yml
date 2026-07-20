@@ -28,5 +28,5 @@ jobs:
         run: go run ./tools/archcheck
       - name: laddercheck (migration-number ladder)
         run: go run ./tools/laddercheck
-      - name: unit tests
-        run: go test ./... -short -race
+      - name: unit tests (exhaustive Store race shards)
+        run: ./tools/racecheck.sh
