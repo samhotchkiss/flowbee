@@ -759,7 +759,11 @@ func (p *HTTPPort) AdoptSession(ctx context.Context, t SessionTarget, a Action) 
 	}
 	expected := id
 	expected.LifecycleKey, expected.TargetEpoch, expected.Ownership = t.LifecycleKey, t.TargetEpoch, "external_observed"
-	if r.Status != "adopted" || r.IdentityBefore != (Identity{}) ||
+	// Adopt is an observation-preserving ownership transition: Driver returns
+	// the exact pre-existing external incarnation both before and after it
+	// records the lifecycle key. Requiring an empty IdentityBefore would reject
+	// a valid, fenced Adopt-v1 receipt and strand the actor in verification.
+	if r.Status != "adopted" || !lifecycleIdentityMatches(r.IdentityBefore, expected) ||
 		!lifecycleIdentityMatches(r.IdentityAfter, expected) || r.AbsenceObservedAt != "" {
 		return LifecycleReceipt{}, ErrIdentityMismatch
 	}

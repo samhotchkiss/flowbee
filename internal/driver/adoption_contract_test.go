@@ -151,7 +151,7 @@ func TestHTTPPortExternalWatchSnapshotAdoptReleaseExactContract(t *testing.T) {
 				"operation": "adopt", "action_id": "adopt-mail", "action_epoch": 1,
 				"lease_id": "project-bind:mail", "lease_epoch": 1, "lifecycle_key": "project:mail:interactor",
 				"tmux_server_domain_id": "flowbee", "external_watch_id": watchID,
-				"target_epoch": 3, "status": "adopted", "identity_before": nil,
+				"target_epoch": 3, "status": "adopted", "identity_before": identityWire("external_observed"),
 				"identity_after": identityWire("external_observed"), "absence_observed_at": nil, "diagnostic_code": nil,
 			}})
 		case "POST /v2/lifecycle/release":
