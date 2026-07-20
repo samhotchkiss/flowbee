@@ -222,7 +222,9 @@ func migrateWithRollbackSnapshot(ctx context.Context, db *sql.DB, dir string) (s
 }
 
 // verifySnapshot opens the freshly-written snapshot read-only and runs an integrity
-// check + a sanity row count, so a corrupt copy is caught at backup time, not restore.
+// check. A newly migrated control plane legitimately has no job_events yet; its
+// rollback snapshot is still valuable before the first admission, so event count
+// is never used as a proxy for database integrity here.
 func verifySnapshot(ctx context.Context, path string) error {
 	snapStore, err := store.Open(ctx, path)
 	if err != nil {
@@ -235,12 +237,6 @@ func verifySnapshot(ctx context.Context, path string) error {
 	}
 	if ic != "ok" {
 		return fmt.Errorf("integrity_check returned %q", ic)
-	}
-	// the ledger is the durable record; a snapshot with zero events is suspicious.
-	var events int
-	_ = snapStore.DB.QueryRowContext(ctx, "SELECT count(*) FROM job_events").Scan(&events)
-	if events == 0 {
-		return fmt.Errorf("snapshot has 0 ledger events (empty/corrupt source?)")
 	}
 	return nil
 }

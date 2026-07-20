@@ -14,6 +14,17 @@ import (
 // literal brief format.
 const fieldSep = "\x1f"
 
+// splitTmuxFields accepts the unit separator tmux normally emits and the
+// backslash-octal spelling emitted by older runner builds. The latter is still
+// an unambiguous separator in our generated formats; accept it only when the
+// native separator is absent, so a real field value is never rewritten.
+func splitTmuxFields(record string) []string {
+	if strings.Contains(record, fieldSep) {
+		return strings.Split(record, fieldSep)
+	}
+	return strings.Split(record, `\037`)
+}
+
 // Pane is one tmux pane as supervision sees it: enough to route attention and to
 // resolve the real agent process behind the shell. Fields are read verbatim from
 // `tmux list-panes -a -F …`.
@@ -54,7 +65,7 @@ func (c *Client) ListPanes(ctx context.Context) ([]Pane, error) {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		f := strings.Split(line, fieldSep)
+		f := splitTmuxFields(line)
 		if len(f) != 7 {
 			// A malformed row (e.g. a stray warning line) is skipped rather than
 			// failing the whole listing — discovery must degrade, not crash.

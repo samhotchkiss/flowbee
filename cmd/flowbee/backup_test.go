@@ -110,3 +110,32 @@ func TestBackupRoundTrip(t *testing.T) {
 		t.Fatalf("seeded job not present in snapshot: %v", err)
 	}
 }
+
+func TestBackupAllowsFreshMigratedControlPlane(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "flowbee.db")
+	ctx := context.Background()
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	backupDir := filepath.Join(dir, "backups")
+	t.Setenv("FLOWBEE_DATABASE_URL", dbPath)
+	t.Setenv("FLOWBEE_BACKUP_DIR", backupDir)
+	t.Setenv("FLOWBEE_CONFIG", "")
+	if err := runBackup(nil); err != nil {
+		t.Fatalf("backup fresh migrated control plane: %v", err)
+	}
+	snaps, _ := filepath.Glob(filepath.Join(backupDir, "flowbee-*.db"))
+	if len(snaps) != 1 {
+		t.Fatalf("want one snapshot, got %d", len(snaps))
+	}
+	if err := verifySnapshot(ctx, snaps[0]); err != nil {
+		t.Fatalf("fresh snapshot verification: %v", err)
+	}
+}

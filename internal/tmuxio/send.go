@@ -365,7 +365,7 @@ func (c *Client) resolvePane(ctx context.Context, target string) (resolvedPane, 
 	if err != nil {
 		return resolvedPane{}, err
 	}
-	f := strings.Split(strings.TrimSpace(out), fieldSep)
+	f := splitTmuxFields(strings.TrimSpace(out))
 	if len(f) != 3 {
 		return resolvedPane{}, fmt.Errorf("tmuxio: unexpected display-message output %q for target %q", out, target)
 	}
