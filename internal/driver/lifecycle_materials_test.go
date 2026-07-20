@@ -43,3 +43,12 @@ func TestCredentialEnvelopeReadsValidatedOwnerFile(t *testing.T) {
 		t.Fatalf("readOwnerEnvelope() = %q, %v", got, err)
 	}
 }
+
+func TestDriverEnvelopeIDIsDeterministicAndWireSafe(t *testing.T) {
+	ref := "flowbee://actor-credential-envelopes/russ/orchestrator/russ-orchestrator/1/1"
+	got := driverEnvelopeID(ref)
+	if got != driverEnvelopeID(ref) || !strings.HasPrefix(got, "flowbee-envelope-") ||
+		strings.ContainsAny(got, "/:") || len(got) > 160 {
+		t.Fatalf("driver envelope ID is not a stable wire-safe identifier: %q", got)
+	}
+}

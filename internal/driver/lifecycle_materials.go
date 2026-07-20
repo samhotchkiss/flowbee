@@ -75,7 +75,7 @@ func (r SQLLifecycleLaunchMaterials) ResolveLifecycleLaunch(ctx context.Context,
 	if persistedHash == "" || persistedHash != secretHash {
 		return action, nil, errors.New("worker credential envelope hash changed")
 	}
-	action.LifecycleCredential = &LifecycleCredentialEnvelope{EnvelopeID: envelopeID,
+	action.LifecycleCredential = &LifecycleCredentialEnvelope{EnvelopeID: driverEnvelopeID(envelopeID),
 		Format: "flowbee_target_bearer_utf8/v1", CredentialEpoch: generation,
 		PayloadSHA256: secretHash, SecretUTF8: secret}
 	action.LifecyclePresentationName = displayName
@@ -118,7 +118,7 @@ func (r SQLLifecycleLaunchMaterials) resolveProjectActorLaunch(ctx context.Conte
 	if sha256Text(secret) != persistedHash {
 		return action, nil, errors.New("project actor credential envelope hash changed")
 	}
-	action.LifecycleCredential = &LifecycleCredentialEnvelope{EnvelopeID: envelopeID,
+	action.LifecycleCredential = &LifecycleCredentialEnvelope{EnvelopeID: driverEnvelopeID(envelopeID),
 		Format: "flowbee_target_bearer_utf8/v1", CredentialEpoch: generation,
 		PayloadSHA256: persistedHash, SecretUTF8: secret}
 	action.LifecyclePresentationName = presentationName
@@ -259,6 +259,16 @@ func (r SQLLifecycleLaunchMaterials) resolveEnvelope(envelopeID string) (string,
 func (r SQLLifecycleLaunchMaterials) envelopePath(envelopeID string) string {
 	h := sha256.Sum256([]byte(envelopeID))
 	return filepath.Join(r.EnvelopeDirectory, hex.EncodeToString(h[:])+".envelope")
+}
+
+// driverEnvelopeID translates Flowbee's durable credential reference (which is
+// deliberately URI-shaped and never sent as a filesystem selector) into the
+// closed, URL-safe identifier accepted by Driver's lifecycle schema.  The
+// mapping is deterministic so an idempotent replay has the exact same body,
+// while the original reference remains exclusively in Flowbee storage.
+func driverEnvelopeID(envelopeRef string) string {
+	h := sha256.Sum256([]byte(envelopeRef))
+	return "flowbee-envelope-" + hex.EncodeToString(h[:])
 }
 
 func readOwnerEnvelope(path string) ([]byte, error) {
