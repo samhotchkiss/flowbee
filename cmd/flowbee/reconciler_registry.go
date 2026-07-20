@@ -16,6 +16,7 @@ func baseV2ReconcilerGrace() map[string]time.Duration {
 		"builder_lifecycle":           30 * time.Second,
 		"epic_worker_stop":            30 * time.Second,
 		"epic_worker_liveness":        30 * time.Second,
+		"bootstrap_actions":           30 * time.Second,
 		"project_actor_lifecycle":     30 * time.Second,
 		"builder_launch":              30 * time.Second,
 		"epic_effects":                30 * time.Second,

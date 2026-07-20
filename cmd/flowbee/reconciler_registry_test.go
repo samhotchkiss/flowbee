@@ -8,6 +8,7 @@ func TestBaseV2ReconcilerGraceCoversDedicatedWorkerTicks(t *testing.T) {
 		"builder_lifecycle",
 		"epic_worker_stop",
 		"epic_worker_liveness",
+		"bootstrap_actions",
 		"project_actor_lifecycle",
 		"builder_launch",
 	} {
