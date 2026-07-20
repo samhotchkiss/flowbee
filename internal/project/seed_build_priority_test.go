@@ -3,9 +3,11 @@ package project
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/gitops"
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
 // fakeHist satisfies HistoryWriter; only HeadSHA matters for seedBuildFromSpec (it resolves
@@ -14,6 +16,29 @@ type fakeHist struct{}
 
 func (fakeHist) CommitHistory(string, string, []gitops.HistoryFile) (string, bool, error) {
 	return "", false, nil
+}
+
+func TestSeedBuildFromSpecInheritsProjectAuthority(t *testing.T) {
+	ctx := context.Background()
+	st, fake, _, clk := newSender(t)
+	if _, err := st.CreatePortfolioProject(ctx, store.PortfolioProject{ID: "mail", Name: "Mail"}, clk.Now()); err != nil {
+		t.Fatal(err)
+	}
+	sender := New(st, fake, clk, nil).WithHistory(fakeHist{}, "main")
+	buildID, err := sender.seedBuildFromSpec(ctx, job.Job{
+		ID: "mail-spec", ProjectID: "mail", Kind: job.KindSpec,
+		SpecText: "build mail", AcceptanceCriteria: "mail tests pass",
+	}, clk.Now().Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build, err := st.GetJob(ctx, buildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if build.ProjectID != "mail" {
+		t.Fatalf("child build project=%q want mail", build.ProjectID)
+	}
 }
 func (fakeHist) HeadSHA(string) (string, error)             { return "mainsha", nil }
 func (fakeHist) FetchBranch(string) error                   { return nil }

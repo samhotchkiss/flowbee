@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -175,6 +178,29 @@ func selectDurableEpicReviewHandoffV2(ctx context.Context, st *store.Store) (boo
 	return selected, nil
 }
 
+// desiredDurableEpicDedicatedWorkersV2 resolves the process request without
+// mutating durable state. Serve must wire the authoritative material provider
+// and credential materializer before the one-way activation transaction can
+// backfill existing epics, so persistence deliberately happens later.
+func desiredDurableEpicDedicatedWorkersV2(ctx context.Context, st *store.Store) (selected, explicit bool, err error) {
+	persisted, err := st.DurableEpicDedicatedWorkersV2(ctx)
+	if err != nil {
+		return true, false, fmt.Errorf("read durable epic-dedicated-workers v2 activation: %w", err)
+	}
+	raw, explicit := os.LookupEnv("FLOWBEE_EPIC_DEDICATED_WORKERS_V2")
+	if !explicit {
+		return persisted, false, nil
+	}
+	switch strings.TrimSpace(raw) {
+	case "1":
+		return true, true, nil
+	case "", "0":
+		return false, true, nil
+	default:
+		return true, true, errors.New("FLOWBEE_EPIC_DEDICATED_WORKERS_V2 must be 0 or 1")
+	}
+}
+
 func readOwnerOnlySecret(path string) (string, error) {
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
@@ -277,6 +303,9 @@ func printServeSystemd() {
 				fmt.Printf("%s=%s\n", key, value)
 			}
 		}
+	}
+	if os.Getenv("FLOWBEE_EPIC_DEDICATED_WORKERS_V2") == "1" {
+		fmt.Printf("FLOWBEE_EPIC_DEDICATED_WORKERS_V2=1\n")
 	}
 	if os.Getenv("FLOWBEE_CAPACITY_ROUTING_V2") == "1" || os.Getenv("FLOWBEE_CAPACITY_V2") == "1" {
 		fmt.Printf("FLOWBEE_CAPACITY_ROUTING_V2=1\n")
@@ -399,6 +428,46 @@ func runServe(args []string) error {
 	}
 	logger.Info("migrations applied")
 
+	// The OS writer fence is the process authority; the durable incarnation makes
+	// that authority auditable and lets readiness identify a replacement after an
+	// unclean exit. This is intentionally after both lock acquisition and migration
+	// success, so no half-boot can publish itself as the current control plane.
+	runningConfig := runningConfigSnapshot(cfg)
+	configPostureSHA256, err := controlPlaneConfigPostureFingerprint(runningConfig)
+	if err != nil {
+		return err
+	}
+	incarnationID, err := store.NewControlPlaneIncarnationID()
+	if err != nil {
+		return err
+	}
+	incarnationStart, err := st.StartControlPlaneIncarnation(ctx,
+		store.StartControlPlaneIncarnationInput{ID: incarnationID, Version: buildVersion(),
+			SourceCommit: runningConfig.SourceCommit, ConfigPostureSHA256: configPostureSHA256,
+			ProcessID: os.Getpid(), StartedAt: time.Now().UTC()})
+	if err != nil {
+		return fmt.Errorf("start control-plane incarnation: %w", err)
+	}
+	if len(incarnationStart.RecoveredPriorIDs) > 0 {
+		logger.Warn("recovered unclean control-plane incarnation",
+			"incarnation_id", incarnationID, "superseded", incarnationStart.RecoveredPriorIDs)
+	}
+	incarnationStopped := false
+	stopIncarnation := func(reason string) {
+		if incarnationStopped {
+			return
+		}
+		incarnationStopped = true
+		if err := st.StopControlPlaneIncarnation(context.Background(), incarnationID,
+			reason, time.Now().UTC()); err != nil {
+			logger.Error("record control-plane incarnation stop", "incarnation_id", incarnationID,
+				"reason", reason, "err", err)
+		}
+	}
+	defer stopIncarnation("graceful_shutdown")
+	logger.Info("control-plane incarnation active", "incarnation_id", incarnationID,
+		"config_posture_sha256", configPostureSHA256)
+
 	// self-provision the control-plane mirror from the GitHub token if it's
 	// configured but absent — so the operator need not pre-clone it, and a PRIVATE
 	// repo works (a plain `git clone` would fail for lack of credentials).
@@ -414,6 +483,18 @@ func runServe(args []string) error {
 	}
 	st.EnableCapacityV2 = os.Getenv("FLOWBEE_CAPACITY_ROUTING_V2") == "1" ||
 		os.Getenv("FLOWBEE_CAPACITY_V2") == "1"
+	dedicatedWorkersDesired, dedicatedWorkersExplicit, err := desiredDurableEpicDedicatedWorkersV2(ctx, st)
+	if err != nil {
+		return err
+	}
+	if dedicatedWorkersDesired {
+		// Resolve exact admitted spec/contract/discipline bytes before Store opens
+		// any dedicated-worker admission or activation transaction. The provider
+		// reads only durable project/repo authority plus the registered local mirror;
+		// Driver owns target-workspace materialization at Ensure time.
+		workerMaterialProvider := newEpicWorkerMaterialProvider(st)
+		st.EpicWorkerBootstrapMaterialProvider = workerMaterialProvider.Resolve
+	}
 	phase1Enabled := os.Getenv("FLOWBEE_PHASE1_DASHBOARD") == "1"
 	driverControl := driverControlReadiness(ctx, st.EnableEpicReviewHandoffV2, nil)
 	controlState := newDriverControlState(driverControl)
@@ -428,6 +509,35 @@ func runServe(args []string) error {
 	if st.EnableCapacityV2 && !st.EnableEpicReviewHandoffV2 {
 		return fmt.Errorf("capacity routing v2 requires FLOWBEE_EPIC_REVIEW_HANDOFF_V2=1")
 	}
+	if dedicatedWorkersDesired && (!st.EnableEpicReviewHandoffV2 || !st.EnableCapacityV2) {
+		return fmt.Errorf("dedicated epic workers v2 requires review handoff and capacity routing v2")
+	}
+	var epicWorkerMaterials driver.SQLLifecycleLaunchMaterials
+	var epicWorkerWorkspaces *localEpicWorkerWorkspaceManager
+	if dedicatedWorkersDesired || phase1Enabled {
+		if cfg.WorkerAuthSecret == "" {
+			return errors.New("managed Flowbee actors/workers require FLOWBEE_WORKER_AUTH_SECRET for one-shot target credentials")
+		}
+		envelopeDir := os.Getenv("FLOWBEE_WORKER_ENVELOPE_DIR")
+		if envelopeDir == "" {
+			envelopeDir = filepath.Join(filepath.Dir(cfg.DatabaseURL), "worker-envelopes")
+		}
+		epicWorkerMaterials = driver.SQLLifecycleLaunchMaterials{DB: st.DB,
+			EnvelopeDirectory: envelopeDir, WorkerAuthSecret: []byte(cfg.WorkerAuthSecret)}
+		st.EpicWorkerCredentialMaterializer = epicWorkerMaterials.PrepareEnvelope
+		st.ProjectActorCredentialMaterializer = epicWorkerMaterials.PrepareEnvelope
+		st.ManagedSessionDriverFreshFor = 5 * time.Minute
+	}
+	// The durable bit and every pre-existing worker obligation are committed in
+	// one transaction only after all material dependencies are live. An omitted
+	// env reuses the persisted selection; an explicit 0 is still passed through
+	// the one-way Store guard and is rejected once obligations exist.
+	if dedicatedWorkersExplicit {
+		if err := st.SetDurableEpicDedicatedWorkersV2(ctx, dedicatedWorkersDesired, time.Now().UTC()); err != nil {
+			return fmt.Errorf("persist epic-dedicated-workers v2 activation: %w", err)
+		}
+	}
+	st.EnableEpicDedicatedWorkersV2 = dedicatedWorkersDesired
 	if st.EnableCapacityV2 {
 		capacityInterval, err = capacityCollectorInterval()
 		if err != nil {
@@ -440,6 +550,7 @@ func runServe(args []string) error {
 	var v2Reconcilers *durableReconcilerSet
 	var controlAlertIngressSecret, controlAlertIngressProjectID string
 	var phase1ProjectCurrent func() api.Phase1ProjectReadiness
+	var bootstrapDispatchAllowed atomic.Bool
 	if st.EnableEpicReviewHandoffV2 {
 		if err := epicflow.ValidateRegistry(); err != nil {
 			return fmt.Errorf("epic v2 recovery contract: %w", err)
@@ -451,12 +562,26 @@ func runServe(args []string) error {
 		if controlAlertIngressProjectID == "" {
 			return fmt.Errorf("epic review handoff v2 requires exact FLOWBEE_WATCHDOG_PROJECT_ID")
 		}
+		if phase1Enabled {
+			matched := false
+			for _, project := range cfg.BootstrapProjects {
+				if project.ProjectID == controlAlertIngressProjectID {
+					if matched {
+						return fmt.Errorf("Phase 1 bootstrap project %q is configured more than once", controlAlertIngressProjectID)
+					}
+					matched = true
+				}
+			}
+			if !matched {
+				return fmt.Errorf("Phase 1 project %q is not authorized by validated bootstrap_projects config", controlAlertIngressProjectID)
+			}
+		}
 		watchdogProject, projectErr := st.GetPortfolioProject(ctx, controlAlertIngressProjectID)
-		if projectErr != nil {
+		if projectErr != nil && !(phase1Enabled && errors.Is(projectErr, store.ErrProjectNotFound)) {
 			return fmt.Errorf("epic review handoff v2 watchdog project %q must exist: %w",
 				controlAlertIngressProjectID, projectErr)
 		}
-		if watchdogProject.State != "active" {
+		if projectErr == nil && watchdogProject.State != "active" {
 			return fmt.Errorf("epic review handoff v2 watchdog project %q is not active", controlAlertIngressProjectID)
 		}
 		alertSecretFile := os.Getenv("FLOWBEE_ALERT_WEBHOOK_SECRET_FILE")
@@ -473,6 +598,31 @@ func runServe(args []string) error {
 		}
 		if !configured {
 			return fmt.Errorf("epic review handoff v2 requires %s; legacy single-endpoint Driver variables are not a routing fallback", config.DriverEndpointsFileEnv)
+		}
+		if dedicatedWorkersDesired {
+			workspaceRoots, rootsErr := localWorkspaceRootsFromEnvironment()
+			if rootsErr != nil {
+				return rootsErr
+			}
+			localHosts := make(map[string]bool)
+			for _, endpoint := range driverInventory.Endpoints {
+				if endpoint.ExpectedTmuxServerOwnership == "managed_dedicated" {
+					localHosts[endpoint.ExpectedHostID] = true
+				}
+			}
+			for _, project := range cfg.BootstrapProjects {
+				for _, seat := range project.LocalSeats {
+					if seat.Box != "" || !localHosts[seat.HostID] {
+						return fmt.Errorf("dedicated worker seat %q is not on the exact local managed Driver host", seat.SeatID)
+					}
+					if _, ok := workspaceRoots[seat.WorkspaceRootID]; !ok {
+						return fmt.Errorf("dedicated worker seat %q workspace root %q has no machine-local mapping",
+							seat.SeatID, seat.WorkspaceRootID)
+					}
+				}
+			}
+			epicWorkerWorkspaces = &localEpicWorkerWorkspaceManager{DB: st.DB, Roots: workspaceRoots,
+				LocalHostIDs: localHosts, MirrorPath: controlMirrorFor}
 		}
 		driverEndpoints, driverResolver, endpointErr := loadServeDriverEndpoints(ctx, driverInventory)
 		if endpointErr != nil {
@@ -510,6 +660,7 @@ func runServe(args []string) error {
 			reconcilerGrace[driverEndpointReconcilerName("driver_control_capability", endpoint.InstanceRef)] = 30 * time.Second
 		}
 		if phase1Enabled {
+			reconcilerGrace["bootstrap_actions"] = 30 * time.Second
 			reconcilerGrace["work_intent_promotion"] = time.Minute
 			reconcilerGrace["work_intent_driver"] = 30 * time.Second
 			reconcilerGrace["work_intent_admission"] = time.Minute
@@ -653,6 +804,20 @@ func runServe(args []string) error {
 			return fmt.Errorf("startup epic delivery backstop: %w", rerr)
 		}
 		logger.Info("startup epic delivery backstop complete", "scanned", backstopRep.Scanned, "alerted", backstopRep.Alerted)
+		if st.EnableEpicDedicatedWorkersV2 {
+			var stopRep store.EpicWorkerStopReconcileResult
+			startupNow = time.Now()
+			rerr = v2Reconcilers.tick(ctx, "epic_worker_stop", startupNow, func() error {
+				var err error
+				stopRep, err = st.ReconcileEpicWorkerStops(ctx, startupNow)
+				return err
+			})
+			if rerr != nil {
+				return fmt.Errorf("startup epic worker stop reconcile: %w", rerr)
+			}
+			logger.Info("startup epic worker stop reconcile complete", "scanned", stopRep.Scanned,
+				"actions_ensured", stopRep.ActionsEnsured, "held", stopRep.Held)
+		}
 		var alertRep store.ControlAlertInteractorProjectionReport
 		startupNow = time.Now()
 		if derr := v2Reconcilers.tick(ctx, "alert_interactor_projection", startupNow, func() error {
@@ -805,6 +970,11 @@ func runServe(args []string) error {
 			Owner: fmt.Sprintf("serve-lifecycle-%d", os.Getpid()), ClaimTTL: time.Minute,
 			MaximumTries: 5,
 		}
+		if st.EnableEpicDedicatedWorkersV2 {
+			lifecycleRuntime.Materials = epicWorkerMaterials
+			lifecycleRuntime.Workspaces = epicWorkerWorkspaces
+			lifecycleRuntime.RequireManagedAgentV3 = true
+		}
 		go func() {
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
@@ -830,9 +1000,35 @@ func runServe(args []string) error {
 				}
 			}
 		}()
+		workerLivenessRuntime := driver.EpicWorkerLivenessRuntime{Resolver: driverResolver, Store: st}
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					var rep driver.EpicWorkerLivenessReport
+					err := v2Reconcilers.tick(ctx, "epic_worker_liveness", now, func() error {
+						var err error
+						rep, err = workerLivenessRuntime.Tick(ctx, now)
+						return err
+					})
+					if err != nil {
+						logger.Error("epic worker liveness reconcile failed", "err", err)
+					} else if rep.Recovered+rep.Stopped+rep.Held+rep.ProbeErrors > 0 {
+						logger.Info("epic worker liveness reconcile complete", "scanned", rep.Scanned,
+							"recovered", rep.Recovered, "stopped", rep.Stopped, "held", rep.Held,
+							"probe_errors", rep.ProbeErrors)
+					}
+				}
+			}
+		}()
 		actorLifecycleRuntime := driver.ActorLifecycleRuntime{
 			Resolver: driverResolver, Store: st, Owner: fmt.Sprintf("serve-project-actor-lifecycle-%d", os.Getpid()),
-			ClaimTTL: time.Minute, MaxRecovery: 5,
+			ClaimTTL: time.Minute, MaxRecovery: 5, Materials: epicWorkerMaterials,
+			RequireManagedAgentV3: true,
 		}
 		var startupActorLifecycle driver.ActorLifecycleRuntimeReport
 		startupNow = time.Now()
@@ -851,18 +1047,17 @@ func runServe(args []string) error {
 			"verified", startupActorLifecycle.Verified, "retried", startupActorLifecycle.Retried,
 			"dead_lettered", startupActorLifecycle.DeadLettered)
 		if phase1Enabled {
-			activation, activationErr := requirePhase1ProjectLiveReady(ctx, st,
-				controlAlertIngressProjectID, time.Now())
-			if activationErr != nil {
-				return activationErr
-			}
-			logger.Info("Phase 1 project activation gate passed", "project_id", activation.Project.ID,
-				"actors", len(activation.Actors), "builder_targets", activation.CurrentBuilderTargets,
-				"reviewers", activation.CurrentReviewerBindings,
-				"capacity_generation", activation.ActiveCapacityGeneration)
 			watchdogID := strings.TrimSpace(os.Getenv("FLOWBEE_EXTERNAL_WATCHDOG_ID"))
 			phase1ProjectCurrent = func() api.Phase1ProjectReadiness {
 				return currentPhase1ProjectReadiness(st, controlAlertIngressProjectID, watchdogID, time.Now())
+			}
+			initial := phase1ProjectCurrent()
+			bootstrapDispatchAllowed.Store(initial.Available)
+			if initial.Available {
+				logger.Info("Phase 1 project activation gate passed", "project_id", controlAlertIngressProjectID)
+			} else {
+				logger.Warn("Phase 1 server entering bootstrap-only dispatch hold",
+					"project_id", controlAlertIngressProjectID, "holds", initial.Holds)
 			}
 		}
 		go func() {
@@ -1205,7 +1400,18 @@ func runServe(args []string) error {
 	// so it is not the default in-env path.
 	var authn auth.Authenticator
 	if cfg.WorkerAuthSecret != "" {
-		authn = auth.NewBearer([]byte(cfg.WorkerAuthSecret), cfg.EnrolledIdentities, cfg.AuthLoopbackBypass)
+		bearer := auth.NewBearer([]byte(cfg.WorkerAuthSecret), cfg.EnrolledIdentities, cfg.AuthLoopbackBypass)
+		bearer.WithCredentialVerifier(func(claims auth.CredentialClaims, observedAt time.Time) bool {
+			switch claims.WorkerRole {
+			case store.DriverInteractorRole, store.DriverOrchestratorRole:
+				return st.AuthorizeProjectActorCredential(context.Background(), claims.Identity,
+					claims.ProjectID, claims.WorkerRole, claims.CredentialID, claims.Generation, observedAt)
+			default:
+				return st.AuthorizeEpicWorkerCredential(context.Background(), claims.Identity,
+					claims.ProjectID, claims.WorkerRole, claims.CredentialID, claims.Generation, observedAt)
+			}
+		})
+		authn = bearer
 		logger.Info("worker mutual-auth enabled", "enrolled", len(cfg.EnrolledIdentities), "loopback_bypass", cfg.AuthLoopbackBypass)
 	} else if !isLoopbackAddr(cfg.PrivateAddr) {
 		// no auth + a non-loopback bind = the worker API is reachable by any host on
@@ -1285,11 +1491,58 @@ func runServe(args []string) error {
 		// PauseMarkerPath: a file beside the live DB whose presence stops new leases.
 		// `flowbee pause` creates it; `flowbee resume` removes it; no server restart needed.
 		PauseMarkerPath:      markerPath(cfg.DatabaseURL),
-		RunningConfig:        runningConfigSnapshot(cfg),
+		RunningConfig:        runningConfig,
 		DriverControl:        driverControl,
 		DriverControlCurrent: driverControlCurrent,
 		Phase1ProjectCurrent: phase1ProjectCurrent,
+		BootstrapProjectID:   map[bool]string{true: controlAlertIngressProjectID}[phase1Enabled],
+		BootstrapDispatchAllowed: func() bool {
+			return !phase1Enabled || bootstrapDispatchAllowed.Load()
+		},
+		ControlPlaneIncarnationID: incarnationID,
 	}, buildVersion())
+	bootstrapRuntime := bootstrapActionRuntime{Store: st, Owner: fmt.Sprintf("serve-bootstrap-%d", os.Getpid())}
+	srv.SetBootstrapActionIntake(&serverBootstrapIntake{Store: st, Now: time.Now})
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		run := func(now time.Time) {
+			if v2Reconcilers != nil {
+				if err := v2Reconcilers.tick(ctx, "bootstrap_actions", now, func() error {
+					return bootstrapRuntime.Tick(ctx, now)
+				}); err != nil {
+					logger.Error("bootstrap action runtime failed", "err", err)
+				}
+				return
+			}
+			if err := bootstrapRuntime.Tick(ctx, now); err != nil {
+				logger.Error("bootstrap action runtime failed", "err", err)
+			}
+		}
+		run(time.Now())
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				run(now)
+			}
+		}
+	}()
+	if phase1Enabled {
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					bootstrapDispatchAllowed.Store(phase1ProjectCurrent().Available)
+				}
+			}
+		}()
+	}
 	if cfg.AllowSelfMerge {
 		logger.Info("autonomous merge enabled (Branch B): self_merge eligible jobs merge without a human gate")
 	}
@@ -1556,7 +1809,7 @@ func runServe(args []string) error {
 	// API: constrained consumers can dedupe, while the dashboard simply re-reads truth.
 	publishEpicNudge := func(event string) {
 		seq, _ := st.EpicDigestSeq(ctx)
-		srv.Broker().Publish(api.LifeEvent{State: "epics", Event: event, DigestSeq: seq})
+		srv.Broker().Publish(api.LifeEvent{State: "epics", Event: event, DigestSeq: seq, Global: true})
 	}
 
 	// THE ONE CONSOLIDATED EPIC-SUPERVISION TICKER (epic-lane Phase 6b, plan §12.2). A
@@ -1630,6 +1883,19 @@ func runServe(args []string) error {
 								logger.Error("epic delivery backstop failed", "err", err)
 							} else if backstopRep.Alerted > 0 {
 								logger.Warn("overdue epic delivery states surfaced", "scanned", backstopRep.Scanned, "alerted", backstopRep.Alerted)
+							}
+							if st.EnableEpicDedicatedWorkersV2 {
+								var stopRep store.EpicWorkerStopReconcileResult
+								if err := v2Reconcilers.tick(ctx, "epic_worker_stop", now, func() error {
+									var err error
+									stopRep, err = st.ReconcileEpicWorkerStops(ctx, now)
+									return err
+								}); err != nil {
+									logger.Error("epic worker stop reconcile failed", "err", err)
+								} else if stopRep.ActionsEnsured+stopRep.Held > 0 {
+									logger.Info("epic worker stop obligations reconciled", "scanned", stopRep.Scanned,
+										"actions_ensured", stopRep.ActionsEnsured, "held", stopRep.Held)
+								}
 							}
 						}
 						if supv != nil {
@@ -1874,8 +2140,11 @@ func runServe(args []string) error {
 		}
 		logger.Info("reconcile cadence", "interval", reconcileEvery.String())
 		go func() {
-			_, err := mgr.SweepAll(ctx)
-			srv.RecordGitHubSweep(err) // surface a sustained GitHub failure (expired token, …)
+			counts, err := mgr.SweepAll(ctx)
+			if observeErr := observeMultiRepoLoopFailures(ctx, st, err, time.Now()); observeErr != nil {
+				logger.Error("record boot repository failure", "err", observeErr)
+			}
+			recordMultiRepoGitHubSweep(srv, counts, err) // global health fails only when no repository succeeded.
 			if err != nil {
 				logger.Error("boot reconcile sweep", "err", err)
 			}
@@ -1888,13 +2157,19 @@ func runServe(args []string) error {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					_, err := mgr.SweepAll(ctx)
-					srv.RecordGitHubSweep(err)
+					counts, err := mgr.SweepAll(ctx)
+					if observeErr := observeMultiRepoLoopFailures(ctx, st, err, time.Now()); observeErr != nil {
+						logger.Error("record repository sweep failure", "err", observeErr)
+					}
+					recordMultiRepoGitHubSweep(srv, counts, err)
 					if err != nil {
 						logger.Error("reconcile sweep", "err", err)
 					}
 				case <-drain.C:
 					if _, err := mgr.DrainAll(ctx); err != nil {
+						if observeErr := observeMultiRepoLoopFailures(ctx, st, err, time.Now()); observeErr != nil {
+							logger.Error("record repository drain failure", "err", observeErr)
+						}
 						logger.Error("project-out drain", "err", err)
 					}
 				}
@@ -2005,6 +2280,7 @@ func runServe(args []string) error {
 	_ = privateSrv.Shutdown(shutdownCtx)
 	select {
 	case <-reexec:
+		stopIncarnation("reexec")
 		return reexecSelf(logger)
 	default:
 	}
@@ -2070,6 +2346,28 @@ func runningConfigSnapshot(cfg config.Config) api.RunningConfig {
 		})
 	}
 	return rc
+}
+
+func controlPlaneConfigPostureFingerprint(in api.RunningConfig) (string, error) {
+	// Provenance and process identity are pinned in dedicated incarnation columns;
+	// remove them from the posture so this hash changes only when effective runtime
+	// configuration changes. The snapshot contains no secret values, only presence.
+	in.Version = ""
+	in.PID = 0
+	in.SourceCommit = ""
+	in.TreeDirty = false
+	in.TreeDirtyKnown = false
+	in.OriginMainSHA = ""
+	in.BehindOriginMainBy = 0
+	in.BehindOriginMainKnown = false
+	in.SourceWarning = ""
+	in.DriverControl = api.DriverControlReadiness{}
+	body, err := json.Marshal(in)
+	if err != nil {
+		return "", fmt.Errorf("encode control-plane config posture: %w", err)
+	}
+	hash := sha256.Sum256(body)
+	return fmt.Sprintf("sha256:%x", hash[:]), nil
 }
 
 func runningConfigPath() string {
@@ -2501,6 +2799,63 @@ func firstRepo(mgr *multirepo.Manager) string {
 	return ""
 }
 
+// observeMultiRepoLoopFailures converts a completed multi-repo pass's typed
+// failures into exact project/repository breaker observations. It deliberately
+// ignores untyped errors rather than guessing a scope. The evidence reference is
+// stable for the same operation/repo/error tuple, allowing the store to make
+// repeated observations idempotent while a changed failure remains new evidence.
+func observeMultiRepoLoopFailures(ctx context.Context, st *store.Store, passErr error, now time.Time) error {
+	var batch *multirepo.RepoLoopFailures
+	if passErr == nil || !errors.As(passErr, &batch) || batch == nil {
+		return nil
+	}
+	kind := "action_failure"
+	if batch.Operation == "sweep" {
+		kind = "github_error"
+	}
+	var observationErrors []error
+	for _, failure := range batch.Failures {
+		if failure.RepoID == "" || failure.Err == nil {
+			observationErrors = append(observationErrors,
+				fmt.Errorf("invalid %s repository failure: %+v", batch.Operation, failure))
+			continue
+		}
+		// One transient write is normal retry traffic, not a project outage. The
+		// outbox sender has already durably incremented attempts before returning;
+		// require three failed passes before opening a breaker. Its half-open probe
+		// later closes only after the exact repo has no failed pending effect.
+		if batch.Operation == "drain" {
+			_, maxAttempts, _, err := st.ReadRepositoryActionProbe(ctx, failure.RepoID)
+			if err != nil {
+				observationErrors = append(observationErrors,
+					fmt.Errorf("inspect drain retry evidence for repo %q: %w", failure.RepoID, err))
+				continue
+			}
+			if maxAttempts < 3 {
+				continue
+			}
+		}
+		evidenceBody := batch.Operation + "\x00" + failure.RepoID + "\x00" + failure.Err.Error()
+		digest := sha256.Sum256([]byte(evidenceBody))
+		evidenceRef := fmt.Sprintf("multirepo:%s:%s@sha256:%x", batch.Operation, failure.RepoID, digest[:])
+		reason := fmt.Sprintf("%s repo %q failed: %v", batch.Operation, failure.RepoID, failure.Err)
+		if _, err := st.RecordProjectBreakerFailureForRepo(ctx, failure.RepoID, kind, reason,
+			time.Minute, evidenceRef, now); err != nil {
+			observationErrors = append(observationErrors,
+				fmt.Errorf("record %s failure for repo %q: %w", batch.Operation, failure.RepoID, err))
+		}
+	}
+	return errors.Join(observationErrors...)
+}
+
+func recordMultiRepoGitHubSweep(srv *api.Server, successful map[string]int, passErr error) {
+	if len(successful) > 0 {
+		srv.RecordGitHubSweep(nil)
+		return
+	}
+	srv.RecordGitHubSweep(passErr)
+}
+
 // logProjectBreakerReport keeps per-scope failures visible without turning one
 // poison repository into a pass-level error that could suppress healthy scopes.
 func logProjectBreakerReport(logger *slog.Logger, message string, report projectbreaker.Report) {
@@ -2519,7 +2874,7 @@ func newProductionProjectBreakerRunner(st *store.Store, mgr *multirepo.Manager, 
 	return projectbreaker.Runner{
 		Store: st,
 		Probe: projectbreaker.MechanicalDependencyProbe{
-			Projects: st, Repositories: mgr, RetryAfter: time.Minute,
+			Projects: st, Repositories: mgr, Actions: st, RetryAfter: time.Minute,
 		},
 		Config: projectbreaker.Config{
 			Owner: owner, ClaimTTL: time.Minute, FailureRetryAfter: time.Minute, Budget: 25,

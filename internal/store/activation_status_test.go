@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,9 @@ import (
 func TestProjectActivationDistinguishesConfiguredInventoryFromLiveCapacity(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.NewStore(t)
+	st.ProjectActorCredentialMaterializer = func(_, _, _, _ string, _ int64, _ time.Time) (string, error) {
+		return "sha256:" + strings.Repeat("a", 64), nil
+	}
 	now := time.Date(2026, 7, 19, 20, 0, 0, 0, time.UTC)
 	if err := st.RegisterRepo(ctx, store.Repo{ID: "mail-repo", Owner: "acme", Repo: "mail", Active: true}); err != nil {
 		t.Fatal(err)
@@ -78,7 +82,7 @@ func TestProjectActivationDistinguishesConfiguredInventoryFromLiveCapacity(t *te
 	}
 	identities := []driver.Identity{
 		{HostID: externalMeta.HostID, StoreID: externalMeta.StoreID, TmuxServerDomainID: "default", TmuxServerInstanceID: "server-external", SessionID: "interactor-session", PaneInstanceID: "pane-i", AgentRunID: "run-i", Provider: "claude"},
-		{HostID: meta.HostID, StoreID: meta.StoreID, TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1", SessionID: "orchestrator-session", PaneInstanceID: "pane-o", AgentRunID: "run-o", Provider: "grok"},
+		{HostID: meta.HostID, StoreID: meta.StoreID, TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1", SessionID: "orchestrator-session", PaneInstanceID: "pane-o", AgentRunID: "run-o", Provider: "codex"},
 		{HostID: meta.HostID, StoreID: meta.StoreID, TmuxServerDomainID: "flowbee", TmuxServerInstanceID: "server-1", SessionID: "reviewer-session", PaneInstanceID: "pane-r", AgentRunID: "run-r", Provider: "grok"},
 	}
 	if err := obsStore.ReplaceSnapshot(ctx, "external-driver", driver.SessionSnapshot{HostID: externalMeta.HostID,
@@ -145,13 +149,18 @@ func TestProjectActivationDistinguishesConfiguredInventoryFromLiveCapacity(t *te
 			TargetHostID: item.id.HostID, TargetStoreID: item.id.StoreID,
 			TargetServerDomainID: item.id.TmuxServerDomainID, TargetServerID: item.id.TmuxServerInstanceID,
 			LifecycleOwnership: item.ownership, ExternalWatchID: item.watchID,
-			LifecycleKey: item.identity, TargetEpoch: 1, ProfileID: item.id.Provider,
+			LifecycleKey: item.identity, TargetEpoch: 1, ProfileID: map[string]string{
+				store.DriverOrchestratorRole: "codex_orchestrator", store.DriverInteractorRole: item.id.Provider,
+			}[item.role],
 		}
 		if item.ownership == "driver_managed" {
 			command.WorkspaceRootID, command.WorkspaceRelativePath = "projects", "mail"
 		} else {
 			command.ExpectedSessionID, command.ExpectedPaneInstanceID = item.id.SessionID, item.id.PaneInstanceID
 			command.ExpectedAgentRunID = item.id.AgentRunID
+			command.ManagedRecoveryProfileID = "claude_interactor_managed"
+			command.ManagedRecoveryWorkspaceRootID = "projects"
+			command.ManagedRecoveryWorkspaceRelativePath = "mail"
 		}
 		_, _, err = st.CommitProjectActorLifecycleIntent(ctx, command, now.Add(time.Duration(index+1)*time.Second))
 		if err != nil {
@@ -229,6 +238,106 @@ func TestProjectActivationDistinguishesConfiguredInventoryFromLiveCapacity(t *te
 		live.CapacityBoundSeats != 1 || live.ActiveCapacityGeneration != "generation-1" || len(live.Holds) != 0 {
 		t.Fatalf("live status=%+v", live)
 	}
+
+	t.Run("dedicated worker activation uses routable reviewer pool without persistent session", func(t *testing.T) {
+		st.EnableEpicDedicatedWorkersV2 = true
+		if _, err := st.DB.ExecContext(ctx, `UPDATE builder_driver_targets SET profile_id='codex_builder'
+			WHERE project_id='mail' AND seat_id=?`, buildSeat.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpsertBuilderDriverTarget(ctx, store.BuilderDriverTarget{ProjectID: "mail",
+			SeatID: reviewSeat.ID, InstanceRef: "local-driver", TmuxServerDomainID: "flowbee",
+			TmuxServerInstanceID: "server-1", ProfileID: "grok_reviewer", WorkspaceRootID: "projects",
+			WorkspaceRelativeBase: "mail-review", Enabled: true}, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB.ExecContext(ctx, `UPDATE driver_session_bindings SET state='superseded'
+			WHERE project_id='mail' AND role='code_reviewer' AND state='active'`); err != nil {
+			t.Fatal(err)
+		}
+		status, err := st.ProjectActivation(ctx, "mail", now.Add(time.Minute), 5*time.Minute)
+		if err != nil || !status.LiveReady || status.CurrentReviewerBindings != 0 ||
+			status.EnabledReviewerTargets != 1 || status.CurrentReviewerTargets != 1 ||
+			status.BuilderDistinctReviewerReadyTargets != 1 {
+			t.Fatalf("dedicated pool activation=%+v err=%v", status, err)
+		}
+
+		blocked := append([]store.CapacitySeatObservation(nil), observations...)
+		for i := range blocked {
+			blocked[i].ObservationID += "-blocked"
+			blocked[i].RawSHA256 += "-blocked"
+			blocked[i].FetchedAt = now.Add(2 * time.Minute)
+			if blocked[i].SeatID == reviewSeat.ID {
+				blocked[i].Windows = []capacity.RouteWindow{{Kind: "monthly", Applicable: true, Known: true, Percent: 100}}
+			}
+		}
+		if err := st.CommitCapacityGeneration(ctx, store.CapacityGeneration{ID: "generation-reviewer-blocked",
+			StartedAt: now.Add(2 * time.Minute), ExpectedSeatIDs: []string{buildSeat.ID, reviewSeat.ID,
+				unrelatedReview.ID}, Observations: blocked}, now.Add(2*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		status, err = st.ProjectActivation(ctx, "mail", now.Add(3*time.Minute), 5*time.Minute)
+		if err != nil || status.LiveReady || !activationHasHold(status, "reviewer_family_capacity_not_routable") {
+			t.Fatalf("unroutable reviewer pool false-greened=%+v err=%v", status, err)
+		}
+
+		sameFamily := append([]store.CapacitySeatObservation(nil), observations...)
+		for i := range sameFamily {
+			sameFamily[i].ObservationID += "-same-pool"
+			sameFamily[i].RawSHA256 += "-same-pool"
+			sameFamily[i].FetchedAt = now.Add(4 * time.Minute)
+			if sameFamily[i].SeatID == buildSeat.ID {
+				sameFamily[i].Provider, sameFamily[i].Source, sameFamily[i].BillingPeriodActive = "grok", "live_billing", true
+				sameFamily[i].Windows = []capacity.RouteWindow{{Kind: "monthly", Applicable: true, Known: true, Percent: 10}}
+			}
+		}
+		if _, err := st.DB.ExecContext(ctx, `UPDATE seats SET agent_family='grok' WHERE id=?`, buildSeat.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB.ExecContext(ctx, `UPDATE builder_driver_targets SET profile_id='grok_builder'
+			WHERE project_id='mail' AND seat_id=?`, buildSeat.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.CommitCapacityGeneration(ctx, store.CapacityGeneration{ID: "generation-same-pool-family",
+			StartedAt: now.Add(4 * time.Minute), ExpectedSeatIDs: []string{buildSeat.ID, reviewSeat.ID,
+				unrelatedReview.ID}, Observations: sameFamily}, now.Add(4*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		status, err = st.ProjectActivation(ctx, "mail", now.Add(5*time.Minute), 5*time.Minute)
+		if err != nil || status.LiveReady || status.BuilderDistinctReviewerReadyTargets != 0 ||
+			!activationHasHold(status, "builder_distinct_reviewer_unavailable") {
+			t.Fatalf("same-family reviewer pool false-greened=%+v err=%v", status, err)
+		}
+
+		// Restore the legacy fixture for the remaining independent lenses.
+		st.EnableEpicDedicatedWorkersV2 = false
+		if _, err := st.DB.ExecContext(ctx, `UPDATE seats SET agent_family='codex' WHERE id=?`, buildSeat.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB.ExecContext(ctx, `UPDATE builder_driver_targets SET profile_id='codex-builder'
+			WHERE project_id='mail' AND seat_id=?`, buildSeat.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB.ExecContext(ctx, `DELETE FROM builder_driver_targets
+			WHERE project_id='mail' AND seat_id=?`, reviewSeat.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB.ExecContext(ctx, `UPDATE driver_session_bindings SET state='active'
+			WHERE project_id='mail' AND role='code_reviewer'`); err != nil {
+			t.Fatal(err)
+		}
+		restored := append([]store.CapacitySeatObservation(nil), observations...)
+		for i := range restored {
+			restored[i].ObservationID += "-post-dedicated"
+			restored[i].RawSHA256 += "-post-dedicated"
+			restored[i].FetchedAt = now.Add(6 * time.Minute)
+		}
+		if err := st.CommitCapacityGeneration(ctx, store.CapacityGeneration{ID: "generation-post-dedicated",
+			StartedAt: now.Add(6 * time.Minute), ExpectedSeatIDs: []string{buildSeat.ID, reviewSeat.ID,
+				unrelatedReview.ID}, Observations: restored}, now.Add(6*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	t.Run("same-family-only reviewer cannot green builder readiness", func(t *testing.T) {
 		sameFamilyBuild := store.Seat{Box: "", AgentFamily: "grok", ConfigDir: "/grok/same-family-build"}
@@ -309,6 +418,24 @@ func TestProjectActivationDistinguishesConfiguredInventoryFromLiveCapacity(t *te
 		}
 		if _, err := st.DB.ExecContext(ctx, `UPDATE driver_session_bindings SET lifecycle_ownership='external_observed'
 			WHERE project_id='mail' AND role='interactor' AND state='active'`); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("managed actor topology requires exact reserved presentation", func(t *testing.T) {
+		if _, err := st.DB.ExecContext(ctx, `UPDATE project_actor_lifecycles SET presentation_name='wrong-name'
+			WHERE project_id='mail' AND role='orchestrator' AND actor_id='orchestrator-mail'`); err != nil {
+			t.Fatal(err)
+		}
+		status, err := st.ProjectActivation(ctx, "mail", now.Add(time.Minute), 5*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Configured || status.LiveReady || !activationHasHold(status, "orchestrator_endpoint_topology_invalid") {
+			t.Fatalf("wrong managed presentation false-greened: %+v", status)
+		}
+		if _, err := st.DB.ExecContext(ctx, `UPDATE project_actor_lifecycles SET presentation_name='mail-orchestrator'
+			WHERE project_id='mail' AND role='orchestrator' AND actor_id='orchestrator-mail'`); err != nil {
 			t.Fatal(err)
 		}
 	})

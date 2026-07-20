@@ -90,7 +90,7 @@ func (s *Store) UpsertBuilderDriverTarget(ctx context.Context, in BuilderDriverT
 }
 
 type BuilderLaunchReconcileResult struct {
-	Scanned, ActionsCreated, Acknowledged, CapacityHeld, Stalled int
+	Scanned, ActionsCreated, ReworksScheduled, Acknowledged, CapacityHeld, Stalled int
 }
 
 type builderLaunchCandidate struct {
@@ -145,6 +145,21 @@ func (s *Store) ReconcileBuilderLaunches(ctx context.Context, now time.Time,
 		out.CapacityHeld += result.CapacityHeld
 		out.Stalled += result.Stalled
 	}
+	for {
+		turn, err := s.scheduleOneFairBuilderCompute(ctx, now, freshFor, provider)
+		if err != nil {
+			return out, err
+		}
+		out.CapacityHeld += turn.CapacityHeld
+		if !turn.Scheduled {
+			break
+		}
+		if turn.Kind == "builder_rework" {
+			out.ReworksScheduled++
+		} else {
+			out.ActionsCreated++
+		}
+	}
 	return out, nil
 }
 
@@ -198,82 +213,6 @@ func (s *Store) reconcileOneBuilderLaunch(ctx context.Context, epicID string, no
 		if leaseAction != "" {
 			return errors.New("builder launch compute lease has no live action")
 		}
-
-		candidates, err := builderLaunchCandidatesTx(ctx, tx, projectID, provider, s.EnableCapacityV2)
-		if err != nil {
-			return err
-		}
-		var selected *builderLaunchCandidate
-		var reasons []string
-		for i := range candidates {
-			decision, err := capacityRouteForSeatQuery(ctx, tx, candidates[i].seatID, now, freshFor)
-			if err != nil {
-				return err
-			}
-			if decision.Routable {
-				selected = &candidates[i]
-				break
-			}
-			reasons = append(reasons, candidates[i].seatID+":"+strings.Join(decision.Reasons, ","))
-		}
-		if selected == nil {
-			detail := "no exact routable " + provider + " builder seat"
-			if len(reasons) > 0 {
-				detail += ": " + strings.Join(reasons, ";")
-			}
-			return holdBuilderLaunchCapacityTx(ctx, tx, projectID, epicID, detail, version, now, &out)
-		}
-
-		payload, _ := json.Marshal(map[string]any{
-			"type": "builder_launch", "project_id": projectID, "epic_id": epicID,
-			"repo": repo, "branch": branch, "slug": slug, "title": title, "spec_path": specPath,
-		})
-		dedup := "builder_launch:" + projectID + ":" + epicID + ":" + selected.storeID
-		h := sha256.Sum256([]byte(dedup))
-		actionID = "builder-launch-" + hex.EncodeToString(h[:12])
-		payloadHash := sha256.Sum256(payload)
-		workspacePath := path.Join(selected.workspaceBase, projectID, epicID)
-		stamp := now.UTC().Format(rfc3339)
-		res, err := tx.ExecContext(ctx, `UPDATE epics SET host=?,seat_id=?,account_key=?,
-			builder_model_family=?,agent=?,tmux_name=?,updated_at=? WHERE id=? AND seat_id=''
-			AND state='launching'`, selected.hostID, selected.seatID, selected.accountKey,
-			selected.family, selected.family, epicSessionNameForProject(projectID, slug), stamp, epicID)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			return errors.New("builder launch lost atomic compute lease race")
-		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO epic_actions
-			(id,project_id,epic_id,kind,state,action_epoch,dedup_key,payload_json,payload_sha256,
-			 executor_kind,target_role,target_host_id,target_store_id,target_server_domain_id,target_server_id,lifecycle_key,
-			 target_epoch,profile_id,workspace_root_id,workspace_relative_path,lease_id,lease_epoch,
-			 next_attempt_at,created_at,updated_at)
-			VALUES (?,?,?,'builder_launch','pending',0,?,?,?,'driver_lifecycle','builder',?,?,?,?,?,1,?,?,?,?,1,?,?,?)`,
-			actionID, projectID, epicID, dedup, string(payload),
-			"sha256:"+hex.EncodeToString(payloadHash[:]), selected.hostID, selected.storeID,
-			selected.serverDomainID, selected.serverID, "flowbee-builder:"+projectID+":"+epicID, selected.profileID,
-			selected.workspaceRootID, workspacePath, "builder-compute:"+epicID, stamp, stamp, stamp)
-		if err != nil {
-			return err
-		}
-		res, err = tx.ExecContext(ctx, `UPDATE epic_deliveries SET builder_model_family=?,
-			builder_affinity_state='pending',compute_lease_action_id=?,compute_lease_action_epoch=0,
-			hold_kind='',hold_reason='',return_state='',last_error='',alert_pending=0,
-			state_version=state_version+1,state_due_at=?,updated_at=?
-			WHERE epic_id=? AND state='admitted' AND state_version=?`, selected.family, actionID,
-			now.Add(10*time.Minute).UTC().Format(rfc3339), stamp, epicID, version)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			return errors.New("builder launch delivery changed during compute lease")
-		}
-		if err := appendEpicControlEventTx(ctx, tx, projectID, epicID, "builder_launch_committed",
-			"admitted", "admitted", version+1, "scheduler", string(payload), now); err != nil {
-			return err
-		}
-		out.ActionsCreated++
 		return nil
 	})
 	return out, err

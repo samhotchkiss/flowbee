@@ -59,6 +59,17 @@ func send() { _ = exec.Command("tmux", "send-keys", "-t", "x", "hello").Run() }
 	}
 }
 
+func TestHumanAttachExceptionRejectsSessionMutation(t *testing.T) {
+	root := t.TempDir()
+	writeArchFixture(t, root, "cmd/flowbee/human_attach.go", `package main
+import "os/exec"
+func attach() { _ = exec.Command("tmux", "send-keys", "-t", "russ-interactor", "hello").Run() }
+`)
+	if got := scanRawTmuxSources(root); got == 0 {
+		t.Fatal("human attach allowlist admitted terminal mutation")
+	}
+}
+
 func TestLegacyTmuxCallSitesRetainDurableV2Fences(t *testing.T) {
 	if got := checkLegacyTmuxFenceInvariants("../.."); got != 0 {
 		t.Fatalf("current legacy call sites lost %d durable-v2 fence(s)", got)

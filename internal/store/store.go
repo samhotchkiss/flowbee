@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +22,15 @@ type Store struct {
 	DB         *sql.DB
 	dsn        string // the SQLite path, for a post-close WAL checkpoint (see Close)
 	writerLock *os.File
+	// writerLockHeld also records the intentionally no-op in-memory fence. Durable
+	// process-incarnation writes require callers to pass through AcquireWriterLock
+	// even in tests; a nil file alone cannot distinguish that from no acquisition.
+	writerLockHeld bool
+	// epicWorkerActivationMu spans authoritative material resolution plus the
+	// following admission/activation transaction. SQLite serializes transactions,
+	// but this closes the smaller in-process window before BEGIN in which a new
+	// epic could otherwise escape an activation candidate snapshot.
+	epicWorkerActivationMu sync.Mutex
 
 	// NoEligibleWorkerDelay is how long a job may sit `ready` with no compliant
 	// worker before the no_eligible_worker alarm fires (I-6). Zero disables
@@ -53,6 +63,30 @@ type Store struct {
 	// deliberately off by default until the incident-slice migrations and
 	// runtime wiring are enabled together.
 	EnableEpicReviewHandoffV2 bool
+
+	// EnableEpicDedicatedWorkersV2 makes the per-epic builder+reviewer lifecycle
+	// ledger authoritative. It is a separate activation fence while existing
+	// review-pool jobs are migrated; when enabled, native epic review cannot be
+	// claimed through the legacy shared-session path.
+	EnableEpicDedicatedWorkersV2 bool
+	// EpicWorkerCredentialMaterializer mints and fsyncs a one-shot owner-only
+	// envelope before the lifecycle action transaction commits. It returns only
+	// the hash persisted in SQLite; plaintext is never returned to Store.
+	EpicWorkerCredentialMaterializer func(identity, projectID, role, envelopeID string,
+		generation int64, expiresAt time.Time) (string, error)
+	// EpicWorkerBootstrapMaterialProvider resolves the exact spec and discipline
+	// bytes used by immutable dedicated-worker manifests. It is called before the
+	// admission/activation transaction; a missing provider or missing byte fails
+	// v2 closed.
+	EpicWorkerBootstrapMaterialProvider EpicWorkerBootstrapMaterialProvider
+	// ProjectActorCredentialMaterializer applies the same one-shot fsync law to
+	// Flowbee-created Interactor/Orchestrator credentials.
+	ProjectActorCredentialMaterializer func(identity, projectID, role, envelopeID string,
+		generation int64, expiresAt time.Time) (string, error)
+	// ManagedSessionDriverFreshFor is the maximum age of the exact Driver instance
+	// and store-scoped observation cursor accepted by actor API authorization.
+	// Zero uses the fail-closed production default of five minutes.
+	ManagedSessionDriverFreshFor time.Duration
 
 	// EnableCapacityV2 routes v2 builders/reviewers/operations only through the
 	// identity-bound active capacity generation. It never falls back to the legacy
@@ -213,7 +247,7 @@ func (s *Store) Ping(ctx context.Context) error { return s.DB.PingContext(ctx) }
 // process and its replacement from alternately draining the same outbox. The
 // non-blocking OS lock makes overlapping control-plane writers fail at startup.
 func (s *Store) AcquireWriterLock() error {
-	if s.writerLock != nil {
+	if s.writerLockHeld {
 		return nil
 	}
 	lock, err := AcquireWriterLockForDSN(s.dsn)
@@ -221,6 +255,7 @@ func (s *Store) AcquireWriterLock() error {
 		return err
 	}
 	s.writerLock = lock.file
+	s.writerLockHeld = true
 	return nil
 }
 
@@ -269,5 +304,6 @@ func (s *Store) Close() error {
 		_ = s.writerLock.Close()
 		s.writerLock = nil
 	}
+	s.writerLockHeld = false
 	return err
 }

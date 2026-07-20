@@ -40,6 +40,10 @@ func (s *Store) ReconcileEpicReviewHandoffs(ctx context.Context, now time.Time, 
 	cutoff := now.Add(-stallAfter).Format(rfc3339)
 	nowText := now.Format(rfc3339)
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		dedicatedWorkers, err := dedicatedEpicWorkersEnabledTx(ctx, s, tx)
+		if err != nil {
+			return err
+		}
 		rows, err := tx.QueryContext(ctx, `
 			SELECT d.epic_id, d.project_id, d.delivery_repo, a.pr_number,
 			       d.head_sha, d.base_sha, a.ci_green_observed_at,
@@ -70,6 +74,16 @@ func (s *Store) ReconcileEpicReviewHandoffs(ctx context.Context, now time.Time, 
 				// A green result without an immutable head cannot be dispatched
 				// safely. Keep it visible to the artifact/CI backstop instead.
 				continue
+			}
+			if dedicatedWorkers {
+				ready, err := ensureEpicReviewerLaunchTx(ctx, s, tx, projectID, epicID, repo,
+					prNumber, head, base, now)
+				if err != nil {
+					return err
+				}
+				if !ready {
+					continue
+				}
 			}
 			suffixHash := sha256.Sum256([]byte(head + "\x00" + base))
 			suffix := hex.EncodeToString(suffixHash[:8])

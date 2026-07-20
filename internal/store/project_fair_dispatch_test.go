@@ -114,3 +114,78 @@ func TestProjectFairWhyNotAndConcurrencyFenceAreDurable(t *testing.T) {
 		t.Fatalf("why-not shadow missing: %+v err=%v", last, err)
 	}
 }
+
+func TestProjectConcurrencyCapCountsPhysicalEpicAndJobLeaseOnce(t *testing.T) {
+	ctx := context.Background()
+	dsn := filepath.Join(t.TempDir(), "mixed-allocation.db")
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MigrateUp(ctx, st.DB); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	now := time.Unix(92_000, 0)
+	if _, err := st.CreatePortfolioProject(ctx, store.PortfolioProject{
+		ID: "mixed", Name: "Mixed", State: "active", SchedulerWeight: 1, ConcurrencyCap: 2,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "russ", Owner: "fixture", Repo: "russ", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddProjectRepo(ctx, "mixed", "russ", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddEpicRun(ctx, store.EpicRun{ID: "physical-builder", ProjectID: "mixed",
+		Repo: "russ", Branch: "epic/physical-builder", Slug: "physical-builder",
+		Title: "Physical builder", FilePath: "epics/physical-builder.md"}, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	// AddEpicRun is admitted/launching but has not consumed compute until an exact
+	// seat is bound. Binding the seat makes it one physical project allocation.
+	if _, err := st.DB.ExecContext(ctx, `UPDATE epics SET seat_id='seat-physical'
+		WHERE id='physical-builder'`); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"service-one", "service-two"} {
+		if _, err := st.SeedJob(ctx, store.SeedParams{ID: id, ProjectID: "mixed",
+			Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+			Now: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snapshot, err := st.LoadProjectFairSnapshot(ctx, scheduler.PoolBuild)
+	if err != nil || snapshot.Active["mixed"] != 1 {
+		t.Fatalf("physical allocation snapshot=%v err=%v", snapshot.Active, err)
+	}
+	if _, err := st.ClaimReadyJob(ctx, store.ClaimParams{JobID: "service-one",
+		LeaseID: "service-lease-one", Identity: "builder-one", ModelFamily: "codex",
+		Role: job.RoleEngWorker, TTL: time.Minute, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = st.LoadProjectFairSnapshot(ctx, scheduler.PoolBuild)
+	if err != nil || snapshot.Active["mixed"] != 2 {
+		t.Fatalf("mixed allocation snapshot=%v err=%v", snapshot.Active, err)
+	}
+	if _, err := st.ClaimReadyJob(ctx, store.ClaimParams{JobID: "service-two",
+		LeaseID: "service-lease-two", Identity: "builder-two", ModelFamily: "codex",
+		Role: job.RoleEngWorker, TTL: time.Minute, Now: now}); err == nil {
+		t.Fatal("project cap ignored the physical epic plus active job lease")
+	}
+
+	// A second unended audit row for the same job must not manufacture a third
+	// allocation. The canonical fold counts resources, not lease rows.
+	if _, err := st.DB.ExecContext(ctx, `INSERT INTO leases
+		(lease_id,job_id,lease_epoch,identity,model_family,ttl_s,deadline)
+		VALUES ('duplicate-audit','service-one',2,'builder-one','codex',60,?)`,
+		now.Add(time.Minute).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = st.LoadProjectFairSnapshot(ctx, scheduler.PoolBuild)
+	if err != nil || snapshot.Active["mixed"] != 2 {
+		t.Fatalf("duplicate lease row double-counted: active=%v err=%v", snapshot.Active, err)
+	}
+}

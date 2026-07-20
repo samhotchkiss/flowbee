@@ -521,12 +521,24 @@ type projectPortfolioCard struct {
 	Active, Parked, NeedsYou, Allocated  int
 	BlockerAge                           string
 	Scheduler                            []projectSchedulerCard
+	Delivery                             store.ProjectDeliveryCounts
+	Breakers                             []projectBreakerCard
+	ThroughputWindow                     string
+	Merged, Completed, Recoveries        int
 }
 
 type projectSchedulerCard struct {
 	Pool, PoolLabel, ServiceShare, WeightShare, EligibleWait string
+	EligibilityStatus, WhyNotCode, WhyNotDetail              string
+	NextEligible, LastDecisionCode, LastDecisionDetail       string
 	Allocated, ServiceTurns, PoolServiceTurns, Eligible      int64
 	Starved                                                  bool
+}
+
+type projectBreakerCard struct {
+	Scope, RepoID, State, FailureKind, Reason string
+	FailureCount                              int
+	ResetLabel, ProbeLeaseLabel               string
 }
 
 const dashboardCompletedLimit = 24
@@ -569,7 +581,7 @@ func (u *UI) epics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "decision inbox error", http.StatusInternalServerError)
 		return
 	}
-	projects, err := u.data.ProjectDashboard(ctx)
+	projects, err := u.data.ProjectDashboardAt(ctx, u.clock.Now())
 	if err != nil {
 		http.Error(w, "project portfolio error", http.StatusInternalServerError)
 		return
@@ -594,20 +606,39 @@ func buildProjectPortfolio(rows []store.ProjectDashboardRow, now time.Time) []pr
 			NeedsYou: row.NeedsYou, Allocated: row.Capacity.Allocated,
 			Blocker: row.OldestBlocker, BlockerKind: humanizeToken(row.BlockerKind),
 			InteractorStatus: row.Interactor.Status, OrchestratorStatus: row.Orchestrator.Status,
+			Delivery: row.Delivery, ThroughputWindow: fmt.Sprintf("%dh", row.Throughput.WindowSeconds/3600),
+			Merged: row.Throughput.Merged, Completed: row.Throughput.Completed, Recoveries: row.Throughput.Recoveries,
 		}
 		for _, metric := range row.Scheduler {
 			schedulerCard := projectSchedulerCard{
 				Pool: metric.Pool, PoolLabel: humanizeToken(metric.Pool),
 				Allocated: int64(metric.Allocated), ServiceTurns: metric.ServiceTurns,
 				PoolServiceTurns: metric.PoolServiceTurns, Eligible: int64(metric.Eligible),
-				ServiceShare: formatBasisPoints(metric.ServiceShareBasisPoints),
-				WeightShare:  formatBasisPoints(metric.ConfiguredWeightShareBasisPoints),
-				Starved:      metric.Starved,
+				ServiceShare:      formatBasisPoints(metric.ServiceShareBasisPoints),
+				WeightShare:       formatBasisPoints(metric.ConfiguredWeightShareBasisPoints),
+				Starved:           metric.Starved,
+				EligibilityStatus: metric.EligibilityStatus, WhyNotCode: humanizeToken(metric.WhyNotCode),
+				WhyNotDetail: metric.WhyNotDetail, LastDecisionCode: humanizeToken(metric.LastDecisionCode),
+				LastDecisionDetail: metric.LastDecisionDetail,
 			}
 			if metric.Eligible > 0 {
 				schedulerCard.EligibleWait = durationAge(time.Duration(metric.EligibleWaitSeconds) * time.Second)
 			}
+			if !metric.NextEligibleAt.IsZero() {
+				schedulerCard.NextEligible = humanRelative(metric.NextEligibleAt, now)
+			}
 			card.Scheduler = append(card.Scheduler, schedulerCard)
+		}
+		for _, breaker := range row.Breakers {
+			view := projectBreakerCard{Scope: breaker.Scope, RepoID: breaker.RepoID, State: breaker.State,
+				FailureKind: humanizeToken(breaker.FailureKind), Reason: breaker.Reason, FailureCount: breaker.FailureCount}
+			if !breaker.ResetAt.IsZero() {
+				view.ResetLabel = humanRelative(breaker.ResetAt, now)
+			}
+			if !breaker.ProbeLeaseExpiresAt.IsZero() {
+				view.ProbeLeaseLabel = humanRelative(breaker.ProbeLeaseExpiresAt, now)
+			}
+			card.Breakers = append(card.Breakers, view)
 		}
 		if !row.BlockedSince.IsZero() {
 			card.BlockerAge = humanAgo(row.BlockedSince, now)

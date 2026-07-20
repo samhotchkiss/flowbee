@@ -22,6 +22,18 @@ type repositoryFactFixture struct {
 	calls []string
 }
 
+type repositoryActionFixture struct {
+	pending, attempts int
+	fingerprint       string
+	err               error
+	calls             []string
+}
+
+func (f *repositoryActionFixture) ReadRepositoryActionProbe(_ context.Context, repoID string) (int, int, string, error) {
+	f.calls = append(f.calls, repoID)
+	return f.pending, f.attempts, f.fingerprint, f.err
+}
+
 func (f *repositoryFactFixture) ReadRepositoryProbe(_ context.Context, repoID string) (multirepo.RepositoryProbeFacts, error) {
 	f.calls = append(f.calls, repoID)
 	return f.facts[repoID], f.errs[repoID]
@@ -89,15 +101,42 @@ func TestMechanicalDependencyProbeReadFailureIsExpectedOpenNotPoison(t *testing.
 	}
 }
 
-func TestMechanicalDependencyProbeNeverClosesEffectBreakerFromReadReceipt(t *testing.T) {
+func TestMechanicalDependencyProbeNeverClosesUnsupportedEffectBreakerFromReadReceipt(t *testing.T) {
 	repos := &repositoryFactFixture{facts: map[string]multirepo.RepositoryProbeFacts{
 		"repo-a": {RepoID: "repo-a", Fingerprint: "healthy-read"},
 	}}
 	probe := projectbreaker.MechanicalDependencyProbe{Projects: projectRepoFixture{}, Repositories: repos}
-	for _, kind := range []string{"merge_incident", "action_failure", "policy_violation"} {
+	for _, kind := range []string{"merge_incident", "policy_violation"} {
 		result, err := probe.Probe(context.Background(), projectbreaker.ProbeRequest{ProjectID: "alpha", RepoID: "repo-a", FailureKind: kind})
 		if err != nil || result.Recovered || result.FailureReason == "" {
 			t.Fatalf("kind=%s result=%+v err=%v", kind, result, err)
 		}
+	}
+}
+
+func TestMechanicalDependencyProbeClosesActionFailureOnlyFromExactOutboxHealth(t *testing.T) {
+	now := time.Date(2026, 7, 19, 19, 0, 0, 0, time.UTC)
+	repos := &repositoryFactFixture{facts: map[string]multirepo.RepositoryProbeFacts{
+		"repo-a": {RepoID: "repo-a", Fingerprint: "healthy-read"},
+	}}
+	actions := &repositoryActionFixture{pending: 1, attempts: 3, fingerprint: "pending-fingerprint"}
+	probe := projectbreaker.MechanicalDependencyProbe{Projects: projectRepoFixture{}, Repositories: repos, Actions: actions,
+		Now: func() time.Time { return now }}
+	result, err := probe.Probe(context.Background(), projectbreaker.ProbeRequest{
+		ProjectID: "alpha", RepoID: "repo-a", FailureKind: "action_failure",
+	})
+	if err != nil || result.Recovered || result.FailureReason == "" {
+		t.Fatalf("pending failed action falsely recovered: result=%+v err=%v", result, err)
+	}
+	actions.pending, actions.attempts, actions.fingerprint = 0, 0, "terminal-fingerprint"
+	result, err = probe.Probe(context.Background(), projectbreaker.ProbeRequest{
+		ProjectID: "alpha", RepoID: "repo-a", FailureKind: "action_failure",
+	})
+	if err != nil || !result.Recovered || result.EvidenceKind != "project_outbox_health" ||
+		result.EvidenceRef != "project:alpha/repo-a@sha256:terminal-fingerprint" || !result.ObservedAt.Equal(now) {
+		t.Fatalf("terminal outbox fact did not recover: result=%+v err=%v", result, err)
+	}
+	if len(actions.calls) != 2 || actions.calls[0] != "repo-a" || actions.calls[1] != "repo-a" {
+		t.Fatalf("action probe escaped exact repo: %v", actions.calls)
 	}
 }

@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/lease"
+	"github.com/samhotchkiss/flowbee/internal/multirepo"
 	"github.com/samhotchkiss/flowbee/internal/projectbreaker"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
@@ -60,6 +62,78 @@ func runner(st *store.Store, probe projectbreaker.DependencyProbe, now time.Time
 		Owner: "breaker-probe-loop", ClaimTTL: time.Minute, FailureRetryAfter: 2 * time.Minute,
 		Budget: 20, Now: func() time.Time { return now },
 	}}
+}
+
+func TestActionFailureHalfOpenIgnoresFreshQueuedWorkButRequiresFailedEffects(t *testing.T) {
+	t0 := time.Date(2026, 7, 19, 20, 45, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*testing.T, *store.Store, int64)
+		recovered bool
+	}{
+		{name: "fresh unrelated queued work", recovered: true},
+		{name: "abandoned effect", mutate: func(t *testing.T, st *store.Store, id int64) {
+			t.Helper()
+			if err := st.MarkOutboxSuppressed(context.Background(), id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "sent without audit", mutate: func(t *testing.T, st *store.Store, id int64) {
+			t.Helper()
+			if _, err := st.DB.ExecContext(context.Background(), `UPDATE outbox SET status='sent' WHERE id=?`, id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := testutil.NewStore(t)
+			seed(t, st, "alpha", "repo-a", t0)
+			if _, err := st.RecordProjectBreakerFailure(ctx, store.ProjectBreakerFailure{
+				ProjectID: "alpha", RepoID: "repo-a", Kind: "action_failure", Reason: "delivery failed",
+				RetryAfter: time.Second, EvidenceRef: "action:failed-effect",
+			}, t0); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.SeedJob(ctx, store.SeedParams{ID: "queued-action", ProjectID: "alpha", Repo: "repo-a",
+				Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: t0}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.EnqueuePROpen(ctx, "queued-action", "head-queued", "main"); err != nil {
+				t.Fatal(err)
+			}
+			row, ok, err := st.NextPendingOutboxForRepo(ctx, "repo-a")
+			if err != nil || !ok {
+				t.Fatalf("row=%+v ok=%v err=%v", row, ok, err)
+			}
+			if tc.mutate != nil {
+				tc.mutate(t, st, row.ID)
+			}
+
+			now := t0.Add(2 * time.Second)
+			repositories := &repositoryFactFixture{facts: map[string]multirepo.RepositoryProbeFacts{
+				"repo-a": {RepoID: "repo-a", Fingerprint: "healthy-repository-read"},
+			}}
+			probe := projectbreaker.MechanicalDependencyProbe{
+				Projects: st, Repositories: repositories, Actions: st, Now: func() time.Time { return now },
+			}
+			report, err := runner(st, probe, now).RunOnce(ctx)
+			if err != nil || report.Claimed != 1 {
+				t.Fatalf("report=%+v err=%v", report, err)
+			}
+			breaker, err := st.GetProjectBreaker(ctx, "alpha", "repo-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.recovered {
+				if report.Recovered != 1 || breaker.State != "closed" {
+					t.Fatalf("fresh queued work blocked recovery: report=%+v breaker=%+v", report, breaker)
+				}
+			} else if report.Reopened != 1 || breaker.State != "open" {
+				t.Fatalf("failed effect falsely recovered: report=%+v breaker=%+v", report, breaker)
+			}
+		})
+	}
 }
 
 func TestRunOnceClosesOnlyWithMechanicalRecoveryEvidence(t *testing.T) {

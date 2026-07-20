@@ -8,12 +8,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/clock"
 	"github.com/samhotchkiss/flowbee/internal/driver"
+	gh "github.com/samhotchkiss/flowbee/internal/github"
 	"github.com/samhotchkiss/flowbee/internal/job"
+	"github.com/samhotchkiss/flowbee/internal/multirepo"
 	"github.com/samhotchkiss/flowbee/internal/scheduler"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/workintent"
 )
+
+type acceptanceFailingSweepClient struct {
+	*gh.Fake
+	err      error
+	attempts int
+}
+
+func (c *acceptanceFailingSweepClient) BoardSweep(context.Context) (gh.BoardSnapshot, error) {
+	c.attempts++
+	return gh.BoardSnapshot{}, c.err
+}
 
 // These acceptance tests intentionally cross the Phase-2 storage, scheduling,
 // decision, breaker, and Driver boundaries. Focused package tests pin each
@@ -50,6 +64,13 @@ func TestPhase2TwoProjectsReuseHumanEpicSlugWithoutAuthorityCollision(t *testing
 
 	for _, projectID := range []string{"alpha", "beta"} {
 		createPhase2Project(t, st, projectID, 1, now)
+		repoID := "repo-" + projectID
+		if err := st.RegisterRepo(ctx, store.Repo{ID: repoID, Owner: "acme", Repo: repoID, Active: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AddProjectRepo(ctx, projectID, repoID, now); err != nil {
+			t.Fatal(err)
+		}
 		epicID := "epic-" + projectID + "-auth"
 		if err := st.AddEpicRun(ctx, store.EpicRun{
 			ID: epicID, ProjectID: projectID, Slug: "auth",
@@ -233,12 +254,21 @@ func TestPhase2ProjectBreakerDoesNotStallAnotherProject(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := st.RecordProjectBreakerFailure(ctx, store.ProjectBreakerFailure{
-		ProjectID: "alpha", RepoID: "repo-alpha", Kind: "ci_outage",
-		Reason: "required checks unavailable", RetryAfter: time.Minute,
-		EvidenceRef: "github:repo-alpha:checks:503",
-	}, now.Add(time.Second)); err != nil {
+	observed, err := st.RecordProjectBreakerFailureForRepo(ctx, "repo-alpha", "github_error",
+		"repository sweep unavailable", time.Minute, "multirepo:sweep:repo-alpha@sha256:stable", now.Add(time.Second))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(observed) != 2 { // alpha plus the legacy-compatible default project binding.
+		t.Fatalf("exact repo projection=%+v", observed)
+	}
+	if _, err := st.RecordProjectBreakerFailureForRepo(ctx, "repo-alpha", "github_error",
+		"same failure observed again", time.Minute, "multirepo:sweep:repo-alpha@sha256:stable", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	alphaBreaker, err := st.GetProjectBreaker(ctx, "alpha", "repo-alpha")
+	if err != nil || alphaBreaker.StateVersion != 1 || alphaBreaker.FailureCount != 1 {
+		t.Fatalf("repeat evidence was not idempotent: breaker=%+v err=%v", alphaBreaker, err)
 	}
 
 	candidates, err := st.ReadyCandidates(ctx)
@@ -254,6 +284,77 @@ func TestPhase2ProjectBreakerDoesNotStallAnotherProject(t *testing.T) {
 	if !turn.OK || turn.Selected.JobID != "beta-build" {
 		t.Fatalf("breaker in alpha stalled or won shared scheduler: turn=%+v candidates=%+v", turn, candidates)
 	}
+}
+
+func TestPhase2RepositoryFailureDoesNotStopHealthySweepOrDrain(t *testing.T) {
+	ctx := context.Background()
+	st := openPhase2Store(t, filepath.Join(t.TempDir(), "repo-loop-isolation.db"))
+	defer st.Close()
+	now := time.Date(2026, 7, 19, 21, 45, 0, 0, time.UTC)
+	for _, projectID := range []string{"alpha", "beta"} {
+		createPhase2Project(t, st, projectID, 1, now)
+		repoID := "repo-" + projectID
+		if err := st.RegisterRepo(ctx, store.Repo{ID: repoID, Owner: "acme", Repo: repoID,
+			DefaultBranch: "main", Active: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AddProjectRepo(ctx, projectID, repoID, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.EnableEpicReviewHandoffV2 = true
+	alphaWriter := gh.NewFake()
+	alphaClient := &acceptanceFailingSweepClient{Fake: alphaWriter, err: errors.New("alpha read outage")}
+	betaGitHub := gh.NewFake()
+	mgr, err := multirepo.New(ctx, st, clock.NewFake(now), nil,
+		func(repo store.Repo) (gh.Client, gh.Writer, error) {
+			if repo.ID == "repo-alpha" {
+				return alphaClient, alphaWriter, nil
+			}
+			return betaGitHub, betaGitHub, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	swept, err := mgr.SweepAll(ctx)
+	if failures := multirepo.RepoFailures(err); len(failures) != 1 || failures[0].RepoID != "repo-alpha" {
+		t.Fatalf("sweep failures=%+v err=%v", failures, err)
+	}
+	if _, ok := swept["repo-beta"]; !ok || alphaClient.attempts != 1 || !containsCall(betaGitHub.Calls(), "BoardSweep") {
+		t.Fatalf("healthy sweep did not progress: counts=%v alpha_attempts=%d beta_calls=%v",
+			swept, alphaClient.attempts, betaGitHub.Calls())
+	}
+
+	for _, fixture := range []struct{ id, project, repo string }{
+		{"alpha-out", "alpha", "repo-alpha"}, {"beta-out", "beta", "repo-beta"},
+	} {
+		if _, err := st.SeedJob(ctx, store.SeedParams{ID: fixture.id, ProjectID: fixture.project,
+			Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker,
+			Repo: fixture.repo, BaseSHA: "base-" + fixture.id, Now: now}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.EnqueuePROpen(ctx, fixture.id, "head-"+fixture.id, "main"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alphaWriter.FailNextWriteWith(errors.New("alpha write outage"))
+	drained, err := mgr.DrainAll(ctx)
+	if failures := multirepo.RepoFailures(err); len(failures) != 1 || failures[0].RepoID != "repo-alpha" {
+		t.Fatalf("drain failures=%+v err=%v", failures, err)
+	}
+	if drained["repo-beta"] != 1 || !containsCall(betaGitHub.Calls(), "OpenPR") {
+		t.Fatalf("healthy drain stopped globally: counts=%v beta_calls=%v", drained, betaGitHub.Calls())
+	}
+}
+
+func containsCall(calls []string, want string) bool {
+	for _, call := range calls {
+		if call == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPhase2SessionIncarnationReplacementFencesOldDriverAuthority(t *testing.T) {

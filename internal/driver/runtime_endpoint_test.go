@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"sort"
 	"testing"
 	"time"
 )
@@ -16,6 +17,15 @@ func endpointRuntimeFake(host, storeID, domain, ownership string) *FakePort {
 	fake.Meta.TmuxServer.Ownership = ownership
 	if ownership == "external" {
 		fake.Meta.TmuxServer.ConnectionVisibility = "default_or_external"
+		fake.ProfileInventory.TmuxServerDomainID = domain
+		fake.ProfileInventory.Profiles = append(fake.ProfileInventory.Profiles, LifecycleProfile{
+			ProfileID: "claude_interactor_managed", Provider: "claude",
+			InitialPromptAdapter: "argv_element", TargetCredentialAdapter: "file_environment",
+			EnsureSupported: true, BootstrapArtifactSupported: true,
+			FlowbeeCredentialInstallSupported: true, HumanVisibleSessionSupported: true})
+		sort.Slice(fake.ProfileInventory.Profiles, func(i, j int) bool {
+			return fake.ProfileInventory.Profiles[i].ProfileID < fake.ProfileInventory.Profiles[j].ProfileID
+		})
 	}
 	return fake
 }

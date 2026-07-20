@@ -7,6 +7,8 @@ package driver
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,8 +16,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 type HTTPPort struct {
@@ -164,10 +168,36 @@ func (p *HTTPPort) Metadata(ctx context.Context) (DriverMetadata, error) {
 			return DriverMetadata{}, errors.New("driver metadata: lifecycle_control must be boolean")
 		}
 	}
+	if raw, present := out.Features["lifecycle_profile_inventory"]; present {
+		if err := json.Unmarshal(raw, &metadata.LifecycleProfileInventoryPath); err != nil {
+			return DriverMetadata{}, errors.New("driver metadata: lifecycle_profile_inventory must be a path string")
+		}
+	}
 	if err := validateDriverMetadata(metadata); err != nil {
 		return DriverMetadata{}, err
 	}
 	return metadata, nil
+}
+
+func (p *HTTPPort) LifecycleProfiles(ctx context.Context) (LifecycleProfileInventory, error) {
+	meta, err := p.Metadata(ctx)
+	if err != nil {
+		return LifecycleProfileInventory{}, err
+	}
+	if meta.LifecycleProfileInventoryPath != "/v2/lifecycle/profiles" {
+		return LifecycleProfileInventory{}, errors.New("driver lifecycle profile inventory path is unavailable")
+	}
+	var out LifecycleProfileInventory
+	if err := p.call(ctx, http.MethodGet, meta.LifecycleProfileInventoryPath, "", nil, &out); err != nil {
+		return LifecycleProfileInventory{}, err
+	}
+	if err := validateLifecycleProfileInventory(out); err != nil {
+		return LifecycleProfileInventory{}, err
+	}
+	if out.TmuxServerDomainID != meta.TmuxServer.DomainID {
+		return LifecycleProfileInventory{}, ErrIdentityMismatch
+	}
+	return out, nil
 }
 
 func (p *HTTPPort) SnapshotSessions(ctx context.Context) (SessionSnapshot, error) {
@@ -343,6 +373,19 @@ type lifecycleReceiptWire struct {
 	IdentityAfter      *lifecycleIdentityWire `json:"identity_after"`
 	AbsenceObservedAt  *string                `json:"absence_observed_at"`
 	DiagnosticCode     *string                `json:"diagnostic_code"`
+	BootstrapArtifact  *struct {
+		ArtifactID    string `json:"artifact_id"`
+		Format        string `json:"format"`
+		PayloadSHA256 string `json:"payload_sha256"`
+		Status        string `json:"status"`
+	} `json:"bootstrap_artifact"`
+	CredentialInstall *struct {
+		EnvelopeID      string `json:"envelope_id"`
+		CredentialEpoch int64  `json:"credential_epoch"`
+		PayloadSHA256   string `json:"payload_sha256"`
+		Status          string `json:"status"`
+	} `json:"credential_install"`
+	PresentationName *string `json:"presentation_name"`
 }
 
 func wireLifecycleReceipt(w lifecycleReceiptWire) LifecycleReceipt {
@@ -365,6 +408,22 @@ func wireLifecycleReceipt(w lifecycleReceiptWire) LifecycleReceipt {
 	}
 	if w.ExternalWatchID != nil {
 		r.ExternalWatchID = *w.ExternalWatchID
+	}
+	if w.BootstrapArtifact != nil {
+		r.BootstrapArtifactPresent = true
+		r.BootstrapArtifact = LifecycleBootstrapReceipt{ArtifactID: w.BootstrapArtifact.ArtifactID,
+			Format: w.BootstrapArtifact.Format, PayloadSHA256: w.BootstrapArtifact.PayloadSHA256,
+			Status: w.BootstrapArtifact.Status}
+	}
+	if w.CredentialInstall != nil {
+		r.CredentialInstallPresent = true
+		r.CredentialInstall = LifecycleCredentialReceipt{EnvelopeID: w.CredentialInstall.EnvelopeID,
+			CredentialEpoch: w.CredentialInstall.CredentialEpoch,
+			PayloadSHA256:   w.CredentialInstall.PayloadSHA256, Status: w.CredentialInstall.Status}
+	}
+	if w.PresentationName != nil {
+		r.PresentationNamePresent = true
+		r.PresentationName = *w.PresentationName
 	}
 	return r
 }
@@ -408,15 +467,42 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 				RootID       string `json:"root_id"`
 				RelativePath string `json:"relative_path"`
 			} `json:"workspace"`
+			Bootstrap          *LifecycleBootstrapArtifact  `json:"bootstrap,omitempty"`
+			CredentialEnvelope *LifecycleCredentialEnvelope `json:"credential_envelope,omitempty"`
+			PresentationName   string                       `json:"presentation_name,omitempty"`
 		} `json:"launch"`
 	}
-	in := ensureRequest{FormatVersion: "tmux-driver.lifecycle-ensure/v2", ActionID: a.ActionID, ActionEpoch: a.Epoch, LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch}
+	v3 := t.Bootstrap != nil || t.CredentialEnvelope != nil || t.PresentationName != ""
+	format := "tmux-driver.lifecycle-ensure/v2"
+	if v3 {
+		if err := validateLifecycleV3Launch(t); err != nil {
+			return LifecycleReceipt{}, err
+		}
+		meta, err := p.Metadata(ctx)
+		if err != nil {
+			return LifecycleReceipt{}, fmt.Errorf("driver lifecycle ensure v3 capability: %w", err)
+		}
+		if err := validateLifecycleV3Contracts(meta.Contracts); err != nil {
+			return LifecycleReceipt{}, err
+		}
+		inventory, err := p.LifecycleProfiles(ctx)
+		if err != nil {
+			return LifecycleReceipt{}, fmt.Errorf("driver lifecycle profile inventory: %w", err)
+		}
+		if err := inventory.ValidateLaunch(profile, t.Identity.TmuxServerDomainID, t); err != nil {
+			return LifecycleReceipt{}, err
+		}
+		format = "tmux-driver.lifecycle-ensure/v3"
+	}
+	in := ensureRequest{FormatVersion: format, ActionID: a.ActionID, ActionEpoch: a.Epoch, LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch}
 	in.Target.LifecycleKey, in.Target.TargetEpoch = t.LifecycleKey, t.TargetEpoch
 	in.Target.ExpectedHostID, in.Target.ExpectedStoreID = t.Identity.HostID, t.Identity.StoreID
 	in.Target.ExpectedTmuxServerDomainID = t.Identity.TmuxServerDomainID
 	in.Target.ExpectedTmuxServerInstanceID = t.Identity.TmuxServerInstanceID
 	in.Launch.ProfileID = profile
 	in.Launch.Workspace.RootID, in.Launch.Workspace.RelativePath = t.WorkspaceRootID, t.WorkspaceRelativePath
+	in.Launch.Bootstrap, in.Launch.CredentialEnvelope = t.Bootstrap, t.CredentialEnvelope
+	in.Launch.PresentationName = t.PresentationName
 	var out struct {
 		Receipt lifecycleReceiptWire `json:"receipt"`
 	}
@@ -424,7 +510,11 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 		return LifecycleReceipt{}, err
 	}
 	r := wireLifecycleReceipt(out.Receipt)
-	if r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" || r.ActionID != a.ActionID ||
+	expectedReceipt := "tmux-driver.lifecycle-receipt/v2"
+	if v3 {
+		expectedReceipt = "tmux-driver.lifecycle-receipt/v3"
+	}
+	if r.FormatVersion != expectedReceipt || r.ActionID != a.ActionID ||
 		r.ActionEpoch != a.Epoch || r.LifecycleKey != t.LifecycleKey ||
 		r.TmuxServerDomainID != t.Identity.TmuxServerDomainID || r.TargetEpoch != t.TargetEpoch {
 		return LifecycleReceipt{}, ErrIdentityMismatch
@@ -440,7 +530,104 @@ func (p *HTTPPort) EnsureLifecycleSession(ctx context.Context, t SessionTarget, 
 		r.IdentityAfter.PaneInstanceID == "" || r.IdentityAfter.AgentRunID == "" {
 		return r, fmt.Errorf("driver lifecycle ensure: status %q", r.Status)
 	}
+	if v3 {
+		if t.Bootstrap != nil && (!r.BootstrapArtifactPresent ||
+			r.BootstrapArtifact.ArtifactID != t.Bootstrap.ArtifactID ||
+			r.BootstrapArtifact.PayloadSHA256 != t.Bootstrap.PayloadSHA256 ||
+			r.BootstrapArtifact.Status != "injected") {
+			return LifecycleReceipt{}, ErrIdentityMismatch
+		}
+		if t.Bootstrap == nil && r.BootstrapArtifactPresent {
+			return LifecycleReceipt{}, ErrIdentityMismatch
+		}
+		if t.CredentialEnvelope != nil && (!r.CredentialInstallPresent ||
+			r.CredentialInstall.EnvelopeID != t.CredentialEnvelope.EnvelopeID ||
+			r.CredentialInstall.CredentialEpoch != t.CredentialEnvelope.CredentialEpoch ||
+			r.CredentialInstall.PayloadSHA256 != t.CredentialEnvelope.PayloadSHA256 ||
+			(r.CredentialInstall.Status != "installed" && r.CredentialInstall.Status != "rebound")) {
+			return LifecycleReceipt{}, ErrIdentityMismatch
+		}
+		if t.CredentialEnvelope == nil && r.CredentialInstallPresent {
+			return LifecycleReceipt{}, ErrIdentityMismatch
+		}
+		if t.PresentationName != "" && (!r.PresentationNamePresent || r.PresentationName != t.PresentationName) {
+			return LifecycleReceipt{}, ErrIdentityMismatch
+		}
+		if t.PresentationName == "" && r.PresentationNamePresent {
+			return LifecycleReceipt{}, ErrIdentityMismatch
+		}
+	}
 	return r, nil
+}
+
+func validateLifecycleV3Contracts(c DriverContractCapabilities) error {
+	required := []struct {
+		got  DriverContractCapability
+		want string
+	}{
+		{c.LifecycleEnsure, "tmux-driver.lifecycle-ensure/v3"},
+		{c.LifecycleEnsureBootstrapArtifact, "tmux-driver.lifecycle-ensure-bootstrap-artifact/v1"},
+		{c.LifecycleHumanVisibleSession, "tmux-driver.lifecycle-human-visible-session/v1"},
+		{c.LifecycleManagedDisplayName, "tmux-driver.lifecycle-managed-display-name/v1"},
+		{c.LifecycleFlowbeeCredentialInstall, "tmux-driver.lifecycle-flowbee-credential-install/v1"},
+	}
+	for _, item := range required {
+		if !item.got.Supported || item.got.ContractID != item.want {
+			return fmt.Errorf("driver lifecycle ensure v3 contract unavailable: %s", item.want)
+		}
+	}
+	return nil
+}
+
+func validateLifecycleV3Launch(t SessionTarget) error {
+	if t.Bootstrap != nil {
+		b := t.Bootstrap
+		if b.ArtifactID == "" || b.Format != "initial_prompt_utf8/v1" || b.ContentUTF8 == "" ||
+			len([]byte(b.ContentUTF8)) > 16<<10 || !utf8.ValidString(b.ContentUTF8) ||
+			strings.ContainsRune(b.ContentUTF8, '\x00') ||
+			sha256Text(b.ContentUTF8) != b.PayloadSHA256 {
+			return errors.New("driver lifecycle ensure v3 invalid bootstrap artifact")
+		}
+	}
+	if t.CredentialEnvelope != nil {
+		c := t.CredentialEnvelope
+		classes := 0
+		var lower, upper, digit, symbol bool
+		for _, ch := range []byte(c.SecretUTF8) {
+			if ch < 33 || ch > 126 {
+				return errors.New("driver lifecycle ensure v3 invalid credential secret")
+			}
+			switch {
+			case ch >= 'a' && ch <= 'z':
+				lower = true
+			case ch >= 'A' && ch <= 'Z':
+				upper = true
+			case ch >= '0' && ch <= '9':
+				digit = true
+			default:
+				symbol = true
+			}
+		}
+		for _, present := range []bool{lower, upper, digit, symbol} {
+			if present {
+				classes++
+			}
+		}
+		if c.EnvelopeID == "" || c.Format != "flowbee_target_bearer_utf8/v1" ||
+			c.CredentialEpoch < 1 || len(c.SecretUTF8) < 32 || len(c.SecretUTF8) > 8<<10 ||
+			classes < 2 || sha256Text(c.SecretUTF8) != c.PayloadSHA256 {
+			return errors.New("driver lifecycle ensure v3 invalid credential envelope")
+		}
+	}
+	if t.PresentationName != "" && !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`).MatchString(t.PresentationName) {
+		return errors.New("driver lifecycle ensure v3 invalid presentation name")
+	}
+	return nil
+}
+
+func sha256Text(value string) string {
+	h := sha256.Sum256([]byte(value))
+	return "sha256:" + hex.EncodeToString(h[:])
 }
 
 func (p *HTTPPort) EnsureExternalWatch(ctx context.Context, paneID, provider, profile string) (ExternalWatch, error) {
@@ -797,7 +984,7 @@ func (p *HTTPPort) LifecycleReceiptByAction(ctx context.Context, actionID, lifec
 		return LifecycleReceipt{}, false, err
 	}
 	r := wireLifecycleReceipt(out.Receipt)
-	if r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" || r.TmuxServerDomainID == "" ||
+	if (r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" && r.FormatVersion != "tmux-driver.lifecycle-receipt/v3") || r.TmuxServerDomainID == "" ||
 		r.ActionID != actionID || r.LifecycleKey != lifecycleKey || r.TargetEpoch != targetEpoch {
 		return LifecycleReceipt{}, false, ErrIdentityMismatch
 	}

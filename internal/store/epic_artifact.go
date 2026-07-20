@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
@@ -16,6 +17,7 @@ var (
 	ErrEpicArtifactOwnershipAmbiguous = errors.New("epic artifact ownership is ambiguous")
 	ErrEpicArtifactIdentityMismatch   = errors.New("epic artifact repository or branch does not match its delivery")
 	ErrEpicArtifactPRConflict         = errors.New("epic artifact is already bound to a different pull request")
+	ErrEpicArtifactProjectMismatch    = errors.New("epic artifact project does not own epic")
 )
 
 // EpicDeliveryOwner is the admission-owned identity used to associate a later
@@ -66,7 +68,10 @@ func (s *Store) EpicDeliveryForRepoBranch(ctx context.Context, repo, branch stri
 // EpicArtifactFact is authoritative reconcile-in data. Agent prose must never
 // populate it; callers build it only from the delivery repository and CI APIs.
 type EpicArtifactFact struct {
-	EpicID                      string
+	EpicID string
+	// ProjectID is an optional caller assertion. Ownership is always loaded from
+	// the admitted epic delivery; a mismatch is rejected and never persisted.
+	ProjectID                   string
 	Repo, Branch                string
 	PRNumber                    int
 	PROpen, Draft, Merged       bool
@@ -116,6 +121,10 @@ func (s *Store) ObserveEpicArtifactFact(ctx context.Context, fact EpicArtifactFa
 		}
 		if err != nil {
 			return err
+		}
+		if fact.ProjectID != "" && fact.ProjectID != projectID {
+			return fmt.Errorf("%w: epic=%s owner=%s asserted=%s",
+				ErrEpicArtifactProjectMismatch, fact.EpicID, projectID, fact.ProjectID)
 		}
 		if oldState == "complete" || oldState == "abandoned" || reviewRequired == 0 {
 			return nil
@@ -221,10 +230,16 @@ func (s *Store) ObserveEpicArtifactFact(ctx context.Context, fact EpicArtifactFa
 				  AND head_sha=? AND base_sha=?`, nowText, nowText, fact.EpicID, fact.HeadSHA, fact.BaseSHA); err != nil {
 				return err
 			}
+			if err := ensureEpicWorkerStopIntentsTx(ctx, tx, projectID, fact.EpicID, now); err != nil {
+				return err
+			}
 		case fact.Merged:
 			// GitHub has not yet supplied the concrete commit identity needed to key
 			// cleanup. Keep the explicit intermediate state under its due clock.
 			newState, due = "merged", now.Add(5*time.Minute)
+			if err := ensureEpicWorkerStopIntentsTx(ctx, tx, projectID, fact.EpicID, now); err != nil {
+				return err
+			}
 		case fact.PRNumber == 0 || !fact.PROpen:
 			if fact.BuilderComplete || oldState != "building" {
 				newState, due = "awaiting_artifact", now.Add(10*time.Minute)
@@ -304,6 +319,78 @@ func (s *Store) ObserveEpicArtifactFact(ctx context.Context, fact EpicArtifactFa
 			fmt.Sprintf(`{"head_sha":%q,"base_sha":%q,"ci_state":%q,"real_green":%t}`, fact.HeadSHA, fact.BaseSHA, ciState, realGreen), nowText)
 		return err
 	})
+}
+
+// EpicArtifactView is the project-owned artifact projection exposed to the
+// workspace API. It contains repository facts only; workflow transition truth
+// remains in epic_deliveries.
+type EpicArtifactView struct {
+	ProjectID       string `json:"project_id"`
+	EpicID          string `json:"epic_id"`
+	Repo            string `json:"repo"`
+	Branch          string `json:"branch"`
+	PRNumber        int    `json:"pr_number"`
+	HeadSHA         string `json:"head_sha"`
+	BaseSHA         string `json:"base_sha"`
+	ArtifactVersion int    `json:"artifact_version"`
+	CIState         string `json:"ci_state"`
+	Merged          bool   `json:"merged"`
+	MergeCommitSHA  string `json:"merge_commit_sha"`
+}
+
+// ListEpicArtifactsForProject filters in SQL by the owning project. Repeated
+// branch labels or other human-facing artifact names in another project cannot
+// enter the returned slice.
+func (s *Store) ListEpicArtifactsForProject(ctx context.Context, projectID string) ([]EpicArtifactView, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return nil, ErrProjectNotFound
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT project_id,epic_id,repo,branch,
+		COALESCE(pr_number,0),head_sha,base_sha,artifact_version,ci_state,merged,merge_commit_sha
+		FROM epic_artifacts WHERE project_id=? ORDER BY epic_id`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []EpicArtifactView{}
+	for rows.Next() {
+		var item EpicArtifactView
+		var merged int
+		if err := rows.Scan(&item.ProjectID, &item.EpicID, &item.Repo, &item.Branch,
+			&item.PRNumber, &item.HeadSHA, &item.BaseSHA, &item.ArtifactVersion,
+			&item.CIState, &merged, &item.MergeCommitSHA); err != nil {
+			return nil, err
+		}
+		item.Merged = merged != 0
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// GetEpicArtifactForProject resolves an artifact only inside an exact project.
+// A real artifact owned by another project is intentionally indistinguishable
+// from a missing artifact to a project-scoped caller.
+func (s *Store) GetEpicArtifactForProject(ctx context.Context, projectID, epicID string) (EpicArtifactView, error) {
+	projectID, epicID = strings.TrimSpace(projectID), strings.TrimSpace(epicID)
+	if projectID == "" || epicID == "" {
+		return EpicArtifactView{}, ErrEpicRunNotFound
+	}
+	var item EpicArtifactView
+	var merged int
+	err := s.DB.QueryRowContext(ctx, `SELECT project_id,epic_id,repo,branch,
+		COALESCE(pr_number,0),head_sha,base_sha,artifact_version,ci_state,merged,merge_commit_sha
+		FROM epic_artifacts WHERE project_id=? AND epic_id=?`, projectID, epicID).Scan(
+		&item.ProjectID, &item.EpicID, &item.Repo, &item.Branch, &item.PRNumber,
+		&item.HeadSHA, &item.BaseSHA, &item.ArtifactVersion, &item.CIState, &merged, &item.MergeCommitSHA)
+	if errors.Is(err, sql.ErrNoRows) {
+		return EpicArtifactView{}, ErrEpicRunNotFound
+	}
+	if err != nil {
+		return EpicArtifactView{}, err
+	}
+	item.Merged = merged != 0
+	return item, nil
 }
 
 // absorbOwnedEpicAdoptedJobsTx supersedes the legitimate collision left by a

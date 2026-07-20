@@ -101,6 +101,10 @@ func TestPhase2PortfolioExposesExactActorRouteHealthAndETag(t *testing.T) {
 		mail.Interactor.AgentRunID != "run-mail" || mail.Orchestrator.Status != store.ProjectActorRouteAbsent {
 		t.Fatalf("portfolio actor health=%+v", mail)
 	}
+	if mail.Breakers == nil || len(mail.Breakers) != 0 || mail.Delivery.Total != 0 ||
+		mail.Throughput.WindowSeconds != int64(store.ProjectThroughputWindow/time.Second) || mail.Throughput.Merged != 0 {
+		t.Fatalf("portfolio must expose explicit empty durable flow/risk fields: %+v", mail)
+	}
 	var build *store.ProjectSchedulerMetric
 	for i := range mail.Scheduler {
 		if mail.Scheduler[i].Pool == "build" {
@@ -128,6 +132,62 @@ func TestPhase2PortfolioExposesExactActorRouteHealthAndETag(t *testing.T) {
 	}
 }
 
+func TestPhase2PortfolioRiskAndFlowAreStrictlyProjectScoped(t *testing.T) {
+	access := auth.NewHumanAccess([]byte(humanTestSecret), nil, map[string][]auth.HumanGrant{
+		"viewer": {{ProjectID: "*", Role: auth.HumanViewer}},
+	}, false)
+	st, ts := phase2ProjectAPIServer(t, access)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 19, 19, 0, 0, 0, time.UTC)
+	for _, projectID := range []string{"alpha", "beta"} {
+		if _, err := st.CreatePortfolioProject(ctx, store.PortfolioProject{ID: projectID, Name: projectID}, now); err != nil {
+			t.Fatal(err)
+		}
+		repoID := "repo-" + projectID
+		if err := st.RegisterRepo(ctx, store.Repo{ID: repoID, Owner: "acme", Repo: repoID, Active: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AddProjectRepo(ctx, projectID, repoID, now); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AddEpicRun(ctx, store.EpicRun{ID: projectID + "-epic", ProjectID: projectID,
+			Repo: repoID, Slug: projectID + "-epic", Title: projectID, Branch: "epic/" + projectID}, 1, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE epic_deliveries SET state='awaiting_review_dispatch' WHERE epic_id='alpha-epic'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.ExecContext(ctx, `UPDATE epic_deliveries SET state='complete' WHERE epic_id='beta-epic'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RecordProjectBreakerFailure(ctx, store.ProjectBreakerFailure{ProjectID: "alpha", RepoID: "repo-alpha",
+		Kind: "github_error", Reason: "alpha only", RetryAfter: time.Minute, EvidenceRef: "alpha:503"}, now); err != nil {
+		t.Fatal(err)
+	}
+	token := signedHumanSession(t, access, "viewer", "csrf-viewer")
+	resp, got := humanRequest(t, ts.Client(), http.MethodGet, ts.URL+"/v1/portfolio", nil, token, "", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("portfolio status=%d", resp.StatusCode)
+	}
+	var body struct {
+		Projects []store.ProjectDashboardRow `json:"projects"`
+	}
+	raw, _ := json.Marshal(got)
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]store.ProjectDashboardRow{}
+	for _, row := range body.Projects {
+		byID[row.Project.ID] = row
+	}
+	alpha, beta := byID["alpha"], byID["beta"]
+	if alpha.Delivery.AwaitingReviewDispatch != 1 || len(alpha.Breakers) != 1 ||
+		beta.Delivery.Terminal != 1 || beta.Breakers == nil || len(beta.Breakers) != 0 {
+		t.Fatalf("portfolio scope leaked alpha=%+v beta=%+v", alpha, beta)
+	}
+}
+
 func TestPhase2ProjectEpicsAreStrictlyProjectScopedAndEmptyIsArray(t *testing.T) {
 	access := auth.NewHumanAccess([]byte(humanTestSecret), nil, map[string][]auth.HumanGrant{
 		"mail-viewer": {{ProjectID: "mail", Role: auth.HumanViewer}},
@@ -140,8 +200,16 @@ func TestPhase2ProjectEpicsAreStrictlyProjectScopedAndEmptyIsArray(t *testing.T)
 			t.Fatal(err)
 		}
 	}
+	for _, pair := range [][2]string{{"mail", "mail-repo"}, {"mail", "mail-docs"}, {"calendar", "calendar-repo"}} {
+		if err := st.RegisterRepo(ctx, store.Repo{ID: pair[1], Owner: "fixture", Repo: pair[1], Active: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AddProjectRepo(ctx, pair[0], pair[1], now); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, e := range []store.EpicRun{
-		{ID: "mail-epic", Slug: "shared-slug", ProjectID: "mail", Repo: "mail-repo", Title: "Mail epic", Branch: "dev/mail"},
+		{ID: "mail-epic", Slug: "shared-slug", ProjectID: "mail", Repositories: []string{"mail-repo", "mail-docs"}, DeliveryRepo: "mail-repo", Title: "Mail epic", Branch: "dev/mail"},
 		{ID: "calendar-epic", Slug: "shared-slug", ProjectID: "calendar", Repo: "calendar-repo", Title: "Calendar epic", Branch: "dev/calendar"},
 	} {
 		if err := st.AddEpicRun(ctx, e, 1, now); err != nil {
@@ -156,6 +224,14 @@ func TestPhase2ProjectEpicsAreStrictlyProjectScopedAndEmptyIsArray(t *testing.T)
 	epics, ok := got["epics"].([]any)
 	if !ok || len(epics) != 1 || epics[0].(map[string]any)["ID"] != "mail-epic" {
 		t.Fatalf("project epic isolation=%v", got["epics"])
+	}
+	mailEpic := epics[0].(map[string]any)
+	if mailEpic["delivery_repo"] != "mail-repo" || mailEpic["repository_set_mode"] != "explicit" {
+		t.Fatalf("repository projection=%v", mailEpic)
+	}
+	repositories, ok := mailEpic["repositories"].([]any)
+	if !ok || len(repositories) != 2 || repositories[0] != "mail-docs" || repositories[1] != "mail-repo" {
+		t.Fatalf("repository set=%v", mailEpic["repositories"])
 	}
 	resp, _ = humanRequest(t, ts.Client(), http.MethodGet, ts.URL+"/v1/projects/calendar/epics", nil, token, "", "")
 	if resp.StatusCode != http.StatusForbidden {

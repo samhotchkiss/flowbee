@@ -3,6 +3,7 @@ package multirepo_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -13,6 +14,17 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
 )
+
+type failingSweepClient struct {
+	*gh.Fake
+	err      error
+	attempts int
+}
+
+func (c *failingSweepClient) BoardSweep(context.Context) (gh.BoardSnapshot, error) {
+	c.attempts++
+	return gh.BoardSnapshot{}, c.err
+}
 
 // seedReadyBuild seeds a ready build job scoped to a repo with a priority and an
 // eng_worker capability requirement (so a shared eng_worker pool can win it).
@@ -201,6 +213,62 @@ func TestMultiRepoControlPlane(t *testing.T) {
 	}
 	if countCalls(fakes["web"].Calls(), "BoardSweep") != 1 {
 		t.Fatalf("web BoardSweep count != 1: %v", fakes["web"].Calls())
+	}
+}
+
+func TestRepoLoopFailureDoesNotStopHealthyRepository(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Unix(15_000, 0)
+	for _, repoID := range []string{"a-failing", "b-healthy"} {
+		if err := st.RegisterRepo(ctx, store.Repo{ID: repoID, Owner: "acme", Repo: repoID,
+			DefaultBranch: "main", Active: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	failingWriter := gh.NewFake()
+	failingClient := &failingSweepClient{Fake: failingWriter, err: errors.New("github read unavailable")}
+	healthy := gh.NewFake()
+	mgr, err := multirepo.New(ctx, st, clock.NewFake(now), nil,
+		func(repo store.Repo) (gh.Client, gh.Writer, error) {
+			if repo.ID == "a-failing" {
+				return failingClient, failingWriter, nil
+			}
+			return healthy, healthy, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	counts, err := mgr.SweepAll(ctx)
+	failures := multirepo.RepoFailures(err)
+	if len(failures) != 1 || failures[0].RepoID != "a-failing" || failures[0].Err == nil {
+		t.Fatalf("sweep failures=%+v err=%v", failures, err)
+	}
+	if failingClient.attempts != 1 {
+		t.Fatalf("failing repo sweep attempts=%d, want one bounded attempt", failingClient.attempts)
+	}
+	if _, ok := counts["b-healthy"]; !ok || countCalls(healthy.Calls(), "BoardSweep") != 1 {
+		t.Fatalf("healthy repo was suppressed by sibling sweep failure: counts=%v calls=%v", counts, healthy.Calls())
+	}
+
+	for _, item := range []struct{ id, repo string }{{"job-a", "a-failing"}, {"job-b", "b-healthy"}} {
+		seedReadyBuild(t, st, item.id, item.repo, 1, now)
+		if _, err := st.EnqueuePROpen(ctx, item.id, "sha-"+item.id, "main"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	failingWriter.FailNextWriteWith(errors.New("github write unavailable"))
+	drained, err := mgr.DrainAll(ctx)
+	failures = multirepo.RepoFailures(err)
+	if len(failures) != 1 || failures[0].RepoID != "a-failing" {
+		t.Fatalf("drain failures=%+v err=%v", failures, err)
+	}
+	if drained["b-healthy"] != 1 || countCalls(healthy.Calls(), "OpenPR") != 1 {
+		t.Fatalf("healthy repo did not drain after sibling failure: counts=%v calls=%v", drained, healthy.Calls())
+	}
+	if countCalls(failingWriter.Calls(), "OpenPR") != 1 {
+		t.Fatalf("failing repo must be attempted exactly once: calls=%v", failingWriter.Calls())
 	}
 }
 

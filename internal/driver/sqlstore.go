@@ -93,6 +93,13 @@ func (s SQLActionStore) claimNextAction(ctx context.Context, owner, executorKind
 		  FROM epic_actions
 		 WHERE state='pending' AND executor_kind=?
 		   AND (next_attempt_at='' OR julianday(next_attempt_at) <= julianday(?))
+		   AND (kind<>'builder_rework'
+		     OR (SELECT COUNT(*) FROM projects WHERE state='active')<=1
+		     OR EXISTS (
+		       SELECT 1 FROM epics e JOIN epic_deliveries d ON d.epic_id=e.id
+		        WHERE e.id=epic_actions.epic_id AND e.state='launching'
+		          AND d.state='changes_requested' AND d.builder_affinity_state='relaunching'
+		          AND d.compute_lease_action_id=epic_actions.id))
 		 ORDER BY created_at, id LIMIT 1`, executorKind, nowText), &a)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Action{}, false, nil
@@ -312,6 +319,91 @@ func (s SQLActionStore) DeadLetterAction(ctx context.Context, id, owner string, 
 	stamp := now.UTC().Format(time.RFC3339Nano)
 	return s.transitionClaimed(ctx, id, owner, epoch, "delivering", "dead_letter", now,
 		"last_error=?, dead_lettered_at=?, claim_deadline_at=''", detail, stamp)
+}
+
+// RecordLifecyclePreEffectFailure is the only transition that certifies an
+// Ensure action as having made no Driver effect.  It is intentionally narrower
+// than RetryAction: the caller must still own a delivering lifecycle claim,
+// there must be no Driver receipt for this immutable action, and this method
+// must be called before any Driver lifecycle method is invoked.  Transport
+// errors and response-loss shapes therefore remain verifying/uncertain and can
+// never be mistaken for a safe local-workspace cleanup.
+//
+// The immutable fact survives retries and a final dead letter.  Merge cleanup
+// consumes it only together with a fresh zero-receipt check.
+func (s SQLActionStore) RecordLifecyclePreEffectFailure(ctx context.Context, id, owner string, epoch int64,
+	failureKind, detail string, maximumTries int, now time.Time) (deadLettered bool, err error) {
+	if s.DB == nil || id == "" || owner == "" || epoch < 1 || detail == "" || maximumTries < 1 {
+		return false, ErrStaleActionEpoch
+	}
+	switch failureKind {
+	case "workspace_prepare", "materials_resolve", "launch_validate":
+	default:
+		return false, ErrStaleActionEpoch
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var attempts, receipts int
+	var state, executor, kind, claimOwner string
+	var actionEpoch int64
+	if err := tx.QueryRowContext(ctx, `SELECT state,executor_kind,kind,claim_owner,action_epoch,attempts
+		FROM epic_actions WHERE id=?`, id).Scan(&state, &executor, &kind, &claimOwner, &actionEpoch, &attempts); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrStaleActionEpoch
+		}
+		return false, err
+	}
+	if state != "delivering" || executor != "driver_lifecycle" || claimOwner != owner || actionEpoch != epoch ||
+		(kind != "builder_launch" && kind != "builder_rework" && kind != "conflict_resolution" &&
+			kind != "reviewer_launch" && kind != "worker_recover") {
+		return false, ErrStaleActionEpoch
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM driver_lifecycle_receipts WHERE action_id=?`, id).Scan(&receipts); err != nil {
+		return false, err
+	}
+	if receipts != 0 {
+		// A persisted receipt means Driver was contacted.  Even a later local
+		// resolver error cannot downgrade the outcome to no-effect.
+		return false, ErrStaleActionEpoch
+	}
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO epic_lifecycle_pre_effect_failures
+		(action_id,action_epoch,failure_kind,reason,recorded_at) VALUES (?,?,?,?,?)`,
+		id, epoch, failureKind, detail, stamp); err != nil {
+		return false, err
+	}
+	deadLettered = attempts >= maximumTries
+	if deadLettered {
+		res, err := tx.ExecContext(ctx, `UPDATE epic_actions SET state='dead_letter',claim_owner='',
+			claim_deadline_at='',dead_lettered_at=?,last_error=?,updated_at=?
+			WHERE id=? AND state='delivering' AND claim_owner=? AND action_epoch=?`,
+			stamp, detail, stamp, id, owner, epoch)
+		if err != nil {
+			return false, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return false, ErrStaleActionEpoch
+		}
+	} else {
+		backoff := time.Minute << min(attempts-1, 3)
+		res, err := tx.ExecContext(ctx, `UPDATE epic_actions SET state='pending',claim_owner='',
+			claim_deadline_at='',next_attempt_at=?,last_error=?,updated_at=?
+			WHERE id=? AND state='delivering' AND claim_owner=? AND action_epoch=?`,
+			now.Add(backoff).UTC().Format(time.RFC3339Nano), detail, stamp, id, owner, epoch)
+		if err != nil {
+			return false, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return false, ErrStaleActionEpoch
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return deadLettered, nil
 }
 
 // RearmDeadLetter updates the historical row in place. It never creates a new

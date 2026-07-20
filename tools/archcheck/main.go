@@ -231,6 +231,7 @@ var allowedRawMutationFiles = map[string]bool{
 	"internal/tmuxio/lifecycle.go": true,
 	"internal/tmuxio/tmuxio.go":    true,
 	"internal/watchdog/runner.go":  true,
+	"cmd/flowbee/human_attach.go":  true, // presentation-only attach/switch-client exception
 	"tools/archcheck/main.go":      true,
 }
 
@@ -319,6 +320,18 @@ func scanRawTmuxSources(root string) int {
 			return nil
 		}
 		text := string(body)
+		if clean == "cmd/flowbee/human_attach.go" {
+			for _, forbidden := range []string{"send-keys", "new-session", "kill-session", "respawn-pane", "split-window", "paste-buffer"} {
+				if strings.Contains(text, forbidden) {
+					fmt.Printf("VIOLATION: human attach exception contains forbidden tmux verb %q\n", forbidden)
+					violations++
+				}
+			}
+			if !strings.Contains(text, `"switch-client"`) || !strings.Contains(text, `"attach-session"`) {
+				fmt.Println("VIOLATION: human attach exception lost its closed attach/switch-client argv")
+				violations++
+			}
+		}
 		if !strings.HasPrefix(clean, "internal/driver/") && clean != "tools/archcheck/main.go" &&
 			(strings.Contains(text, "sender_session_id") || strings.Contains(text, "SenderSessionID")) {
 			fmt.Printf("VIOLATION: product session-origin materialization surface in %s\n", clean)

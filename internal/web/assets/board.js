@@ -11,7 +11,16 @@
   function wireSSE() {
     var live = document.querySelector("nav.fb-nav .live");
     try {
-      var es = new EventSource("/v1/events");
+      // A project workspace requests only its exact project's lifecycle. Global
+      // boards omit the parameter deliberately and therefore require an
+      // explicit portfolio grant server-side. EventSource carries the existing
+      // same-origin HttpOnly human-session cookie automatically.
+      var workspace = document.querySelector("[data-conversation-workspace][data-project-id]");
+      var eventsURL = "/v1/events";
+      if (workspace) {
+        eventsURL += "?project_id=" + encodeURIComponent(workspace.getAttribute("data-project-id"));
+      }
+      var es = new EventSource(eventsURL);
       var t = null;
       var scheduleRefresh = function () {
         clearTimeout(t);

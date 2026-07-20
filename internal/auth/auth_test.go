@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func req(t *testing.T, remoteAddr, authz, identityQuery string) *http.Request {
@@ -59,6 +60,38 @@ func TestBearerUnenrolledIdentityRejected(t *testing.T) {
 	tok := a.Mint("rogue.codex") // validly signed, but rogue.codex is not enrolled
 	if _, err := a.Authenticate(req(t, "100.64.0.2:5555", "Bearer "+tok, "")); err != ErrUnauthorized {
 		t.Fatalf("unenrolled identity must be unauthorized, got %v", err)
+	}
+}
+
+func TestCredentialBearerUsesInjectedClockAndBindsProjectRole(t *testing.T) {
+	observed := time.Date(2032, 3, 4, 5, 6, 7, 0, time.UTC)
+	var got CredentialClaims
+	a := NewBearer([]byte("s3cret"), nil, false).
+		WithNow(func() time.Time { return observed }).
+		WithCredentialVerifier(func(claims CredentialClaims, at time.Time) bool {
+			got = claims
+			return at.Equal(observed) && claims.ProjectID == "russ" &&
+				claims.WorkerRole == "reviewer"
+		})
+	tok := a.MintCredential("epic-worker.reviewer.e1", "russ", "reviewer",
+		"envelope-1", 4, observed.Add(time.Hour))
+	id, err := a.Authenticate(req(t, "100.64.0.2:5555", "Bearer "+tok, ""))
+	if err != nil || id != "epic-worker.reviewer.e1" {
+		t.Fatalf("credential authenticate id=%q err=%v", id, err)
+	}
+	if got.CredentialID != "envelope-1" || got.Generation != 4 {
+		t.Fatalf("claims=%+v", got)
+	}
+	observed = observed.Add(2 * time.Hour)
+	if _, err := a.Authenticate(req(t, "100.64.0.2:5555", "Bearer "+tok, "")); err != ErrUnauthorized {
+		t.Fatalf("expired credential accepted: %v", err)
+	}
+}
+
+func TestCredentialPrefixIsReservedFromLegacyIdentity(t *testing.T) {
+	a := NewBearer([]byte("s3cret"), []string{"fbw2.legacy:codex"}, false)
+	if tok := a.Mint("fbw2.legacy"); tok != "" {
+		t.Fatalf("reserved legacy identity minted ambiguous token %q", tok)
 	}
 }
 

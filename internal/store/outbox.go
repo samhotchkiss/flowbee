@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/job"
@@ -16,13 +17,14 @@ import (
 // a single serialized sender. The (JobID, Action, HeadSHA) triple is the
 // idempotency key: enqueuing the same triple twice is a no-op (ON CONFLICT).
 type OutboxRow struct {
-	ID       int64
-	JobID    string
-	Action   string
-	HeadSHA  string
-	Payload  string // action-specific JSON args
-	Status   string
-	Attempts int // failed-send count so far (the dead-letter backstop reads this)
+	ID        int64
+	JobID     string
+	ProjectID string
+	Action    string
+	HeadSHA   string
+	Payload   string // action-specific JSON args
+	Status    string
+	Attempts  int // failed-send count so far (the dead-letter backstop reads this)
 }
 
 // outbox action constants (§8.2.1).
@@ -47,15 +49,25 @@ const (
 // something it never enqueued). A duplicate (job, action, head_sha) is ignored —
 // the dedupe key collapses re-enqueues to one effect.
 func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, row OutboxRow) error {
+	var projectID string
+	if err := tx.QueryRowContext(ctx, `SELECT project_id FROM jobs WHERE id=?`, row.JobID).Scan(&projectID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("enqueue outbox: owning job %q not found", row.JobID)
+		}
+		return fmt.Errorf("enqueue outbox: resolve project for job %q: %w", row.JobID, err)
+	}
+	if row.ProjectID != "" && row.ProjectID != projectID {
+		return fmt.Errorf("enqueue outbox: project %q does not own job %q (owner %q)", row.ProjectID, row.JobID, projectID)
+	}
 	payload := row.Payload
 	if payload == "" {
 		payload = "{}"
 	}
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO outbox (job_id, action, head_sha, payload, status)
-		VALUES (?, ?, ?, ?, 'pending')
+		INSERT INTO outbox (job_id, project_id, action, head_sha, payload, status)
+		VALUES (?, ?, ?, ?, ?, 'pending')
 		ON CONFLICT (job_id, action, head_sha) DO NOTHING`,
-		row.JobID, row.Action, row.HeadSHA, payload)
+		row.JobID, projectID, row.Action, row.HeadSHA, payload)
 	return err
 }
 
@@ -75,9 +87,9 @@ func (s *Store) EnqueueOutbox(ctx context.Context, row OutboxRow) error {
 func (s *Store) NextPendingOutbox(ctx context.Context) (OutboxRow, bool, error) {
 	var row OutboxRow
 	err := s.DB.QueryRowContext(ctx, `
-		SELECT id, job_id, action, head_sha, payload, status, attempts
+		SELECT id, job_id, project_id, action, head_sha, payload, status, attempts
 		  FROM outbox WHERE status = 'pending' ORDER BY id ASC LIMIT 1`).
-		Scan(&row.ID, &row.JobID, &row.Action, &row.HeadSHA, &row.Payload, &row.Status, &row.Attempts)
+		Scan(&row.ID, &row.JobID, &row.ProjectID, &row.Action, &row.HeadSHA, &row.Payload, &row.Status, &row.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OutboxRow{}, false, nil
 	}
@@ -96,11 +108,11 @@ func (s *Store) NextPendingOutbox(ctx context.Context) (OutboxRow, bool, error) 
 func (s *Store) NextPendingOutboxForRepo(ctx context.Context, repo string) (OutboxRow, bool, error) {
 	var row OutboxRow
 	err := s.DB.QueryRowContext(ctx, `
-		SELECT o.id, o.job_id, o.action, o.head_sha, o.payload, o.status, o.attempts
+		SELECT o.id, o.job_id, o.project_id, o.action, o.head_sha, o.payload, o.status, o.attempts
 		  FROM outbox o JOIN jobs j ON j.id = o.job_id
 		 WHERE o.status = 'pending' AND j.repo = ?
 		 ORDER BY o.id ASC LIMIT 1`, repo).
-		Scan(&row.ID, &row.JobID, &row.Action, &row.HeadSHA, &row.Payload, &row.Status, &row.Attempts)
+		Scan(&row.ID, &row.JobID, &row.ProjectID, &row.Action, &row.HeadSHA, &row.Payload, &row.Status, &row.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OutboxRow{}, false, nil
 	}
@@ -119,8 +131,8 @@ func (s *Store) MarkOutboxSent(ctx context.Context, id int64, detail string) err
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		var row OutboxRow
 		if err := tx.QueryRowContext(ctx,
-			`SELECT job_id, action, head_sha FROM outbox WHERE id = ?`, id).
-			Scan(&row.JobID, &row.Action, &row.HeadSHA); err != nil {
+			`SELECT job_id, project_id, action, head_sha FROM outbox WHERE id = ?`, id).
+			Scan(&row.JobID, &row.ProjectID, &row.Action, &row.HeadSHA); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
@@ -128,10 +140,10 @@ func (s *Store) MarkOutboxSent(ctx context.Context, id int64, detail string) err
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO audit_log (job_id, action, head_sha, detail)
-			VALUES (?, ?, ?, ?)
+			INSERT INTO audit_log (job_id, project_id, action, head_sha, detail)
+			VALUES (?, ?, ?, ?, ?)
 			ON CONFLICT (job_id, action, head_sha) DO NOTHING`,
-			row.JobID, row.Action, row.HeadSHA, detail); err != nil {
+			row.JobID, row.ProjectID, row.Action, row.HeadSHA, detail); err != nil {
 			return err
 		}
 		return nil
@@ -243,6 +255,7 @@ func (s *Store) OutboxAbandonedByAction(ctx context.Context) (map[string]int, er
 type AbandonedOutboxRow struct {
 	ID         int64
 	JobID      string
+	ProjectID  string
 	Repo       string
 	Action     string
 	JobState   string
@@ -255,7 +268,7 @@ type AbandonedOutboxRow struct {
 // so `flowbee outbox` can show WHY each write was dropped and whether it still needs attention.
 func (s *Store) AbandonedOutbox(ctx context.Context) ([]AbandonedOutboxRow, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT o.id, o.job_id, COALESCE(j.repo,''), o.action, COALESCE(j.state,'(no job)'), o.attempts,
+		SELECT o.id, o.job_id, o.project_id, COALESCE(j.repo,''), o.action, COALESCE(j.state,'(no job)'), o.attempts,
 		       CAST((julianday('now')-julianday(o.enqueued_at))*24 AS INT)
 		  FROM outbox o LEFT JOIN jobs j ON j.id = o.job_id
 		 WHERE o.status='abandoned'
@@ -267,7 +280,7 @@ func (s *Store) AbandonedOutbox(ctx context.Context) ([]AbandonedOutboxRow, erro
 	var out []AbandonedOutboxRow
 	for rows.Next() {
 		var r AbandonedOutboxRow
-		if err := rows.Scan(&r.ID, &r.JobID, &r.Repo, &r.Action, &r.JobState, &r.Attempts, &r.AgeHours); err != nil {
+		if err := rows.Scan(&r.ID, &r.JobID, &r.ProjectID, &r.Repo, &r.Action, &r.JobState, &r.Attempts, &r.AgeHours); err != nil {
 			return nil, err
 		}
 		r.Actionable = r.JobState != string(job.StateDone) && r.JobState != string(job.StateCancelled)
@@ -342,18 +355,19 @@ func (s *Store) AbandonOutboxForJobSHA(ctx context.Context, jobID, currentSHA st
 
 // AuditRow is one recorded GitHub action (§3.3), keyed (job_id, action, head_sha).
 type AuditRow struct {
-	JobID   string    `json:"job_id"`
-	Action  string    `json:"action"`
-	HeadSHA string    `json:"head_sha"`
-	Detail  string    `json:"detail"`
-	ActedAt time.Time `json:"acted_at"`
+	JobID     string    `json:"job_id"`
+	ProjectID string    `json:"project_id"`
+	Action    string    `json:"action"`
+	HeadSHA   string    `json:"head_sha"`
+	Detail    string    `json:"detail"`
+	ActedAt   time.Time `json:"acted_at"`
 }
 
 // AuditLog returns the audit-log rows for a job, in order (for the §3.3
 // once-per-key assertion + the audit UI).
 func (s *Store) AuditLog(ctx context.Context, jobID string) ([]AuditRow, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT job_id, action, head_sha, detail, acted_at
+		SELECT job_id, project_id, action, head_sha, detail, acted_at
 		  FROM audit_log WHERE job_id = ? ORDER BY id ASC`, jobID)
 	if err != nil {
 		return nil, err
@@ -363,7 +377,7 @@ func (s *Store) AuditLog(ctx context.Context, jobID string) ([]AuditRow, error) 
 	for rows.Next() {
 		var a AuditRow
 		var acted string
-		if err := rows.Scan(&a.JobID, &a.Action, &a.HeadSHA, &a.Detail, &acted); err != nil {
+		if err := rows.Scan(&a.JobID, &a.ProjectID, &a.Action, &a.HeadSHA, &a.Detail, &acted); err != nil {
 			return nil, err
 		}
 		if ts, perr := time.Parse(sqliteTS, acted); perr == nil {
@@ -377,7 +391,7 @@ func (s *Store) AuditLog(ctx context.Context, jobID string) ([]AuditRow, error) 
 // AllAudit returns every audit row (for the audit board + whole-run assertions).
 func (s *Store) AllAudit(ctx context.Context) ([]AuditRow, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT job_id, action, head_sha, detail, acted_at FROM audit_log ORDER BY id ASC`)
+		SELECT job_id, project_id, action, head_sha, detail, acted_at FROM audit_log ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +400,7 @@ func (s *Store) AllAudit(ctx context.Context) ([]AuditRow, error) {
 	for rows.Next() {
 		var a AuditRow
 		var acted string
-		if err := rows.Scan(&a.JobID, &a.Action, &a.HeadSHA, &a.Detail, &acted); err != nil {
+		if err := rows.Scan(&a.JobID, &a.ProjectID, &a.Action, &a.HeadSHA, &a.Detail, &acted); err != nil {
 			return nil, err
 		}
 		if ts, perr := time.Parse(sqliteTS, acted); perr == nil {

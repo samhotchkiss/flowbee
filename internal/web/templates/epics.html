@@ -28,6 +28,16 @@
           <div><dt>Allocated</dt><dd>{{.Allocated}}</dd></div>
           <div><dt>Needs you</dt><dd class="{{if .NeedsYou}}warn{{end}}">{{.NeedsYou}}</dd></div>
         </dl>
+        <div class="pf-flow" aria-label="Durable delivery flow" data-delivery-total="{{.Delivery.Total}}">
+          <span>artifact <b>{{.Delivery.AwaitingArtifact}}</b></span>
+          <span>CI <b>{{.Delivery.AwaitingCI}}</b></span>
+          <span>review dispatch <b>{{.Delivery.AwaitingReviewDispatch}}</b></span>
+          <span>in review <b>{{.Delivery.InReview}}</b></span>
+          <span>merge <b>{{.Delivery.Merge}}</b></span>
+          <span>cleanup <b>{{.Delivery.Cleanup}}</b></span>
+          <span>terminal <b>{{.Delivery.Terminal}}</b></span>
+        </div>
+        <p class="pf-throughput" data-throughput-window="{{.ThroughputWindow}}">{{.ThroughputWindow}} throughput · {{.Merged}} merged · {{.Completed}} completed · {{.Recoveries}} recovered</p>
         <div class="pf-scheduler" aria-label="Capacity allocation and scheduler fairness">
           {{range .Scheduler}}
           <div class="pf-pool {{if .Starved}}starved{{end}}" data-pool="{{.Pool}}" data-starved="{{.Starved}}">
@@ -36,6 +46,8 @@
             <span>service {{.ServiceTurns}}/{{.PoolServiceTurns}} · {{.ServiceShare}}</span>
             <span>weight share {{.WeightShare}}</span>
             {{if .Eligible}}<span>{{.Eligible}} eligible · oldest {{.EligibleWait}}</span>{{else}}<span>0 eligible</span>{{end}}
+            {{if .WhyNotCode}}<span class="pf-why-not">why not · {{.WhyNotCode}}{{if .NextEligible}} · next {{.NextEligible}}{{end}}</span>{{end}}
+            {{if .LastDecisionCode}}<span class="pf-last-decision">last turn · {{.LastDecisionCode}}</span>{{end}}
             {{if .Starved}}<b>starvation bound exceeded</b>{{end}}
           </div>
           {{end}}
@@ -44,6 +56,9 @@
           <span class="{{.InteractorStatus}}">Interactor · {{.InteractorStatus}}</span>
           <span class="{{.OrchestratorStatus}}">Orchestrator · {{.OrchestratorStatus}}</span>
         </div>
+        {{if .Breakers}}<div class="pf-breakers" aria-label="Open project breakers">
+          {{range .Breakers}}<p data-breaker-scope="{{.Scope}}" data-breaker-state="{{.State}}"><strong>{{.Scope}}{{if .RepoID}} · {{.RepoID}}{{end}} · {{.State}}</strong><span>{{.FailureKind}} · {{.Reason}}</span><small>{{.FailureCount}} failure{{if ne .FailureCount 1}}s{{end}}{{if .ResetLabel}} · reset {{.ResetLabel}}{{end}}{{if .ProbeLeaseLabel}} · probe lease {{.ProbeLeaseLabel}}{{end}}</small></p>{{end}}
+        </div>{{end}}
         {{if .Blocker}}<p class="pf-blocker"><span>Oldest blocker{{if .BlockerAge}} · {{.BlockerAge}}{{end}}</span><strong>{{.Blocker}}</strong>{{if .BlockerKind}}<small>{{.BlockerKind}}</small>{{end}}</p>{{else}}<p class="pf-clear">No blocking fact</p>{{end}}
         <footer><span>priority {{.Priority}}</span><span>weight {{.Weight}}</span><span>cap {{if .Cap}}{{.Cap}}{{else}}fleet{{end}}</span></footer>
       </a>

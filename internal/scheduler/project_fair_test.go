@@ -152,6 +152,41 @@ func TestProjectFairIsDeterministicAndDoesNotMutateInputState(t *testing.T) {
 	}
 }
 
+func TestProjectFairReworkWinsOnlyWithinWinningProject(t *testing.T) {
+	now := time.Unix(70_000, 0)
+	policies := []ProjectPolicy{
+		{ProjectID: "alpha", State: "active", Weight: 1},
+		{ProjectID: "beta", State: "active", Weight: 1},
+	}
+	within := []Candidate{
+		{ProjectID: "alpha", JobID: "fresh", Pool: PoolBuild, Priority: 1,
+			EnqueuedAt: now.Add(-time.Hour)},
+		{ProjectID: "alpha", JobID: "rework", Pool: PoolBuild, Priority: 10,
+			EnqueuedAt: now, ReleasesCapacity: true},
+	}
+	got := PickProjectFair(within, policies, nil, FairState{}, FairConfig{
+		Pool: PoolBuild, Now: now,
+	})
+	if !got.OK || got.Selected.JobID != "rework" {
+		t.Fatalf("rework did not release capacity before fresh work in-project: %+v", got)
+	}
+
+	// The release hint is deliberately not a global priority. A different project
+	// that owns the fair turn still wins, so a noisy rework queue cannot bypass
+	// cross-project fairness.
+	crossProject := append(within, Candidate{ProjectID: "beta", JobID: "beta-fresh",
+		Pool: PoolBuild, Priority: 5, EnqueuedAt: now})
+	state := FairState{DeficitByPool: map[string]map[string]int64{
+		PoolBuild: {"alpha": -10, "beta": 10},
+	}}
+	got = PickProjectFair(crossProject, policies, nil, state, FairConfig{
+		Pool: PoolBuild, Now: now,
+	})
+	if !got.OK || got.WinningProject != "beta" || got.Selected.JobID != "beta-fresh" {
+		t.Fatalf("rework bypassed another project's fair turn: %+v", got)
+	}
+}
+
 func assertDecisionCode(t *testing.T, decisions []CandidateDecision, jobID string, want WhyNotCode) {
 	t.Helper()
 	for _, decision := range decisions {

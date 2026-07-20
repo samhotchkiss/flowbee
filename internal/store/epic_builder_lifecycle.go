@@ -31,6 +31,7 @@ type BuilderLifecycleActionProjection struct {
 	LeaseID                                                                         string
 	LeaseEpoch                                                                      int64
 	RecipientSessionID, RecipientPaneInstanceID, RecipientAgentRunID                string
+	TargetRole                                                                      string
 }
 
 type BuilderLifecycleReceiptProjection struct {
@@ -113,8 +114,9 @@ func (s *Store) PrepareBuilderLaunch(ctx context.Context, action BuilderLifecycl
 		if holdKind == "builder_capacity_unavailable" {
 			if _, err := tx.ExecContext(ctx, `UPDATE attention_items SET state='resolved',
 				resolution='capacity_reacquired',resolved_at=?,updated_at=? WHERE epic_id=?
-				AND kind='capacity_pool_exhausted' AND state IN ('open','leased','delivering','awaiting_ack')`,
-				stamp, stamp, action.EpicID); err != nil {
+				AND project_id=? AND kind='capacity_pool_exhausted'
+				AND state IN ('open','leased','delivering','awaiting_ack')`,
+				stamp, stamp, action.EpicID, projectID); err != nil {
 				return err
 			}
 		}
@@ -148,8 +150,42 @@ func (s *Store) PrepareBuilderRelaunch(ctx context.Context, action BuilderLifecy
 			return err
 		}
 		if epicState == "launching" && deliveryState == "changes_requested" && affinity == "relaunching" {
-			if leaseActionID != action.ActionID || leaseActionEpoch != action.Epoch {
+			if leaseActionID != action.ActionID || leaseActionEpoch > action.Epoch {
 				return errors.New("builder relaunch compute lease belongs to a different action epoch")
+			}
+			// The fair scheduler acquires physical compute before the lifecycle
+			// executor claims the immutable action, so its durable epoch starts at
+			// zero. Bind the first claimant epoch here after one last exact-capacity
+			// recheck; later/replayed callers must present the already-bound epoch.
+			if leaseActionEpoch == 0 {
+				if action.Epoch < 1 {
+					return errors.New("builder relaunch claimant has no action epoch")
+				}
+				if s.EnableCapacityV2 {
+					decision, err := capacityRouteForSeatQueryExcludingEpic(ctx, tx, seatID,
+						action.EpicID, now, freshFor)
+					if err != nil {
+						return err
+					}
+					if !decision.Routable {
+						out.Detail = strings.Join(decision.Reasons, ",")
+						return markBuilderCapacityHoldTx(ctx, tx, projectID, action.EpicID,
+							seatID, out.Detail, version, now)
+					}
+				}
+				res, err := tx.ExecContext(ctx, `UPDATE epic_deliveries SET
+					compute_lease_action_epoch=?,state_version=state_version+1,updated_at=?
+					WHERE epic_id=? AND compute_lease_action_id=? AND compute_lease_action_epoch=0
+					AND state='changes_requested' AND builder_affinity_state='relaunching'`,
+					action.Epoch, now.UTC().Format(rfc3339), action.EpicID, action.ActionID)
+				if err != nil {
+					return err
+				}
+				if n, _ := res.RowsAffected(); n != 1 {
+					return errors.New("builder relaunch lost fair claimant epoch fence")
+				}
+			} else if leaseActionEpoch != action.Epoch {
+				return errors.New("builder relaunch claimant epoch is stale")
 			}
 			out.Allowed = true
 			return nil
@@ -193,7 +229,8 @@ func (s *Store) PrepareBuilderRelaunch(ctx context.Context, action BuilderLifecy
 		dedup := builderCapacityDedup(action.EpicID, seatID)
 		if _, err := tx.ExecContext(ctx, `UPDATE attention_items SET state='resolved',
 			resolution='capacity_reacquired',resolved_at=?,updated_at=? WHERE dedup_key=?
-			AND state IN ('open','leased','delivering','awaiting_ack')`, stamp, stamp, dedup); err != nil {
+			AND project_id=? AND state IN ('open','leased','delivering','awaiting_ack')`,
+			stamp, stamp, dedup, projectID); err != nil {
 			return err
 		}
 		payload, _ := json.Marshal(map[string]string{"seat_id": seatID, "action_id": action.ActionID})
@@ -248,8 +285,8 @@ func markBuilderCapacityHoldTx(ctx context.Context, tx *sql.Tx, projectID, epicI
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE attention_items SET occurrences=occurrences+?,
 		last_seen_at=?,detail=?,evidence_json=?,updated_at=? WHERE dedup_key=?
-		AND state IN ('open','leased','delivering','awaiting_ack')`, delta, stamp, detail,
-		string(evidence), stamp, dedup); err != nil {
+		AND project_id=? AND state IN ('open','leased','delivering','awaiting_ack')`, delta,
+		stamp, detail, string(evidence), stamp, dedup, projectID); err != nil {
 		return err
 	}
 	if err := ensureControlAlertTx(ctx, tx, projectID, epicID, "capacity_pool_exhausted",
@@ -275,12 +312,21 @@ func ensureBuilderParkActionTx(ctx context.Context, tx *sql.Tx, projectID, epicI
 		"epic_id": epicID, "final_epic_state": finalState, "type": "builder_park",
 	})
 	dedup := fmt.Sprintf("%s:%s:builder_park:%s", projectID, epicID, binding.AgentRunID)
-	return ensureBuilderLifecycleActionTx(ctx, tx, builderLifecycleAction{
+	if err := ensureBuilderLifecycleActionTx(ctx, tx, builderLifecycleAction{
 		ProjectID: projectID, EpicID: epicID, Kind: "builder_park", Dedup: dedup,
 		Payload: string(payloadBytes), Binding: binding, ExactTarget: true,
 		TargetEpoch: binding.TargetEpoch, LeaseEpoch: binding.BindingEpoch,
 		Now: now,
-	})
+	}); err != nil {
+		return err
+	}
+	idHash := sha256.Sum256([]byte(dedup))
+	actionID := "builder_park-" + hex.EncodeToString(idHash[:12])
+	_, err = tx.ExecContext(ctx, `UPDATE epic_worker_sessions SET state='stop_pending',
+		stop_action_id=?,updated_at=? WHERE epic_id=? AND worker_role='builder'
+		AND state IN ('active','ensure_pending','planned')`, actionID,
+		now.UTC().Format(rfc3339), epicID)
+	return err
 }
 
 // ensureBuilderReworkActionTx creates the one rejection effect against the
@@ -420,6 +466,14 @@ func (s *Store) ProjectBuilderLifecycleResult(ctx context.Context, action Builde
 			return s.projectBuilderRelaunchTx(ctx, tx, action, receipt, now)
 		case "conflict_resolution":
 			return s.projectBuilderConflictRelaunchTx(ctx, tx, action, receipt, now)
+		case "reviewer_launch":
+			return s.projectEpicReviewerLaunchTx(ctx, tx, action, receipt, now)
+		case "worker_stop":
+			return projectEpicWorkerStopTx(ctx, tx, action, receipt, now)
+		case "worker_workspace_cleanup":
+			return projectEpicWorkerPreEffectWorkspaceCleanupTx(ctx, tx, action, receipt, now)
+		case "worker_recover":
+			return s.projectEpicWorkerRecoveryTx(ctx, tx, action, receipt, now)
 		default:
 			return fmt.Errorf("unsupported lifecycle action %s", action.Kind)
 		}
@@ -487,6 +541,13 @@ func (s *Store) projectBuilderLaunchTx(ctx context.Context, tx *sql.Tx, action B
 		action.ProfileID, action.WorkspaceRootID, action.WorkspaceRelativePath, id.SessionID,
 		id.PaneInstanceID, id.AgentRunID, id.Provider, id.ConversationID, stamp, stamp, stamp)
 	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE epic_worker_sessions SET state='active',binding_id=?,
+		bootstrap_state='route_pending',target_epoch=?,updated_at=?
+		WHERE epic_id=? AND worker_role='builder' AND ensure_action_id=?
+		AND state='ensure_pending'`, binding.BindingID, action.TargetEpoch, stamp,
+		action.EpicID, action.ActionID); err != nil {
 		return err
 	}
 	if !s.HasDriverControlOriginForBinding(binding) {
@@ -705,6 +766,12 @@ func projectBuilderParkTx(ctx context.Context, tx *sql.Tx, action BuilderLifecyc
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE goal_sessions SET enabled=0,updated_at=?
 		WHERE id=(SELECT tmux_name FROM epics WHERE id=?)`, stamp, action.EpicID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE epic_worker_sessions SET state='stopped',
+		stopped_at=?,updated_at=? WHERE epic_id=? AND worker_role='builder'
+		AND state='stop_pending' AND stop_action_id=?`, stamp, stamp, action.EpicID,
+		action.ActionID); err != nil {
 		return err
 	}
 	return appendEpicControlEventTx(ctx, tx, projectID, action.EpicID, "builder_parked",

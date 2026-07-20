@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,25 +17,34 @@ import (
 // `EpicRun` (not `Epic`) deliberately — see the migration's comment — to stay
 // unambiguous from the pre-existing, unrelated F4 "epic" (store.SeedEpic/EpicIssue).
 type EpicRun struct {
-	ID              string // slug parsed off the filename (epics/YYYY-MM-DD-<slug>.md)
-	ProjectID       string
-	Slug            string
-	AdmissionKey    string
-	WorkIntentID    string
-	IntentVersion   int
-	ContractHash    string
-	Repo            string
-	FilePath        string
-	Title           string
-	Scope           []string
-	Host            string
-	Branch          string
-	TmuxName        string // "epic-<slug>" — also the linked goal_sessions.id (same string)
-	Agent           string
-	State           string // pending|launching|running|blocked|achieved|abandoned|done
-	DeliveryState   string
-	DeliveryCIState string
-	ReviewJobID     string
+	ID            string // slug parsed off the filename (epics/YYYY-MM-DD-<slug>.md)
+	ProjectID     string
+	Slug          string
+	AdmissionKey  string
+	WorkIntentID  string
+	IntentVersion int
+	ContractHash  string
+	// Repositories is the explicit product scope. DeliveryRepo is its exactly-one
+	// Git delivery member; Repo remains the compatibility projection of that value.
+	Repositories      []string `json:"repositories"`
+	DeliveryRepo      string   `json:"delivery_repo"`
+	RepositorySetMode string   `json:"repository_set_mode"`
+	Repo              string
+	FilePath          string
+	Title             string
+	Scope             []string
+	Host              string
+	Branch            string
+	TmuxName          string // "epic-<slug>" — also the linked goal_sessions.id (same string)
+	Agent             string
+	State             string // pending|launching|running|blocked|achieved|abandoned|done
+	DeliveryState     string
+	DeliveryCIState   string
+	ReviewJobID       string
+	// WorkerBootstrapMaterials is explicit, authoritative launch context supplied
+	// before admission. It is deliberately not persisted on epics; its exact bytes
+	// are committed into each immutable epic_worker_sessions bootstrap manifest.
+	WorkerBootstrapMaterials *EpicWorkerBootstrapMaterials `json:"-"`
 
 	StatusUpdatedAt   string // raw "Updated:" text off the agent's own ## Status
 	StatusCurrentStep int
@@ -82,11 +92,99 @@ var (
 	// obligation. Callers with durable source state (notably work intents) turn
 	// this error into a visible admission hold after this transaction rolls back.
 	ErrEpicDistinctReviewerUnavailable = errors.New("no distinct routable review family at admission")
+	ErrEpicRepositorySetInvalid        = errors.New("epic repository set is invalid")
 )
+
+func normalizeEpicRepositorySet(e *EpicRun) (explicit bool, err error) {
+	explicit = len(e.Repositories) > 0 || strings.TrimSpace(e.DeliveryRepo) != ""
+	delivery := strings.TrimSpace(e.DeliveryRepo)
+	legacyRepo := strings.TrimSpace(e.Repo)
+	if delivery == "" {
+		delivery = legacyRepo
+	}
+	if legacyRepo != "" && delivery != legacyRepo {
+		return explicit, fmt.Errorf("%w: legacy repo %q differs from delivery repo %q",
+			ErrEpicRepositorySetInvalid, legacyRepo, delivery)
+	}
+	repos := append([]string(nil), e.Repositories...)
+	if len(repos) == 0 {
+		repos = []string{delivery}
+	}
+	for i := range repos {
+		repos[i] = strings.TrimSpace(repos[i])
+		if repos[i] == "" && !(e.ProjectID == "" || e.ProjectID == "default") {
+			return explicit, fmt.Errorf("%w: empty repository", ErrEpicRepositorySetInvalid)
+		}
+	}
+	sort.Strings(repos)
+	deliveryCount := 0
+	for i, repoID := range repos {
+		if i > 0 && repoID == repos[i-1] {
+			return explicit, fmt.Errorf("%w: duplicate repository %q", ErrEpicRepositorySetInvalid, repoID)
+		}
+		if repoID == delivery {
+			deliveryCount++
+		}
+	}
+	if deliveryCount != 1 {
+		return explicit, fmt.Errorf("%w: delivery repository %q must occur exactly once", ErrEpicRepositorySetInvalid, delivery)
+	}
+	e.Repositories, e.DeliveryRepo, e.Repo = repos, delivery, delivery
+	if explicit {
+		e.RepositorySetMode = "explicit"
+	} else {
+		e.RepositorySetMode = "legacy"
+	}
+	return explicit, nil
+}
+
+func epicRepositorySetTx(ctx context.Context, tx *sql.Tx, epicID string) ([]string, string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT repo_id,is_delivery FROM epic_repositories
+		WHERE epic_id=? ORDER BY repo_id`, epicID)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	var repos []string
+	var delivery string
+	for rows.Next() {
+		var repoID string
+		var isDelivery int
+		if err := rows.Scan(&repoID, &isDelivery); err != nil {
+			return nil, "", err
+		}
+		repos = append(repos, repoID)
+		if isDelivery == 1 {
+			if delivery != "" {
+				return nil, "", fmt.Errorf("%w: multiple delivery repositories", ErrEpicRepositorySetInvalid)
+			}
+			delivery = repoID
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	if len(repos) == 0 || delivery == "" && !(len(repos) == 1 && repos[0] == "") {
+		return nil, "", fmt.Errorf("%w: incomplete durable repository set", ErrEpicRepositorySetInvalid)
+	}
+	return repos, delivery, nil
+}
+
+func equalStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // AddEpicRun registers a new epic at state='launching' — `flowbee epic start`'s
 // one durable write before the tmux launch. The per-seat CONCURRENCY-CAP gate and the
-// same-repo scope-overlap gate run INSIDE the same transaction as the insert (review
+// shared-repository scope-overlap gate run INSIDE the same transaction as the insert (review
 // m6): the store pins MaxOpenConns(1), so the count-then-insert is serialized against
 // any concurrent start and can never over-book a seat or double-book a scope.
 //
@@ -108,6 +206,8 @@ var (
 // this back cleanly on any preflight/launch failure, so in steady state a row only
 // ever reaches 'launching' for the few seconds a launch is actually in flight.
 func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, seatCap int, now time.Time) error {
+	s.epicWorkerActivationMu.Lock()
+	defer s.epicWorkerActivationMu.Unlock()
 	if e.ID == "" {
 		return errors.New("epic id is required")
 	}
@@ -118,10 +218,48 @@ func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, seatCap int, now time
 	if e.ProjectID == "" {
 		e.ProjectID = "default"
 	}
+	explicitRepositorySet, err := normalizeEpicRepositorySet(&e)
+	if err != nil {
+		return err
+	}
 	if e.Slug == "" {
 		e.Slug = e.ID // legacy callers use the historical ID-as-slug model.
 	}
+	// Resolve external material before opening the admission transaction. A stable
+	// admission-key replay does not need the source bytes again: the immutable
+	// committed worker contract is already authoritative and is validated in-tx.
+	dedicatedWorkers := s.EnableEpicDedicatedWorkersV2
+	if !dedicatedWorkers {
+		var durableErr error
+		dedicatedWorkers, durableErr = s.DurableEpicDedicatedWorkersV2(ctx)
+		if durableErr != nil {
+			return durableErr
+		}
+	}
+	if dedicatedWorkers {
+		existingReplay := false
+		if e.AdmissionKey != "" {
+			var n int
+			if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM epics WHERE project_id=? AND admission_key=?`,
+				e.ProjectID, e.AdmissionKey).Scan(&n); err != nil {
+				return err
+			}
+			existingReplay = n > 0
+		}
+		if !existingReplay {
+			material, err := s.resolveEpicWorkerBootstrapMaterials(ctx, e)
+			if err != nil {
+				return err
+			}
+			e.WorkerBootstrapMaterials = material
+		}
+	}
 	return s.tx(ctx, func(tx *sql.Tx) error {
+		reviewerFamily := ""
+		dedicatedWorkers, err := dedicatedEpicWorkersEnabledTx(ctx, s, tx)
+		if err != nil {
+			return err
+		}
 		// Stable admission keys make lost acknowledgements safe. A retry with the
 		// same contract returns success; a changed contract is an explicit conflict.
 		if e.AdmissionKey != "" {
@@ -135,11 +273,40 @@ func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, seatCap int, now time
 					(existingIntent != e.WorkIntentID || existingVersion != e.IntentVersion) {
 					return fmt.Errorf("%w: project=%s admission_key=%s", ErrEpicAdmissionConflict, e.ProjectID, e.AdmissionKey)
 				}
+				existingRepos, existingDelivery, repoErr := epicRepositorySetTx(ctx, tx, existingID)
+				if repoErr != nil {
+					return repoErr
+				}
+				if existingDelivery != e.DeliveryRepo || !equalStringSet(existingRepos, e.Repositories) {
+					return fmt.Errorf("%w: project=%s admission_key=%s repository set changed",
+						ErrEpicAdmissionConflict, e.ProjectID, e.AdmissionKey)
+				}
 				e.ID = existingID
 				return nil
 			}
 			if !errors.Is(err, sql.ErrNoRows) {
 				return err
+			}
+		}
+		// Native Phase-2 admission carries project authority. Prove that the
+		// requested delivery repository is an active member of that exact project
+		// before creating any workflow state; a repository may belong to several
+		// projects, so this is membership—not global ownership inference. Only a
+		// v2-off legacy caller may retain the historical unregistered-repo behavior;
+		// "default" is a compatibility identity, not an authorization bypass.
+		strictMembership := explicitRepositorySet || e.ProjectID != "default"
+		if !strictMembership && s.EnableEpicReviewHandoffV2 {
+			var activeProjects int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE state!='archived'`).Scan(&activeProjects); err != nil {
+				return err
+			}
+			strictMembership = activeProjects > 1
+		}
+		if strictMembership {
+			for _, repoID := range e.Repositories {
+				if err := assertProjectRepoMembershipTx(ctx, tx, e.ProjectID, repoID); err != nil {
+					return err
+				}
 			}
 		}
 		var active int
@@ -174,7 +341,7 @@ func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, seatCap int, now time
 			if e.BuilderModelFamily == "" {
 				e.BuilderModelFamily = "codex"
 			}
-			decision, err := distinctReviewerCapacityTx(ctx, tx, e.ProjectID, e.BuilderModelFamily, now, 5*time.Minute)
+			decision, family, err := distinctReviewerFamilyTx(ctx, tx, e.ProjectID, e.BuilderModelFamily, now, 5*time.Minute)
 			if err != nil {
 				return err
 			}
@@ -185,6 +352,18 @@ func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, seatCap int, now time
 				}
 				return fmt.Errorf("%w: builder_family=%s: %s",
 					ErrEpicDistinctReviewerUnavailable, e.BuilderModelFamily, detail)
+			}
+			reviewerFamily = family
+		} else if dedicatedWorkers {
+			// Tests and explicitly capacity-disabled local development still get a
+			// deterministic anti-affine worker plan. Production activation enables
+			// capacity v2 and persists the actually proven family above.
+			if e.BuilderModelFamily == "" {
+				e.BuilderModelFamily = "codex"
+			}
+			reviewerFamily = "grok"
+			if e.BuilderModelFamily == "grok" {
+				reviewerFamily = "codex"
 			}
 		}
 		if e.SeatID != "" {
@@ -208,55 +387,78 @@ func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, seatCap int, now time
 					ErrEpicHostBusy, capacityKey, capacityValue, active, seatCap)
 			}
 		}
-		scopeQuery := `SELECT id, scope_json FROM epics WHERE repo = ? AND state IN ` + epicActiveStatesSQL
-		if s.EnableEpicReviewHandoffV2 {
-			// Physical compute is released when the builder is positively parked,
-			// but branch/worktree/scope affinity survives until merge/abandon cleanup.
-			scopeQuery = `SELECT e.id,e.scope_json FROM epics e
-				JOIN epic_deliveries d ON d.epic_id=e.id
-				WHERE e.repo=? AND d.state NOT IN ('complete','abandoned')`
-		}
-		rows, err := tx.QueryContext(ctx, scopeQuery, e.Repo)
-		if err != nil {
-			return err
-		}
 		type activeScope struct {
 			id    string
 			scope []string
 		}
-		var others []activeScope
-		for rows.Next() {
-			var id, scopeJSON string
-			if err := rows.Scan(&id, &scopeJSON); err != nil {
-				rows.Close()
+		for _, repoID := range e.Repositories {
+			scopeQuery := `SELECT e.id,e.scope_json FROM epics e
+				JOIN epic_repositories er ON er.epic_id=e.id
+				WHERE er.repo_id=? AND e.state IN ` + epicActiveStatesSQL
+			if s.EnableEpicReviewHandoffV2 {
+				// Physical compute is released when the builder is positively parked,
+				// but repository/scope affinity survives until merge/abandon cleanup.
+				scopeQuery = `SELECT e.id,e.scope_json FROM epics e
+					JOIN epic_repositories er ON er.epic_id=e.id
+					JOIN epic_deliveries d ON d.epic_id=e.id
+					WHERE er.repo_id=? AND d.state NOT IN ('complete','abandoned')`
+			}
+			rows, err := tx.QueryContext(ctx, scopeQuery, repoID)
+			if err != nil {
 				return err
 			}
-			others = append(others, activeScope{id: id, scope: unmarshalStrings(scopeJSON)})
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		for _, o := range others {
-			if overlaps, ga, gb := epicspec.ScopeOverlap(e.Scope, o.scope); overlaps {
-				return fmt.Errorf("%w: %q overlaps epic %q's %q in repo %q",
-					ErrEpicScopeOverlap, ga, o.id, gb, e.Repo)
+			var others []activeScope
+			for rows.Next() {
+				var id, scopeJSON string
+				if err := rows.Scan(&id, &scopeJSON); err != nil {
+					rows.Close()
+					return err
+				}
+				others = append(others, activeScope{id: id, scope: unmarshalStrings(scopeJSON)})
+			}
+			if err := rows.Close(); err != nil {
+				return err
+			}
+			for _, o := range others {
+				if overlaps, ga, gb := epicspec.ScopeOverlap(e.Scope, o.scope); overlaps {
+					return fmt.Errorf("%w: %q overlaps epic %q's %q in repo %q",
+						ErrEpicScopeOverlap, ga, o.id, gb, repoID)
+				}
 			}
 		}
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO epics
 			    (id, repo, file_path, title, scope_json, host, branch, tmux_name, agent,
 			     state, account_key, seat_id, builder_model_family, project_id, slug, admission_key,
-			     work_intent_id, intent_version, contract_hash, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			     work_intent_id, intent_version, contract_hash, repository_set_mode,
+			     repository_set_finalized, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'launching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
 			e.ID, e.Repo, e.FilePath, e.Title, marshalStrings(e.Scope), e.Host, e.Branch,
 			e.TmuxName, e.Agent, e.AccountKey, e.SeatID, e.BuilderModelFamily, e.ProjectID, e.Slug,
-			e.AdmissionKey, e.WorkIntentID, e.IntentVersion, e.ContractHash, ts, ts)
+			e.AdmissionKey, e.WorkIntentID, e.IntentVersion, e.ContractHash, e.RepositorySetMode, ts, ts)
 		if err != nil {
 			if isUniqueConstraintErr(err) {
 				return ErrEpicRunExists
 			}
 			return fmt.Errorf("add epic %q: %w", e.ID, err)
+		}
+		for _, repoID := range e.Repositories {
+			if repoID == e.DeliveryRepo {
+				continue // the migration trigger created the exactly-one delivery row.
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO epic_repositories
+				(epic_id,project_id,repo_id,is_delivery,membership_validated,created_at)
+				VALUES (?,?,?,0,1,?)`, e.ID, e.ProjectID, repoID, ts); err != nil {
+				return fmt.Errorf("add epic repository %q: %w", repoID, err)
+			}
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE epics SET repository_set_finalized=1
+			WHERE id=? AND repository_set_finalized=0`, e.ID)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("%w: repository set finalization", ErrEpicRepositorySetInvalid)
 		}
 		// The review obligation is admission-time durable state, in the same tx.
 		_, err = tx.ExecContext(ctx, `INSERT INTO epic_deliveries
@@ -278,6 +480,11 @@ func (s *Store) AddEpicRun(ctx context.Context, e EpicRun, seatCap int, now time
 			(project_id, epic_id, kind, from_state, to_state, state_version, epic_seq, actor_kind, payload_json, created_at)
 			VALUES (?, ?, 'epic_admitted', '', 'admitted', 0, 1, 'flowbee', '{}', ?)`, e.ProjectID, e.ID, ts); err != nil {
 			return err
+		}
+		if dedicatedWorkers {
+			if err := insertEpicWorkerSessionsTx(ctx, tx, e, reviewerFamily, now); err != nil {
+				return err
+			}
 		}
 		if e.WorkIntentID != "" {
 			res, err := tx.ExecContext(ctx, `UPDATE work_intents SET state='admitted',
@@ -381,6 +588,11 @@ func (s *Store) GetEpicRunByProjectSlug(ctx context.Context, projectID, slug str
 const epicRunSelect = `
 	SELECT id, repo, file_path, title, scope_json, host, branch, tmux_name, agent, state,
 	       project_id, slug, admission_key, work_intent_id, intent_version, contract_hash,
+	       repository_set_mode,
+	       COALESCE((SELECT json_group_array(repo_id) FROM
+	         (SELECT repo_id FROM epic_repositories er WHERE er.epic_id=epics.id ORDER BY repo_id)),'[]'),
+	       COALESCE((SELECT repo_id FROM epic_repositories er
+	                  WHERE er.epic_id=epics.id AND er.is_delivery=1),repo),
 	       COALESCE((SELECT state FROM epic_deliveries d WHERE d.epic_id=epics.id),''),
 	       COALESCE((SELECT ci_state FROM epic_deliveries d WHERE d.epic_id=epics.id),''),
 	       COALESCE((SELECT review_job_id FROM epic_deliveries d WHERE d.epic_id=epics.id),''),
@@ -393,10 +605,11 @@ const epicRunSelect = `
 
 func scanEpicRun(row rowScanner) (EpicRun, error) {
 	var e EpicRun
-	var scopeJSON, checklistJSON string
+	var scopeJSON, checklistJSON, repositoriesJSON string
 	err := row.Scan(&e.ID, &e.Repo, &e.FilePath, &e.Title, &scopeJSON, &e.Host, &e.Branch,
 		&e.TmuxName, &e.Agent, &e.State,
 		&e.ProjectID, &e.Slug, &e.AdmissionKey, &e.WorkIntentID, &e.IntentVersion, &e.ContractHash,
+		&e.RepositorySetMode, &repositoriesJSON, &e.DeliveryRepo,
 		&e.DeliveryState, &e.DeliveryCIState, &e.ReviewJobID,
 		&e.StatusUpdatedAt, &e.StatusCurrentStep, &e.StatusStepsTotal, &e.StatusStateDetail,
 		&checklistJSON, &e.StatusBlockers,
@@ -410,6 +623,10 @@ func scanEpicRun(row rowScanner) (EpicRun, error) {
 		return EpicRun{}, err
 	}
 	e.Scope = unmarshalStrings(scopeJSON)
+	e.Repositories = unmarshalStrings(repositoriesJSON)
+	if e.DeliveryRepo == "" && e.Repo != "" {
+		e.DeliveryRepo = e.Repo
+	}
 	e.StatusChecklist = unmarshalChecklist(checklistJSON)
 	return e, nil
 }

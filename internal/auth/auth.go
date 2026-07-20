@@ -24,9 +24,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // ErrUnauthorized is returned when a credential is missing, malformed, or not on
@@ -54,10 +57,52 @@ type Authenticator interface {
 // declared identity (query/body) since there is no token to bind; the network
 // boundary is the trust boundary. Non-loopback callers ALWAYS need a valid token.
 type BearerAuth struct {
-	secret         []byte
-	enrolled       map[string]struct{}
-	family         map[string]string // identity -> operator-declared model_family (optional)
-	loopbackBypass bool
+	secret             []byte
+	enrolled           map[string]struct{}
+	family             map[string]string // identity -> operator-declared model_family (optional)
+	loopbackBypass     bool
+	credentialVerifier func(CredentialClaims, time.Time) bool
+	now                func() time.Time
+}
+
+type CredentialClaims struct {
+	Identity, ProjectID, WorkerRole, CredentialID string
+	Generation                                    int64
+	ExpiresAt                                     time.Time
+}
+
+// CredentialTokenPrefix is reserved for durable, project/role-bound worker
+// credentials. Legacy enrolled identities may not begin with this prefix: the
+// parser always treats it as the version discriminator and fails closed.
+const CredentialTokenPrefix = "fbw2."
+
+// WithCredentialVerifier enables generation/expiry/revocation enforcement for
+// Flowbee-minted per-session credentials. The verifier is consulted on every
+// request; durable Stop/replacement can therefore revoke a token without
+// restarting the API or rebuilding a static allowlist.
+func (b *BearerAuth) WithCredentialVerifier(verifier func(CredentialClaims, time.Time) bool) *BearerAuth {
+	b.credentialVerifier = verifier
+	return b
+}
+
+// WithNow installs the API server clock. One observed-at value is used for both
+// signed expiry and the durable verifier, making recovery deterministic.
+func (b *BearerAuth) WithNow(now func() time.Time) *BearerAuth {
+	if now != nil {
+		b.now = now
+	}
+	return b
+}
+
+func (b *BearerAuth) MintCredential(identity, projectID, workerRole, credentialID string, generation int64,
+	expiresAt time.Time) string {
+	identity64 := base64.RawURLEncoding.EncodeToString([]byte(identity))
+	project64 := base64.RawURLEncoding.EncodeToString([]byte(projectID))
+	role64 := base64.RawURLEncoding.EncodeToString([]byte(workerRole))
+	credential64 := base64.RawURLEncoding.EncodeToString([]byte(credentialID))
+	material := fmt.Sprintf("fbw2.%s.%s.%s.%s.%d.%d", identity64, project64, role64,
+		credential64, generation, expiresAt.Unix())
+	return material + "." + sign(b.secret, material)
 }
 
 // NewBearer builds a bearer authenticator with the given server secret and the set of
@@ -72,12 +117,16 @@ func NewBearer(secret []byte, enrolled []string, loopbackBypass bool) *BearerAut
 	fam := make(map[string]string)
 	for _, e := range enrolled {
 		id, f := parseEnrolledEntry(e)
+		if strings.HasPrefix(id, CredentialTokenPrefix) {
+			continue
+		}
 		set[id] = struct{}{}
 		if f != "" {
 			fam[id] = f
 		}
 	}
-	return &BearerAuth{secret: secret, enrolled: set, family: fam, loopbackBypass: loopbackBypass}
+	return &BearerAuth{secret: secret, enrolled: set, family: fam,
+		loopbackBypass: loopbackBypass, now: time.Now}
 }
 
 // parseEnrolledEntry splits an "identity:family" enrolled entry into its parts.
@@ -101,6 +150,9 @@ func (b *BearerAuth) FamilyFor(identity string) (string, bool) {
 // Mint produces the signed token a worker presents in Authorization: Bearer.
 // (Enrollment hands this to the worker out-of-band; the worker never derives it.)
 func (b *BearerAuth) Mint(identity string) string {
+	if strings.HasPrefix(identity, CredentialTokenPrefix) {
+		return ""
+	}
 	return identity + "." + sign(b.secret, identity)
 }
 
@@ -108,29 +160,66 @@ func (b *BearerAuth) Mint(identity string) string {
 // LoopbackBypass is on). The returned identity is the one bound by the token's
 // MAC — for non-loopback callers it cannot be forged.
 func (b *BearerAuth) Authenticate(r *http.Request) (string, error) {
+	id, _, err := b.authenticateWithClaims(r)
+	return id, err
+}
+
+// authenticateWithClaims preserves the project/role/generation authority of a
+// durable Flowbee credential for endpoint-level authorization. Legacy enrolled
+// tokens and the explicit loopback bypass return nil claims.
+func (b *BearerAuth) authenticateWithClaims(r *http.Request) (string, *CredentialClaims, error) {
 	tok := bearerToken(r)
 	if tok == "" {
 		// no token: only loopback may proceed, and only if bypass is enabled.
 		if b.loopbackBypass && isLoopback(r) {
-			return declaredIdentity(r), nil
+			return declaredIdentity(r), nil, nil
 		}
-		return "", ErrUnauthorized
+		return "", nil, ErrUnauthorized
+	}
+	if strings.HasPrefix(tok, CredentialTokenPrefix) {
+		parts := strings.Split(tok, ".")
+		if len(parts) != 8 {
+			return "", nil, ErrUnauthorized
+		}
+		material := strings.Join(parts[:7], ".")
+		if !hmac.Equal([]byte(parts[7]), []byte(sign(b.secret, material))) {
+			return "", nil, ErrUnauthorized
+		}
+		identityBytes, identityErr := base64.RawURLEncoding.DecodeString(parts[1])
+		projectBytes, projectErr := base64.RawURLEncoding.DecodeString(parts[2])
+		roleBytes, roleErr := base64.RawURLEncoding.DecodeString(parts[3])
+		credentialBytes, credentialErr := base64.RawURLEncoding.DecodeString(parts[4])
+		generation, generationErr := strconv.ParseInt(parts[5], 10, 64)
+		expiresUnix, expiresErr := strconv.ParseInt(parts[6], 10, 64)
+		claims := CredentialClaims{Identity: string(identityBytes), ProjectID: string(projectBytes),
+			WorkerRole: string(roleBytes), CredentialID: string(credentialBytes),
+			Generation: generation, ExpiresAt: time.Unix(expiresUnix, 0).UTC()}
+		observedAt := b.now().UTC()
+		if identityErr != nil || projectErr != nil || roleErr != nil || credentialErr != nil ||
+			generationErr != nil || expiresErr != nil || claims.Identity == "" || claims.ProjectID == "" ||
+			(claims.WorkerRole != "builder" && claims.WorkerRole != "reviewer" &&
+				claims.WorkerRole != "interactor" && claims.WorkerRole != "orchestrator") ||
+			claims.CredentialID == "" || claims.Generation < 1 || !observedAt.Before(claims.ExpiresAt) ||
+			b.credentialVerifier == nil || !b.credentialVerifier(claims, observedAt) {
+			return "", nil, ErrUnauthorized
+		}
+		return claims.Identity, &claims, nil
 	}
 	// the identity itself contains dots (e.g. "studio.opus"), so split on the LAST
 	// dot: everything before it is the identity, the suffix is the MAC.
 	dot := strings.LastIndex(tok, ".")
 	if dot <= 0 || dot == len(tok)-1 {
-		return "", ErrUnauthorized
+		return "", nil, ErrUnauthorized
 	}
 	id, mac := tok[:dot], tok[dot+1:]
 	// constant-time MAC check: a forged identity cannot produce a valid MAC.
 	if !hmac.Equal([]byte(mac), []byte(sign(b.secret, id))) {
-		return "", ErrUnauthorized
+		return "", nil, ErrUnauthorized
 	}
 	if _, ok := b.enrolled[id]; !ok {
-		return "", ErrUnauthorized
+		return "", nil, ErrUnauthorized
 	}
-	return id, nil
+	return id, nil, nil
 }
 
 func sign(secret []byte, identity string) string {
@@ -181,12 +270,18 @@ type identityCtxKey struct{}
 // identityFamilyCtxKey carries the credential-bound model family down to handlers.
 type identityFamilyCtxKey struct{}
 
+type credentialClaimsCtxKey struct{}
+
 func withIdentity(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, identityCtxKey{}, id)
 }
 
 func withFamily(ctx context.Context, family string) context.Context {
 	return context.WithValue(ctx, identityFamilyCtxKey{}, family)
+}
+
+func withCredentialClaims(ctx context.Context, claims CredentialClaims) context.Context {
+	return context.WithValue(ctx, credentialClaimsCtxKey{}, claims)
 }
 
 // FamilyFrom returns the credential-bound model family stashed by Middleware, if the
@@ -208,7 +303,14 @@ func Middleware(a Authenticator, next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id, err := a.Authenticate(r)
+		var id string
+		var claims *CredentialClaims
+		var err error
+		if bearer, ok := a.(*BearerAuth); ok {
+			id, claims, err = bearer.authenticateWithClaims(r)
+		} else {
+			id, err = a.Authenticate(r)
+		}
 		if err != nil {
 			// Actionable body (the worker logs this verbatim on every retry, and the
 			// private listener is loopback/Tailscale-only so it leaks nothing useful to
@@ -220,6 +322,9 @@ func Middleware(a Authenticator, next http.Handler) http.Handler {
 			return
 		}
 		ctx := withIdentity(r.Context(), id)
+		if claims != nil {
+			ctx = withCredentialClaims(ctx, *claims)
+		}
 		// bind the operator-declared model family (if any) so the handler can clamp the
 		// self-asserted model_family — the anti-affinity trust root (I-10).
 		if fr, ok := a.(FamilyResolver); ok {
@@ -235,4 +340,12 @@ func Middleware(a Authenticator, next http.Handler) http.Handler {
 func IdentityFrom(r *http.Request) (string, bool) {
 	id, ok := r.Context().Value(identityCtxKey{}).(string)
 	return id, ok && id != ""
+}
+
+// CredentialClaimsFrom returns signed, durable credential claims after
+// Middleware authentication. Values from request bodies or query parameters are
+// never promoted into this context.
+func CredentialClaimsFrom(r *http.Request) (CredentialClaims, bool) {
+	claims, ok := r.Context().Value(credentialClaimsCtxKey{}).(CredentialClaims)
+	return claims, ok && claims.Identity != "" && claims.ProjectID != "" && claims.WorkerRole != ""
 }

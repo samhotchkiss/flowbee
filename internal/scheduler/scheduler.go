@@ -37,6 +37,10 @@ type Candidate struct {
 	Priority             int
 	EnqueuedAt           time.Time
 	RequiredCapabilities []string
+	// ReleasesCapacity marks rework/recovery which can unblock an already-admitted
+	// delivery. Project fairness is still chosen first; only candidates inside the
+	// winning project use this bit, where release work precedes fresh admission.
+	ReleasesCapacity bool
 	// CIReady is set ONLY for review candidates: true when the PR's reconciled CI is
 	// green (the review can actually be done). A not-ready review can't progress, so a
 	// ready one must be offered first — else a CI-red review starves CI-green ones (a
@@ -109,6 +113,9 @@ func Order(cands []Candidate, attested []string, now time.Time) []Candidate {
 		}
 	}
 	sort.SliceStable(eligible, func(i, k int) bool {
+		if eligible[i].ReleasesCapacity != eligible[k].ReleasesCapacity {
+			return eligible[i].ReleasesCapacity
+		}
 		// CI-ready reviews first: a not-ready review can't be done, so it must never
 		// be offered ahead of a ready one (anti-starvation). No effect when both equal
 		// (all non-review candidates, both false).

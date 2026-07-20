@@ -96,6 +96,18 @@ its migration is written); that is expected and not a violation.
 0053_interactor_control_alert_projection
 0054_deadman_ingress_storage
 0055_external_watchdog_heartbeat
+0056_phase2_outbox_project_attribution
+0057_phase2_attention_project_isolation
+0058_phase2_builder_fair_dispatch
+0059_phase2_repo_admission_routing
+0060_control_plane_incarnations
+0061_phase2_artifact_cost_attribution
+0062_phase2_epic_worker_lifecycle
+0063_phase2_epic_repository_sets
+0064_bootstrap_action_ledger
+0065_phase2_actor_q3_materials
+0066_phase2_adopted_interactor_recovery
+0067_epic_worker_pre_effect_cleanup
 ```
 <!-- ladder:reserved:end -->
 

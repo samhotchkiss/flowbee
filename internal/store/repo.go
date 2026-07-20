@@ -146,16 +146,26 @@ func (s *Store) SetRepoActive(ctx context.Context, id string, active bool) error
 // to the legacy single-repo (repo=”) jobs, so the pre-F9 JobIDForPR path is the
 // degenerate single-repo case of this one.
 func (s *Store) JobIDForPRInRepo(ctx context.Context, repo string, prNumber int) (string, bool, error) {
+	return s.jobIDForPRInProjectRepo(ctx, "", repo, prNumber)
+}
+
+// JobIDForPRInProjectRepo is the legacy multi-project compatibility lookup. It
+// prevents equal PR numbers in projects sharing a repository from cross-binding.
+func (s *Store) JobIDForPRInProjectRepo(ctx context.Context, projectID, repo string, prNumber int) (string, bool, error) {
+	return s.jobIDForPRInProjectRepo(ctx, projectID, repo, prNumber)
+}
+
+func (s *Store) jobIDForPRInProjectRepo(ctx context.Context, projectID, repo string, prNumber int) (string, bool, error) {
 	var id string
 	err := s.DB.QueryRowContext(ctx,
 		`SELECT id FROM jobs
-		  WHERE repo = ? AND pr_number = ?
+		  WHERE (?='' OR project_id=?) AND repo = ? AND pr_number = ?
 		  ORDER BY CASE
 		    WHEN state IN ('ready','leased','building','review_pending','code_review',
 		                   'mergeable','merging','merge_handoff','resolving_conflict') THEN 0
 		    ELSE 1
 		  END, updated_at DESC, id DESC
-		  LIMIT 1`, repo, prNumber).Scan(&id)
+		  LIMIT 1`, projectID, projectID, repo, prNumber).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}

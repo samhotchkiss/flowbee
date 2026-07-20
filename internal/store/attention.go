@@ -22,6 +22,7 @@ import (
 // that wires those decisions into serialized store transactions and ledgers each move.
 type AttentionItem struct {
 	ID             string
+	ProjectID      string
 	Kind           string
 	EpicID         string
 	Repo           string
@@ -52,6 +53,9 @@ var (
 	// ErrAttentionState is returned when an item is not in the state a transition
 	// requires (e.g. AckAttention on an item that is not awaiting_ack).
 	ErrAttentionState = errors.New("attention item not in the expected state")
+	// ErrAttentionProject is returned when a caller tries to address an item through
+	// a project other than the immutable owner derived from its epic or producer.
+	ErrAttentionProject = errors.New("attention item project mismatch")
 )
 
 // A fenced deliver/resolve call from a superseded incarnation is rejected by wrapping
@@ -60,7 +64,7 @@ var (
 // unchanged.
 
 const attentionSelect = `
-	SELECT id, kind, epic_id, repo, priority, state, dedup_key, blocking, leased_by,
+	SELECT id, project_id, kind, epic_id, repo, priority, state, dedup_key, blocking, leased_by,
 	       item_epoch, lease_expires_at, awaiting_since, delivery_key, evidence_json, detail,
 	       resolution, verdict, occurrences, first_seen_at, last_seen_at, resolved_at,
 	       created_at, updated_at
@@ -70,7 +74,7 @@ func scanAttentionItem(row rowScanner) (AttentionItem, error) {
 	var a AttentionItem
 	var blocking int
 	var evidenceJSON string
-	err := row.Scan(&a.ID, &a.Kind, &a.EpicID, &a.Repo, &a.Priority, &a.State, &a.DedupKey,
+	err := row.Scan(&a.ID, &a.ProjectID, &a.Kind, &a.EpicID, &a.Repo, &a.Priority, &a.State, &a.DedupKey,
 		&blocking, &a.LeasedBy, &a.ItemEpoch, &a.LeaseExpiresAt, &a.AwaitingSince, &a.DeliveryKey,
 		&evidenceJSON, &a.Detail, &a.Resolution, &a.Verdict, &a.Occurrences, &a.FirstSeenAt,
 		&a.LastSeenAt, &a.ResolvedAt, &a.CreatedAt, &a.UpdatedAt)
@@ -87,7 +91,16 @@ func scanAttentionItem(row rowScanner) (AttentionItem, error) {
 
 // GetAttentionItem returns one item by id (for tests + the read-only view).
 func (s *Store) GetAttentionItem(ctx context.Context, id string) (AttentionItem, error) {
-	return scanAttentionItem(s.DB.QueryRowContext(ctx, attentionSelect+` WHERE id = ?`, id))
+	return s.GetAttentionItemForProject(ctx, "default", id)
+}
+
+// GetAttentionItemForProject returns an item only through its exact project
+// namespace. A cross-project id is indistinguishable from a missing id.
+func (s *Store) GetAttentionItemForProject(ctx context.Context, projectID, id string) (AttentionItem, error) {
+	if projectID == "" {
+		return AttentionItem{}, ErrAttentionProject
+	}
+	return scanAttentionItem(s.DB.QueryRowContext(ctx, attentionSelect+` WHERE project_id = ? AND id = ?`, projectID, id))
 }
 
 // UpsertAttentionItem is the ONE entry point every producer calls (plan §1.3 "Dedup
@@ -111,7 +124,12 @@ func (s *Store) UpsertAttentionItem(ctx context.Context, item AttentionItem, now
 	ts := now.Format(rfc3339)
 	evidenceJSON := marshalEvidence(item.Evidence)
 	err = s.tx(ctx, func(tx *sql.Tx) error {
-		existingID, found, e := activeItemIDByDedupTx(ctx, tx, item.DedupKey)
+		projectID, e := attentionOwnerProjectTx(ctx, tx, item)
+		if e != nil {
+			return e
+		}
+		item.ProjectID = projectID
+		existingID, found, e := activeItemIDByDedupTx(ctx, tx, projectID, item.DedupKey)
 		if e != nil {
 			return e
 		}
@@ -128,17 +146,17 @@ func (s *Store) UpsertAttentionItem(ctx context.Context, item AttentionItem, now
 		// 'open', so it defaults to '' and is set ONLY on entry to awaiting_ack (below).
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO attention_items
-			    (id, kind, epic_id, repo, priority, state, dedup_key, blocking, leased_by,
+			    (id, project_id, kind, epic_id, repo, priority, state, dedup_key, blocking, leased_by,
 			     item_epoch, lease_expires_at, delivery_key, evidence_json, detail, resolution,
 			     verdict, occurrences, first_seen_at, last_seen_at, resolved_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, 'open', ?, ?, '', 0, '', '', ?, ?, '', '', 1, ?, ?, '', ?, ?)`,
-			item.ID, item.Kind, item.EpicID, item.Repo, item.Priority, item.DedupKey, b2i(item.Blocking),
+			VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, '', 0, '', '', ?, ?, '', '', 1, ?, ?, '', ?, ?)`,
+			item.ID, projectID, item.Kind, item.EpicID, item.Repo, item.Priority, item.DedupKey, b2i(item.Blocking),
 			evidenceJSON, item.Detail, ts, ts, ts, ts); err != nil {
 			if isUniqueConstraintErr(err) {
 				// The partial UNIQUE index fired: an active row for this dedup_key already
 				// exists (unreachable under MaxOpenConns=1, but honor the comment). Fall back
 				// to a refresh so a producer NEVER surfaces a raw constraint error.
-				existingID, found, e2 := activeItemIDByDedupTx(ctx, tx, item.DedupKey)
+				existingID, found, e2 := activeItemIDByDedupTx(ctx, tx, projectID, item.DedupKey)
 				if e2 != nil {
 					return e2
 				}
@@ -162,12 +180,49 @@ func (s *Store) UpsertAttentionItem(ctx context.Context, item AttentionItem, now
 	return created, id, err
 }
 
+// attentionOwnerProjectTx derives ownership from the immutable epic whenever an
+// epic is present. ProjectID supplied by a caller is an assertion, never authority.
+// Empty-project, missing-epic rows retain the legacy default-project behavior used
+// by operational attention created before Phase 2; new non-default producers must
+// name an existing project explicitly.
+func attentionOwnerProjectTx(ctx context.Context, tx *sql.Tx, item AttentionItem) (string, error) {
+	asserted := strings.TrimSpace(item.ProjectID)
+	if item.EpicID != "" {
+		var owner string
+		err := tx.QueryRowContext(ctx, `SELECT project_id FROM epics WHERE id=?`, item.EpicID).Scan(&owner)
+		if err == nil {
+			if asserted != "" && asserted != owner {
+				return "", fmt.Errorf("%w: project %q does not own epic %q (owner %q)",
+					ErrAttentionProject, asserted, item.EpicID, owner)
+			}
+			return owner, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		if asserted != "" && asserted != "default" {
+			return "", fmt.Errorf("%w: epic %q has no durable owner", ErrAttentionProject, item.EpicID)
+		}
+	}
+	if asserted == "" {
+		return "default", nil
+	}
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM projects WHERE id=?)`, asserted).Scan(&exists); err != nil {
+		return "", err
+	}
+	if exists != 1 {
+		return "", fmt.Errorf("%w: project %q does not exist", ErrAttentionProject, asserted)
+	}
+	return asserted, nil
+}
+
 // activeItemIDByDedupTx returns the id of the (at most one) ACTIVE item for a dedup_key.
-func activeItemIDByDedupTx(ctx context.Context, tx *sql.Tx, dedupKey string) (string, bool, error) {
+func activeItemIDByDedupTx(ctx context.Context, tx *sql.Tx, projectID, dedupKey string) (string, bool, error) {
 	var id string
 	e := tx.QueryRowContext(ctx,
-		`SELECT id FROM attention_items WHERE dedup_key = ? AND state IN `+attentionActiveStatesSQL+` LIMIT 1`,
-		dedupKey).Scan(&id)
+		`SELECT id FROM attention_items WHERE project_id = ? AND dedup_key = ? AND state IN `+attentionActiveStatesSQL+` LIMIT 1`,
+		projectID, dedupKey).Scan(&id)
 	if errors.Is(e, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -186,8 +241,8 @@ func refreshActiveAttentionTx(ctx context.Context, tx *sql.Tx, id string, item A
 		UPDATE attention_items
 		   SET occurrences = occurrences + 1, last_seen_at = ?, evidence_json = ?,
 		       detail = ?, priority = ?, blocking = ?, repo = ?, epic_id = ?, updated_at = ?
-		 WHERE id = ?`,
-		ts, evidenceJSON, item.Detail, item.Priority, b2i(item.Blocking), item.Repo, item.EpicID, ts, id)
+		 WHERE id = ? AND project_id = ?`,
+		ts, evidenceJSON, item.Detail, item.Priority, b2i(item.Blocking), item.Repo, item.EpicID, ts, id, item.ProjectID)
 	return err
 }
 
@@ -204,13 +259,20 @@ func refreshActiveAttentionTx(ctx context.Context, tx *sql.Tx, id string, item A
 // item, and the NEXT producer tick's re-upsert simply no-ops. For 'open' (never leased) and
 // 'awaiting_ack' (delivered, awaiting confirmation) clear-wins is correct: reality moved on.
 func (s *Store) AutoResolveCleared(ctx context.Context, dedupKey string, now time.Time) (resolved bool, err error) {
+	return s.AutoResolveClearedForProject(ctx, "default", dedupKey, now)
+}
+
+func (s *Store) AutoResolveClearedForProject(ctx context.Context, projectID, dedupKey string, now time.Time) (resolved bool, err error) {
+	if projectID == "" {
+		return false, ErrAttentionProject
+	}
 	ts := now.Format(rfc3339)
 	err = s.tx(ctx, func(tx *sql.Tx) error {
 		var id, epicID string
 		var itemEpoch int
 		e := tx.QueryRowContext(ctx,
-			`SELECT id, epic_id, item_epoch FROM attention_items WHERE dedup_key = ? AND state IN ('open','awaiting_ack') LIMIT 1`,
-			dedupKey).Scan(&id, &epicID, &itemEpoch)
+			`SELECT id, epic_id, item_epoch FROM attention_items WHERE project_id = ? AND dedup_key = ? AND state IN ('open','awaiting_ack') LIMIT 1`,
+			projectID, dedupKey).Scan(&id, &epicID, &itemEpoch)
 		if errors.Is(e, sql.ErrNoRows) {
 			return nil
 		}
@@ -221,7 +283,7 @@ func (s *Store) AutoResolveCleared(ctx context.Context, dedupKey string, now tim
 			UPDATE attention_items
 			   SET state = 'resolved', resolution = 'cleared', leased_by = '', delivery_key = '',
 			       resolved_at = ?, updated_at = ?
-			 WHERE id = ?`, ts, ts, id); err != nil {
+			 WHERE id = ? AND project_id = ?`, ts, ts, id, projectID); err != nil {
 			return err
 		}
 		resolved = true
@@ -240,6 +302,13 @@ func (s *Store) AutoResolveCleared(ctx context.Context, dedupKey string, now tim
 // item_epoch (its fence), sets lease_expires_at=now+ttl, and ledgers attention_leased.
 // Returns the leased rows (with the bumped item_epoch), most-urgent first.
 func (s *Store) LeaseAttention(ctx context.Context, masterID string, epoch, max int, kinds []string, ttl time.Duration, now time.Time) ([]AttentionItem, error) {
+	return s.LeaseAttentionForProject(ctx, "default", masterID, epoch, max, kinds, ttl, now)
+}
+
+func (s *Store) LeaseAttentionForProject(ctx context.Context, projectID, masterID string, epoch, max int, kinds []string, ttl time.Duration, now time.Time) ([]AttentionItem, error) {
+	if projectID == "" {
+		return nil, ErrAttentionProject
+	}
 	var out []AttentionItem
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var liveEpoch int
@@ -256,7 +325,7 @@ func (s *Store) LeaseAttention(ctx context.Context, masterID string, epoch, max 
 			return fmt.Errorf("lease attention as %q (epoch %d, live %d, state %s): %w",
 				masterID, epoch, liveEpoch, state, lease.ErrStaleEpoch)
 		}
-		open, inflight, err := gatherAttentionForLease(ctx, tx)
+		open, inflight, err := gatherAttentionForLease(ctx, tx, projectID)
 		if err != nil {
 			return err
 		}
@@ -268,8 +337,8 @@ func (s *Store) LeaseAttention(ctx context.Context, masterID string, epoch, max 
 			res, err := tx.ExecContext(ctx, `
 				UPDATE attention_items
 				   SET state = 'leased', leased_by = ?, item_epoch = ?, lease_expires_at = ?, updated_at = ?
-				 WHERE id = ? AND state = 'open'`,
-				masterID, newItemEpoch, exp, ts, g.ID)
+				 WHERE id = ? AND project_id = ? AND state = 'open'`,
+				masterID, newItemEpoch, exp, ts, g.ID, projectID)
 			if err != nil {
 				return err
 			}
@@ -282,7 +351,7 @@ func (s *Store) LeaseAttention(ctx context.Context, masterID string, epoch, max 
 				ledger.KindAttentionLeased, masterID, newItemEpoch, g.ID, string(g.Kind), now); err != nil {
 				return err
 			}
-			it, err := scanAttentionItem(tx.QueryRowContext(ctx, attentionSelect+` WHERE id = ?`, g.ID))
+			it, err := scanAttentionItem(tx.QueryRowContext(ctx, attentionSelect+` WHERE id = ? AND project_id = ?`, g.ID, projectID))
 			if err != nil {
 				return err
 			}
@@ -301,11 +370,18 @@ func (s *Store) LeaseAttention(ctx context.Context, masterID string, epoch, max 
 // the stranded-delivery reaper re-captures the pane and matches against it rather than
 // blindly re-sending.
 func (s *Store) BeginDelivery(ctx context.Context, id, masterID string, epoch, itemEpoch int, deliveryKey string, now time.Time) error {
+	return s.BeginDeliveryForProject(ctx, "default", id, masterID, epoch, itemEpoch, deliveryKey, now)
+}
+
+func (s *Store) BeginDeliveryForProject(ctx context.Context, projectID, id, masterID string, epoch, itemEpoch int, deliveryKey string, now time.Time) error {
+	if projectID == "" {
+		return ErrAttentionProject
+	}
 	if deliveryKey == "" {
 		return errors.New("delivery_key is required")
 	}
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		f, err := loadFenceTx(ctx, tx, id, masterID, epoch, itemEpoch, attention.StateLeased)
+		f, err := loadFenceForProjectTx(ctx, tx, projectID, id, masterID, epoch, itemEpoch, attention.StateLeased)
 		if err != nil {
 			return err
 		}
@@ -314,8 +390,8 @@ func (s *Store) BeginDelivery(ctx context.Context, id, masterID string, epoch, i
 		}
 		_, err = tx.ExecContext(ctx, `
 			UPDATE attention_items SET state = 'delivering', delivery_key = ?, updated_at = ?
-			 WHERE id = ? AND state = 'leased'`,
-			deliveryKey, now.Format(rfc3339), id)
+			 WHERE id = ? AND project_id = ? AND state = 'leased'`,
+			deliveryKey, now.Format(rfc3339), id, projectID)
 		return err
 	})
 }
@@ -329,13 +405,20 @@ func (s *Store) BeginDelivery(ctx context.Context, id, masterID string, epoch, i
 //
 // Every verdict ledgers epic_intervention.
 func (s *Store) RecordDeliveryVerdict(ctx context.Context, id, masterID string, epoch, itemEpoch int, verdict string, now time.Time) error {
+	return s.RecordDeliveryVerdictForProject(ctx, "default", id, masterID, epoch, itemEpoch, verdict, now)
+}
+
+func (s *Store) RecordDeliveryVerdictForProject(ctx context.Context, projectID, id, masterID string, epoch, itemEpoch int, verdict string, now time.Time) error {
+	if projectID == "" {
+		return ErrAttentionProject
+	}
 	switch verdict {
 	case "strong", "weak", "failed":
 	default:
 		return fmt.Errorf("invalid delivery verdict %q (want strong|weak|failed)", verdict)
 	}
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		f, err := loadFenceTx(ctx, tx, id, masterID, epoch, itemEpoch, attention.StateDelivering)
+		f, err := loadFenceForProjectTx(ctx, tx, projectID, id, masterID, epoch, itemEpoch, attention.StateDelivering)
 		if err != nil {
 			return err
 		}
@@ -343,7 +426,7 @@ func (s *Store) RecordDeliveryVerdict(ctx context.Context, id, masterID string, 
 			return fmt.Errorf("record delivery verdict %q: %w", id, lease.ErrStaleEpoch)
 		}
 		var epicID string
-		if e := tx.QueryRowContext(ctx, `SELECT epic_id FROM attention_items WHERE id = ?`, id).Scan(&epicID); e != nil {
+		if e := tx.QueryRowContext(ctx, `SELECT epic_id FROM attention_items WHERE id = ? AND project_id = ?`, id, projectID).Scan(&epicID); e != nil {
 			return e
 		}
 		ts := now.Format(rfc3339)
@@ -352,13 +435,13 @@ func (s *Store) RecordDeliveryVerdict(ctx context.Context, id, masterID string, 
 				UPDATE attention_items
 				   SET state = 'open', detail = 'delivery_failed', verdict = 'failed',
 				       leased_by = '', delivery_key = '', lease_expires_at = '', updated_at = ?
-				 WHERE id = ? AND state = 'delivering'`, ts, id)
+				 WHERE id = ? AND project_id = ? AND state = 'delivering'`, ts, id, projectID)
 		} else {
 			// entry into awaiting_ack: stamp the send-and-ack clock (awaiting_since), the
 			// ONLY place it is written alongside RecoverStrandedAwaitingAck.
 			_, err = tx.ExecContext(ctx, `
 				UPDATE attention_items SET state = 'awaiting_ack', verdict = ?, awaiting_since = ?, updated_at = ?
-				 WHERE id = ? AND state = 'delivering'`, verdict, ts, ts, id)
+				 WHERE id = ? AND project_id = ? AND state = 'delivering'`, verdict, ts, ts, id, projectID)
 		}
 		if err != nil {
 			return err
@@ -372,7 +455,11 @@ func (s *Store) RecordDeliveryVerdict(ctx context.Context, id, masterID string, 
 // confirmed the steer was PROCESSED, plan §12.3). ErrAttentionNotFound if the id is
 // unknown; ErrAttentionState if it is not awaiting_ack.
 func (s *Store) AckAttention(ctx context.Context, id string, now time.Time) error {
-	return s.resolveFromStateTx(ctx, id, "acked", attention.StateAwaitingAck,
+	return s.AckAttentionForProject(ctx, "default", id, now)
+}
+
+func (s *Store) AckAttentionForProject(ctx context.Context, projectID, id string, now time.Time) error {
+	return s.resolveFromStateTx(ctx, projectID, id, "acked", attention.StateAwaitingAck,
 		ledger.KindAttentionResolved, now)
 }
 
@@ -382,9 +469,16 @@ func (s *Store) AckAttention(ctx context.Context, id string, now time.Time) erro
 // its lease cleared, item_epoch preserved (a late fenced call from the old lease still
 // fails). Ledgers attention_opened (the reopen). ErrAttentionState if not awaiting_ack.
 func (s *Store) ReopenUnacked(ctx context.Context, id string, now time.Time) error {
+	return s.ReopenUnackedForProject(ctx, "default", id, now)
+}
+
+func (s *Store) ReopenUnackedForProject(ctx context.Context, projectID, id string, now time.Time) error {
+	if projectID == "" {
+		return ErrAttentionProject
+	}
 	ts := now.Format(rfc3339)
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		epicID, itemEpoch, _, err := loadItemMetaTx(ctx, tx, id)
+		epicID, itemEpoch, _, err := loadItemMetaForProjectTx(ctx, tx, projectID, id)
 		if err != nil {
 			return err
 		}
@@ -392,7 +486,7 @@ func (s *Store) ReopenUnacked(ctx context.Context, id string, now time.Time) err
 			UPDATE attention_items
 			   SET state = 'open', detail = 'steer_not_processed', leased_by = '',
 			       delivery_key = '', lease_expires_at = '', awaiting_since = '', updated_at = ?
-			 WHERE id = ? AND state = 'awaiting_ack'`, ts, id)
+			 WHERE id = ? AND project_id = ? AND state = 'awaiting_ack'`, ts, id, projectID)
 		if err != nil {
 			return err
 		}
@@ -410,12 +504,19 @@ func (s *Store) ReopenUnacked(ctx context.Context, id string, now time.Time) err
 // (routed to the operator), any other ledgers attention_resolved. ErrAttentionState if
 // the item is already resolved.
 func (s *Store) ResolveAttention(ctx context.Context, id, resolution string, now time.Time) error {
+	return s.ResolveAttentionForProject(ctx, "default", id, resolution, now)
+}
+
+func (s *Store) ResolveAttentionForProject(ctx context.Context, projectID, id, resolution string, now time.Time) error {
+	if projectID == "" {
+		return ErrAttentionProject
+	}
 	if resolution == "" {
 		return errors.New("resolution is required")
 	}
 	ts := now.Format(rfc3339)
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		epicID, itemEpoch, state, err := loadItemMetaTx(ctx, tx, id)
+		epicID, itemEpoch, state, err := loadItemMetaForProjectTx(ctx, tx, projectID, id)
 		if err != nil {
 			return err
 		}
@@ -426,7 +527,7 @@ func (s *Store) ResolveAttention(ctx context.Context, id, resolution string, now
 			UPDATE attention_items
 			   SET state = 'resolved', resolution = ?, leased_by = '', delivery_key = '',
 			       resolved_at = ?, updated_at = ?
-			 WHERE id = ?`, resolution, ts, ts, id); err != nil {
+			 WHERE id = ? AND project_id = ?`, resolution, ts, ts, id, projectID); err != nil {
 			return err
 		}
 		kind := ledger.KindAttentionResolved
@@ -447,12 +548,19 @@ func (s *Store) ResolveAttention(ctx context.Context, id, resolution string, now
 // the read and the write. An "escalated" resolution ledgers attention_escalated (routed to
 // the operator sink in Phase 7); anything else ledgers attention_resolved.
 func (s *Store) ResolveAttentionFenced(ctx context.Context, id, masterID string, epoch, itemEpoch int, resolution string, now time.Time) error {
+	return s.ResolveAttentionFencedForProject(ctx, "default", id, masterID, epoch, itemEpoch, resolution, now)
+}
+
+func (s *Store) ResolveAttentionFencedForProject(ctx context.Context, projectID, id, masterID string, epoch, itemEpoch int, resolution string, now time.Time) error {
+	if projectID == "" {
+		return ErrAttentionProject
+	}
 	if resolution == "" {
 		return errors.New("resolution is required")
 	}
 	ts := now.Format(rfc3339)
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		f, err := loadFenceTx(ctx, tx, id, masterID, epoch, itemEpoch, attention.StateLeased)
+		f, err := loadFenceForProjectTx(ctx, tx, projectID, id, masterID, epoch, itemEpoch, attention.StateLeased)
 		if err != nil {
 			return err
 		}
@@ -460,7 +568,7 @@ func (s *Store) ResolveAttentionFenced(ctx context.Context, id, masterID string,
 			return fmt.Errorf("resolve attention %q: %w", id, lease.ErrStaleEpoch)
 		}
 		var epicID string
-		if e := tx.QueryRowContext(ctx, `SELECT epic_id FROM attention_items WHERE id = ?`, id).Scan(&epicID); e != nil {
+		if e := tx.QueryRowContext(ctx, `SELECT epic_id FROM attention_items WHERE id = ? AND project_id = ?`, id, projectID).Scan(&epicID); e != nil {
 			return e
 		}
 		// belt-and-suspenders: the WHERE re-asserts the fence atomically with the write.
@@ -468,8 +576,8 @@ func (s *Store) ResolveAttentionFenced(ctx context.Context, id, masterID string,
 			UPDATE attention_items
 			   SET state = 'resolved', resolution = ?, leased_by = '', delivery_key = '',
 			       resolved_at = ?, updated_at = ?
-			 WHERE id = ? AND state = 'leased' AND leased_by = ? AND item_epoch = ?`,
-			resolution, ts, ts, id, masterID, itemEpoch)
+			 WHERE id = ? AND project_id = ? AND state = 'leased' AND leased_by = ? AND item_epoch = ?`,
+			resolution, ts, ts, id, projectID, masterID, itemEpoch)
 		if err != nil {
 			return err
 		}
@@ -502,7 +610,7 @@ func (s *Store) ReapExpiredLeases(ctx context.Context, now time.Time) ([]Attenti
 			res, err := tx.ExecContext(ctx, `
 				UPDATE attention_items
 				   SET state = 'open', leased_by = '', delivery_key = '', lease_expires_at = '', updated_at = ?
-				 WHERE id = ? AND state = 'leased'`, ts, ex.id)
+				 WHERE id = ? AND project_id = ? AND state = 'leased'`, ts, ex.id, ex.projectID)
 			if err != nil {
 				return err
 			}
@@ -513,7 +621,7 @@ func (s *Store) ReapExpiredLeases(ctx context.Context, now time.Time) ([]Attenti
 				ledger.KindAttentionOpened, "system", ex.itemEpoch, ex.id, "lease_expired", now); err != nil {
 				return err
 			}
-			it, err := scanAttentionItem(tx.QueryRowContext(ctx, attentionSelect+` WHERE id = ?`, ex.id))
+			it, err := scanAttentionItem(tx.QueryRowContext(ctx, attentionSelect+` WHERE id = ? AND project_id = ?`, ex.id, ex.projectID))
 			if err != nil {
 				return err
 			}
@@ -537,7 +645,7 @@ func (s *Store) ListStrandedDeliveries(ctx context.Context, now time.Time) ([]At
 	}
 	var out []AttentionItem
 	for _, ex := range expired {
-		it, err := s.GetAttentionItem(ctx, ex.id)
+		it, err := s.GetAttentionItemForProject(ctx, ex.projectID, ex.id)
 		if err != nil {
 			return nil, err
 		}
@@ -556,12 +664,19 @@ func (s *Store) ListStrandedDeliveries(ctx context.Context, now time.Time) ([]At
 // awaiting_since (the ack loop's clock) so a recovered delivery still ack-expires normally.
 // ErrAttentionState if the row is not delivering-with-this-key (and not already recovered).
 func (s *Store) RecoverStrandedAwaitingAck(ctx context.Context, id, deliveryKey string, now time.Time) error {
+	return s.RecoverStrandedAwaitingAckForProject(ctx, "default", id, deliveryKey, now)
+}
+
+func (s *Store) RecoverStrandedAwaitingAckForProject(ctx context.Context, projectID, id, deliveryKey string, now time.Time) error {
+	if projectID == "" {
+		return ErrAttentionProject
+	}
 	if deliveryKey == "" {
 		return errors.New("delivery_key is required")
 	}
 	ts := now.Format(rfc3339)
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		epicID, itemEpoch, state, err := loadItemMetaTx(ctx, tx, id)
+		epicID, itemEpoch, state, err := loadItemMetaForProjectTx(ctx, tx, projectID, id)
 		if err != nil {
 			return err
 		}
@@ -571,7 +686,7 @@ func (s *Store) RecoverStrandedAwaitingAck(ctx context.Context, id, deliveryKey 
 		res, err := tx.ExecContext(ctx, `
 			UPDATE attention_items
 			   SET state = 'awaiting_ack', detail = 'recovered_stranded', awaiting_since = ?, updated_at = ?
-			 WHERE id = ? AND state = 'delivering' AND delivery_key = ?`, ts, ts, id, deliveryKey)
+			 WHERE id = ? AND project_id = ? AND state = 'delivering' AND delivery_key = ?`, ts, ts, id, projectID, deliveryKey)
 		if err != nil {
 			return err
 		}
@@ -592,9 +707,16 @@ func (s *Store) RecoverStrandedAwaitingAck(ctx context.Context, id, deliveryKey 
 // no longer match, and a subsequent re-lease bumps item_epoch out from under it). Ledgers
 // attention_opened. ErrAttentionState if the row is not delivering.
 func (s *Store) ReopenStranded(ctx context.Context, id string, now time.Time) error {
+	return s.ReopenStrandedForProject(ctx, "default", id, now)
+}
+
+func (s *Store) ReopenStrandedForProject(ctx context.Context, projectID, id string, now time.Time) error {
+	if projectID == "" {
+		return ErrAttentionProject
+	}
 	ts := now.Format(rfc3339)
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		epicID, itemEpoch, _, err := loadItemMetaTx(ctx, tx, id)
+		epicID, itemEpoch, _, err := loadItemMetaForProjectTx(ctx, tx, projectID, id)
 		if err != nil {
 			return err
 		}
@@ -602,7 +724,7 @@ func (s *Store) ReopenStranded(ctx context.Context, id string, now time.Time) er
 			UPDATE attention_items
 			   SET state = 'open', detail = 'delivery_stranded', leased_by = '', delivery_key = '',
 			       lease_expires_at = '', updated_at = ?
-			 WHERE id = ? AND state = 'delivering'`, ts, id)
+			 WHERE id = ? AND project_id = ? AND state = 'delivering'`, ts, id, projectID)
 		if err != nil {
 			return err
 		}
@@ -618,8 +740,29 @@ func (s *Store) ReopenStranded(ctx context.Context, id string, now time.Time) er
 // filters to a single state ("" = all active states); kinds (if non-empty) and repo (if
 // non-empty) narrow further. Most-urgent first (priority asc, then oldest first_seen_at).
 func (s *Store) ListOpenAttention(ctx context.Context, state string, kinds []string, repo string) ([]AttentionItem, error) {
+	return s.ListOpenAttentionForProject(ctx, "default", state, kinds, repo)
+}
+
+// ListAllOpenAttention is reserved for internal portfolio reconcilers that must
+// intentionally enumerate projects and then use project-scoped transition APIs.
+func (s *Store) ListAllOpenAttention(ctx context.Context, state string, kinds []string, repo string) ([]AttentionItem, error) {
+	return s.listOpenAttention(ctx, "", state, kinds, repo)
+}
+
+func (s *Store) ListOpenAttentionForProject(ctx context.Context, projectID, state string, kinds []string, repo string) ([]AttentionItem, error) {
+	if projectID == "" {
+		return nil, ErrAttentionProject
+	}
+	return s.listOpenAttention(ctx, projectID, state, kinds, repo)
+}
+
+func (s *Store) listOpenAttention(ctx context.Context, projectID, state string, kinds []string, repo string) ([]AttentionItem, error) {
 	var where []string
 	var args []any
+	if projectID != "" {
+		where = append(where, `project_id = ?`)
+		args = append(args, projectID)
+	}
 	if state == "" {
 		where = append(where, `state IN `+attentionActiveStatesSQL)
 	} else {
@@ -665,10 +808,13 @@ const attentionActiveStatesSQL = `('open','leased','delivering','awaiting_ack')`
 // resolveFromStateTx resolves an item that must currently be in `fromState`, stamping
 // resolution + resolved_at and ledgering `kind`. ErrAttentionState if the state guard
 // fails (the row exists but is not in fromState).
-func (s *Store) resolveFromStateTx(ctx context.Context, id, resolution, fromState string, kind ledger.EventKind, now time.Time) error {
+func (s *Store) resolveFromStateTx(ctx context.Context, projectID, id, resolution, fromState string, kind ledger.EventKind, now time.Time) error {
+	if projectID == "" {
+		return ErrAttentionProject
+	}
 	ts := now.Format(rfc3339)
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		epicID, itemEpoch, _, err := loadItemMetaTx(ctx, tx, id)
+		epicID, itemEpoch, _, err := loadItemMetaForProjectTx(ctx, tx, projectID, id)
 		if err != nil {
 			return err
 		}
@@ -676,7 +822,7 @@ func (s *Store) resolveFromStateTx(ctx context.Context, id, resolution, fromStat
 			UPDATE attention_items
 			   SET state = 'resolved', resolution = ?, leased_by = '', delivery_key = '',
 			       resolved_at = ?, updated_at = ?
-			 WHERE id = ? AND state = ?`, resolution, ts, ts, id, fromState)
+			 WHERE id = ? AND project_id = ? AND state = ?`, resolution, ts, ts, id, projectID, fromState)
 		if err != nil {
 			return err
 		}
@@ -698,15 +844,34 @@ func loadItemMetaTx(ctx context.Context, tx *sql.Tx, id string) (epicID string, 
 	return epicID, itemEpoch, state, e
 }
 
+func loadItemMetaForProjectTx(ctx context.Context, tx *sql.Tx, projectID, id string) (epicID string, itemEpoch int, state string, err error) {
+	e := tx.QueryRowContext(ctx, `SELECT epic_id, item_epoch, state FROM attention_items WHERE project_id = ? AND id = ?`, projectID, id).
+		Scan(&epicID, &itemEpoch, &state)
+	if errors.Is(e, sql.ErrNoRows) {
+		return "", 0, "", ErrAttentionNotFound
+	}
+	return epicID, itemEpoch, state, e
+}
+
 // loadFenceTx builds the attention.Fence for a fenced call: the item's live state,
 // leased_by, and item_epoch, plus the live supervisor epoch of whoever holds the lease.
 // A missing item is ErrAttentionNotFound; a missing/empty leaseholder yields a live
 // supervisor epoch of -1 (which no claim can match), so the fence fails closed.
 func loadFenceTx(ctx context.Context, tx *sql.Tx, id, masterID string, epoch, itemEpoch int, expect string) (attention.Fence, error) {
+	return loadFenceForProjectTx(ctx, tx, "", id, masterID, epoch, itemEpoch, expect)
+}
+
+func loadFenceForProjectTx(ctx context.Context, tx *sql.Tx, projectID, id, masterID string, epoch, itemEpoch int, expect string) (attention.Fence, error) {
 	var state, leasedBy string
 	var liveItemEpoch int
-	e := tx.QueryRowContext(ctx, `SELECT state, leased_by, item_epoch FROM attention_items WHERE id = ?`, id).
-		Scan(&state, &leasedBy, &liveItemEpoch)
+	var e error
+	if projectID == "" {
+		e = tx.QueryRowContext(ctx, `SELECT state, leased_by, item_epoch FROM attention_items WHERE id = ?`, id).
+			Scan(&state, &leasedBy, &liveItemEpoch)
+	} else {
+		e = tx.QueryRowContext(ctx, `SELECT state, leased_by, item_epoch FROM attention_items WHERE project_id = ? AND id = ?`, projectID, id).
+			Scan(&state, &leasedBy, &liveItemEpoch)
+	}
 	if errors.Is(e, sql.ErrNoRows) {
 		return attention.Fence{}, ErrAttentionNotFound
 	}
@@ -732,10 +897,10 @@ func loadFenceTx(ctx context.Context, tx *sql.Tx, id, masterID string, epoch, it
 // state=open item folded into an attention.Item, plus the set of epic ids that already
 // hold an in-flight (leased/delivering/awaiting_ack) item (the one-in-flight-per-epic
 // backstop the pure core enforces).
-func gatherAttentionForLease(ctx context.Context, tx *sql.Tx) ([]attention.Item, map[string]bool, error) {
+func gatherAttentionForLease(ctx context.Context, tx *sql.Tx, projectID string) ([]attention.Item, map[string]bool, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, kind, epic_id, priority, state, blocking, first_seen_at, item_epoch, leased_by
-		  FROM attention_items WHERE state IN `+attentionActiveStatesSQL)
+		  FROM attention_items WHERE project_id = ? AND state IN `+attentionActiveStatesSQL, projectID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -763,6 +928,7 @@ func gatherAttentionForLease(ctx context.Context, tx *sql.Tx) ([]attention.Item,
 
 type expiredRef struct {
 	id        string
+	projectID string
 	epicID    string
 	itemEpoch int
 }
@@ -771,7 +937,7 @@ type expiredRef struct {
 // `now`. Parsed in Go (not an SQL string compare) — see ReapExpiredLeases.
 func expiredIDsTx(ctx context.Context, tx *sql.Tx, state string, now time.Time) ([]expiredRef, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id, epic_id, item_epoch, lease_expires_at FROM attention_items WHERE state = ? AND lease_expires_at <> ''`,
+		`SELECT id, project_id, epic_id, item_epoch, lease_expires_at FROM attention_items WHERE state = ? AND lease_expires_at <> ''`,
 		state)
 	if err != nil {
 		return nil, err
@@ -782,7 +948,7 @@ func expiredIDsTx(ctx context.Context, tx *sql.Tx, state string, now time.Time) 
 
 func expiredIDsTxDB(ctx context.Context, db *sql.DB, state string, now time.Time) ([]expiredRef, error) {
 	rows, err := db.QueryContext(ctx,
-		`SELECT id, epic_id, item_epoch, lease_expires_at FROM attention_items WHERE state = ? AND lease_expires_at <> ''`,
+		`SELECT id, project_id, epic_id, item_epoch, lease_expires_at FROM attention_items WHERE state = ? AND lease_expires_at <> ''`,
 		state)
 	if err != nil {
 		return nil, err
@@ -794,9 +960,9 @@ func expiredIDsTxDB(ctx context.Context, db *sql.DB, state string, now time.Time
 func collectExpired(rows *sql.Rows, now time.Time) ([]expiredRef, error) {
 	var out []expiredRef
 	for rows.Next() {
-		var id, epicID, exp string
+		var id, projectID, epicID, exp string
 		var itemEpoch int
-		if err := rows.Scan(&id, &epicID, &itemEpoch, &exp); err != nil {
+		if err := rows.Scan(&id, &projectID, &epicID, &itemEpoch, &exp); err != nil {
 			return nil, err
 		}
 		t, perr := time.Parse(rfc3339, exp)
@@ -804,7 +970,7 @@ func collectExpired(rows *sql.Rows, now time.Time) ([]expiredRef, error) {
 			continue // unparseable expiry: leave it (degrade to inert, never a false reap)
 		}
 		if !now.Before(t) { // now >= expiry
-			out = append(out, expiredRef{id: id, epicID: epicID, itemEpoch: itemEpoch})
+			out = append(out, expiredRef{id: id, projectID: projectID, epicID: epicID, itemEpoch: itemEpoch})
 		}
 	}
 	return out, rows.Err()

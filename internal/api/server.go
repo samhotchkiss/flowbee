@@ -46,6 +46,10 @@ type Server struct {
 	registry *worker.Registry
 	broker   *Broker
 	version  string
+	// controlPlaneIncarnationID is the exact durable process authority this HTTP
+	// server belongs to. Health fails closed if the DB projection moves to a
+	// replacement incarnation; metrics identify the current replacement.
+	controlPlaneIncarnationID string
 
 	// GitHub reconcile health (the operator's "is the control plane still talking to
 	// GitHub?" signal). A sustained BoardSweep failure — almost always an EXPIRED
@@ -66,6 +70,9 @@ type Server struct {
 	// Wired from the multi-repo Manager via SetAdopter; nil until then (single-repo /
 	// test servers have no Manager, so adopt 503s there).
 	adopter PRAdopter
+	// bootstrapIntake is installed only when serve owns the exact, capability-
+	// gated bootstrap mutation port. Nil is an explicit 503, never direct CLI DB.
+	bootstrapIntake BootstrapActionIntake
 
 	facts  store.FactSource
 	policy job.Policy
@@ -165,6 +172,12 @@ type Server struct {
 	// without restarting the API server.
 	driverControlCurrent func() DriverControlReadiness
 	phase1ProjectCurrent func() Phase1ProjectReadiness
+	// bootstrapProjectID enables the process-only bootstrap readiness endpoint.
+	// bootstrapDispatchAllowed is an independent lease gate: it never aliases the
+	// operator pause marker/bit and therefore can neither clear nor override a
+	// human pause. Nil preserves the pre-Phase-1 posture.
+	bootstrapProjectID       string
+	bootstrapDispatchAllowed func() bool
 
 	// projectFairMu serializes the read-pick-claim scheduling turn. The lease
 	// claim commits the selected turn in its own SQLite transaction, so this
@@ -346,9 +359,15 @@ type Config struct {
 	RunningConfig   RunningConfig
 	// DriverControl carries the exact runtime messaging capability into health,
 	// config, and dashboard read models. It never enables a transport path.
-	DriverControl        DriverControlReadiness
-	DriverControlCurrent func() DriverControlReadiness
-	Phase1ProjectCurrent func() Phase1ProjectReadiness
+	DriverControl            DriverControlReadiness
+	DriverControlCurrent     func() DriverControlReadiness
+	Phase1ProjectCurrent     func() Phase1ProjectReadiness
+	BootstrapProjectID       string
+	BootstrapDispatchAllowed func() bool
+	// ControlPlaneIncarnationID binds health/readiness to the durable authority
+	// installed only after the process acquired the OS writer lock and migrated.
+	// Empty preserves the pre-v2 dev/test posture.
+	ControlPlaneIncarnationID string
 }
 
 func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, version string) *Server {
@@ -409,6 +428,7 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		registry:                   worker.NewRegistry(st, cfg.LeaseTTLS, cfg.HeartbeatIntervalS, allow),
 		broker:                     NewBroker(),
 		version:                    version,
+		controlPlaneIncarnationID:  cfg.ControlPlaneIncarnationID,
 		facts:                      facts,
 		policy:                     cfg.Policy,
 		leaseTTL:                   cfg.LeaseTTL,
@@ -433,6 +453,8 @@ func New(st *store.Store, clk clock.Clock, minter *ulid.Minter, cfg Config, vers
 		driverControl:              driverControl,
 		driverControlCurrent:       cfg.DriverControlCurrent,
 		phase1ProjectCurrent:       cfg.Phase1ProjectCurrent,
+		bootstrapProjectID:         cfg.BootstrapProjectID,
+		bootstrapDispatchAllowed:   cfg.BootstrapDispatchAllowed,
 	}
 	// seed GitHub health to "just succeeded" so the age metric starts ~0, not at the
 	// unix epoch, before the first sweep runs.
@@ -492,16 +514,42 @@ func (s *Server) SetPaneDeliverer(d PaneDeliverer) { s.deliverer = d }
 func (s *Server) HealthHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("GET /bootstrapz", s.bootstrapz)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	return mux
+}
+
+// bootstrapz proves only that the pinned process owns its DB incarnation and
+// has installed the authenticated, server-owned bootstrap action intake. It is
+// deliberately distinct from /healthz: project actors/capacity/watchdog may not
+// exist yet, so final health remains degraded and dispatch remains fenced.
+func (s *Server) bootstrapz(w http.ResponseWriter, r *http.Request) {
+	ready := s.bootstrapProjectID != "" && s.bootstrapIntake != nil && s.store.Ping(r.Context()) == nil
+	reason := "ready"
+	if !ready {
+		reason = "bootstrap_intake_or_database_unavailable"
+	}
+	if ready && s.controlPlaneIncarnationID != "" {
+		incarnation, err := s.store.CurrentControlPlaneIncarnation(r.Context())
+		ready = err == nil && incarnation.ID == s.controlPlaneIncarnationID && incarnation.State == "active"
+		if !ready {
+			reason = "control_plane_incarnation_not_authoritative"
+		}
+	}
+	code, status := http.StatusOK, "bootstrap_ready"
+	if !ready {
+		code, status = http.StatusServiceUnavailable, "unavailable"
+	}
+	writeJSON(w, code, map[string]any{"format_version": "flowbee.bootstrap-readiness/v1",
+		"status": status, "project_id": s.bootstrapProjectID, "dispatch_allowed": s.bootstrapDispatchAllowed == nil || s.bootstrapDispatchAllowed(), "reason": reason})
 }
 
 // PrivateHandler serves the worker API + SSE + dashboard (loopback / Tailscale
 // only). When an Authenticator is configured (§7.6), the mutating worker-protocol
 // routes are wrapped in mutual-auth middleware: an unenrolled caller is rejected
-// 401 and never reaches a handler — it cannot lease job context. The read-only
-// dashboard/SSE views are served without auth (they expose no Domain-A write and
-// bind to loopback/Tailscale).
+// 401 and never reaches a handler — it cannot lease job context. Phase-2 human
+// APIs and lifecycle SSE use the separate human-session trust boundary; legacy
+// read-only dashboard views retain their loopback/Tailscale posture.
 func (s *Server) PrivateHandler() http.Handler {
 	roleWorker := func(h http.HandlerFunc) http.Handler { return s.requireWorkerRole(h) }
 	// the authenticated worker-protocol surface (every mutating call + lease).
@@ -524,9 +572,10 @@ func (s *Server) PrivateHandler() http.Handler {
 	worker.Handle("GET /v1/jobs/{job}/bundle", roleWorker(s.bundle))
 	worker.HandleFunc("GET /v1/config", s.configJSON)
 	worker.HandleFunc("GET /configz", s.configJSON)
-	authed := auth.Middleware(s.authn, worker)
+	authed := auth.Middleware(s.authn, s.rejectProjectActorCredential(worker))
 
 	mux := http.NewServeMux()
+	human := func(h http.HandlerFunc) http.Handler { return auth.HumanMiddleware(s.human, h) }
 	// worker-protocol routes go through the authenticated surface.
 	for _, p := range []string{
 		"POST /v1/workers/register", "POST /v1/workers/usage", "GET /v1/lease",
@@ -540,13 +589,14 @@ func (s *Server) PrivateHandler() http.Handler {
 	} {
 		mux.Handle(p, authed)
 	}
-	// read-only dashboard + live feed (board / roster / budget / audit / cost, SSE).
-	mux.HandleFunc("GET /v1/events", s.eventsHandler)
+	// Lifecycle SSE shares the human dashboard trust boundary. Its handler then
+	// applies exact-project or explicit portfolio authorization before streaming.
+	mux.Handle("GET /v1/events", human(s.eventsHandler))
 	mux.HandleFunc("GET /v1/budget", s.budgetJSON)
 	mux.HandleFunc("GET /v1/roster", s.rosterJSON)
 	mux.HandleFunc("GET /v1/fleet-health", s.fleetHealthJSON)
 	mux.HandleFunc("GET /v1/audit", s.auditJSON)
-	mux.HandleFunc("GET /v1/cost", s.costJSON)
+	mux.Handle("GET /v1/cost", human(s.costJSON))
 	mux.HandleFunc("GET /v1/needs-human", s.needsHumanJSON)
 	mux.HandleFunc("GET /v1/merge-handoff", s.mergeHandoffJSON)
 	mux.HandleFunc("GET /v1/needs-input", s.needsInputJSON)
@@ -557,12 +607,13 @@ func (s *Server) PrivateHandler() http.Handler {
 	// the browser fragment and exchanged once for an HttpOnly signed session.
 	mux.HandleFunc("GET /login", s.humanLoginPage)
 	mux.HandleFunc("POST /v1/human/session", s.humanSessionCreate)
-	human := func(h http.HandlerFunc) http.Handler { return auth.HumanMiddleware(s.human, h) }
 	s.MountProjectCircuitBreakerRoutes(mux)
 	mux.Handle("GET /v1/decisions/audit", s.HumanDecisionAuditHandler())
 	mux.Handle("GET /v1/projects", human(s.projectsList))
 	mux.Handle("GET /v1/portfolio", human(s.portfolio))
+	mux.Handle("GET /v1/bootstrap/actions/{action_id}", human(s.bootstrapActionStatus))
 	mux.Handle("GET /v1/projects/{project_id}", human(s.projectOne))
+	mux.Handle("GET /v1/projects/{project_id}/activation", human(s.projectActivation))
 	mux.Handle("GET /v1/projects/{project_id}/epics", human(s.projectEpics))
 	mux.Handle("GET /v1/decisions", human(s.decisionsList))
 	mux.Handle("GET /v1/decisions/{id}", human(s.decisionOne))
@@ -592,6 +643,9 @@ func (s *Server) PrivateHandler() http.Handler {
 	op := func(h http.HandlerFunc) http.Handler {
 		return auth.Middleware(s.authn, s.requireWorkerRole(h))
 	}
+	orchestratorOp := func(h http.HandlerFunc) http.Handler {
+		return auth.Middleware(s.authn, s.requireOrchestratorActorOrWorker(h))
+	}
 	mux.Handle("POST /v1/jobs/{job}/design", op(s.resolveDesign))
 	mux.Handle("POST /v1/jobs/{job}/promote", op(s.promoteBacklog))
 	mux.Handle("POST /v1/jobs/{job}/adopt", op(s.adoptOptIn))
@@ -600,7 +654,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.Handle("POST /v1/specs", op(s.specCreate))
 	mux.Handle("POST /v1/epics", op(s.epicCreate))
 	mux.Handle("POST /v1/epics/{id}/effect-recovery", op(s.epicEffectRecovery))
-	mux.Handle("POST /v1/work-intents/{id}/epic-contract", op(s.workIntentEpicContract))
+	mux.Handle("POST /v1/work-intents/{id}/epic-contract", orchestratorOp(s.workIntentEpicContract))
 	mux.Handle("POST /v1/adopt", op(s.adoptPR))
 	mux.Handle("POST /v1/decisions", human(s.decisionCreate))
 	mux.Handle("POST /v1/human/login-links", human(s.humanLoginLinkCreate))
@@ -608,6 +662,7 @@ func (s *Server) PrivateHandler() http.Handler {
 	mux.Handle("POST /v1/projects/{project_id}/state", human(s.projectState))
 	mux.Handle("POST /v1/projects/{project_id}/repos", human(s.projectRepoAdd))
 	mux.Handle("POST /v1/projects/{project_id}/actors", human(s.projectActorRegister))
+	mux.Handle("POST /v1/bootstrap/actions", human(s.bootstrapActionCommit))
 	mux.Handle("POST /v1/decisions/{id}/view", human(s.decisionView))
 	mux.Handle("POST /v1/decisions/{id}/answer", human(s.decisionRespond(workintent.ResponseAnswer)))
 	mux.Handle("POST /v1/decisions/{id}/approve", human(s.decisionRespond(workintent.ResponseApprove)))
@@ -656,12 +711,100 @@ func (s *Server) requireWorkerRole(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if claims, ok := auth.CredentialClaimsFrom(r); ok &&
+			(claims.WorkerRole == store.DriverInteractorRole || claims.WorkerRole == store.DriverOrchestratorRole) {
+			http.Error(w, "forbidden: project actor credential is not worker/operator authority", http.StatusForbidden)
+			return
+		}
 		identity, ok := auth.IdentityFrom(r)
-		if !ok || !s.registry.HasRoleAuthority(identity) {
+		if ok {
+			registered, err := s.store.IsRegisteredProjectActorIdentity(r.Context(), identity)
+			if err != nil {
+				http.Error(w, "project actor authorization failed", http.StatusInternalServerError)
+				return
+			}
+			if registered {
+				http.Error(w, "forbidden: registered project actor identity cannot use worker/operator authority", http.StatusForbidden)
+				return
+			}
+		}
+		authorized := false
+		var err error
+		if ok {
+			authorized, err = s.registry.HasRoleAuthority(r.Context(), identity, s.clock.Now())
+		}
+		if err != nil {
+			http.Error(w, "worker authorization failed", http.StatusInternalServerError)
+			return
+		}
+		if !authorized {
 			http.Error(w, "forbidden: worker identity has no authorized role", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// rejectProjectActorCredential closes the raw worker protocol, registration,
+// usage, config, and control surface to both durable actor credentials and
+// legacy/loopback identities colliding with a registered project actor. Only
+// explicitly mounted actor routes may accept actor authority.
+func (s *Server) rejectProjectActorCredential(next http.Handler) http.Handler {
+	if s.authn == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if claims, ok := auth.CredentialClaimsFrom(r); ok &&
+			(claims.WorkerRole == store.DriverInteractorRole || claims.WorkerRole == store.DriverOrchestratorRole) {
+			http.Error(w, "forbidden: project actor credential cannot use worker protocol", http.StatusForbidden)
+			return
+		}
+		identity, ok := auth.IdentityFrom(r)
+		if ok {
+			registered, err := s.store.IsRegisteredProjectActorIdentity(r.Context(), identity)
+			if err != nil {
+				http.Error(w, "project actor authorization failed", http.StatusInternalServerError)
+				return
+			}
+			if registered {
+				http.Error(w, "forbidden: registered project actor identity cannot use worker protocol", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireOrchestratorActorOrWorker is deliberately used on the single
+// Orchestrator-owned work-intent contract surface. A project actor credential is
+// never promoted into the broad worker/operator write tier; Interactors are
+// denied here, while legacy enrolled workers retain the pre-v2 compatibility
+// path through the existing role authority check.
+func (s *Server) requireOrchestratorActorOrWorker(next http.Handler) http.Handler {
+	if s.authn == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if claims, ok := auth.CredentialClaimsFrom(r); ok {
+			if claims.WorkerRole != store.DriverOrchestratorRole {
+				http.Error(w, "forbidden: actor role cannot submit work-intent contracts", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		if identity, ok := auth.IdentityFrom(r); ok {
+			registered, err := s.store.IsRegisteredProjectActorIdentity(r.Context(), identity)
+			if err != nil {
+				http.Error(w, "project actor authorization failed", http.StatusInternalServerError)
+				return
+			}
+			if registered {
+				http.Error(w, "forbidden: managed project actor requires durable actor credential claims", http.StatusForbidden)
+				return
+			}
+		}
+		s.requireWorkerRole(next).ServeHTTP(w, r)
 	})
 }
 
@@ -736,7 +879,27 @@ func (s *Server) auditJSON(w http.ResponseWriter, r *http.Request) {
 // costJSON serves the per-job cost meter (§6.7, I-15): tokens + micro-USD + over
 // budget, for the dashboard cost pane.
 func (s *Server) costJSON(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.store.AllJobCost(r.Context())
+	values, supplied := r.URL.Query()["project_id"]
+	var (
+		rows []store.FlowCostRow
+		err  error
+	)
+	if !supplied {
+		if _, ok := s.requireHumanPortfolio(w, r, auth.HumanProjectRead); !ok {
+			return
+		}
+		rows, err = s.store.AllJobCost(r.Context())
+	} else {
+		if len(values) != 1 || strings.TrimSpace(values[0]) == "" || strings.TrimSpace(values[0]) == "*" {
+			http.Error(w, "an exact project_id is required", http.StatusBadRequest)
+			return
+		}
+		projectID := strings.TrimSpace(values[0])
+		if _, ok := s.requireHumanProject(w, r, projectID, auth.HumanProjectRead); !ok {
+			return
+		}
+		rows, err = s.store.AllJobCostForProject(r.Context(), projectID)
+	}
 	if err != nil {
 		http.Error(w, "cost error", http.StatusInternalServerError)
 		return
@@ -960,6 +1123,23 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// Process authority is the final readiness fence: a superseded HTTP server is
+	// unavailable even when every dependency it can still read appears healthy.
+	if dbOK && s.controlPlaneIncarnationID != "" {
+		incarnation, err := s.store.CurrentControlPlaneIncarnation(r.Context())
+		if err != nil {
+			status, code = "unavailable", http.StatusServiceUnavailable
+			resp["status"] = status
+			resp["control_plane_incarnation_error"] = err.Error()
+		} else {
+			resp["control_plane_incarnation"] = incarnation
+			if incarnation.ID != s.controlPlaneIncarnationID || incarnation.State != "active" {
+				status, code = "unavailable", http.StatusServiceUnavailable
+				resp["status"] = status
+				resp["control_plane_incarnation_expected"] = s.controlPlaneIncarnationID
+			}
+		}
+	}
 	if e := s.ghLastErr.Load(); e != nil {
 		resp["github_last_error"] = *e
 	}
@@ -978,6 +1158,26 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "# HELP flowbee_build_info Build version (always 1).\n")
 	fmt.Fprintf(&b, "# TYPE flowbee_build_info gauge\n")
 	fmt.Fprintf(&b, "flowbee_build_info{version=%q} 1\n", s.version)
+	if s.controlPlaneIncarnationID != "" {
+		fmt.Fprintf(&b, "# HELP flowbee_control_plane_incarnation_info Durable current control-plane process incarnation (always 1).\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_control_plane_incarnation_info gauge\n")
+		fmt.Fprintf(&b, "# HELP flowbee_control_plane_incarnation_current 1 when this HTTP server owns the durable current incarnation.\n")
+		fmt.Fprintf(&b, "# TYPE flowbee_control_plane_incarnation_current gauge\n")
+		current := 0
+		if incarnation, err := s.store.CurrentControlPlaneIncarnation(ctx); err == nil {
+			if incarnation.ID == s.controlPlaneIncarnationID && incarnation.State == "active" {
+				current = 1
+			}
+			fmt.Fprintf(&b, "flowbee_control_plane_incarnation_info{incarnation_id=%q,state=%q,version=%q,source_commit=%q,config_posture_sha256=%q} 1\n",
+				incarnation.ID, incarnation.State, incarnation.Version, incarnation.SourceCommit,
+				incarnation.ConfigPostureSHA256)
+			fmt.Fprintf(&b, "# HELP flowbee_control_plane_incarnation_start_time_seconds Unix start time of the durable current control-plane incarnation.\n")
+			fmt.Fprintf(&b, "# TYPE flowbee_control_plane_incarnation_start_time_seconds gauge\n")
+			fmt.Fprintf(&b, "flowbee_control_plane_incarnation_start_time_seconds %d\n", incarnation.StartedAt.Unix())
+		}
+		fmt.Fprintf(&b, "flowbee_control_plane_incarnation_current{expected_incarnation_id=%q} %d\n",
+			s.controlPlaneIncarnationID, current)
+	}
 
 	// GitHub reconcile health: seconds since the last successful BoardSweep. Grows
 	// without bound when the control plane can't reach GitHub (expired/revoked token,
@@ -1209,8 +1409,10 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "usage error", http.StatusInternalServerError)
 		return
 	}
-	for _, id := range atCeiling {
-		s.broker.Publish(LifeEvent{JobID: "", State: "capacity", Event: "account_at_ceiling:" + id})
+	for range atCeiling {
+		// SSE is only a wake-up; account identity is refetched through an
+		// authorized read model and never broadcast on an exact-project stream.
+		s.broker.Publish(LifeEvent{State: "capacity", Event: "account_at_ceiling", Global: true})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "at_ceiling": atCeiling})
 }
@@ -1469,6 +1671,13 @@ func (s *Server) isPaused() bool {
 // it (the claim also rejects, belt-and-suspenders), so the job stays `ready` and
 // its no_eligible_worker alarm can fire (I-6).
 func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
+	// Bootstrap dispatch is an independent fail-closed gate. It is evaluated
+	// before worker-seen, attestation, scheduler, or lease mutations; heartbeat
+	// and result handlers remain available for an already-running upgrade.
+	if s.bootstrapDispatchAllowed != nil && !s.bootstrapDispatchAllowed() {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	// The identity is the CREDENTIAL-BOUND one (§7.6: unforgeable), not the
 	// self-asserted query param, whenever the request was authenticated. This is
 	// the boundary that stops an enrolled box from leasing as someone else.
@@ -1485,6 +1694,11 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	// already unforgeable above; this grounds family in the same credential.
 	if bound, ok := auth.FamilyFrom(r); ok {
 		family = bound
+	} else if boundFamily, bound, err := s.registry.ModelFamilyFor(r.Context(), identity, s.clock.Now()); err != nil {
+		http.Error(w, "lease authorization failed", http.StatusInternalServerError)
+		return
+	} else if bound {
+		family = boundFamily
 	}
 	// model is the ACTUAL backend/model the worker runs (e.g. "codex", "sonnet") — a
 	// display label recorded on the bound event so the §F card shows which model did each

@@ -234,3 +234,40 @@ func TestDriverEndpointInventoryRejectsSymlinkedUDS(t *testing.T) {
 		t.Fatalf("symlinked UDS accepted: %v", err)
 	}
 }
+
+func TestDriverEndpointInventoryAcceptsOnlyManagerDerivedServiceEnsureAuthority(t *testing.T) {
+	path, inventory := writeDriverInventoryFixture(t)
+	inventory.Endpoints[1].ServiceEnsure = &DriverServiceEnsureConfig{
+		ServiceManagerPath: "/opt/tmux-driver/bin/tmux-driver-service", ServiceManagerSHA256: "sha256:" + strings.Repeat("c", 64),
+		ReleaseID: "0.1.0-pinned", ExecutablePath: "/opt/tmux-driver/bin/tmux-driver",
+		ExecutableSHA256: "sha256:" + strings.Repeat("a", 64), ConfigPath: "/etc/tmux-driver/flowbee.toml",
+		ConfigSHA256:      "sha256:" + strings.Repeat("b", 64),
+		RequiredContracts: map[string]string{"service_ensure": "tmux-driver.service-ensure/v1"},
+	}
+	rewriteDriverInventoryFixture(t, path, inventory)
+	if _, err := LoadDriverEndpointInventory(path); err != nil {
+		t.Fatalf("valid service Ensure config rejected: %v", err)
+	}
+
+	inventory.Endpoints[1].ServiceEnsure.ExecutableSHA256 = "sha256:short"
+	rewriteDriverInventoryFixture(t, path, inventory)
+	if _, err := LoadDriverEndpointInventory(path); err == nil {
+		t.Fatal("non-exact executable hash was accepted")
+	}
+}
+
+func TestDriverEndpointInventoryRejectsCallerSuppliedLaunchdAuthority(t *testing.T) {
+	path, _ := writeDriverInventoryFixture(t)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = []byte(strings.Replace(string(body), `"expected_tmux_server_ownership":"managed_dedicated"`,
+		`"expected_tmux_server_ownership":"managed_dedicated","service_ensure":{"launchd_label":"forged"}`, 1))
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadDriverEndpointInventory(path); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("caller-supplied launchd authority accepted: %v", err)
+	}
+}

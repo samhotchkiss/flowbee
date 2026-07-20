@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/samhotchkiss/flowbee/internal/auth"
 	"github.com/samhotchkiss/flowbee/internal/store"
 )
 
@@ -59,6 +60,18 @@ func (s *Server) workIntentEpicContract(w http.ResponseWriter, r *http.Request) 
 	if body.SubmissionKey == "" || key != body.SubmissionKey {
 		http.Error(w, "Idempotency-Key must equal the work-intent submission key", http.StatusConflict)
 		return
+	}
+	if claims, ok := auth.CredentialClaimsFrom(r); ok {
+		if claims.WorkerRole != store.DriverOrchestratorRole || body.ProjectID != claims.ProjectID {
+			http.Error(w, "forbidden: actor credential is scoped to another project or role", http.StatusForbidden)
+			return
+		}
+		binding, err := s.store.ActiveDriverSessionBinding(r.Context(), claims.ProjectID,
+			claims.Identity, store.DriverOrchestratorRole)
+		if err != nil || binding.BindingID == "" || body.OrchestratorBindingID != binding.BindingID {
+			http.Error(w, "forbidden: orchestrator binding is not current for this credential", http.StatusForbidden)
+			return
+		}
 	}
 	row, err := s.store.RecordWorkIntentEpicContract(r.Context(),
 		store.RecordWorkIntentEpicContractInput{

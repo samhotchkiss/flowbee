@@ -280,9 +280,9 @@ func (s *Store) RegisterWorkIntentOrchestrator(ctx context.Context, projectID, i
 			return ErrWorkIntentFenced
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE attention_items SET state='resolved',
-			resolution='orchestrator_registered',resolved_at=?,updated_at=? WHERE dedup_key=?
+			resolution='orchestrator_registered',resolved_at=?,updated_at=? WHERE project_id=? AND dedup_key=?
 			AND state IN ('open','leased','delivering','awaiting_ack')`, now.UTC().Format(rfc3339),
-			now.UTC().Format(rfc3339), "work_intent_promotion_stalled:"+id); err != nil {
+			now.UTC().Format(rfc3339), projectID, "work_intent_promotion_stalled:"+id); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE control_alerts SET state='acknowledged',
@@ -608,11 +608,11 @@ func holdWorkIntentDeliveryTx(ctx context.Context, tx *sql.Tx, item WorkIntent, 
 	}
 	dedup := "work_intent_promotion_stalled:" + item.ID
 	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO attention_items
-		(id,kind,epic_id,repo,priority,state,dedup_key,blocking,evidence_json,detail,
+		(id,project_id,kind,epic_id,repo,priority,state,dedup_key,blocking,evidence_json,detail,
 		 occurrences,first_seen_at,last_seen_at,created_at,updated_at)
-		VALUES (?,'work_intent_promotion_stalled','','',10,'open',?,1,
+		VALUES (?,?,'work_intent_promotion_stalled','','',10,'open',?,1,
 		 json_object('work_intent_id',?,'project_id',?),?,1,?,?,?,?)`,
-		"work-intent-stalled-"+stableID(dedup), dedup, item.ID, item.ProjectID, detail,
+		"work-intent-stalled-"+stableID(dedup), item.ProjectID, dedup, item.ID, item.ProjectID, detail,
 		now.UTC().Format(rfc3339), now.UTC().Format(rfc3339), now.UTC().Format(rfc3339), now.UTC().Format(rfc3339))
 	if err != nil {
 		return err
@@ -638,11 +638,11 @@ func holdWorkIntentRouteTx(ctx context.Context, tx *sql.Tx, item WorkIntent, now
 	}
 	dedup := "work_intent_promotion_stalled:" + item.ID
 	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO attention_items
-		(id,kind,epic_id,repo,priority,state,dedup_key,blocking,evidence_json,detail,
+		(id,project_id,kind,epic_id,repo,priority,state,dedup_key,blocking,evidence_json,detail,
 		 occurrences,first_seen_at,last_seen_at,created_at,updated_at)
-		VALUES (?,'work_intent_promotion_stalled','','',10,'open',?,1,
+		VALUES (?,?,'work_intent_promotion_stalled','','',10,'open',?,1,
 		 json_object('work_intent_id',?,'project_id',?),?,1,?,?,?,?)`,
-		"work-intent-stalled-"+stableID(dedup), dedup, item.ID, item.ProjectID, detail,
+		"work-intent-stalled-"+stableID(dedup), item.ProjectID, dedup, item.ID, item.ProjectID, detail,
 		now.UTC().Format(rfc3339), now.UTC().Format(rfc3339), now.UTC().Format(rfc3339), now.UTC().Format(rfc3339))
 	if err != nil {
 		return err

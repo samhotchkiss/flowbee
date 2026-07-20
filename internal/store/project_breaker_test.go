@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samhotchkiss/flowbee/internal/job"
 	"github.com/samhotchkiss/flowbee/internal/lease"
 	"github.com/samhotchkiss/flowbee/internal/store"
 	"github.com/samhotchkiss/flowbee/internal/testutil"
@@ -75,17 +76,122 @@ func TestProjectBreakerFaultIsolationNeverStopsAnotherProject(t *testing.T) {
 	}
 }
 
+func TestRepoFailureProjectionIsExactAndEvidenceIdempotent(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	t0 := time.Date(2026, 7, 19, 19, 30, 0, 0, time.UTC)
+	seedBreakerProject(t, st, "alpha", "repo-a")
+	seedBreakerProject(t, st, "beta", "repo-b")
+
+	first, err := st.RecordProjectBreakerFailureForRepo(ctx, "repo-a", "github_error",
+		"repository sweep failed", time.Minute, "multirepo:sweep:repo-a@sha256:same", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// RegisterRepo explicitly binds every legacy repo to the default project; the
+	// additional alpha binding is equally authoritative. Beta is not a repo-a
+	// owner and must not receive the failure.
+	if len(first) != 2 || first[0].ProjectID != "alpha" || first[1].ProjectID != "default" {
+		t.Fatalf("repo-a projection scopes=%+v, want alpha and default in stable order", first)
+	}
+	second, err := st.RecordProjectBreakerFailureForRepo(ctx, "repo-a", "github_error",
+		"repository sweep failed again", time.Minute, "multirepo:sweep:repo-a@sha256:same", t0.Add(10*time.Second))
+	if err != nil || len(second) != 2 {
+		t.Fatalf("repeat=%+v err=%v", second, err)
+	}
+	for _, projectID := range []string{"alpha", "default"} {
+		breaker, err := st.GetProjectBreaker(ctx, projectID, "repo-a")
+		if err != nil || breaker.StateVersion != 1 || breaker.FailureCount != 1 {
+			t.Fatalf("repeat evidence stormed %s breaker: %+v err=%v", projectID, breaker, err)
+		}
+		events, err := st.ListProjectBreakerEvents(ctx, projectID, "repo-a")
+		if err != nil || len(events) != 1 || events[0].EvidenceRef != "multirepo:sweep:repo-a@sha256:same" {
+			t.Fatalf("repeat evidence stormed %s ledger: %+v err=%v", projectID, events, err)
+		}
+	}
+	if _, err := st.GetProjectBreaker(ctx, "beta", "repo-b"); !errors.Is(err, store.ErrProjectBreakerNotFound) {
+		t.Fatalf("repo-a failure escaped into beta/repo-b: %v", err)
+	}
+
+	third, err := st.RecordProjectBreakerFailureForRepo(ctx, "repo-a", "github_error",
+		"new repository failure", time.Minute, "multirepo:sweep:repo-a@sha256:new", t0.Add(time.Minute))
+	if err != nil || len(third) != 2 || third[0].StateVersion != 2 || third[0].FailureCount != 2 {
+		t.Fatalf("new evidence did not refresh exact breaker: %+v err=%v", third, err)
+	}
+}
+
+func TestRepositoryActionProbeRequiresAuditedSendAndRejectsAbandonedOrInflight(t *testing.T) {
+	st := testutil.NewStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 19, 19, 45, 0, 0, time.UTC)
+	seedBreakerProject(t, st, "alpha", "repo-a")
+	if _, err := st.SeedJob(ctx, store.SeedParams{ID: "action-probe", ProjectID: "alpha", Repo: "repo-a",
+		Kind: job.KindBuild, Flow: "build", Stage: "build", Role: job.RoleEngWorker, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnqueuePROpen(ctx, "action-probe", "head-action", "main"); err != nil {
+		t.Fatal(err)
+	}
+	row, ok, err := st.NextPendingOutboxForRepo(ctx, "repo-a")
+	if err != nil || !ok {
+		t.Fatalf("row=%+v ok=%v err=%v", row, ok, err)
+	}
+	assertProbe := func(want int, label string) {
+		t.Helper()
+		unresolved, _, fingerprint, err := st.ReadRepositoryActionProbe(ctx, "repo-a")
+		if err != nil || unresolved != want || fingerprint == "" {
+			t.Fatalf("%s unresolved=%d fingerprint=%q err=%v, want %d", label, unresolved, fingerprint, err, want)
+		}
+	}
+	assertProbe(0, "fresh unrelated queued work")
+	if err := st.BumpOutboxAttempts(ctx, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertProbe(1, "retried pending")
+	if err := st.MarkOutboxSuppressed(ctx, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertProbe(1, "abandoned without effect")
+	if _, err := st.DB.ExecContext(ctx, `UPDATE outbox SET status='delivering' WHERE id=?`, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertProbe(1, "future in-flight status")
+	if _, err := st.DB.ExecContext(ctx, `UPDATE outbox SET status='sent' WHERE id=?`, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertProbe(1, "sent without audit")
+	if _, err := st.DB.ExecContext(ctx, `UPDATE outbox SET status='pending',attempts=0 WHERE id=?`, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertProbe(0, "pending with no attempts is neutral")
+	if err := st.MarkOutboxSent(ctx, row.ID, "verified effect"); err != nil {
+		t.Fatal(err)
+	}
+	assertProbe(0, "audited send")
+}
+
 func TestProjectBreakerProbeLifecycleFactsAndFences(t *testing.T) {
 	st := testutil.NewStore(t)
 	ctx := context.Background()
 	t0 := time.Date(2026, 7, 19, 20, 0, 0, 0, time.UTC)
 	seedBreakerProject(t, st, "alpha", "repo-a")
+	seedBreakerProject(t, st, "beta")
 	opened, err := st.RecordProjectBreakerFailure(ctx, store.ProjectBreakerFailure{
 		ProjectID: "alpha", RepoID: "repo-a", Kind: "merge_incident", Reason: "merge API 503",
 		RetryAfter: 2 * time.Minute, EvidenceRef: "github:merge:503",
 	}, t0)
 	if err != nil || opened.State != "open" || opened.StateVersion != 1 {
 		t.Fatalf("opened=%+v err=%v", opened, err)
+	}
+	// The active dedup key is only unique inside one project. A malformed or
+	// independently produced item in another project must never be updated or
+	// resolved by alpha's breaker lifecycle.
+	stamp := t0.UTC().Format(time.RFC3339Nano)
+	if _, err := st.DB.ExecContext(ctx, `INSERT INTO attention_items
+		(id,project_id,kind,state,dedup_key,occurrences,first_seen_at,last_seen_at,created_at,updated_at)
+		VALUES ('beta-same-breaker-dedup','beta','needs_input','open',
+		'project_breaker:alpha:repo-a',1,?,?,?,?)`, stamp, stamp, stamp, stamp); err != nil {
+		t.Fatal(err)
 	}
 	if due, err := st.ReconcileDueProjectBreakerProbes(ctx, "breaker-loop", t0.Add(time.Minute), time.Minute, 5); err != nil || len(due) != 0 {
 		t.Fatalf("early probes=%+v err=%v", due, err)
@@ -107,6 +213,15 @@ func TestProjectBreakerProbeLifecycleFactsAndFences(t *testing.T) {
 	if err != nil || reopened.State != "open" || reopened.StateVersion != 3 {
 		t.Fatalf("failed probe=%+v err=%v", reopened, err)
 	}
+	var betaState string
+	var betaOccurrences int
+	if err := st.DB.QueryRowContext(ctx, `SELECT state,occurrences FROM attention_items
+		WHERE project_id='beta' AND id='beta-same-breaker-dedup'`).Scan(&betaState, &betaOccurrences); err != nil {
+		t.Fatal(err)
+	}
+	if betaState != "open" || betaOccurrences != 1 {
+		t.Fatalf("alpha breaker mutated beta attention state=%q occurrences=%d", betaState, betaOccurrences)
+	}
 	probes, err = st.ReconcileDueProjectBreakerProbes(ctx, "breaker-loop-2", t0.Add(3*time.Minute+time.Second), time.Minute, 5)
 	if err != nil || len(probes) != 1 || probes[0].Epoch != 2 {
 		t.Fatalf("second probe=%+v err=%v", probes, err)
@@ -116,6 +231,10 @@ func TestProjectBreakerProbeLifecycleFactsAndFences(t *testing.T) {
 	}, "", 0, t0.Add(3*time.Minute+2*time.Second))
 	if err != nil || closed.State != "closed" || closed.LastRecoveryFact != "github:mergeable:sha-abc" {
 		t.Fatalf("closed=%+v err=%v", closed, err)
+	}
+	if err := st.DB.QueryRowContext(ctx, `SELECT state FROM attention_items
+		WHERE project_id='beta' AND id='beta-same-breaker-dedup'`).Scan(&betaState); err != nil || betaState != "open" {
+		t.Fatalf("alpha breaker recovery resolved beta attention state=%q err=%v", betaState, err)
 	}
 	events, err := st.ListProjectBreakerEvents(ctx, "alpha", "repo-a")
 	if err != nil || len(events) != 5 || events[len(events)-1].Kind != "probe_recovered" || events[len(events)-1].EvidenceRef == "" {

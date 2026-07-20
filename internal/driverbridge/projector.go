@@ -31,6 +31,7 @@ func builderAction(a driver.Action) store.BuilderLifecycleActionProjection {
 		RecipientSessionID:      a.RecipientSessionID,
 		RecipientPaneInstanceID: a.RecipientPaneInstanceID,
 		RecipientAgentRunID:     a.RecipientAgentRunID,
+		TargetRole:              a.TargetRole,
 	}
 }
 

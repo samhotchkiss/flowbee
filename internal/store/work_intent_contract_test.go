@@ -16,6 +16,12 @@ func seedOrchestratingWorkIntent(t *testing.T, st *store.Store, sourceMessage, o
 	now time.Time) (store.WorkIntent, store.DriverSessionBinding) {
 	t.Helper()
 	ctx := context.Background()
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "russ", Owner: "fixture", Repo: "russ", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RegisterRepo(ctx, store.Repo{ID: "docs", Owner: "fixture", Repo: "docs", Active: true}); err != nil {
+		t.Fatal(err)
+	}
 	bindWorkIntentDriverRoute(t, st, orchestrator, now)
 	intent, err := st.CreateWorkIntent(ctx, store.CreateWorkIntentInput{
 		ProjectID: "default", SourceConversationID: "thread-" + sourceMessage,
@@ -61,7 +67,7 @@ func seedOrchestratingWorkIntent(t *testing.T, st *store.Store, sourceMessage, o
 
 func validPreparedContract(slug string) store.WorkIntentEpicContract {
 	return store.WorkIntentEpicContract{
-		Slug: slug, Title: "Durable handoff", Repositories: []string{"russ"},
+		Slug: slug, Title: "Durable handoff", Repositories: []string{"russ", "docs"},
 		DeliveryRepo: "russ", SpecPath: "epics/" + slug + ".md",
 		Scope: []string{"internal/flowbee/**"}, IssueRefs: []string{"#4950", "#4951"},
 		Acceptance: []string{"interrupted review dispatch self-heals"},
@@ -106,7 +112,8 @@ func TestWorkIntentContractAutomaticallyAdmitsExactlyOneEpicAndLinksAcknowledgem
 	epic, err := st.GetEpicRun(ctx, intent.AdmittedEpicID)
 	if err != nil || epic.WorkIntentID != intent.ID || epic.AdmissionKey != key ||
 		epic.Slug != contract.Slug || epic.Branch != "epic/"+contract.Slug ||
-		epic.DeliveryState != "admitted" {
+		epic.DeliveryState != "admitted" || epic.DeliveryRepo != "russ" ||
+		!equalEpicRepositorySets(epic.Repositories, []string{"docs", "russ"}) {
 		t.Fatalf("epic=%+v err=%v", epic, err)
 	}
 	prepared, err = st.GetPreparedWorkIntentEpicContract(ctx, "default", intent.ID, 1)
@@ -123,6 +130,18 @@ func TestWorkIntentContractAutomaticallyAdmitsExactlyOneEpicAndLinksAcknowledgem
 	if epics != 1 || deliveries != 1 {
 		t.Fatalf("epics=%d deliveries=%d", epics, deliveries)
 	}
+}
+
+func equalEpicRepositorySets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestWorkIntentContractRejectsChangedReplayAndSupersededOrchestrator(t *testing.T) {

@@ -53,7 +53,7 @@ type Data interface {
 	ListAccountWindows(ctx context.Context) ([]store.AccountWindow, error)
 	ListOpenAttention(ctx context.Context, state string, kinds []string, repo string) ([]store.AttentionItem, error)
 	ListDecisionInboxAllProjects(ctx context.Context, resolvedLimit int) ([]store.DecisionInboxRow, error)
-	ProjectDashboard(ctx context.Context) ([]store.ProjectDashboardRow, error)
+	ProjectDashboardAt(ctx context.Context, now time.Time) ([]store.ProjectDashboardRow, error)
 }
 
 // UI serves the F12 dashboards. It holds the parsed templates + the data source +

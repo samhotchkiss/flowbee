@@ -49,6 +49,16 @@ type CapacitySeatIdentity struct {
 // configured, fresh fleet has no viable independent-review path at all.
 func distinctReviewerCapacityTx(ctx context.Context, tx *sql.Tx, projectID, builderFamily string,
 	now time.Time, freshFor time.Duration) (capacity.RouteDecision, error) {
+	decision, _, err := distinctReviewerFamilyTx(ctx, tx, projectID, builderFamily, now, freshFor)
+	return decision, err
+}
+
+// distinctReviewerFamilyTx returns the family whose fresh, project-bound seat
+// made the admission proof. The choice is persisted in the epic worker plan so
+// later launch/recovery never has to re-infer anti-affinity from mutable fleet
+// inventory.
+func distinctReviewerFamilyTx(ctx context.Context, tx *sql.Tx, projectID, builderFamily string,
+	now time.Time, freshFor time.Duration) (capacity.RouteDecision, string, error) {
 	// Capacity is useful only when the project has an active reviewer route to
 	// the exact seat. A healthy seat elsewhere in the fleet is inventory, not an
 	// admission proof for this project. Keep the binding/seat authority checks in
@@ -65,7 +75,7 @@ func distinctReviewerCapacityTx(ctx context.Context, tx *sql.Tx, projectID, buil
 		  AND b.provider=s.agent_family
 		ORDER BY s.agent_family,s.id`, projectID, DriverReviewerRole, builderFamily)
 	if err != nil {
-		return capacity.RouteDecision{}, err
+		return capacity.RouteDecision{}, "", err
 	}
 	type candidate struct{ seatID, family string }
 	var candidates []candidate
@@ -73,31 +83,31 @@ func distinctReviewerCapacityTx(ctx context.Context, tx *sql.Tx, projectID, buil
 		var item candidate
 		if err := rows.Scan(&item.seatID, &item.family); err != nil {
 			rows.Close()
-			return capacity.RouteDecision{}, err
+			return capacity.RouteDecision{}, "", err
 		}
 		candidates = append(candidates, item)
 	}
 	if err := rows.Close(); err != nil {
-		return capacity.RouteDecision{}, err
+		return capacity.RouteDecision{}, "", err
 	}
 	if len(candidates) == 0 {
 		return capacity.RouteDecision{Reasons: []string{
 			"no active project-bound review seat from a distinct family",
-		}}, nil
+		}}, "", nil
 	}
 	var reasons []string
 	for _, candidate := range candidates {
 		decision, err := capacityRouteForSeatQuery(ctx, tx, candidate.seatID, now, freshFor)
 		if err != nil {
-			return capacity.RouteDecision{}, err
+			return capacity.RouteDecision{}, "", err
 		}
 		if decision.Routable {
-			return capacity.RouteDecision{Routable: true}, nil
+			return capacity.RouteDecision{Routable: true}, candidate.family, nil
 		}
 		reasons = append(reasons, candidate.family+"/"+candidate.seatID+"="+
 			strings.Join(decision.Reasons, ","))
 	}
-	return capacity.RouteDecision{Reasons: reasons}, nil
+	return capacity.RouteDecision{Reasons: reasons}, "", nil
 }
 
 // BindCapacitySeatIdentity establishes the operator-approved provider identity
@@ -512,6 +522,16 @@ func capacityRouteForSeatQueryExcludingEpic(ctx context.Context, q capacityQuery
 		AND state IN `+epicActiveStatesSQL, seatID, excludedEpicID).Scan(&o.SeatActive)
 	_ = q.QueryRowContext(ctx, `SELECT COUNT(*) FROM epics WHERE account_key=? AND id<>?
 		AND state IN `+epicActiveStatesSQL, o.AccountKey, excludedEpicID).Scan(&o.AccountActive)
+	var reviewerSeatActive, reviewerAccountActive int
+	_ = q.QueryRowContext(ctx, `SELECT COUNT(*) FROM epic_worker_sessions WHERE seat_id=?
+		AND worker_role='reviewer' AND epic_id<>? AND state IN ('ensure_pending','active','stop_pending','held')`,
+		seatID, excludedEpicID).Scan(&reviewerSeatActive)
+	_ = q.QueryRowContext(ctx, `SELECT COUNT(*) FROM epic_worker_sessions w JOIN seats s ON s.id=w.seat_id
+		WHERE s.expected_account_key=? AND w.worker_role='reviewer' AND w.epic_id<>?
+		AND w.state IN ('ensure_pending','active','stop_pending','held')`, o.AccountKey,
+		excludedEpicID).Scan(&reviewerAccountActive)
+	o.SeatActive += reviewerSeatActive
+	o.AccountActive += reviewerAccountActive
 	return capacity.DecideRoute(now, o, capacity.RoutePolicy{FreshFor: freshFor, ReservePct: reserve}), nil
 }
 

@@ -170,6 +170,90 @@ type Config struct {
 	// scheduler. Empty falls back to the single-repo FLOWBEE_GITHUB_OWNER/REPO env
 	// path (the legacy posture). Configured in flowbee.yaml only (a structured list).
 	Repos []RepoConfig `yaml:"repos"`
+
+	// BootstrapProjects is the explicit origin→project admission map used only by
+	// the no-argument bootstrap path. A repository id is never assumed to also be
+	// a project id. Every lifecycle/workspace/capacity identity is operator data;
+	// bootstrap has no model, path, account, or seat defaults.
+	BootstrapProjects []BootstrapProjectConfig `yaml:"bootstrap_projects"`
+}
+
+type BootstrapProjectConfig struct {
+	ProjectID     string                      `yaml:"project_id"`
+	Name          string                      `yaml:"name"`
+	RepositoryIDs []string                    `yaml:"repository_ids"`
+	ControlPlane  BootstrapControlPlaneConfig `yaml:"control_plane"`
+	Interactor    BootstrapInteractorConfig   `yaml:"interactor"`
+	Orchestrator  BootstrapOrchestratorConfig `yaml:"orchestrator"`
+	LocalSeats    []BootstrapSeatConfig       `yaml:"local_seats"`
+}
+
+// BootstrapControlPlaneConfig is the exact Driver-owned lifecycle target for
+// the Flowbee server. The Driver profile owns argv and executable selection;
+// Flowbee supplies only stable lifecycle/workspace identity and the reserved
+// human-facing presentation name through the v3 Ensure contract.
+type BootstrapControlPlaneConfig struct {
+	InstanceRef           string `yaml:"instance_ref"`
+	LifecycleKey          string `yaml:"lifecycle_key"`
+	TargetEpoch           int64  `yaml:"target_epoch"`
+	ProfileID             string `yaml:"profile_id"`
+	WorkspaceRootID       string `yaml:"workspace_root_id"`
+	WorkspaceRelativePath string `yaml:"workspace_relative_path"`
+	TmuxServerInstanceID  string `yaml:"tmux_server_instance_id"`
+}
+
+type BootstrapInteractorConfig struct {
+	ActorID                       string `yaml:"actor_id"`
+	PresentationName              string `yaml:"presentation_name"`
+	Operation                     string `yaml:"operation"`
+	InstanceRef                   string `yaml:"instance_ref"`
+	LifecycleKey                  string `yaml:"lifecycle_key"`
+	TargetEpoch                   int64  `yaml:"target_epoch"`
+	ProfileID                     string `yaml:"profile_id"`
+	ExternalWatchID               string `yaml:"external_watch_id"`
+	ExistingSessionID             string `yaml:"existing_session_id"`
+	ExpectedPaneInstanceID        string `yaml:"expected_pane_instance_id"`
+	ExpectedAgentRunID            string `yaml:"expected_agent_run_id"`
+	WorkspaceRootID               string `yaml:"workspace_root_id"`
+	WorkspaceRelativePath         string `yaml:"workspace_relative_path"`
+	RecoveryProfileID             string `yaml:"recovery_profile_id"`
+	RecoveryWorkspaceRootID       string `yaml:"recovery_workspace_root_id"`
+	RecoveryWorkspaceRelativePath string `yaml:"recovery_workspace_relative_path"`
+	TmuxServerInstanceID          string `yaml:"tmux_server_instance_id"`
+}
+
+type BootstrapOrchestratorConfig struct {
+	ActorID               string `yaml:"actor_id"`
+	PresentationName      string `yaml:"presentation_name"`
+	InstanceRef           string `yaml:"instance_ref"`
+	LifecycleKey          string `yaml:"lifecycle_key"`
+	TargetEpoch           int64  `yaml:"target_epoch"`
+	ProfileID             string `yaml:"profile_id"`
+	WorkspaceRootID       string `yaml:"workspace_root_id"`
+	WorkspaceRelativePath string `yaml:"workspace_relative_path"`
+	TmuxServerInstanceID  string `yaml:"tmux_server_instance_id"`
+}
+
+type BootstrapSeatConfig struct {
+	SeatID string `yaml:"seat_id"`
+	// Box is intentionally required empty for the local-only first release.
+	// HostID is Driver's authenticated stable host identity, never an SSH alias.
+	Box                   string `yaml:"box"`
+	HostID                string `yaml:"host_id"`
+	AgentFamily           string `yaml:"agent_family"`
+	ConfigDir             string `yaml:"config_dir"`
+	CodexHome             string `yaml:"codex_home"`
+	MaxConcurrent         int    `yaml:"max_concurrent"`
+	AccountKey            string `yaml:"account_key"`
+	CredentialLineage     string `yaml:"credential_lineage"`
+	ReservePct            int    `yaml:"reserve_pct"`
+	AccountMaximum        int    `yaml:"account_maximum"`
+	InstanceRef           string `yaml:"instance_ref"`
+	TmuxServerDomainID    string `yaml:"tmux_server_domain_id"`
+	TmuxServerInstanceID  string `yaml:"tmux_server_instance_id"`
+	ProfileID             string `yaml:"profile_id"`
+	WorkspaceRootID       string `yaml:"workspace_root_id"`
+	WorkspaceRelativeBase string `yaml:"workspace_relative_base"`
 }
 
 // RepoConfig is one managed repo's coordinates in the F9 registry (build-list F9).
@@ -506,6 +590,114 @@ func (c Config) Validate() error {
 		seen[id] = true
 		if strings.TrimSpace(r.Owner) == "" || strings.TrimSpace(r.Repo) == "" {
 			return fmt.Errorf("repos[%q]: owner and repo are required (the GitHub coords)", id)
+		}
+	}
+	bootstrapProjects, bootstrapRepos := map[string]bool{}, map[string]string{}
+	configuredRepos := map[string]RepoConfig{}
+	for _, repo := range c.Repos {
+		configuredRepos[repo.ID] = repo
+	}
+	if len(c.Repos) == 0 && c.GithubOwner != "" && c.GithubRepo != "" {
+		configuredRepos[c.GithubRepo] = RepoConfig{ID: c.GithubRepo, Owner: c.GithubOwner, Repo: c.GithubRepo}
+	}
+	for i, project := range c.BootstrapProjects {
+		prefix := fmt.Sprintf("bootstrap_projects[%d]", i)
+		if project.ProjectID == "" || project.Name == "" || bootstrapProjects[project.ProjectID] {
+			return fmt.Errorf("%s: unique project_id and name are required", prefix)
+		}
+		bootstrapProjects[project.ProjectID] = true
+		if len(project.RepositoryIDs) == 0 {
+			return fmt.Errorf("%s: repository_ids is required", prefix)
+		}
+		seenProjectRepo := map[string]bool{}
+		for _, repoID := range project.RepositoryIDs {
+			repo, exists := configuredRepos[repoID]
+			if repoID == "" || !exists || !repo.IsActive() || seenProjectRepo[repoID] {
+				return fmt.Errorf("%s: repository %q must be unique, configured, and active", prefix, repoID)
+			}
+			seenProjectRepo[repoID] = true
+			if prior := bootstrapRepos[repoID]; prior != "" && prior != project.ProjectID {
+				return fmt.Errorf("%s: repository %q is ambiguously mapped to projects %q and %q", prefix, repoID, prior, project.ProjectID)
+			}
+			bootstrapRepos[repoID] = project.ProjectID
+		}
+		cp := project.ControlPlane
+		if cp.InstanceRef == "" || cp.LifecycleKey == "" || cp.TargetEpoch < 1 ||
+			cp.ProfileID != "flowbee_control" || cp.WorkspaceRootID == "" ||
+			cp.WorkspaceRelativePath == "" || cp.TmuxServerInstanceID == "" {
+			return fmt.Errorf("%s: control_plane requires exact managed endpoint/lifecycle/workspace identity and profile flowbee_control", prefix)
+		}
+		i := project.Interactor
+		commonInteractor := i.ActorID != "" && i.InstanceRef != "" && i.LifecycleKey != "" &&
+			i.TargetEpoch > 0 && i.ProfileID != "" && i.TmuxServerInstanceID != "" &&
+			i.PresentationName == project.ProjectID+"-interactor"
+		switch i.Operation {
+		case "adopt":
+			if !commonInteractor || i.ExternalWatchID == "" || i.ExistingSessionID == "" ||
+				i.ExpectedPaneInstanceID == "" || i.ExpectedAgentRunID == "" ||
+				i.WorkspaceRootID != "" || i.WorkspaceRelativePath != "" ||
+				i.RecoveryProfileID != "claude_interactor_managed" || i.RecoveryWorkspaceRootID == "" ||
+				i.RecoveryWorkspaceRelativePath == "" {
+				return fmt.Errorf("%s: Interactor adopt requires exact external watch/session/pane/run authority, a managed v3 recovery workspace, no launch workspace, and reserved presentation_name %q",
+					prefix, project.ProjectID+"-interactor")
+			}
+		case "ensure":
+			if !commonInteractor || i.ProfileID != "claude_interactor_managed" ||
+				i.WorkspaceRootID == "" || i.WorkspaceRelativePath == "" || i.ExternalWatchID != "" ||
+				i.ExistingSessionID != "" || i.ExpectedPaneInstanceID != "" || i.ExpectedAgentRunID != "" ||
+				i.RecoveryProfileID != "" || i.RecoveryWorkspaceRootID != "" || i.RecoveryWorkspaceRelativePath != "" {
+				return fmt.Errorf("%s: Interactor ensure requires exact managed workspace authority, profile claude_interactor_managed, no adopt identity, and reserved presentation_name %q",
+					prefix, project.ProjectID+"-interactor")
+			}
+		default:
+			return fmt.Errorf("%s: Interactor operation must be adopt or ensure", prefix)
+		}
+		o := project.Orchestrator
+		if o.ActorID == "" || o.PresentationName != project.ProjectID+"-orchestrator" || o.InstanceRef == "" ||
+			o.LifecycleKey == "" || o.TargetEpoch < 1 || o.ProfileID != "codex_orchestrator" || o.WorkspaceRootID == "" ||
+			o.WorkspaceRelativePath == "" || o.TmuxServerInstanceID == "" {
+			return fmt.Errorf("%s: Orchestrator requires exact actor/presentation/endpoint/lifecycle/workspace identity and profile codex_orchestrator", prefix)
+		}
+		seatIDs := map[string]bool{}
+		var builderFamilies, reviewerFamilies []string
+		for j, seat := range project.LocalSeats {
+			validFamilyPath := seat.AgentFamily == "codex" && seat.CodexHome != "" && seat.ConfigDir == "" ||
+				(seat.AgentFamily == "claude" || seat.AgentFamily == "grok") && seat.ConfigDir != "" && seat.CodexHome == ""
+			path := seat.ConfigDir
+			if seat.CodexHome != "" {
+				path = seat.CodexHome
+			}
+			workerRoleProfile := seat.AgentFamily + "_builder"
+			if seat.ProfileID == seat.AgentFamily+"_reviewer" {
+				workerRoleProfile = seat.AgentFamily + "_reviewer"
+			}
+			if seat.SeatID == "" || seatIDs[seat.SeatID] || seat.Box != "" || !canonicalUUIDPattern.MatchString(seat.HostID) ||
+				!validFamilyPath || !filepath.IsAbs(path) || seat.MaxConcurrent < 1 || seat.AccountKey == "" ||
+				seat.CredentialLineage == "" || seat.ReservePct < 0 || seat.AccountMaximum < 1 ||
+				seat.InstanceRef == "" || seat.TmuxServerDomainID != "flowbee" || seat.TmuxServerInstanceID == "" ||
+				seat.ProfileID != workerRoleProfile || seat.WorkspaceRootID == "" || seat.WorkspaceRelativeBase == "" ||
+				filepath.IsAbs(seat.WorkspaceRelativeBase) || filepath.Clean(seat.WorkspaceRelativeBase) != seat.WorkspaceRelativeBase ||
+				strings.HasPrefix(seat.WorkspaceRelativeBase, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("%s.local_seats[%d]: exact unique seat, runtime, capacity, and Driver target identity required", prefix, j)
+			}
+			seatIDs[seat.SeatID] = true
+			if strings.HasSuffix(seat.ProfileID, "_reviewer") {
+				reviewerFamilies = append(reviewerFamilies, seat.AgentFamily)
+			} else {
+				builderFamilies = append(builderFamilies, seat.AgentFamily)
+			}
+		}
+		if len(builderFamilies) == 0 || len(reviewerFamilies) == 0 {
+			return fmt.Errorf("%s: local_seats requires exact builder and reviewer profile pools", prefix)
+		}
+		for _, builderFamily := range builderFamilies {
+			distinct := false
+			for _, reviewerFamily := range reviewerFamilies {
+				distinct = distinct || reviewerFamily != builderFamily
+			}
+			if !distinct {
+				return fmt.Errorf("%s: every builder family requires a distinct reviewer family", prefix)
+			}
 		}
 	}
 	return nil

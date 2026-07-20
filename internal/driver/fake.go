@@ -10,38 +10,49 @@ import (
 // FakePort is deterministic and intentionally strict: forbidden or stale sends
 // produce zero mutations, and a receipt never implies workflow completion.
 type FakePort struct {
-	mu                  sync.Mutex
-	Meta                DriverMetadata
-	Capability          ControlOriginCapability
-	Snapshot            SessionSnapshot
-	Grants              map[string]Grant
-	Sessions            map[string]Identity
-	Receipts            map[string]Receipt
-	LifecycleReceipts   map[string]LifecycleReceipt
-	Watches             map[string]ExternalWatch
-	Observations        []Observation
-	Batches             []ObservationBatch
-	ObserveCalls        []string
-	SendRequests        []SendRequest
-	SendCalls           int
-	EnsureCalls         int
-	WatchCalls          int
-	AdoptCalls          int
-	ReattachCalls       int
-	ReleaseCalls        int
-	StopCalls           int
-	NextStatus          ReceiptStatus
-	NextLifecycleStatus string
-	NextError           error
+	mu                    sync.Mutex
+	Meta                  DriverMetadata
+	ProfileInventory      LifecycleProfileInventory
+	Capability            ControlOriginCapability
+	Snapshot              SessionSnapshot
+	Grants                map[string]Grant
+	Sessions              map[string]Identity
+	Receipts              map[string]Receipt
+	LifecycleReceipts     map[string]LifecycleReceipt
+	LifecycleFingerprints map[string]string
+	EnsureTargets         []SessionTarget
+	Watches               map[string]ExternalWatch
+	Observations          []Observation
+	Batches               []ObservationBatch
+	ObserveCalls          []string
+	SendRequests          []SendRequest
+	SendCalls             int
+	EnsureCalls           int
+	WatchCalls            int
+	AdoptCalls            int
+	ReattachCalls         int
+	ReleaseCalls          int
+	StopCalls             int
+	NextStatus            ReceiptStatus
+	NextLifecycleStatus   string
+	NextError             error
 }
 
 func NewFake() *FakePort {
 	return &FakePort{Meta: DriverMetadata{
-		LifecycleControl: true,
+		LifecycleControl:              true,
+		LifecycleProfileInventoryPath: "/v2/lifecycle/profiles",
 		TmuxServer: TmuxServerMetadata{DomainID: "flowbee", Ownership: "managed_dedicated",
 			InstanceID: "00000000-0000-4000-8000-000000000003", ConnectionVisibility: "isolated_socket"},
 		Contracts: defaultDriverContractCapabilities(),
-	}, Capability: ControlOriginCapability{
+	}, ProfileInventory: LifecycleProfileInventory{APIVersion: "v2", ServerTime: "2026-07-19T00:00:00Z",
+		FormatVersion: "tmux-driver.lifecycle-profile-inventory/v1", LifecycleEnabled: true,
+		TmuxServerDomainID: "flowbee", Profiles: []LifecycleProfile{
+			managedProfile("claude_builder", "claude"), managedProfile("claude_reviewer", "claude"),
+			managedProfile("codex_builder", "codex"), managedProfile("codex_orchestrator", "codex"),
+			managedProfile("codex_reviewer", "codex"), managedProfile("grok_builder", "grok"),
+			managedProfile("grok_reviewer", "grok"),
+		}}, Capability: ControlOriginCapability{
 		FormatVersion: controlOriginCapabilityFormat, Supported: true, Authorized: true,
 		PrincipalID: "flowbee-control", PrincipalKind: "control_plane",
 		RequiredScopes:   []string{"messages:send", "routes:manage"},
@@ -50,7 +61,15 @@ func NewFake() *FakePort {
 		GrantEndpoint: "/v2/routes/grants", MessageEndpoint: "/v2/messages",
 		OnBehalfOfSessionIDRule: "forbidden",
 	}, Grants: map[string]Grant{}, Sessions: map[string]Identity{}, Receipts: map[string]Receipt{},
-		LifecycleReceipts: map[string]LifecycleReceipt{}, Watches: map[string]ExternalWatch{}}
+		LifecycleReceipts: map[string]LifecycleReceipt{}, LifecycleFingerprints: map[string]string{},
+		Watches: map[string]ExternalWatch{}}
+}
+
+func managedProfile(id, provider string) LifecycleProfile {
+	return LifecycleProfile{ProfileID: id, Provider: provider, InitialPromptAdapter: "argv_element",
+		TargetCredentialAdapter: "file_environment", EnsureSupported: true,
+		BootstrapArtifactSupported: true, FlowbeeCredentialInstallSupported: true,
+		ManagedDisplayNameSupported: true}
 }
 
 func (f *FakePort) EnsureExternalWatch(_ context.Context, paneID, provider, profile string) (ExternalWatch, error) {
@@ -183,6 +202,14 @@ func (f *FakePort) Metadata(_ context.Context) (DriverMetadata, error) {
 	return f.Meta, f.NextError
 }
 
+func (f *FakePort) LifecycleProfiles(_ context.Context) (LifecycleProfileInventory, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.ProfileInventory
+	out.Profiles = append([]LifecycleProfile(nil), out.Profiles...)
+	return out, f.NextError
+}
+
 func (f *FakePort) SnapshotSessions(_ context.Context) (SessionSnapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -217,7 +244,26 @@ func (f *FakePort) EnsureLifecycleSession(_ context.Context, t SessionTarget, a 
 		t.LifecycleKey == "" || t.TargetEpoch < 1 {
 		return LifecycleReceipt{}, ErrIdentityMismatch
 	}
+	v3 := t.Bootstrap != nil || t.CredentialEnvelope != nil || t.PresentationName != ""
+	if v3 {
+		if err := validateLifecycleV3Contracts(f.Meta.Contracts); err != nil {
+			return LifecycleReceipt{}, err
+		}
+		if err := validateLifecycleV3Launch(t); err != nil {
+			return LifecycleReceipt{}, err
+		}
+		if err := f.ProfileInventory.ValidateLaunch(t.ProfileID, t.Identity.TmuxServerDomainID, t); err != nil {
+			return LifecycleReceipt{}, err
+		}
+	}
+	fingerprint := fmt.Sprintf("%s|%d|%s|%s|%s|%d|%s|%s|%s|%d|%s", t.LifecycleKey,
+		t.TargetEpoch, t.ProfileID, t.WorkspaceRootID, t.WorkspaceRelativePath, a.Epoch,
+		valueOrEmpty(t.Bootstrap), t.PresentationName, credentialID(t.CredentialEnvelope),
+		credentialEpoch(t.CredentialEnvelope), credentialHash(t.CredentialEnvelope))
 	if r, ok := f.LifecycleReceipts[a.ActionID]; ok {
+		if f.LifecycleFingerprints[a.ActionID] != fingerprint {
+			return LifecycleReceipt{}, ErrIdempotencyBody
+		}
 		return r, nil
 	}
 	id := t.Identity
@@ -236,15 +282,71 @@ func (f *FakePort) EnsureLifecycleSession(_ context.Context, t SessionTarget, a 
 		return LifecycleReceipt{}, ErrIdentityMismatch
 	}
 	f.EnsureCalls++
+	observedTarget := t
+	if t.Bootstrap != nil {
+		copy := *t.Bootstrap
+		observedTarget.Bootstrap = &copy
+	}
+	if t.CredentialEnvelope != nil {
+		copy := *t.CredentialEnvelope
+		observedTarget.CredentialEnvelope = &copy
+	}
+	f.EnsureTargets = append(f.EnsureTargets, observedTarget)
 	f.Sessions[id.SessionID] = id
-	r := LifecycleReceipt{FormatVersion: "tmux-driver.lifecycle-receipt/v2",
+	format := "tmux-driver.lifecycle-receipt/v2"
+	if v3 {
+		format = "tmux-driver.lifecycle-receipt/v3"
+	}
+	r := LifecycleReceipt{FormatVersion: format,
 		LifecycleReceiptID: "lifecycle-" + a.ActionID,
 		Operation:          "ensure", ActionID: a.ActionID, ActionEpoch: a.Epoch,
 		LeaseID: t.LeaseID, LeaseEpoch: t.LeaseEpoch, LifecycleKey: t.LifecycleKey,
 		TmuxServerDomainID: id.TmuxServerDomainID, TargetEpoch: t.TargetEpoch,
 		Status: "ensured", IdentityAfter: id}
+	if v3 {
+		if t.Bootstrap != nil {
+			r.BootstrapArtifact = LifecycleBootstrapReceipt{ArtifactID: t.Bootstrap.ArtifactID,
+				Format: t.Bootstrap.Format, PayloadSHA256: t.Bootstrap.PayloadSHA256, Status: "injected"}
+			r.BootstrapArtifactPresent = true
+		}
+		if t.CredentialEnvelope != nil {
+			r.CredentialInstall = LifecycleCredentialReceipt{EnvelopeID: t.CredentialEnvelope.EnvelopeID,
+				CredentialEpoch: t.CredentialEnvelope.CredentialEpoch,
+				PayloadSHA256:   t.CredentialEnvelope.PayloadSHA256, Status: "installed"}
+			r.CredentialInstallPresent = true
+		}
+		if t.PresentationName != "" {
+			r.PresentationName, r.PresentationNamePresent = t.PresentationName, true
+		}
+	}
+	f.LifecycleFingerprints[a.ActionID] = fingerprint
 	f.LifecycleReceipts[a.ActionID] = r
 	return r, nil
+}
+
+func valueOrEmpty(v *LifecycleBootstrapArtifact) string {
+	if v == nil {
+		return ""
+	}
+	return v.ArtifactID + "|" + v.Format + "|" + v.PayloadSHA256
+}
+func credentialID(v *LifecycleCredentialEnvelope) string {
+	if v == nil {
+		return ""
+	}
+	return v.EnvelopeID
+}
+func credentialEpoch(v *LifecycleCredentialEnvelope) int64 {
+	if v == nil {
+		return 0
+	}
+	return v.CredentialEpoch
+}
+func credentialHash(v *LifecycleCredentialEnvelope) string {
+	if v == nil {
+		return ""
+	}
+	return v.PayloadSHA256
 }
 
 func (f *FakePort) StopSession(_ context.Context, t SessionTarget, a Action) (LifecycleReceipt, error) {

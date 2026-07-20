@@ -350,6 +350,25 @@ func TestDashboardJSHasPeriodicRefreshFallback(t *testing.T) {
 	}
 }
 
+func TestDashboardJSLifecycleSSEUsesExactWorkspaceScopeAndPortfolioOmission(t *testing.T) {
+	st := testutil.NewStore(t)
+	h := mountUI(t, st, fixedClock{t: time.Now()})
+	code, js := getBody(t, h, "/assets/board.js")
+	if code != http.StatusOK {
+		t.Fatalf("board.js status = %d", code)
+	}
+	for _, want := range []string{
+		`eventsURL = "/v1/events"`,
+		`[data-conversation-workspace][data-project-id]`,
+		`eventsURL += "?project_id=" + encodeURIComponent`,
+		`new EventSource(eventsURL)`,
+	} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("board.js missing project-safe SSE wiring %q:\n%s", want, js)
+		}
+	}
+}
+
 // TestEpicDashboardDerivesStaleMasterFromHeartbeat proves stored state='active'
 // cannot paint a dead master green. The web layer receives the same stale-heartbeat
 // threshold as the liveness reaper and must derive the operator-visible state by age.

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -87,6 +88,39 @@ type ProjectBreakerEvent struct {
 	CreatedAt                     time.Time
 }
 
+// ReadRepositoryActionProbe returns a mechanical, repository-scoped projection
+// of failed project-out work. Only a sent row with its matching audit record is
+// successful effect evidence. Fresh pending work which has never been attempted
+// is neutral: it is not evidence about the prior failed effect. A retried
+// pending row, abandoned/dead-lettered row, unaudited sent row, or any future
+// claimed/in-flight status remains unresolved and cannot false-green a
+// half-open breaker.
+func (s *Store) ReadRepositoryActionProbe(ctx context.Context, repoID string) (pendingFailures, maxAttempts int, fingerprint string, err error) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return 0, 0, "", ErrProjectBreakerInput
+	}
+	var maxRowID, maxAuditedSentID int64
+	err = s.DB.QueryRowContext(ctx, `SELECT
+		COALESCE(SUM(CASE
+		  WHEN o.status='sent' AND EXISTS (SELECT 1 FROM audit_log a
+		    WHERE a.job_id=o.job_id AND a.action=o.action AND a.head_sha=o.head_sha) THEN 0
+		  WHEN o.status='pending' AND o.attempts=0 THEN 0
+		  ELSE 1 END),0),
+		COALESCE(MAX(CASE WHEN o.status='pending' THEN o.attempts ELSE 0 END),0),
+		COALESCE(MAX(o.id),0),
+		COALESCE(MAX(CASE WHEN o.status='sent' AND EXISTS (SELECT 1 FROM audit_log a
+		  WHERE a.job_id=o.job_id AND a.action=o.action AND a.head_sha=o.head_sha) THEN o.id ELSE 0 END),0)
+		FROM outbox o JOIN jobs j ON j.id=o.job_id WHERE j.repo=?`, repoID).
+		Scan(&pendingFailures, &maxAttempts, &maxRowID, &maxAuditedSentID)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d\x00%d\x00%d",
+		repoID, pendingFailures, maxAttempts, maxRowID, maxAuditedSentID)))
+	return pendingFailures, maxAttempts, fmt.Sprintf("%x", sum[:]), nil
+}
+
 var projectBreakerFailureKinds = map[string]bool{
 	"ci_outage": true, "github_error": true, "merge_incident": true,
 	"action_failure": true, "policy_violation": true,
@@ -133,6 +167,23 @@ func (s *Store) RecordProjectBreakerFailure(ctx context.Context, in ProjectBreak
 		if err != nil && !errors.Is(err, ErrProjectBreakerNotFound) {
 			return err
 		}
+		// A supervisor can observe the same failed dependency on every tick. The
+		// durable evidence identity, not timing or error prose, determines whether
+		// this is new information. Replaying the exact active failure is a no-op:
+		// it neither advances the breaker epoch nor creates an attention storm.
+		if err == nil && prior.State == "open" && prior.FailureKind == in.Kind && in.EvidenceRef != "" {
+			var latestEvidence string
+			qerr := tx.QueryRowContext(ctx, `SELECT evidence_ref
+				FROM project_circuit_breaker_events
+				WHERE project_id=? AND repo_id=? AND kind='failure_recorded'
+				ORDER BY seq DESC LIMIT 1`, in.ProjectID, in.RepoID).Scan(&latestEvidence)
+			if qerr != nil && !errors.Is(qerr, sql.ErrNoRows) {
+				return qerr
+			}
+			if qerr == nil && latestEvidence == in.EvidenceRef {
+				return nil
+			}
+		}
 		from, version, failures, opened, created := "closed", 1, 1, now, now
 		if err == nil {
 			from, version, failures, created = prior.State, prior.StateVersion+1, prior.FailureCount+1, prior.CreatedAt
@@ -161,6 +212,55 @@ func (s *Store) RecordProjectBreakerFailure(ctx context.Context, in ProjectBreak
 		return ProjectBreaker{}, err
 	}
 	return s.GetProjectBreaker(ctx, in.ProjectID, in.RepoID)
+}
+
+// RecordProjectBreakerFailureForRepo projects one repository failure onto every
+// ACTIVE project that is explicitly bound to that repo. It never falls back to a
+// default project: the project_repos join is the sole routing authority. Results
+// are returned in stable project-id order so recovery and tests remain
+// deterministic across restarts.
+func (s *Store) RecordProjectBreakerFailureForRepo(ctx context.Context, repoID, kind, reason string,
+	retryAfter time.Duration, evidenceRef string, now time.Time) ([]ProjectBreaker, error) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return nil, ErrProjectBreakerInput
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT pr.project_id
+		FROM project_repos pr
+		JOIN projects p ON p.id=pr.project_id
+		WHERE pr.repo_id=? AND pr.state='active' AND p.state='active'
+		ORDER BY pr.project_id`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	var projectIDs []string
+	for rows.Next() {
+		var projectID string
+		if err := rows.Scan(&projectID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		projectIDs = append(projectIDs, projectID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if len(projectIDs) == 0 {
+		return nil, fmt.Errorf("%w: repo %q has no active project binding", ErrProjectBreakerInput, repoID)
+	}
+
+	out := make([]ProjectBreaker, 0, len(projectIDs))
+	for _, projectID := range projectIDs {
+		breaker, err := s.RecordProjectBreakerFailure(ctx, ProjectBreakerFailure{
+			ProjectID: projectID, RepoID: repoID, Kind: kind, Reason: reason,
+			RetryAfter: retryAfter, EvidenceRef: evidenceRef,
+		}, now)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, breaker)
+	}
+	return out, nil
 }
 
 // ReconcileDueProjectBreakerProbes claims a bounded set of due probes. Expired
@@ -555,7 +655,8 @@ func appendProjectBreakerEventTx(ctx context.Context, tx *sql.Tx, projectID, rep
 	dedup := "project_breaker:" + projectID + ":" + repoID
 	if to == "closed" {
 		_, err := tx.ExecContext(ctx, `UPDATE attention_items SET state='resolved',resolution='recovery_fact_observed',
-			resolved_at=?,updated_at=? WHERE dedup_key=? AND state IN ('open','leased','delivering','awaiting_ack')`, stamp, stamp, dedup)
+			resolved_at=?,updated_at=? WHERE project_id=? AND dedup_key=?
+			AND state IN ('open','leased','delivering','awaiting_ack')`, stamp, stamp, projectID, dedup)
 		return err
 	}
 	detail := fmt.Sprintf("%s breaker %s", map[bool]string{true: "repository", false: "project"}[repoID != ""], to)
@@ -573,7 +674,8 @@ func appendProjectBreakerEventTx(ctx context.Context, tx *sql.Tx, projectID, rep
 		delta = 0
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE attention_items SET occurrences=occurrences+?,last_seen_at=?,
-		evidence_json=?,detail=?,updated_at=? WHERE dedup_key=? AND state IN ('open','leased','delivering','awaiting_ack')`,
-		delta, stamp, string(payload), detail+": "+reason, stamp, dedup)
+		evidence_json=?,detail=?,updated_at=? WHERE project_id=? AND dedup_key=?
+		AND state IN ('open','leased','delivering','awaiting_ack')`,
+		delta, stamp, string(payload), detail+": "+reason, stamp, projectID, dedup)
 	return err
 }

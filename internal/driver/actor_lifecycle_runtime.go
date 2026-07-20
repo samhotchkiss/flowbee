@@ -15,11 +15,13 @@ import (
 // have independent intent versions, watches, leases, receipts, and recovery
 // clocks.
 type ActorLifecycleRuntime struct {
-	Resolver    *EndpointResolver
-	Store       *store.Store
-	Owner       string
-	ClaimTTL    time.Duration
-	MaxRecovery int
+	Resolver              *EndpointResolver
+	Store                 *store.Store
+	Materials             LifecycleLaunchMaterialResolver
+	RequireManagedAgentV3 bool
+	Owner                 string
+	ClaimTTL              time.Duration
+	MaxRecovery           int
 }
 
 type ActorLifecycleRuntimeReport struct {
@@ -32,6 +34,10 @@ type ActorLifecycleRuntimeReport struct {
 	Verified          int
 	Retried           int
 	DeadLettered      int
+	PresenceScanned   int
+	PresenceHeld      int
+	PresenceRecovered int
+	PresenceErrors    int
 }
 
 func actorDriverAction(action store.ProjectActorLifecycleAction) Action {
@@ -91,6 +97,10 @@ func (r ActorLifecycleRuntime) Tick(ctx context.Context, now time.Time) (ActorLi
 	if err != nil {
 		return ActorLifecycleRuntimeReport{}, err
 	}
+	presenceReport, err := r.reconcileActivePresence(ctx, now)
+	if err != nil {
+		return ActorLifecycleRuntimeReport{}, err
+	}
 	recovery, err := r.Store.ReconcileExpiredProjectActorLifecycleClaims(ctx, now, r.MaxRecovery, 20)
 	if err != nil {
 		return ActorLifecycleRuntimeReport{}, err
@@ -101,7 +111,10 @@ func (r ActorLifecycleRuntime) Tick(ctx context.Context, now time.Time) (ActorLi
 	}
 	report := ActorLifecycleRuntimeReport{Materialized: intentRecovery.Materialized,
 		Held: intentRecovery.Held, Resumed: intentRecovery.Resumed, DeliveryUncertain: recovery.DeliveryUncertain,
-		VerificationReady: recovery.VerificationReady, DeadLettered: recovery.DeadLettered}
+		VerificationReady: recovery.VerificationReady, DeadLettered: recovery.DeadLettered,
+		PresenceScanned: presenceReport.Scanned, PresenceHeld: presenceReport.Held,
+		PresenceRecovered: presenceReport.Recovered,
+		PresenceErrors:    presenceReport.Errors}
 	verification, err := r.Store.ClaimNextProjectActorLifecycleVerification(ctx, r.Owner, now, now.Add(r.ClaimTTL))
 	if err == nil {
 		return r.verify(ctx, verification, now, report)
@@ -120,7 +133,25 @@ func (r ActorLifecycleRuntime) Tick(ctx context.Context, now time.Time) (ActorLi
 	if err != nil {
 		return r.preEffectFailure(ctx, action, err, now, report)
 	}
-	receipt, executeErr := executeActorLifecycle(ctx, endpoint.Port, actorDriverAction(action))
+	driverAction := actorDriverAction(action)
+	cleanup := func(bool) {}
+	if action.Operation == "ensure" && (r.RequireManagedAgentV3 || r.Materials != nil) {
+		if r.Materials == nil {
+			return r.preEffectFailure(ctx, action, errors.New("project actor Q3 material resolver unavailable"), now, report)
+		}
+		driverAction, cleanup, err = r.Materials.ResolveLifecycleLaunch(ctx, driverAction, now)
+		if err != nil {
+			return r.preEffectFailure(ctx, action, err, now, report)
+		}
+		if r.RequireManagedAgentV3 {
+			if err := ValidateFlowbeeManagedAgentLaunch(driverAction.SessionTarget()); err != nil {
+				cleanup(false)
+				return r.preEffectFailure(ctx, action, err, now, report)
+			}
+		}
+	}
+	receipt, executeErr := executeActorLifecycle(ctx, endpoint.Port, driverAction)
+	cleanup(executeErr == nil && receipt.Resolved())
 	if executeErr != nil {
 		// Once the lifecycle method was invoked, Flowbee cannot infer whether the
 		// Driver committed before the response was lost. Verification is the only
@@ -138,7 +169,7 @@ func (r ActorLifecycleRuntime) Tick(ctx context.Context, now time.Time) (ActorLi
 		}
 		return report, nil
 	}
-	if err := r.persistProjectAcknowledge(ctx, action, receipt, now); err != nil {
+	if err := r.persistProjectAcknowledge(ctx, action, driverAction, receipt, now); err != nil {
 		// Persisted receipts are replayable. If projection/ack failed, preserve the
 		// effect as verification work and never call the lifecycle mutation again.
 		_ = r.Store.MarkProjectActorLifecycleActionVerifying(ctx, action.ID, r.Owner,
@@ -147,6 +178,111 @@ func (r ActorLifecycleRuntime) Tick(ctx context.Context, now time.Time) (ActorLi
 	}
 	report.Executed++
 	return report, nil
+}
+
+type actorPresenceReport struct{ Scanned, Held, Recovered, Errors int }
+
+func (r ActorLifecycleRuntime) reconcileActivePresence(ctx context.Context, now time.Time) (actorPresenceReport, error) {
+	var report actorPresenceReport
+	targets, err := r.Store.ActiveProjectActorLivenessTargets(ctx)
+	if err != nil {
+		return report, err
+	}
+	for _, target := range targets {
+		report.Scanned++
+		endpoint, err := r.Resolver.ResolveAction(Action{InstanceRef: target.InstanceRef,
+			TargetHostID: target.HostID, TargetStoreID: target.StoreID,
+			TargetServerDomainID: target.ServerDomainID, TargetServerID: target.ServerID})
+		if err != nil {
+			report.Errors++
+			continue
+		}
+		if target.LifecycleOwnership == "external_observed" {
+			if err := target.ValidateManagedRecovery(); err != nil {
+				report.Errors++
+				continue
+			}
+			inventory, err := endpoint.Port.LifecycleProfiles(ctx)
+			if err != nil {
+				report.Errors++
+				continue
+			}
+			probe := SessionTarget{Identity: Identity{HostID: target.HostID, StoreID: target.StoreID,
+				TmuxServerDomainID: target.ServerDomainID, TmuxServerInstanceID: target.ServerID,
+				Ownership: "driver_managed", LifecycleKey: target.LifecycleKey, TargetEpoch: target.TargetEpoch + 1},
+				LifecycleKey: target.LifecycleKey, TargetEpoch: target.TargetEpoch + 1,
+				ProfileID:             target.ManagedRecoveryProfileID,
+				WorkspaceRootID:       target.ManagedRecoveryWorkspaceRootID,
+				WorkspaceRelativePath: target.ManagedRecoveryWorkspaceRelativePath,
+				Bootstrap: &LifecycleBootstrapArtifact{Format: "initial_prompt_utf8/v1", ContentUTF8: "preflight",
+					PayloadSHA256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+				CredentialEnvelope: &LifecycleCredentialEnvelope{EnvelopeID: "preflight", Format: "flowbee.credential/v1",
+					SecretUTF8: "preflight", PayloadSHA256: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+					CredentialEpoch: target.TargetEpoch + 1},
+				PresentationName: target.ProjectID + "-interactor"}
+			if err := inventory.ValidateLaunch(target.ManagedRecoveryProfileID, target.ServerDomainID, probe); err != nil {
+				report.Errors++
+				continue
+			}
+		}
+		presence, err := endpoint.Port.LifecycleTargetPresence(ctx, target.LifecycleKey, target.TargetEpoch)
+		if err != nil {
+			report.Errors++
+			continue
+		}
+		if presence.Presence == "present" && actorLivenessPresenceMatches(presence.Identity, target) {
+			continue
+		}
+		if !presence.ExactAbsent() {
+			report.Errors++
+			continue
+		}
+		if target.LifecycleOwnership == "external_observed" {
+			_, promoted, err := r.Store.PromoteAdoptedInteractorExactAbsence(ctx, target, now)
+			if err != nil {
+				report.Errors++
+				continue
+			}
+			if promoted {
+				report.Recovered++
+			}
+			continue
+		}
+		if err := r.Store.HoldManagedProjectActorExactAbsence(ctx, target, now); err != nil {
+			return report, err
+		}
+		held, err := r.Store.CurrentProjectActorLifecycle(ctx, target.ProjectID, target.Role)
+		if err != nil {
+			return report, err
+		}
+		_, _, err = r.Store.CommitProjectActorLifecycleIntent(ctx, store.ProjectActorLifecycleCommand{
+			ProjectID: target.ProjectID, Role: target.Role, ActorID: target.ActorID,
+			ExpectedRouteStateVersion:     target.RouteStateVersion,
+			ExpectedLifecycleStateVersion: held.StateVersion, Operation: "ensure",
+			IdempotencyKey: "actor-presence-recover:" + target.ProjectID + ":" + target.Role + ":" +
+				target.ActorID + ":" + fmt.Sprint(target.TargetEpoch+1),
+			InstanceRef: target.InstanceRef, TargetHostID: target.HostID, TargetStoreID: target.StoreID,
+			TargetServerDomainID: target.ServerDomainID, TargetServerID: target.ServerID,
+			LifecycleOwnership: "driver_managed", LifecycleKey: target.LifecycleKey,
+			TargetEpoch: target.TargetEpoch + 1, ProfileID: target.ProfileID,
+			WorkspaceRootID: target.WorkspaceRootID, WorkspaceRelativePath: target.WorkspaceRelativePath,
+		}, now)
+		if err != nil {
+			report.Held++
+			continue
+		}
+		report.Recovered++
+	}
+	return report, nil
+}
+
+func actorLivenessPresenceMatches(id Identity, target store.ProjectActorLivenessTarget) bool {
+	expectedOwnership := target.LifecycleOwnership
+	return id.HostID == target.HostID && id.StoreID == target.StoreID &&
+		id.TmuxServerDomainID == target.ServerDomainID && id.TmuxServerInstanceID == target.ServerID &&
+		id.Ownership == expectedOwnership && id.LifecycleKey == target.LifecycleKey &&
+		id.TargetEpoch == target.TargetEpoch && id.SessionID == target.SessionID &&
+		id.PaneInstanceID == target.PaneInstanceID && id.AgentRunID == target.AgentRunID
 }
 
 func executeActorLifecycle(ctx context.Context, port DriverPort, action Action) (LifecycleReceipt, error) {
@@ -200,9 +336,17 @@ func (r ActorLifecycleRuntime) preEffectFailure(ctx context.Context, action stor
 }
 
 func (r ActorLifecycleRuntime) persistProjectAcknowledge(ctx context.Context,
-	action store.ProjectActorLifecycleAction, receipt LifecycleReceipt, now time.Time) error {
+	action store.ProjectActorLifecycleAction, driverAction Action, receipt LifecycleReceipt, now time.Time) error {
 	if _, err := r.Store.PersistProjectActorLifecycleReceipt(ctx, actorStoreReceipt(receipt), now); err != nil {
 		return err
+	}
+	// Receipt durability precedes destruction of the one-shot credential source.
+	// A crash after this point is recoverable by action lookup; a crash before it
+	// leaves the exact committed envelope available for the same idempotent action.
+	if finalizer, ok := r.Materials.(LifecycleLaunchMaterialFinalizer); ok {
+		if err := finalizer.FinalizeLifecycleLaunch(ctx, driverAction, receipt, now); err != nil {
+			return err
+		}
 	}
 	if err := r.Store.ProjectPersistedProjectActorLifecycleReceipt(ctx, action.ID, now); err != nil {
 		return err
@@ -247,7 +391,7 @@ func (r ActorLifecycleRuntime) verify(ctx context.Context, action store.ProjectA
 	if !found || !receipt.Resolved() {
 		return report, nil
 	}
-	if err := r.persistProjectAcknowledge(ctx, action, receipt, now); err != nil {
+	if err := r.persistProjectAcknowledge(ctx, action, driverAction, receipt, now); err != nil {
 		return report, err
 	}
 	report.Verified++

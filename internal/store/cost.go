@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/engine"
@@ -12,11 +14,16 @@ import (
 	"github.com/samhotchkiss/flowbee/internal/ledger"
 )
 
+var ErrCostProjectMismatch = errors.New("cost report project does not own job")
+
 // CostParams is a fenced cost report (§6.7, I-15): a worker's {tokens_in,
 // tokens_out, $} delta reported on heartbeat/result. Dollars are MICRO-USD
 // ($1.00 = 1_000_000) so the ceiling arithmetic is exact integer math.
 type CostParams struct {
-	JobID          string
+	JobID string
+	// ProjectID is an optional caller assertion. Durable ownership always comes
+	// from JobID's parent row; a supplied mismatch is rejected, never trusted.
+	ProjectID      string
 	Epoch          int
 	Now            time.Time
 	TokensInDelta  int64
@@ -53,6 +60,9 @@ func (s *Store) RecordCost(ctx context.Context, p CostParams) (CostResult, error
 		j, seq, err := loadJobTx(ctx, tx, p.JobID)
 		if err != nil {
 			return err
+		}
+		if asserted := strings.TrimSpace(p.ProjectID); asserted != "" && asserted != j.ProjectID {
+			return ErrCostProjectMismatch
 		}
 		// fold the delta into a COPY of the job so the engine sees the NEW meter (the
 		// ceiling predicate compares the accumulated total, I-15). The persisted
@@ -189,6 +199,7 @@ func (s *Store) RecordCost(ctx context.Context, p CostParams) (CostResult, error
 
 // FlowCostRow is the per-job line of a per-flow cost rollup (§12.6.5).
 type FlowCostRow struct {
+	ProjectID       string `json:"project_id"`
 	JobID           string `json:"job_id"`
 	Flow            string `json:"flow"`
 	Stage           string `json:"stage"`
@@ -204,6 +215,7 @@ type FlowCostRow struct {
 // FlowCostRollup is the answer to "what did this feature cost across spec+build+
 // review?" (§12.6.5): every job sharing the flow_id, plus the summed totals.
 type FlowCostRollup struct {
+	ProjectID      string        `json:"project_id"`
 	FlowID         string        `json:"flow_id"`
 	Jobs           []FlowCostRow `json:"jobs"`
 	TotalTokensIn  int64         `json:"total_tokens_in"`
@@ -215,11 +227,22 @@ type FlowCostRollup struct {
 // the meter across every job of the feature (spec_author + spec_reviewer +
 // eng_worker + code_reviewer + merger), answering the end-to-end cost question.
 func (s *Store) FlowCostRollup(ctx context.Context, flowID string) (FlowCostRollup, error) {
-	rollup := FlowCostRollup{FlowID: flowID}
+	return s.FlowCostRollupForProject(ctx, "default", flowID)
+}
+
+// FlowCostRollupForProject scopes a reusable human-facing flow label to its
+// exact durable project. Identical flow IDs in another project are never summed
+// or returned. FlowCostRollup remains the default-project compatibility wrapper.
+func (s *Store) FlowCostRollupForProject(ctx context.Context, projectID, flowID string) (FlowCostRollup, error) {
+	projectID = strings.TrimSpace(projectID)
+	rollup := FlowCostRollup{ProjectID: projectID, FlowID: flowID}
+	if projectID == "" {
+		return rollup, ErrProjectNotFound
+	}
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, flow, stage, role, state,
+		SELECT project_id, id, flow, stage, role, state,
 		       cost_tokens_in, cost_tokens_out, cost_micro_usd, cost_ceiling_micro_usd, over_budget
-		  FROM jobs WHERE flow_id = ? ORDER BY id ASC`, flowID)
+		  FROM jobs WHERE project_id=? AND flow_id = ? ORDER BY id ASC`, projectID, flowID)
 	if err != nil {
 		return rollup, err
 	}
@@ -228,7 +251,7 @@ func (s *Store) FlowCostRollup(ctx context.Context, flowID string) (FlowCostRoll
 		var r FlowCostRow
 		var ceiling sql.NullInt64
 		var over int
-		if err := rows.Scan(&r.JobID, &r.Flow, &r.Stage, &r.Role, &r.State,
+		if err := rows.Scan(&r.ProjectID, &r.JobID, &r.Flow, &r.Stage, &r.Role, &r.State,
 			&r.TokensIn, &r.TokensOut, &r.MicroUSD, &ceiling, &over); err != nil {
 			return rollup, err
 		}
@@ -249,10 +272,29 @@ func (s *Store) FlowCostRollup(ctx context.Context, flowID string) (FlowCostRoll
 // dashboard cost pane reads this to show tokens + micro-USD + over-budget across
 // the whole board, complementing FlowCostRollup's per-feature view.
 func (s *Store) AllJobCost(ctx context.Context) ([]FlowCostRow, error) {
+	return s.allJobCost(ctx, "")
+}
+
+// AllJobCostForProject returns the exact project's cost projection. The
+// project predicate is part of the SQL authority boundary, not an in-memory
+// post-filter which could accidentally serialize another project's row.
+func (s *Store) AllJobCostForProject(ctx context.Context, projectID string) ([]FlowCostRow, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return nil, ErrProjectNotFound
+	}
+	return s.allJobCost(ctx, projectID)
+}
+
+func (s *Store) allJobCost(ctx context.Context, projectID string) ([]FlowCostRow, error) {
+	where, args := "", []any{}
+	if projectID != "" {
+		where, args = " WHERE project_id=?", []any{projectID}
+	}
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, flow, stage, role, state,
+		SELECT project_id, id, flow, stage, role, state,
 		       cost_tokens_in, cost_tokens_out, cost_micro_usd, cost_ceiling_micro_usd, over_budget
-		  FROM jobs ORDER BY cost_micro_usd DESC, id ASC`)
+		  FROM jobs`+where+` ORDER BY cost_micro_usd DESC, id ASC`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +304,7 @@ func (s *Store) AllJobCost(ctx context.Context) ([]FlowCostRow, error) {
 		var r FlowCostRow
 		var ceiling sql.NullInt64
 		var over int
-		if err := rows.Scan(&r.JobID, &r.Flow, &r.Stage, &r.Role, &r.State,
+		if err := rows.Scan(&r.ProjectID, &r.JobID, &r.Flow, &r.Stage, &r.Role, &r.State,
 			&r.TokensIn, &r.TokensOut, &r.MicroUSD, &ceiling, &over); err != nil {
 			return nil, err
 		}

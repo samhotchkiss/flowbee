@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"sort"
 	"strings"
 	"time"
@@ -21,6 +22,9 @@ type ProjectDashboardRow struct {
 	Orchestrator  ProjectActorHealth       `json:"orchestrator"`
 	Capacity      ProjectCapacity          `json:"capacity"`
 	Scheduler     []ProjectSchedulerMetric `json:"scheduler"`
+	Delivery      ProjectDeliveryCounts    `json:"delivery"`
+	Breakers      []ProjectBreakerView     `json:"breakers"`
+	Throughput    ProjectThroughput        `json:"throughput"`
 	ActiveEpics   int                      `json:"active_epics"`
 	ParkedEpics   int                      `json:"parked_epics"`
 	NeedsYou      int                      `json:"needs_you"`
@@ -28,6 +32,55 @@ type ProjectDashboardRow struct {
 	BlockerKind   string                   `json:"blocker_kind,omitempty"`
 	BlockedSince  time.Time                `json:"blocked_since,omitempty"`
 }
+
+// ProjectDeliveryCounts is a complete, project-scoped fold of the durable
+// epic_deliveries state machine. Buckets are intentionally stable UI concepts;
+// Other keeps new states visible until the projection is deliberately extended.
+type ProjectDeliveryCounts struct {
+	Total                  int `json:"total"`
+	Admitted               int `json:"admitted"`
+	Building               int `json:"building"`
+	AwaitingArtifact       int `json:"awaiting_artifact"`
+	AwaitingCI             int `json:"awaiting_ci"`
+	AwaitingReviewDispatch int `json:"awaiting_review_dispatch"`
+	InReview               int `json:"in_review"`
+	Merge                  int `json:"merge"`
+	Cleanup                int `json:"cleanup"`
+	Held                   int `json:"held"`
+	Terminal               int `json:"terminal"`
+	Other                  int `json:"other"`
+}
+
+// ProjectBreakerView exposes every active project/repository breaker. ResetAt
+// is the next automatic probe for an open breaker; half-open rows separately
+// expose their epoch-fenced probe lease horizon.
+type ProjectBreakerView struct {
+	Scope               string    `json:"scope"`
+	RepoID              string    `json:"repo_id"`
+	State               string    `json:"state"`
+	HalfOpen            bool      `json:"half_open"`
+	FailureKind         string    `json:"failure_kind"`
+	Reason              string    `json:"reason"`
+	FailureCount        int       `json:"failure_count"`
+	OpenedAt            time.Time `json:"opened_at"`
+	ResetAt             time.Time `json:"reset_at"`
+	ProbeEpoch          int       `json:"probe_epoch"`
+	ProbeLeaseExpiresAt time.Time `json:"probe_lease_expires_at"`
+}
+
+// ProjectThroughput is a trailing, injected-clock window over immutable control
+// events. Merged counts authoritative merge facts; Completed counts verified
+// cleanup; Recoveries counts named automatic recovery actions. The fixed window
+// is explicit in every response rather than being hidden UI policy.
+type ProjectThroughput struct {
+	WindowSeconds int64     `json:"window_seconds"`
+	WindowStart   time.Time `json:"window_start"`
+	Merged        int       `json:"merged"`
+	Completed     int       `json:"completed"`
+	Recoveries    int       `json:"recoveries"`
+}
+
+const ProjectThroughputWindow = 24 * time.Hour
 
 // ProjectCapacity is the current physical/service allocation attributable to a
 // project. It is intentionally an allocation, not a quota estimate: every slot
@@ -61,6 +114,13 @@ type ProjectSchedulerMetric struct {
 	EligibleWaitSeconds              int64     `json:"eligible_wait_seconds"`
 	StarvationBoundSeconds           int64     `json:"starvation_bound_seconds"`
 	Starved                          bool      `json:"starved"`
+	EligibilityStatus                string    `json:"eligibility_status"`
+	WhyNotCode                       string    `json:"why_not_code"`
+	WhyNotDetail                     string    `json:"why_not_detail"`
+	NextEligibleAt                   time.Time `json:"next_eligible_at"`
+	LastDecisionCode                 string    `json:"last_decision_code"`
+	LastDecisionDetail               string    `json:"last_decision_detail"`
+	LastDecisionAt                   time.Time `json:"last_decision_at"`
 }
 
 const ProjectStarvationBound = 15 * time.Minute
@@ -100,6 +160,13 @@ const (
 // means retained affinity with no occupied pane. The two counts are intentionally
 // disjoint so the dashboard cannot imply that parked work consumes capacity.
 func (s *Store) ProjectDashboard(ctx context.Context) ([]ProjectDashboardRow, error) {
+	return s.ProjectDashboardAt(ctx, time.Now().UTC())
+}
+
+// ProjectDashboardAt is ProjectDashboard with an injected clock for the rolling
+// throughput window. Production API/UI callers pass their shared Flowbee clock.
+func (s *Store) ProjectDashboardAt(ctx context.Context, now time.Time) ([]ProjectDashboardRow, error) {
+	now = now.UTC()
 	projects, err := s.ListPortfolioProjects(ctx)
 	if err != nil {
 		return nil, err
@@ -110,7 +177,116 @@ func (s *Store) ProjectDashboard(ctx context.Context) ([]ProjectDashboardRow, er
 		rows[i].Project = projects[i]
 		rows[i].Interactor = ProjectActorHealth{Role: DriverInteractorRole, Status: ProjectActorUnregistered}
 		rows[i].Orchestrator = ProjectActorHealth{Role: DriverOrchestratorRole, Status: ProjectActorUnregistered}
+		rows[i].Breakers = []ProjectBreakerView{}
+		rows[i].Throughput = ProjectThroughput{WindowSeconds: int64(ProjectThroughputWindow / time.Second), WindowStart: now.Add(-ProjectThroughputWindow)}
 		byID[projects[i].ID] = &rows[i]
+	}
+
+	// Fold every delivery into one stable product-stage bucket. Project ownership
+	// comes directly from epic_deliveries.project_id; repo/session labels are never
+	// consulted.
+	deliveryRows, err := s.DB.QueryContext(ctx, `SELECT project_id,state,COUNT(*)
+		FROM epic_deliveries GROUP BY project_id,state ORDER BY project_id,state`)
+	if err != nil {
+		return nil, err
+	}
+	for deliveryRows.Next() {
+		var projectID, state string
+		var count int
+		if err := deliveryRows.Scan(&projectID, &state, &count); err != nil {
+			deliveryRows.Close()
+			return nil, err
+		}
+		row := byID[projectID]
+		if row == nil {
+			continue
+		}
+		row.Delivery.Total += count
+		switch state {
+		case "admitted":
+			row.Delivery.Admitted += count
+		case "building":
+			row.Delivery.Building += count
+		case "awaiting_artifact":
+			row.Delivery.AwaitingArtifact += count
+		case "awaiting_ci", "rebuild_in_flight":
+			row.Delivery.AwaitingCI += count
+		case "awaiting_review_dispatch":
+			row.Delivery.AwaitingReviewDispatch += count
+		case "review_queued", "in_review", "changes_requested":
+			row.Delivery.InReview += count
+		case "approved", "merge_queued", "merging", "conflict_resolution", "merged":
+			row.Delivery.Merge += count
+		case "cleanup_pending":
+			row.Delivery.Cleanup += count
+		case "needs_human", "paused", "awaiting_decision":
+			row.Delivery.Held += count
+		case "complete", "abandoned":
+			row.Delivery.Terminal += count
+		default:
+			row.Delivery.Other += count
+		}
+	}
+	if err := deliveryRows.Close(); err != nil {
+		return nil, err
+	}
+
+	breakerRows, err := s.DB.QueryContext(ctx, `SELECT project_id,repo_id,state,failure_kind,reason,
+		failure_count,opened_at,probe_due_at,probe_epoch,probe_lease_expires_at
+		FROM project_circuit_breakers WHERE state IN ('open','half_open')
+		ORDER BY project_id,CASE WHEN repo_id='' THEN 0 ELSE 1 END,repo_id`)
+	if err != nil {
+		return nil, err
+	}
+	for breakerRows.Next() {
+		var projectID, opened, reset, leaseExpires string
+		var view ProjectBreakerView
+		if err := breakerRows.Scan(&projectID, &view.RepoID, &view.State, &view.FailureKind,
+			&view.Reason, &view.FailureCount, &opened, &reset, &view.ProbeEpoch, &leaseExpires); err != nil {
+			breakerRows.Close()
+			return nil, err
+		}
+		view.Scope = "project"
+		if view.RepoID != "" {
+			view.Scope = "repository"
+		}
+		view.HalfOpen = view.State == "half_open"
+		view.OpenedAt = parseDashboardTime(opened)
+		view.ResetAt = parseDashboardTime(reset)
+		view.ProbeLeaseExpiresAt = parseDashboardTime(leaseExpires)
+		if row := byID[projectID]; row != nil {
+			row.Breakers = append(row.Breakers, view)
+		}
+	}
+	if err := breakerRows.Close(); err != nil {
+		return nil, err
+	}
+
+	throughputRows, err := s.DB.QueryContext(ctx, `SELECT project_id,
+		COUNT(DISTINCT CASE WHEN (kind='artifact_reconciled' AND to_state='cleanup_pending') OR kind='merge_verified' THEN epic_id END),
+		COUNT(DISTINCT CASE WHEN kind='cleanup_complete' THEN epic_id END),
+		SUM(CASE WHEN kind IN ('review_handoff_recovered','effect_recovery_budget_granted',
+			'builder_relaunched','conflict_resolver_relaunched','merge_no_effect_verified') THEN 1 ELSE 0 END)
+		FROM control_events WHERE julianday(created_at)>=julianday(?) GROUP BY project_id ORDER BY project_id`,
+		now.Add(-ProjectThroughputWindow).Format(rfc3339))
+	if err != nil {
+		return nil, err
+	}
+	for throughputRows.Next() {
+		var projectID string
+		var merged, completed, recoveries sql.NullInt64
+		if err := throughputRows.Scan(&projectID, &merged, &completed, &recoveries); err != nil {
+			throughputRows.Close()
+			return nil, err
+		}
+		if row := byID[projectID]; row != nil {
+			row.Throughput.Merged = int(merged.Int64)
+			row.Throughput.Completed = int(completed.Int64)
+			row.Throughput.Recoveries = int(recoveries.Int64)
+		}
+	}
+	if err := throughputRows.Close(); err != nil {
+		return nil, err
 	}
 
 	actors, err := s.DB.QueryContext(ctx, `SELECT r.project_id,r.role,r.actor_id,r.state,
@@ -177,25 +353,42 @@ func (s *Store) ProjectDashboard(ctx context.Context) ([]ProjectDashboardRow, er
 		return nil, err
 	}
 
-	counts, err := s.DB.QueryContext(ctx, `SELECT project_id,
-		SUM(CASE WHEN builder_affinity_state='active' THEN 1 ELSE 0 END),
-		SUM(CASE WHEN builder_affinity_state='parked' AND state NOT IN ('complete','abandoned') THEN 1 ELSE 0 END)
-		FROM epic_deliveries GROUP BY project_id`)
+	counts, err := s.DB.QueryContext(ctx, `SELECT project_id,COUNT(*) FROM epics
+		WHERE seat_id<>'' AND state IN `+epicActiveStatesSQL+` GROUP BY project_id`)
 	if err != nil {
 		return nil, err
 	}
 	for counts.Next() {
 		var projectID string
-		var active, parked sql.NullInt64
-		if err := counts.Scan(&projectID, &active, &parked); err != nil {
+		var active int
+		if err := counts.Scan(&projectID, &active); err != nil {
 			counts.Close()
 			return nil, err
 		}
 		if row := byID[projectID]; row != nil {
-			row.ActiveEpics, row.ParkedEpics = int(active.Int64), int(parked.Int64)
+			row.ActiveEpics = active
 		}
 	}
 	if err := counts.Close(); err != nil {
+		return nil, err
+	}
+	parkedRows, err := s.DB.QueryContext(ctx, `SELECT project_id,COUNT(*) FROM epic_deliveries
+		WHERE builder_affinity_state='parked' AND state NOT IN ('complete','abandoned') GROUP BY project_id`)
+	if err != nil {
+		return nil, err
+	}
+	for parkedRows.Next() {
+		var projectID string
+		var parked int
+		if err := parkedRows.Scan(&projectID, &parked); err != nil {
+			parkedRows.Close()
+			return nil, err
+		}
+		if row := byID[projectID]; row != nil {
+			row.ParkedEpics = parked
+		}
+	}
+	if err := parkedRows.Close(); err != nil {
 		return nil, err
 	}
 
@@ -314,7 +507,7 @@ func (s *Store) foldProjectSchedulerDashboard(ctx context.Context, byID map[stri
 	for projectID, row := range byID {
 		metrics[projectID] = map[string]*ProjectSchedulerMetric{}
 		for _, pool := range []string{scheduler.PoolBuild, scheduler.PoolReview} {
-			metric := &ProjectSchedulerMetric{Pool: pool}
+			metric := &ProjectSchedulerMetric{Pool: pool, EligibilityStatus: "held", WhyNotCode: "no_ready_work", WhyNotDetail: "no durable ready work in this pool"}
 			if row.Project.State == "active" && activeWeight > 0 {
 				metric.ConfiguredWeightShareBasisPoints = ratioBasisPoints(int64(row.Project.SchedulerWeight), int64(activeWeight))
 			}
@@ -327,7 +520,7 @@ func (s *Store) foldProjectSchedulerDashboard(ctx context.Context, byID map[stri
 			return nil
 		}
 		if metrics[projectID][pool] == nil {
-			metric := &ProjectSchedulerMetric{Pool: pool}
+			metric := &ProjectSchedulerMetric{Pool: pool, EligibilityStatus: "held", WhyNotCode: "no_ready_work", WhyNotDetail: "no durable ready work in this pool"}
 			if row.Project.State == "active" && activeWeight > 0 {
 				metric.ConfiguredWeightShareBasisPoints = ratioBasisPoints(int64(row.Project.SchedulerWeight), int64(activeWeight))
 			}
@@ -379,8 +572,11 @@ func (s *Store) foldProjectSchedulerDashboard(ctx context.Context, byID map[stri
 	}
 
 	poolTotals := map[string]int64{}
-	turnRows, err := s.DB.QueryContext(ctx, `SELECT pool,project_id,COUNT(*)
-		FROM project_scheduler_turns GROUP BY pool,project_id`)
+	turnRows, err := s.DB.QueryContext(ctx, `SELECT pool,project_id,COUNT(*) FROM (
+		SELECT pool,project_id FROM project_scheduler_turns
+		UNION ALL
+		SELECT pool,project_id FROM project_scheduler_effects)
+		GROUP BY pool,project_id`)
 	if err != nil {
 		return err
 	}
@@ -426,6 +622,30 @@ func (s *Store) foldProjectSchedulerDashboard(ctx context.Context, byID map[stri
 	if err != nil {
 		return err
 	}
+	rawReady := map[string]map[string]int{}
+	rawRows, err := s.DB.QueryContext(ctx, `SELECT project_id,
+		CASE WHEN state='review_pending' THEN ? ELSE ? END AS pool,COUNT(*)
+		FROM jobs WHERE state IN ('ready','review_pending') GROUP BY project_id,pool`,
+		scheduler.PoolReview, scheduler.PoolBuild)
+	if err != nil {
+		return err
+	}
+	for rawRows.Next() {
+		var projectID, pool string
+		var count int
+		if err := rawRows.Scan(&projectID, &pool, &count); err != nil {
+			rawRows.Close()
+			return err
+		}
+		if rawReady[projectID] == nil {
+			rawReady[projectID] = map[string]int{}
+		}
+		rawReady[projectID][pool] = count
+	}
+	if err := rawRows.Close(); err != nil {
+		return err
+	}
+
 	for _, candidate := range append(build, review...) {
 		row := byID[candidate.ProjectID]
 		if row == nil || row.Project.State != "active" ||
@@ -436,6 +656,127 @@ func (s *Store) foldProjectSchedulerDashboard(ctx context.Context, byID map[stri
 		metric.Eligible++
 		if metric.OldestEligibleAt.IsZero() || candidate.EnqueuedAt.Before(metric.OldestEligibleAt) {
 			metric.OldestEligibleAt = candidate.EnqueuedAt
+		}
+	}
+
+	// V2 builders are physical epic resources, not synthetic jobs. Fold the same
+	// admitted/rework workflow predicates as the authoritative builder scheduler
+	// so portfolio eligibility cannot disappear merely because no jobs row exists.
+	v2Rows, err := s.DB.QueryContext(ctx, `SELECT project_id,created_at,route_open FROM (
+		SELECT e.project_id,d.created_at,
+		       NOT EXISTS (SELECT 1 FROM project_circuit_breakers b
+		         WHERE b.project_id=e.project_id AND b.state<>'closed'
+		           AND (b.repo_id='' OR b.repo_id=e.repo)) AS route_open
+		  FROM epics e JOIN epic_deliveries d ON d.epic_id=e.id
+		 WHERE d.state='admitted' AND d.compute_lease_action_id='' AND e.seat_id=''
+		   AND (d.hold_kind='' OR d.hold_kind='builder_capacity_unavailable')
+		   AND NOT EXISTS (SELECT 1 FROM epic_actions a WHERE a.epic_id=e.id
+		     AND a.kind IN ('builder_launch','builder_launch_contract') AND a.state<>'cancelled_superseded')
+		UNION ALL
+		SELECT e.project_id,d.state_entered_at,
+		       NOT EXISTS (SELECT 1 FROM project_circuit_breakers b
+		         WHERE b.project_id=e.project_id AND b.state<>'closed'
+		           AND (b.repo_id='' OR b.repo_id=e.repo)) AS route_open
+		  FROM epics e JOIN epic_deliveries d ON d.epic_id=e.id
+		 WHERE d.state='changes_requested' AND d.builder_affinity_state='relaunching'
+		   AND d.compute_lease_action_id='' AND e.state IN ('done','achieved')
+		   AND EXISTS (SELECT 1 FROM epic_actions a WHERE a.epic_id=e.id
+		     AND a.kind='builder_rework' AND a.state='pending' AND a.action_epoch=0))
+		ORDER BY project_id,created_at`)
+	if err != nil {
+		return err
+	}
+	for v2Rows.Next() {
+		var projectID, created string
+		var routeOpen int
+		if err := v2Rows.Scan(&projectID, &created, &routeOpen); err != nil {
+			v2Rows.Close()
+			return err
+		}
+		if rawReady[projectID] == nil {
+			rawReady[projectID] = map[string]int{}
+		}
+		rawReady[projectID][scheduler.PoolBuild]++
+		row, metric := byID[projectID], ensureMetric(projectID, scheduler.PoolBuild)
+		if row == nil || metric == nil || routeOpen == 0 || row.Project.State != "active" ||
+			(row.Project.ConcurrencyCap > 0 && row.Capacity.Allocated >= row.Project.ConcurrencyCap) {
+			continue
+		}
+		metric.Eligible++
+		at := parseDashboardTime(created)
+		if metric.OldestEligibleAt.IsZero() || (!at.IsZero() && at.Before(metric.OldestEligibleAt)) {
+			metric.OldestEligibleAt = at
+		}
+	}
+	if err := v2Rows.Close(); err != nil {
+		return err
+	}
+
+	// The immutable turn ledger retains the exact reason each candidate did or
+	// did not win. Surface the newest decision per project/pool as historical
+	// evidence; current eligibility below is independently recomputed from current
+	// durable state so a stale turn is never presented as current truth.
+	turnRows, err = s.DB.QueryContext(ctx, `SELECT pool,decisions_json,created_at FROM (
+		SELECT pool,decisions_json,created_at,seq,0 AS source_rank FROM project_scheduler_turns
+		UNION ALL
+		SELECT pool,decisions_json,created_at,seq,1 AS source_rank FROM project_scheduler_effects)
+		ORDER BY julianday(created_at) DESC,source_rank DESC,seq DESC`)
+	if err != nil {
+		return err
+	}
+	for turnRows.Next() {
+		var pool, rawDecisions, decided string
+		if err := turnRows.Scan(&pool, &rawDecisions, &decided); err != nil {
+			turnRows.Close()
+			return err
+		}
+		var decisions []scheduler.CandidateDecision
+		if err := json.Unmarshal([]byte(rawDecisions), &decisions); err != nil {
+			turnRows.Close()
+			return err
+		}
+		for _, decision := range decisions {
+			metric := ensureMetric(decision.Candidate.ProjectID, pool)
+			if metric == nil || !metric.LastDecisionAt.IsZero() {
+				continue
+			}
+			metric.LastDecisionCode = string(decision.Code)
+			metric.LastDecisionDetail = decision.Detail
+			metric.LastDecisionAt = parseDashboardTime(decided)
+		}
+	}
+	if err := turnRows.Close(); err != nil {
+		return err
+	}
+
+	for projectID, row := range byID {
+		for pool, metric := range metrics[projectID] {
+			switch {
+			case metric.Eligible > 0:
+				metric.EligibilityStatus = "eligible"
+				metric.WhyNotCode, metric.WhyNotDetail = "", ""
+			case row.Project.State != "active":
+				metric.WhyNotCode = "project_inactive"
+				metric.WhyNotDetail = "project is " + row.Project.State
+			case row.Project.ConcurrencyCap > 0 && row.Capacity.Allocated >= row.Project.ConcurrencyCap:
+				metric.WhyNotCode = "project_concurrency_cap"
+				metric.WhyNotDetail = "project has no free allocation below its concurrency cap"
+			case rawReady[projectID][pool] > 0 && len(row.Breakers) > 0:
+				metric.WhyNotCode = "project_breaker"
+				metric.WhyNotDetail = "ready work is held by an active project/repository breaker"
+				for _, breaker := range row.Breakers {
+					next := breaker.ResetAt
+					if breaker.HalfOpen && !breaker.ProbeLeaseExpiresAt.IsZero() {
+						next = breaker.ProbeLeaseExpiresAt
+					}
+					if !next.IsZero() && (metric.NextEligibleAt.IsZero() || next.Before(metric.NextEligibleAt)) {
+						metric.NextEligibleAt = next
+					}
+				}
+			case rawReady[projectID][pool] > 0:
+				metric.WhyNotCode = "workflow_gate"
+				metric.WhyNotDetail = "durable work exists but is not currently offerable by its workflow facts"
+			}
 		}
 	}
 

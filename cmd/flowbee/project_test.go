@@ -330,6 +330,8 @@ func TestProjectActorLifecycleCLICommitsIntentAndRejectsRawPaneSelector(t *testi
 		"--host-id", "mac", "--store-id", "external-store", "--tmux-server-domain-id", "default",
 		"--tmux-server-instance-id", "server-external", "--lifecycle-key", "russ-claude",
 		"--target-epoch", "1", "--profile-id", "claude-interactor", "--external-watch-id", "watch-russ-claude",
+		"--recovery-profile-id", "claude_interactor_managed", "--recovery-workspace-root-id", "russ-root",
+		"--recovery-workspace-relative-path", "russ",
 		"--session-id", "session-russ-claude", "--agent-run-id", "run-russ-claude"}
 	if err := runProjectActorLifecycle(ctx, st, append(base, "--pane-instance-id", "%1")); err == nil {
 		t.Fatal("actor lifecycle CLI accepted raw tmux pane selector")

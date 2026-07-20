@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/samhotchkiss/flowbee/internal/epicexec"
@@ -86,6 +87,59 @@ type Manager struct {
 	autoMergeHandoff bool
 	loops            map[string]*repoLoop // keyed by repos.id
 	order            []string             // repo ids in stable (sorted) order
+}
+
+// RepoLoopFailure is one repository-scoped failure from a bounded multi-repo
+// pass. RepoID is the durable registry id (never owner/name, cwd, or position in
+// the pass), so callers can attach recovery state to exactly the failed scope.
+type RepoLoopFailure struct {
+	RepoID string
+	Err    error
+}
+
+// RepoLoopFailures reports every repository that failed during one complete
+// SweepAll or DrainAll pass. The manager always attempts each managed repository
+// exactly once before returning this error; one bad repository therefore cannot
+// suppress progress in a healthy sibling.
+type RepoLoopFailures struct {
+	Operation string
+	Failures  []RepoLoopFailure
+}
+
+func (e *RepoLoopFailures) Error() string {
+	if e == nil || len(e.Failures) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(e.Failures))
+	for _, failure := range e.Failures {
+		parts = append(parts, fmt.Sprintf("%s repo %q: %v", e.Operation, failure.RepoID, failure.Err))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// Unwrap preserves errors.Is/errors.As compatibility for callers that used to
+// inspect the single wrapped repository error returned by these methods.
+func (e *RepoLoopFailures) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	out := make([]error, 0, len(e.Failures))
+	for _, failure := range e.Failures {
+		if failure.Err != nil {
+			out = append(out, failure.Err)
+		}
+	}
+	return out
+}
+
+// RepoFailures extracts a defensive copy of the deterministic per-repository
+// outcomes. Non-batch errors return nil so production never guesses a repo scope.
+func RepoFailures(err error) []RepoLoopFailure {
+	var batch *RepoLoopFailures
+	if !errors.As(err, &batch) || batch == nil {
+		return nil
+	}
+	return append([]RepoLoopFailure(nil), batch.Failures...)
 }
 
 // HistoryWriter is the per-repo LOCAL-git writer that lands the F11 issue-archive
@@ -163,6 +217,17 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 	}
 	m := &Manager{store: st, clk: clk, pub: pub, autoMergeHandoff: cfg.autoMergeHandoff, loops: map[string]*repoLoop{}}
 	for _, r := range repos {
+		// Repo-origin GitHub adoption is compatibility-only. When it is enabled,
+		// resolve the repository to exactly one active project and persist a
+		// visible hold on zero/ambiguous ownership. Native v2 never infers project
+		// authority from a repository; its admitted epic/work-intent already owns it.
+		legacyProjectID := ""
+		if !st.EnableEpicReviewHandoffV2 {
+			legacyProjectID, err = st.ResolveRepoAdmissionProjectAndHold(ctx, r.ID, clk.Now())
+			if err != nil {
+				return nil, fmt.Errorf("resolve legacy repo admission project %q: %w", r.ID, err)
+			}
+		}
 		client, writer, ferr := factory(r)
 		if ferr != nil {
 			return nil, fmt.Errorf("build github for repo %q: %w", r.ID, ferr)
@@ -175,6 +240,9 @@ func New(ctx context.Context, st *store.Store, clk Clock, pub Publisher, factory
 		sender.SetArchiveHistory(cfg.archiveHistory[r.ID])
 		sender.SetLogger(cfg.logger)
 		rec := reconcile.NewForRepo(r.ID, st, client, recClk, asReconcilePub(pub))
+		if legacyProjectID != "" {
+			rec = reconcile.NewForRepoProject(r.ID, legacyProjectID, st, client, recClk, asReconcilePub(pub))
+		}
 		// F11 (build-list §F): wire the per-repo history writer so the merged->done
 		// post-merge archive commit lands on the repo's integration branch. The same
 		// mirror also resolves base_sha for GitHub-issue intake (adopt a labeled issue
@@ -253,16 +321,21 @@ func (m *Manager) AuthorizeEpicMerge(ctx context.Context, action store.EpicDomai
 
 // SweepAll runs one reconcile-IN sweep PER managed repo (the §8.1 floor, per repo).
 // Each repo's sweep reads its own board and binds its PRs only within that repo. It
-// returns the per-repo outcome counts and stops on the first error (the caller
-// retries on the next tick).
+// returns the successful per-repo outcome counts and a deterministic aggregate
+// of failures after every managed repo has been attempted exactly once.
 func (m *Manager) SweepAll(ctx context.Context) (map[string]int, error) {
 	counts := map[string]int{}
+	var failures []RepoLoopFailure
 	for _, id := range m.order {
 		outs, err := m.loops[id].rec.Sweep(ctx)
 		if err != nil {
-			return counts, fmt.Errorf("sweep repo %q: %w", id, err)
+			failures = append(failures, RepoLoopFailure{RepoID: id, Err: err})
+			continue
 		}
 		counts[id] = len(outs)
+	}
+	if len(failures) > 0 {
+		return counts, &RepoLoopFailures{Operation: "sweep", Failures: failures}
 	}
 	return counts, nil
 }
@@ -271,12 +344,17 @@ func (m *Manager) SweepAll(ctx context.Context) (map[string]int, error) {
 // its own repo's rows, over its own writer). Returns the per-repo sent counts.
 func (m *Manager) DrainAll(ctx context.Context) (map[string]int, error) {
 	counts := map[string]int{}
+	var failures []RepoLoopFailure
 	for _, id := range m.order {
 		n, err := m.loops[id].sender.DrainOnce(ctx)
 		if err != nil {
-			return counts, fmt.Errorf("drain repo %q: %w", id, err)
+			failures = append(failures, RepoLoopFailure{RepoID: id, Err: err})
+			continue
 		}
 		counts[id] = n
+	}
+	if len(failures) > 0 {
+		return counts, &RepoLoopFailures{Operation: "drain", Failures: failures}
 	}
 	return counts, nil
 }

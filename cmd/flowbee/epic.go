@@ -59,6 +59,20 @@ func runEpic(args []string) error {
 	st.EnableEpicReviewHandoffV2 = durableV2 || os.Getenv("FLOWBEE_EPIC_REVIEW_HANDOFF_V2") == "1"
 	st.EnableCapacityV2 = os.Getenv("FLOWBEE_CAPACITY_ROUTING_V2") == "1" ||
 		os.Getenv("FLOWBEE_CAPACITY_V2") == "1"
+	durableDedicatedWorkers, err := st.DurableEpicDedicatedWorkersV2(ctx)
+	if err != nil {
+		return fmt.Errorf("read durable epic-dedicated-workers v2 activation: %w", err)
+	}
+	rawDedicatedWorkers, explicitDedicatedWorkers := os.LookupEnv("FLOWBEE_EPIC_DEDICATED_WORKERS_V2")
+	if explicitDedicatedWorkers && strings.TrimSpace(rawDedicatedWorkers) != "0" &&
+		strings.TrimSpace(rawDedicatedWorkers) != "1" && strings.TrimSpace(rawDedicatedWorkers) != "" {
+		return errors.New("FLOWBEE_EPIC_DEDICATED_WORKERS_V2 must be 0 or 1")
+	}
+	if durableDedicatedWorkers && explicitDedicatedWorkers &&
+		(strings.TrimSpace(rawDedicatedWorkers) == "0" || strings.TrimSpace(rawDedicatedWorkers) == "") {
+		return errors.New("offline CLI cannot disable durable dedicated epic workers; serve owns the one-way activation boundary")
+	}
+	st.EnableEpicDedicatedWorkersV2 = durableDedicatedWorkers || strings.TrimSpace(rawDedicatedWorkers) == "1"
 
 	switch sub {
 	case "start":

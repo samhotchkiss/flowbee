@@ -151,6 +151,7 @@ func (s *Server) mastersHeartbeat(w http.ResponseWriter, r *http.Request) {
 // judges from (slug/evidence/checklist come from the digest keyed on the same epic).
 type leasedItem struct {
 	ID        string            `json:"id"`
+	ProjectID string            `json:"project_id"`
 	Kind      string            `json:"kind"`
 	Epic      string            `json:"epic"`
 	Repo      string            `json:"repo"`
@@ -167,10 +168,11 @@ type leasedItem struct {
 // (the standalone GET /v1/epics/digest offers real ETag/304 for constrained consumers).
 func (s *Server) mastersLease(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		MasterID string   `json:"master_id"`
-		Epoch    int      `json:"epoch"`
-		Max      int      `json:"max"`
-		Kinds    []string `json:"kinds"`
+		MasterID  string   `json:"master_id"`
+		ProjectID string   `json:"project_id"`
+		Epoch     int      `json:"epoch"`
+		Max       int      `json:"max"`
+		Kinds     []string `json:"kinds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -178,6 +180,9 @@ func (s *Server) mastersLease(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	now := s.clock.Now()
+	if req.ProjectID == "" {
+		req.ProjectID = "default"
+	}
 
 	// Fold the heartbeat first — a superseded incarnation stops here and re-registers.
 	revoked, err := s.store.SupervisorHeartbeat(ctx, req.MasterID, req.Epoch, now)
@@ -200,7 +205,7 @@ func (s *Server) mastersLease(w http.ResponseWriter, r *http.Request) {
 	if maxN <= 0 {
 		maxN = 5
 	}
-	granted, err := s.store.LeaseAttention(ctx, req.MasterID, req.Epoch, maxN, req.Kinds, attentionLeaseTTL, now)
+	granted, err := s.store.LeaseAttentionForProject(ctx, req.ProjectID, req.MasterID, req.Epoch, maxN, req.Kinds, attentionLeaseTTL, now)
 	if err != nil {
 		if errors.Is(err, lease.ErrStaleEpoch) {
 			// a stale/superseded epoch presented — tell the caller to re-register.
@@ -233,9 +238,13 @@ func (s *Server) mastersLease(w http.ResponseWriter, r *http.Request) {
 // mastersAttention is GET /v1/masters/attention (plan §1.4) — the read-only queue view,
 // no lease. Optional ?state= and ?kinds= (comma-separated) narrow it.
 func (s *Server) mastersAttention(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	if projectID == "" {
+		projectID = "default"
+	}
 	state := r.URL.Query().Get("state")
 	kinds := splitCSV(r.URL.Query().Get("kinds"))
-	items, err := s.store.ListOpenAttention(r.Context(), state, kinds, "")
+	items, err := s.store.ListOpenAttentionForProject(r.Context(), projectID, state, kinds, "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -256,6 +265,7 @@ func (s *Server) mastersAttention(w http.ResponseWriter, r *http.Request) {
 
 type resolveRequest struct {
 	MasterID       string `json:"master_id"`
+	ProjectID      string `json:"project_id"`
 	Epoch          int    `json:"epoch"`
 	ItemEpoch      int    `json:"item_epoch"`
 	Action         string `json:"action"` // reply|amend|dismiss|ack|escalate
@@ -277,6 +287,9 @@ func (s *Server) mastersResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	now := s.clock.Now()
+	if req.ProjectID == "" {
+		req.ProjectID = "default"
+	}
 
 	switch req.Action {
 	case "reply", "amend":
@@ -306,7 +319,7 @@ func (s *Server) resolveWithSend(w http.ResponseWriter, r *http.Request, id stri
 	}
 	// Resolve the target pane BEFORE the fenced transition, so a vanished epic is a clean
 	// 404 rather than a stranded delivering row.
-	item, err := s.store.GetAttentionItem(ctx, id)
+	item, err := s.store.GetAttentionItemForProject(ctx, req.ProjectID, id)
 	if err != nil {
 		http.Error(w, "unknown attention item", http.StatusNotFound)
 		return
@@ -326,7 +339,7 @@ func (s *Server) resolveWithSend(w http.ResponseWriter, r *http.Request, id stri
 	}
 
 	// Step 3a: fenced transition to delivering (rejects a superseded/stale caller → 409).
-	if err := s.store.BeginDelivery(ctx, id, req.MasterID, req.Epoch, req.ItemEpoch, idem, now); err != nil {
+	if err := s.store.BeginDeliveryForProject(ctx, req.ProjectID, id, req.MasterID, req.Epoch, req.ItemEpoch, idem, now); err != nil {
 		s.writeAttentionErr(w, err)
 		return
 	}
@@ -345,7 +358,7 @@ func (s *Server) resolveWithSend(w http.ResponseWriter, r *http.Request, id stri
 	if derr != nil || verdict == "" {
 		// infra failure delivering — record a failed verdict (item returns to open for a
 		// fast master retry, plan §15.4) and surface the failure.
-		_ = s.store.RecordDeliveryVerdict(ctx, id, req.MasterID, req.Epoch, req.ItemEpoch, "failed", s.clock.Now())
+		_ = s.store.RecordDeliveryVerdictForProject(ctx, req.ProjectID, id, req.MasterID, req.Epoch, req.ItemEpoch, "failed", s.clock.Now())
 		msg := "delivery failed"
 		if derr != nil {
 			msg = "delivery failed: " + derr.Error()
@@ -355,7 +368,7 @@ func (s *Server) resolveWithSend(w http.ResponseWriter, r *http.Request, id stri
 	}
 
 	// Step 3c: record the verdict (strong|weak → awaiting_ack; failed → open).
-	if err := s.store.RecordDeliveryVerdict(ctx, id, req.MasterID, req.Epoch, req.ItemEpoch, verdict, s.clock.Now()); err != nil {
+	if err := s.store.RecordDeliveryVerdictForProject(ctx, req.ProjectID, id, req.MasterID, req.Epoch, req.ItemEpoch, verdict, s.clock.Now()); err != nil {
 		s.writeAttentionErr(w, err)
 		return
 	}
@@ -379,13 +392,13 @@ func (s *Server) resolveWithSend(w http.ResponseWriter, r *http.Request, id stri
 // push notification land in Phase 7. So escalate does not itself page a human today — it
 // marks the item as needing one, which the Phase-7 operator drawer/alarm consumes.
 func (s *Server) resolveNoSend(ctx context.Context, w http.ResponseWriter, id string, req resolveRequest, now time.Time) {
-	item, err := s.store.GetAttentionItem(ctx, id)
+	item, err := s.store.GetAttentionItemForProject(ctx, req.ProjectID, id)
 	if err != nil {
 		http.Error(w, "unknown attention item", http.StatusNotFound)
 		return
 	}
 	resolution := map[string]string{"dismiss": "dismissed", "ack": "acked", "escalate": "escalated"}[req.Action]
-	if err := s.store.ResolveAttentionFenced(ctx, id, req.MasterID, req.Epoch, req.ItemEpoch, resolution, now); err != nil {
+	if err := s.store.ResolveAttentionFencedForProject(ctx, req.ProjectID, id, req.MasterID, req.Epoch, req.ItemEpoch, resolution, now); err != nil {
 		s.writeAttentionErr(w, err)
 		return
 	}
@@ -500,6 +513,7 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 // (plan §2.1) and the read-only queue view.
 type attentionView struct {
 	ID        string            `json:"id"`
+	ProjectID string            `json:"project_id"`
 	Kind      string            `json:"kind"`
 	Epic      string            `json:"epic"`
 	Repo      string            `json:"repo"`
@@ -709,14 +723,14 @@ func (s *Server) masterHBIntervalS() int {
 
 func toLeasedItem(it store.AttentionItem) leasedItem {
 	return leasedItem{
-		ID: it.ID, Kind: it.Kind, Epic: it.EpicID, Repo: it.Repo, Priority: it.Priority,
+		ID: it.ID, ProjectID: it.ProjectID, Kind: it.Kind, Epic: it.EpicID, Repo: it.Repo, Priority: it.Priority,
 		Evidence: nonNilMap(it.Evidence), Detail: it.Detail, DedupKey: it.DedupKey, ItemEpoch: it.ItemEpoch,
 	}
 }
 
 func toAttentionView(it store.AttentionItem) attentionView {
 	return attentionView{
-		ID: it.ID, Kind: it.Kind, Epic: it.EpicID, Repo: it.Repo, Priority: it.Priority,
+		ID: it.ID, ProjectID: it.ProjectID, Kind: it.Kind, Epic: it.EpicID, Repo: it.Repo, Priority: it.Priority,
 		State: it.State, Blocking: it.Blocking, Evidence: nonNilMap(it.Evidence),
 		Detail: it.Detail, DedupKey: it.DedupKey, ItemEpoch: it.ItemEpoch,
 	}

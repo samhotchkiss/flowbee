@@ -137,7 +137,7 @@ func (s *Store) reconcileCapacityPool(ctx context.Context, req CapacityPoolRequi
 			if err != nil {
 				return err
 			}
-			res, err := tx.ExecContext(ctx, `UPDATE attention_items SET state='resolved',resolution='capacity_restored',resolved_at=?,updated_at=? WHERE dedup_key=? AND state IN ('open','leased','delivering','awaiting_ack')`, nowText, nowText, dedupBase)
+			res, err := tx.ExecContext(ctx, `UPDATE attention_items SET state='resolved',resolution='capacity_restored',resolved_at=?,updated_at=? WHERE project_id=? AND dedup_key=? AND state IN ('open','leased','delivering','awaiting_ack')`, nowText, nowText, req.ProjectID, dedupBase)
 			if err != nil {
 				return err
 			}
@@ -162,8 +162,8 @@ func (s *Store) reconcileCapacityPool(ctx context.Context, req CapacityPoolRequi
 		}
 		evidence, _ := json.Marshal(map[string]any{"project_id": req.ProjectID, "pool": req.Pool, "provider": req.Provider, "queued_work": req.QueuedWork, "routable_seats": routable, "first_zero_at": firstZero})
 		attentionID := "capacity-pool-" + stableID(dedupBase+"\x00"+firstZero)
-		insert, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO attention_items(id,kind,epic_id,repo,priority,state,dedup_key,blocking,evidence_json,detail,occurrences,first_seen_at,last_seen_at,created_at,updated_at)
-			VALUES (?,?, '', '',10,'open',?,1,?,?,1,?,?,?,?)`, attentionID, string(attention.KindCapacityPoolExhausted), dedupBase, string(evidence), fmt.Sprintf("%s %s pool has %d queued work and zero routable seats", req.Provider, req.Pool, req.QueuedWork), firstZero, nowText, nowText, nowText)
+		insert, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO attention_items(id,project_id,kind,epic_id,repo,priority,state,dedup_key,blocking,evidence_json,detail,occurrences,first_seen_at,last_seen_at,created_at,updated_at)
+			VALUES (?,?,?, '', '',10,'open',?,1,?,?,1,?,?,?,?)`, attentionID, req.ProjectID, string(attention.KindCapacityPoolExhausted), dedupBase, string(evidence), fmt.Sprintf("%s %s pool has %d queued work and zero routable seats", req.Provider, req.Pool, req.QueuedWork), firstZero, nowText, nowText, nowText)
 		if err != nil {
 			return err
 		}
@@ -172,7 +172,7 @@ func (s *Store) reconcileCapacityPool(ctx context.Context, req CapacityPoolRequi
 		if inserted == 1 {
 			delta = 0
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE attention_items SET occurrences=occurrences+?,last_seen_at=?,evidence_json=?,updated_at=? WHERE dedup_key=? AND state IN ('open','leased','delivering','awaiting_ack')`, delta, nowText, string(evidence), nowText, dedupBase)
+		_, err = tx.ExecContext(ctx, `UPDATE attention_items SET occurrences=occurrences+?,last_seen_at=?,evidence_json=?,updated_at=? WHERE project_id=? AND dedup_key=? AND state IN ('open','leased','delivering','awaiting_ack')`, delta, nowText, string(evidence), nowText, req.ProjectID, dedupBase)
 		if err != nil {
 			return err
 		}

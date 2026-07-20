@@ -206,6 +206,9 @@ func runProjectActorLifecycle(ctx context.Context, st *store.Store, args []strin
 	profileID := fs.String("profile-id", "", "Driver lifecycle profile (ensure/adopt)")
 	workspaceRootID := fs.String("workspace-root-id", "", "managed workspace root id (ensure only)")
 	workspacePath := fs.String("workspace-relative-path", "", "managed workspace-relative path (ensure only)")
+	recoveryProfileID := fs.String("recovery-profile-id", "", "managed replacement profile (adopted Interactor only)")
+	recoveryWorkspaceRootID := fs.String("recovery-workspace-root-id", "", "managed replacement workspace root (adopted Interactor only)")
+	recoveryWorkspacePath := fs.String("recovery-workspace-relative-path", "", "managed replacement workspace path (adopted Interactor only)")
 	externalWatchID := fs.String("external-watch-id", "", "existing exact Driver watch UUID (adopt only)")
 	sessionID := fs.String("session-id", "", "exact Driver session UUID (adopt only)")
 	paneInstanceID := fs.String("pane-instance-id", "", "exact Driver pane-incarnation UUID (adopt only; never raw %N)")
@@ -233,7 +236,8 @@ func runProjectActorLifecycle(ctx context.Context, st *store.Store, args []strin
 	case "ensure":
 		if route.ActorID != *actorID || *hostID == "" || *storeID == "" || *domainID == "" || *serverID == "" ||
 			*lifecycleKey == "" || *targetEpoch < 1 || *profileID == "" || *workspaceRootID == "" || *workspacePath == "" ||
-			*externalWatchID != "" || *sessionID != "" || *paneInstanceID != "" || *agentRunID != "" {
+			*externalWatchID != "" || *sessionID != "" || *paneInstanceID != "" || *agentRunID != "" ||
+			*recoveryProfileID != "" || *recoveryWorkspaceRootID != "" || *recoveryWorkspacePath != "" {
 			return errors.New("ensure requires the active actor plus exact endpoint, lifecycle, profile, and managed workspace flags")
 		}
 		command.TargetHostID, command.TargetStoreID = *hostID, *storeID
@@ -244,13 +248,18 @@ func runProjectActorLifecycle(ctx context.Context, st *store.Store, args []strin
 		if route.ActorID != *actorID || *hostID == "" || *storeID == "" || *domainID == "" || *serverID == "" ||
 			*lifecycleKey == "" || *targetEpoch < 1 || *profileID == "" || *externalWatchID == "" ||
 			*sessionID == "" || *paneInstanceID == "" || *agentRunID == "" ||
-			strings.HasPrefix(*paneInstanceID, "%") || *workspaceRootID != "" || *workspacePath != "" {
-			return errors.New("adopt requires an existing watch UUID and exact stable endpoint/session/pane-incarnation/agent-run UUIDs; raw pane selectors are forbidden")
+			strings.HasPrefix(*paneInstanceID, "%") || *workspaceRootID != "" || *workspacePath != "" ||
+			*role != store.DriverInteractorRole || *recoveryProfileID != "claude_interactor_managed" ||
+			*recoveryWorkspaceRootID == "" || *recoveryWorkspacePath == "" {
+			return errors.New("adopt requires an existing Interactor watch and exact stable endpoint/session/pane/run plus a managed v3 recovery profile/workspace; raw pane selectors are forbidden")
 		}
 		command.TargetHostID, command.TargetStoreID = *hostID, *storeID
 		command.TargetServerDomainID, command.TargetServerID = *domainID, *serverID
 		command.LifecycleOwnership, command.LifecycleKey, command.TargetEpoch = "external_observed", *lifecycleKey, *targetEpoch
 		command.ProfileID, command.ExternalWatchID = *profileID, *externalWatchID
+		command.ManagedRecoveryProfileID = *recoveryProfileID
+		command.ManagedRecoveryWorkspaceRootID = *recoveryWorkspaceRootID
+		command.ManagedRecoveryWorkspaceRelativePath = *recoveryWorkspacePath
 		command.ExpectedSessionID, command.ExpectedPaneInstanceID, command.ExpectedAgentRunID = *sessionID, *paneInstanceID, *agentRunID
 	case "reattach", "stop", "release":
 		// Exact target authority is derived from the current active binding inside
@@ -258,7 +267,8 @@ func runProjectActorLifecycle(ctx context.Context, st *store.Store, args []strin
 		// they cannot override a stale pane/run fence.
 		if *hostID != "" || *storeID != "" || *domainID != "" || *serverID != "" || *lifecycleKey != "" ||
 			*targetEpoch != 0 || *profileID != "" || *workspaceRootID != "" || *workspacePath != "" ||
-			*externalWatchID != "" || *sessionID != "" || *paneInstanceID != "" || *agentRunID != "" {
+			*externalWatchID != "" || *sessionID != "" || *paneInstanceID != "" || *agentRunID != "" ||
+			*recoveryProfileID != "" || *recoveryWorkspaceRootID != "" || *recoveryWorkspacePath != "" {
 			return errors.New("reattach/stop/release derive their exact target from the durable active binding; target override flags are forbidden")
 		}
 	default:
