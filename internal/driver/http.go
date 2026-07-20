@@ -944,7 +944,10 @@ func (p *HTTPPort) StopSession(ctx context.Context, t SessionTarget, a Action) (
 		return LifecycleReceipt{}, err
 	}
 	r := wireLifecycleReceipt(out.Receipt)
-	if r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" || r.ActionID != a.ActionID ||
+	// A target created with Ensure-v3 retains that receipt family when Driver
+	// stops it. Stop itself is v2-shaped, but v3 is a valid terminal receipt
+	// for a v3-managed incarnation.
+	if (r.FormatVersion != "tmux-driver.lifecycle-receipt/v2" && r.FormatVersion != "tmux-driver.lifecycle-receipt/v3") || r.ActionID != a.ActionID ||
 		r.ActionEpoch != a.Epoch || r.LifecycleKey != t.LifecycleKey ||
 		r.TmuxServerDomainID != id.TmuxServerDomainID || r.TargetEpoch != t.TargetEpoch {
 		return LifecycleReceipt{}, ErrIdentityMismatch
