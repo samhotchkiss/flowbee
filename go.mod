@@ -3,7 +3,7 @@ module github.com/samhotchkiss/flowbee
 go 1.25.6
 
 require (
-	github.com/oklog/ulid/v2 v2.1.1
+	github.com/oklog/ulid/v2 v2.1.2
 	github.com/zeebo/blake3 v0.2.4
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.52.0
